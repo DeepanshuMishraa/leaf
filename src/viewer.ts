@@ -13,13 +13,17 @@ import {
   SyntaxStyle,
   t,
   TextAttributes,
+  TextBufferRenderable,
   TextRenderable,
   type CliRenderer,
   type KeyEvent,
   type MarkdownOptions,
+  type OptimizedBuffer,
   type Renderable,
+  type Selection,
 } from "@opentui/core"
 import { Doc, type LazyImage, type RawImage } from "./doc"
+import { Highlight } from "./highlight"
 import { Mono, type Rgb } from "./mono"
 import { Progress, type ImageMode } from "./progress"
 
@@ -43,6 +47,29 @@ const colors = {
   bg: RGBA.defaultBackground(),
   dim: RGBA.fromIndex(8),
   code: RGBA.fromIndex(3),
+  selection: RGBA.fromIndex(8),
+  // Highlighter yellow under dark ink reads the same on light and dark themes.
+  mark: RGBA.fromInts(250, 214, 64),
+  markInk: RGBA.fromInts(20, 20, 20),
+}
+
+/** The text blocks under `renderable` that take part in selection, in reading order. */
+const textBlocks = (renderable: Renderable): TextBufferRenderable[] =>
+  renderable instanceof TextBufferRenderable
+    ? renderable.selectable
+      ? [renderable]
+      : []
+    : renderable.getChildren().flatMap(textBlocks)
+
+/**
+ * Selected text is drawn in the terminal's own colors; the inverted default
+ * colors OpenTUI falls back to don't show in every terminal.
+ */
+const showSelection = (renderable: Renderable) => {
+  for (const block of textBlocks(renderable)) {
+    block.selectionBg = colors.selection
+    block.selectionFg = colors.fg
+  }
 }
 
 const theme = (renderer: CliRenderer) =>
@@ -86,6 +113,9 @@ export type ViewerOptions = {
   onPage?: (page: number) => void
   imageMode?: ImageMode
   onImageMode?: (mode: ImageMode) => void
+  highlights?: readonly Highlight[]
+  /** Hears every highlight there is, each time one is added or cleared. */
+  onHighlights?: (highlights: readonly Highlight[]) => void
 }
 
 /** Terminal cell size for an image, given the column budget and pixel size. */
@@ -283,6 +313,7 @@ export const Viewer = {
           wrapMode: "word",
         }),
       )
+      showSelection(box)
       return box
     }
 
@@ -298,6 +329,7 @@ export const Viewer = {
         borderColor: colors.dim,
       })
       box.add(new TextRenderable(renderer, { content: code, fg: colors.fg, wrapMode: "char" }))
+      showSelection(box)
       return box
     }
 
@@ -321,6 +353,7 @@ export const Viewer = {
             const block = context.defaultRender()
             if (!block) return null
             block.marginBottom = 0
+            showSelection(block)
             const box = new BoxRenderable(renderer, { width: "100%", marginBottom: 1 })
             box.add(block)
             return box
@@ -346,10 +379,18 @@ export const Viewer = {
       const separator =
         number === undefined || index === 0
           ? undefined
-          : new TextRenderable(renderer, { content: `·  ${number}  ·`, fg: colors.dim, alignSelf: "center", marginY: 1 })
+          : new TextRenderable(renderer, {
+              content: `·  ${number}  ·`,
+              fg: colors.dim,
+              alignSelf: "center",
+              marginY: 1,
+              selectable: false,
+            })
       if (separator) box.add(separator)
       if (markdown === "") {
-        box.add(new TextRenderable(renderer, { content: "blank page", fg: colors.dim, alignSelf: "center", marginY: 1 }))
+        box.add(
+          new TextRenderable(renderer, { content: "blank page", fg: colors.dim, alignSelf: "center", marginY: 1, selectable: false }),
+        )
       } else {
         box.add(markdownView(markdown, index))
       }
@@ -431,6 +472,75 @@ export const Viewer = {
       }
     }
 
+    let highlights: readonly Highlight[] = options.highlights ?? []
+
+    /** The selection as ranges of page text, one per page it spans. */
+    const selectedRanges = (selection: Selection) => {
+      const selected = new Set(selection.selectedRenderables)
+      const ranges: Highlight[] = []
+      pages.forEach((page, index) => {
+        let base = 0
+        for (const block of textBlocks(page.box)) {
+          const range = selected.has(block) ? block.getSelection() : null
+          if (range) ranges.push({ page: index, start: base + range.start, end: base + range.end, text: block.getSelectedText() })
+          base += block.textLength + 1
+        }
+      })
+      return Highlight.merge(ranges)
+    }
+
+    const toggleHighlight = () => {
+      const selection = renderer.getSelection()
+      if (!selection) return
+      highlights = Highlight.toggle(highlights, selectedRanges(selection))
+      renderer.clearSelection()
+      options.onHighlights?.(highlights)
+    }
+
+    /**
+     * Paints highlights over the finished frame, keeping each cell's character
+     * and style, on the pages in view and outside any open dialog.
+     */
+    const paintHighlights = (buffer: OptimizedBuffer) => {
+      if (highlights.length === 0) return
+      const top = scroll.viewport.y
+      const bottom = top + scroll.viewport.height
+      const covers = (x: number, y: number) =>
+        overlay.visible && x >= panel.x && x < panel.x + panel.width && y >= panel.y && y < panel.y + panel.height
+      buffer.withBuffers((cells) => {
+        const paint = (block: TextBufferRenderable, from: number, to: number) => {
+          const { lineStartCols, lineWidthCols } = block.lineInfo
+          lineStartCols.forEach((lineStart, line) => {
+            const y = block.y + line
+            if (y < top || y >= bottom || y >= cells.height) return
+            const end = Math.min(to, lineStart + (lineWidthCols[line] ?? 0))
+            for (let col = Math.max(from, lineStart); col < end; col++) {
+              const x = block.x + col - lineStart
+              if (x < 0 || x >= cells.width || covers(x, y)) continue
+              const cell = (y * cells.width + x) * 4
+              cells.bg.set(colors.mark.buffer, cell)
+              cells.fg.set(colors.markInk.buffer, cell)
+            }
+          })
+        }
+        pages.forEach((page, index) => {
+          const { box } = page
+          if (!box.visible || box.y >= bottom || box.y + box.height <= top) return
+          const marks = highlights.filter((highlight) => highlight.page === index)
+          if (marks.length === 0) return
+          let base = 0
+          for (const block of textBlocks(box)) {
+            for (const mark of marks) {
+              const from = Math.max(mark.start, base) - base
+              const to = Math.min(mark.end, base + block.textLength) - base
+              if (from < to) paint(block, from, to)
+            }
+            base += block.textLength + 1
+          }
+        })
+      })
+    }
+
     const scroll = new ScrollBoxRenderable(renderer, {
       id: "scroll",
       flexGrow: 1,
@@ -439,7 +549,14 @@ export const Viewer = {
     // The page number in the footer says where you are; a scrollbar would only add noise.
     scroll.verticalScrollBar.visible = false
 
-    const footer = new TextRenderable(renderer, { id: "footer", fg: colors.dim, wrapMode: "none", alignSelf: "center", marginY: 1 })
+    const footer = new TextRenderable(renderer, {
+      id: "footer",
+      fg: colors.dim,
+      wrapMode: "none",
+      alignSelf: "center",
+      marginY: 1,
+      selectable: false,
+    })
 
     const updateFooter = () => {
       if (doc.pageCount === undefined) {
@@ -506,6 +623,8 @@ export const Viewer = {
         ["g/G", paged ? "first / last page" : "top / bottom"],
         ...(paged ? [["t  :", "go to page"] as const] : []),
         ["i", imageMode === "color" ? "paint images" : "show original images"],
+        ["drag", "select and copy text"],
+        ["y", "highlight selection, or clear one"],
         ["?", "this help"],
         ["q", "quit"],
       ]
@@ -570,9 +689,18 @@ export const Viewer = {
       const paged = layout === "paged"
       const here = pageHere()
       switch (key.name) {
-        case "q":
         case "escape":
+          if (renderer.hasSelection) {
+            renderer.clearSelection()
+            return
+          }
           renderer.destroy()
+          return
+        case "q":
+          renderer.destroy()
+          return
+        case "y":
+          toggleHighlight()
           return
         case "j":
         case "down":
@@ -625,6 +753,18 @@ export const Viewer = {
       }
       updateFooter()
     })
+
+    // Taking over the mouse turns off the terminal's own selection, so copy what's selected here.
+    renderer.on("selection", (selection: Selection) => {
+      const text = selection.getSelectedText()
+      if (text === "") return
+      try {
+        renderer.copyToClipboardOSC52(text)
+      } catch {
+        // A terminal that refuses the clipboard write only loses the copy; the selection stays and can be highlighted.
+      }
+    })
+    renderer.addPostProcessFn(paintHighlights)
 
     // Resizes and mouse wheel scrolling bypass the key handler; keep everything current.
     renderer.setFrameCallback(async () => {

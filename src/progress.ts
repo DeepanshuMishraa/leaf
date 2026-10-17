@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Result, TaggedError } from "better-result"
+import type { Highlight } from "./highlight"
 
 /** Where a reader is in a paged document. `page` is 1-based. */
 export type Progress = { page: number; pageCount: number; percent: number }
@@ -17,12 +18,18 @@ export class ProgressStoreFailed extends TaggedError("ProgressStoreFailed")<{
 /** How figures draw: as the image itself, or painted in the terminal's text color on a transparent ground. */
 export type ImageMode = "color" | "mono"
 
-/** Saved reading places, one per document key (a PDF's real path), plus the image mode for every document. */
+/**
+ * Saved reading places and highlights, per document key (a PDF's real path or
+ * a URL), plus the image mode for every document.
+ */
 export type ProgressStore = {
   load: (key: string) => Result<Progress | undefined, ProgressStoreFailed>
   save: (key: string, progress: Progress) => Result<void, ProgressStoreFailed>
   loadImageMode: () => Result<ImageMode | undefined, ProgressStoreFailed>
   saveImageMode: (mode: ImageMode) => Result<void, ProgressStoreFailed>
+  loadHighlights: (key: string) => Result<Highlight[], ProgressStoreFailed>
+  /** Replaces every highlight saved for `key`. */
+  saveHighlights: (key: string, highlights: readonly Highlight[]) => Result<void, ProgressStoreFailed>
 }
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
@@ -37,7 +44,15 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS progress (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
-)`
+);
+CREATE TABLE IF NOT EXISTS highlights (
+  key TEXT NOT NULL,
+  page INTEGER NOT NULL,
+  start INTEGER NOT NULL,
+  end INTEGER NOT NULL,
+  text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS highlights_key ON highlights (key)`
 
 /** A stored image mode, or undefined if the row is missing or isn't one we wrote. */
 const parseImageMode = (row: unknown): ImageMode | undefined => {
@@ -53,6 +68,14 @@ const parseRow = (row: unknown): Progress | undefined => {
   const { page, page_count, percent } = row as Record<string, unknown>
   if (!isCount(page) || !isCount(page_count) || !isCount(percent) || page < 1) return undefined
   return { page, pageCount: page_count, percent }
+}
+
+/** A highlight row, or undefined if it isn't one we wrote. */
+const parseHighlight = (row: unknown): Highlight | undefined => {
+  if (typeof row !== "object" || row === null) return undefined
+  const { page, start, end, text } = row as Record<string, unknown>
+  if (!isCount(page) || !isCount(start) || !isCount(end) || typeof text !== "string" || end <= start) return undefined
+  return { page, start, end, text }
 }
 
 export const Progress = {
@@ -73,7 +96,7 @@ export const Progress = {
         operation,
         path,
         cause,
-        message: `Could not ${what} reading progress in ${path} (${errorMessage(cause)}). The document itself is unaffected. Check that the folder is writable, or delete the file to start fresh.`,
+        message: `Could not ${what} reading progress and highlights in ${path} (${errorMessage(cause)}). The document itself is unaffected. Check that the folder is writable, or delete the file to start fresh.`,
       })
 
     return Result.try({
@@ -95,7 +118,21 @@ export const Progress = {
       const upsertSetting = db.query(
         "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       )
+      const selectHighlights = db.query("SELECT page, start, end, text FROM highlights WHERE key = ? ORDER BY page, start")
+      const deleteHighlights = db.query("DELETE FROM highlights WHERE key = ?")
+      const insertHighlight = db.query("INSERT INTO highlights (key, page, start, end, text) VALUES (?, ?, ?, ?, ?)")
+      const replaceHighlights = db.transaction((key: string, highlights: readonly Highlight[]) => {
+        deleteHighlights.run(key)
+        for (const { page, start, end, text } of highlights) insertHighlight.run(key, page, start, end, text)
+      })
       return {
+        loadHighlights: (key) =>
+          Result.try({
+            try: () => selectHighlights.all(key).flatMap((row) => parseHighlight(row) ?? []),
+            catch: failed("load", "read"),
+          }),
+        saveHighlights: (key, highlights) =>
+          Result.try({ try: () => void replaceHighlights(key, highlights), catch: failed("save", "save") }),
         loadImageMode: () =>
           Result.try({ try: () => parseImageMode(selectSetting.get("image_mode")), catch: failed("load", "read") }),
         saveImageMode: (mode) =>

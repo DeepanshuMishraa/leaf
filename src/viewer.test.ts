@@ -279,3 +279,69 @@ test("t also opens the go-to-page box", async () => {
   await s.renderOnce()
   expect(s.captureCharFrame()).toContain("Go to page")
 })
+
+/** The text on screen with the highlighter's yellow behind it. */
+const highlighted = (s: NonNullable<typeof setup>) =>
+  s
+    .captureSpans()
+    .lines.flatMap((line) => line.spans)
+    .filter((span) => {
+      const [r, g, b] = span.bg.toInts()
+      return r === 250 && g === 214 && b === 64
+    })
+    .map((span) => span.text)
+    .join("")
+
+/** Screen position of the first appearance of `text`, once it has drawn. */
+const find = async (s: NonNullable<typeof setup>, text: string) => {
+  for (let tries = 0; tries < 20 && !s.captureCharFrame().includes(text); tries++) await settle(s)
+  const lines = s.captureCharFrame().split("\n")
+  const y = lines.findIndex((line) => line.includes(text))
+  return { x: lines[y]?.indexOf(text) ?? -1, y }
+}
+
+test("a dragged selection is copied, and y highlights it in yellow and reports it", async () => {
+  const saved: unknown[] = []
+  const s = await mountBook(["Alpha text here", "Bravo text"], 120, 30, { onHighlights: (h) => saved.push(h) })
+  const copied: string[] = []
+  s.renderer.copyToClipboardOSC52 = (text) => copied.push(text) > 0
+  const { x, y } = await find(s, "text here")
+  await s.mockMouse.drag(x, y, x + 3, y)
+  expect(copied).toEqual(["text"])
+  s.mockInput.pressKey("y")
+  await settle(s)
+  expect(highlighted(s)).toBe("text")
+  expect(saved).toEqual([[{ page: 0, start: 6, end: 10, text: "text" }]])
+  // The highlight belongs to its page: turning the page leaves it behind.
+  s.mockInput.pressArrow("right")
+  await settle(s)
+  expect(highlighted(s)).toBe("")
+})
+
+test("saved highlights come back, and y on a selection touching one clears it", async () => {
+  const saved: unknown[] = []
+  const s = await mountBook(["Alpha text here", "Bravo text"], 120, 30, {
+    highlights: [{ page: 0, start: 0, end: 5, text: "Alpha" }],
+    onHighlights: (h) => saved.push(h),
+  })
+  const { x, y } = await find(s, "Alpha")
+  expect(highlighted(s)).toBe("Alpha")
+  await s.mockMouse.drag(x + 2, y, x + 7, y)
+  s.mockInput.pressKey("y")
+  await settle(s)
+  expect(highlighted(s)).toBe("")
+  expect(saved).toEqual([[]])
+})
+
+test("escape clears a selection before it quits", async () => {
+  const s = await mountBook(["Alpha text here"], 120, 30)
+  const { x, y } = await find(s, "Alpha")
+  await s.mockMouse.drag(x, y, x + 3, y)
+  s.mockInput.pressEscape()
+  await settle(s)
+  expect(s.renderer.isDestroyed).toBe(false)
+  expect(s.renderer.hasSelection).toBe(false)
+  s.mockInput.pressEscape()
+  await settle(s)
+  expect(s.renderer.isDestroyed).toBe(true)
+})

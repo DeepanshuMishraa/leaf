@@ -8,7 +8,7 @@ import { realpathSync } from "node:fs"
 
 const USAGE = `Usage: leaf open <file.pdf | url>
 
-Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, i painted images, ? keys, q quit`
+Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, i painted images, drag select + copy, y highlight, ? keys, q quit`
 
 class UnsupportedTarget extends TaggedError("UnsupportedTarget")<{ target: string; message: string }> {}
 
@@ -42,8 +42,8 @@ if (command !== "open" || target === undefined) {
 }
 
 /**
- * Remembers the image mode, and where each PDF (file or link) was left, so they
- * come back next time. Progress that can't be read or saved is reported after
+ * Remembers the image mode, each document's highlights, and where each PDF
+ * (file or link) was left, so they come back next time. Progress that can't be read or saved is reported after
  * the reader closes; reading goes on.
  */
 function resume(target: string, pageCount: number | undefined): ViewerOptions {
@@ -60,19 +60,23 @@ function resume(target: string, pageCount: number | undefined): ViewerOptions {
     if (result.isErr()) failure = result.error.message
   }
 
+  const key = isUrl(target) ? target : realpathSync(target)
   const imageMode = store.value.loadImageMode()
   recordFailure(imageMode)
-  const images: ViewerOptions = {
+  const highlights = store.value.loadHighlights(key)
+  recordFailure(highlights)
+  const everyDoc: ViewerOptions = {
     imageMode: imageMode.isOk() ? imageMode.value : undefined,
     onImageMode: (mode) => recordFailure(store.value.saveImageMode(mode)),
+    highlights: highlights.isOk() ? highlights.value : undefined,
+    onHighlights: (next) => recordFailure(store.value.saveHighlights(key, next)),
   }
-  if (pageCount === undefined) return images
+  if (pageCount === undefined) return everyDoc
 
-  const key = isUrl(target) ? target : realpathSync(target)
   const saved = store.value.load(key)
   recordFailure(saved)
   return {
-    ...images,
+    ...everyDoc,
     startPage: saved.isOk() ? saved.value?.page : undefined,
     onPage: (page) => recordFailure(store.value.save(key, Progress.of(page, pageCount))),
   }

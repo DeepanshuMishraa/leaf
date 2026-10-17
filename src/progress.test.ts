@@ -33,6 +33,19 @@ test("a store that can't be created is an error value, not a throw", () => {
   expect(store.isErr()).toBe(true)
 })
 
+test("highlights come back for the same document, and saving replaces them", () => {
+  const store = memoryStore()
+  expect(store.loadHighlights("/books/a.pdf").unwrap()).toEqual([])
+  const first = { page: 2, start: 10, end: 15, text: "hello" }
+  const second = { page: 0, start: 0, end: 3, text: "abc" }
+  store.saveHighlights("/books/a.pdf", [first, second]).unwrap()
+  store.saveHighlights("/books/b.pdf", [first]).unwrap()
+  expect(store.loadHighlights("/books/a.pdf").unwrap()).toEqual([second, first])
+  store.saveHighlights("/books/a.pdf", [second]).unwrap()
+  expect(store.loadHighlights("/books/a.pdf").unwrap()).toEqual([second])
+  expect(store.loadHighlights("/books/b.pdf").unwrap()).toEqual([first])
+})
+
 test("the image mode is remembered across documents", () => {
   const store = memoryStore()
   expect(store.loadImageMode().unwrap()).toBeUndefined()
