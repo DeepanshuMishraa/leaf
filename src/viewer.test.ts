@@ -1,0 +1,142 @@
+import { afterEach, expect, test } from "bun:test"
+import { createTestRenderer } from "@opentui/core/testing"
+import { Doc } from "./doc"
+import { Viewer } from "./viewer"
+
+let setup: Awaited<ReturnType<typeof createTestRenderer>> | undefined
+
+afterEach(() => {
+  setup?.renderer.destroy()
+  setup = undefined
+})
+
+const mount = async (markdown: string) => {
+  setup = await createTestRenderer({ width: 80, height: 20 })
+  const { loaded } = Viewer.mount(setup.renderer, Doc.whole("Sample", markdown))
+  await loaded
+  // Markdown lays out across frames; give it a beat before capturing.
+  await setup.renderOnce()
+  await Bun.sleep(50)
+  await setup.renderOnce()
+  return setup
+}
+
+test("shows the title and rendered markdown, with key hints only on ?", async () => {
+  const s = await mount("## Intro\n\nSome **bold** words and a [link](https://example.com).")
+  const frame = s.captureCharFrame()
+  expect(frame).toContain("Sample")
+  expect(frame).toContain("Intro")
+  expect(frame).toContain("bold")
+  expect(frame).not.toContain("**")
+  expect(frame).not.toContain("q quit")
+  s.mockInput.pressKey("?")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).toContain("q quit")
+})
+
+test("a numbered list item from a PDF keeps its number and no stray backslash", async () => {
+  const frame = (await mount("\u206010. Batch Processing · 389")).captureCharFrame()
+  expect(frame).toContain("10. Batch Processing · 389")
+  expect(frame).not.toContain("\\")
+})
+
+test("streamed chunks all show up, in order", async () => {
+  setup = await createTestRenderer({ width: 80, height: 20 })
+  const doc: Doc = {
+    title: "Book",
+    pageCount: 3,
+    images: new Map(),
+    chunks: (async function* () {
+      yield { markdown: "First page", page: 1 }
+      yield { markdown: "Second page", page: 2 }
+      yield { markdown: "Third page", page: 3 }
+    })(),
+  }
+  const { loaded } = Viewer.mount(setup.renderer, doc)
+  await loaded
+  await setup.renderOnce()
+  await Bun.sleep(50)
+  await setup.renderOnce()
+  const frame = setup.captureCharFrame()
+  expect(frame.indexOf("First page")).toBeLessThan(frame.indexOf("Second page"))
+  expect(frame.indexOf("Second page")).toBeLessThan(frame.indexOf("Third page"))
+  expect(frame).not.toContain("loading")
+})
+
+test("j scrolls the document down", async () => {
+  const lines = Array.from({ length: 60 }, (_, i) => `Paragraph ${i}`).join("\n\n")
+  const s = await mount(lines)
+  expect(s.captureCharFrame()).toContain("Paragraph 0")
+  for (let i = 0; i < 10; i++) s.mockInput.pressKey("j")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).not.toContain("Paragraph 0\n")
+})
+
+const book = (pages: string[]): Doc => ({
+  title: "Book",
+  pageCount: pages.length,
+  images: new Map(),
+  chunks: (async function* () {
+    for (const [i, markdown] of pages.entries()) yield { markdown, page: i + 1 }
+  })(),
+})
+
+const mountBook = async (pages: string[], width: number, height: number) => {
+  setup = await createTestRenderer({ width, height })
+  const { loaded } = Viewer.mount(setup.renderer, book(pages))
+  await loaded
+  await setup.renderOnce()
+  await Bun.sleep(50)
+  await setup.renderOnce()
+  return setup
+}
+
+test("a wide window shows one page at a time, and → turns the page", async () => {
+  const s = await mountBook(["Alpha text", "Bravo text", "Charlie text"], 120, 30)
+  let frame = s.captureCharFrame()
+  expect(frame).toContain("Alpha text")
+  expect(frame).not.toContain("Bravo text")
+  expect(frame).toContain("1 / 3")
+  s.mockInput.pressArrow("right")
+  // The page that just appeared lays out across frames.
+  await s.renderOnce()
+  await Bun.sleep(50)
+  await s.renderOnce()
+  frame = s.captureCharFrame()
+  expect(frame).not.toContain("Alpha text")
+  expect(frame).toContain("Bravo text")
+  expect(frame).toContain("2 / 3")
+})
+
+test("a narrow window stacks the pages with the page number between them", async () => {
+  const s = await mountBook(["Alpha text", "Bravo text"], 70, 30)
+  const frame = s.captureCharFrame()
+  expect(frame).toContain("Alpha text")
+  expect(frame).toContain("Bravo text")
+  expect(frame).toContain("·  2  ·")
+})
+
+test("consecutive paragraphs are separated by a blank line", async () => {
+  const { captureCharFrame } = await mount("First paragraph.\n\nSecond paragraph.")
+  const lines = captureCharFrame().split("\n")
+  const first = lines.findIndex((l) => l.includes("First paragraph."))
+  const second = lines.findIndex((l) => l.includes("Second paragraph."))
+  expect(second - first).toBe(2)
+})
+
+test("a short top-level heading is drawn in large letters", async () => {
+  const { captureCharFrame } = await mount("# Intro\n\nBody.")
+  const lines = captureCharFrame().split("\n")
+  // The large font spans more than one row of block glyphs.
+  expect(lines.filter((l) => /[█▀▄]/.test(l)).length).toBeGreaterThan(1)
+})
+
+test("i switches images between original and painted", async () => {
+  const s = await mount("Text")
+  s.mockInput.pressKey("?")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).toContain("i painted")
+  s.mockInput.pressKey("i")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).toContain("i original")
+})

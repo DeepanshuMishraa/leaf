@@ -1,0 +1,28 @@
+{
+  "name": "leaf",
+  "module": "src/cli.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/turndown": "^5.0.6"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "@opentui/core": "^0.6.6",
+    "better-result": "^3.0.1",
+    "linkedom": "^0.18.13",
+    "mupdf": "^1.28.1",
+    "turndown": "^7.2.4"
+  },
+  "bin": {
+    "leaf": "src/cli.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  }
+}
