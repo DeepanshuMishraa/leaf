@@ -3,6 +3,7 @@ import { parseHTML } from "linkedom"
 import TurndownService from "turndown"
 import { Result, TaggedError } from "better-result"
 import { Doc } from "./doc"
+import { Pdf } from "./pdf"
 
 export class ArticleFetchFailed extends TaggedError("ArticleFetchFailed")<{
   url: string
@@ -36,6 +37,20 @@ const absolutize = (root: ReturnType<typeof parseHTML>["document"], base: string
   }
 }
 
+const isPdf = (response: Response, url: string) => {
+  const type = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase()
+  if (type === "application/pdf") return true
+  // Some servers label PDFs as generic binary; fall back to the extension.
+  return type === "application/octet-stream" && new URL(url).pathname.toLowerCase().endsWith(".pdf")
+}
+
+/** A title for a PDF without one: the file name from its URL, or the host. */
+const pdfTitle = (url: string) => {
+  const { pathname, hostname } = new URL(url)
+  const last = decodeURIComponent(pathname.split("/").filter(Boolean).at(-1) ?? "")
+  return last.replace(/\.pdf$/i, "") || hostname
+}
+
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced", bulletListMarker: "-" })
 
 // Heading permalinks ("#", "¶", "🔗") are page chrome, not content.
@@ -64,7 +79,16 @@ export const Article = {
     return Result.ok({ doc: Doc.whole(title, markdown), markdown })
   },
 
-  open: async (url: string) => {
+  /** Abstract pages hold only the summary; point them at the full paper. */
+  paperUrl: (url: string) => {
+    const parsed = URL.parse(url)
+    if (parsed?.hostname !== "arxiv.org" || !parsed.pathname.startsWith("/abs/")) return url
+    parsed.pathname = parsed.pathname.replace(/^\/abs\//, "/pdf/")
+    return parsed.href
+  },
+
+  open: async (link: string) => {
+    const url = Article.paperUrl(link)
     const response = await Result.tryPromise({
       try: () => fetch(url, { headers: { "user-agent": "Mozilla/5.0 (leaf reader)" }, redirect: "follow" }),
       catch: (cause) =>
@@ -85,6 +109,19 @@ export const Article = {
       )
     }
     const finalUrl = response.value.url || url
+    // Paper links often serve a PDF from a URL without ".pdf"; trust the content type.
+    if (isPdf(response.value, finalUrl)) {
+      const bytes = await Result.tryPromise({
+        try: async () => new Uint8Array(await response.value.arrayBuffer()),
+        catch: (cause) =>
+          new ArticleFetchFailed({
+            url,
+            cause,
+            message: `The connection to ${url} dropped while downloading the PDF. Try again.`,
+          }),
+      })
+      return bytes.andThen((pdf) => Pdf.fromBytes(pdf, url, pdfTitle(finalUrl)))
+    }
     const html = await Result.tryPromise({
       try: () => response.value.text(),
       catch: (cause) =>

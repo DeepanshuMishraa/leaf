@@ -328,7 +328,7 @@ export const Pdf = {
    */
   open: (path: string) =>
     Result.try({
-      try: () => mupdf.Document.openDocument(readFileSync(path), "application/pdf"),
+      try: () => readFileSync(path),
       catch: (cause) =>
         new PdfOpenFailed({
           path,
@@ -336,7 +336,22 @@ export const Pdf = {
           message:
             cause instanceof Error && "code" in cause && cause.code === "EPERM"
               ? `macOS blocked access to ${path} (${cause.message}). Allow your terminal in System Settings → Privacy & Security → Files & Folders, then restart it.`
-              : `Could not open ${path} as a PDF (${errorMessage(cause)}). It may be missing, encrypted or damaged. Check the path, or open it in a PDF viewer to confirm it is valid.`,
+              : `Could not read ${path} (${errorMessage(cause)}). Check that the path is right and the file exists.`,
+        }),
+    }).andThen((bytes) => Pdf.fromBytes(bytes, path, basename(path, ".pdf"))),
+
+  /**
+   * `open` for PDF bytes already in hand (a download, say). `source` names the
+   * PDF in errors; `fallbackTitle` is used when the PDF has no title of its own.
+   */
+  fromBytes: (bytes: Uint8Array, source: string, fallbackTitle: string) =>
+    Result.try({
+      try: () => mupdf.Document.openDocument(bytes, "application/pdf"),
+      catch: (cause) =>
+        new PdfOpenFailed({
+          path: source,
+          cause,
+          message: `Could not open ${source} as a PDF (${errorMessage(cause)}). It may be encrypted or damaged. Open it in a PDF viewer to confirm it is valid.`,
         }),
     }).map((document) => {
       const pageCount = document.countPages()
@@ -398,7 +413,7 @@ export const Pdf = {
       }
 
       const doc: Doc = {
-        title: document.getMetaData("info:Title")?.trim() || basename(path, ".pdf"),
+        title: document.getMetaData("info:Title")?.trim() || fallbackTitle,
         pageCount,
         chunks: chunks(),
         images,

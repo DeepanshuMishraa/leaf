@@ -21,10 +21,11 @@ const mount = async (markdown: string) => {
   return setup
 }
 
-test("shows the title and rendered markdown, with key hints only on ?", async () => {
+test("shows rendered markdown without a title line, with key hints only on ?", async () => {
   const s = await mount("## Intro\n\nSome **bold** words and a [link](https://example.com).")
   const frame = s.captureCharFrame()
-  expect(frame).toContain("Sample")
+  // The title goes to the terminal tab, not the screen.
+  expect(frame).not.toContain("Sample")
   expect(frame).toContain("Intro")
   expect(frame).toContain("bold")
   expect(frame).not.toContain("**")
@@ -81,9 +82,9 @@ const book = (pages: string[]): Doc => ({
   })(),
 })
 
-const mountBook = async (pages: string[], width: number, height: number) => {
+const mountBook = async (pages: string[], width: number, height: number, options?: Parameters<typeof Viewer.mount>[2]) => {
   setup = await createTestRenderer({ width, height })
-  const { loaded } = Viewer.mount(setup.renderer, book(pages))
+  const { loaded } = Viewer.mount(setup.renderer, book(pages), options)
   await loaded
   await setup.renderOnce()
   await Bun.sleep(50)
@@ -106,6 +107,39 @@ test("a wide window shows one page at a time, and → turns the page", async () 
   expect(frame).not.toContain("Alpha text")
   expect(frame).toContain("Bravo text")
   expect(frame).toContain("2 / 3")
+})
+
+test("the footer shows how much of the book is read", async () => {
+  const s = await mountBook(["A", "B", "C", "D"], 120, 30)
+  expect(s.captureCharFrame()).toContain("1 / 4 · 25%")
+})
+
+test("opens at a saved page and reports each page it lands on", async () => {
+  const seen: number[] = []
+  const s = await mountBook(["Alpha text", "Bravo text", "Charlie text"], 120, 30, {
+    startPage: 2,
+    onPage: (page) => seen.push(page),
+  })
+  let frame = s.captureCharFrame()
+  expect(frame).toContain("Bravo text")
+  expect(frame).not.toContain("Alpha text")
+  expect(frame).toContain("2 / 3")
+  s.mockInput.pressArrow("right")
+  await s.renderOnce()
+  frame = s.captureCharFrame()
+  expect(frame).toContain("3 / 3 · 100%")
+  expect(seen).toEqual([2, 3])
+})
+
+test("a narrow window scrolls to the saved page once it loads", async () => {
+  const filler = (name: string) => Array.from({ length: 20 }, (_, i) => `${name} line ${i}`).join("\n\n")
+  const s = await mountBook([filler("Alpha"), filler("Bravo"), filler("Charlie")], 70, 30, { startPage: 3 })
+  await s.renderOnce()
+  await Bun.sleep(50)
+  await s.renderOnce()
+  const frame = s.captureCharFrame()
+  expect(frame).toContain("Charlie line 0")
+  expect(frame).toContain("3 / 3")
 })
 
 test("a narrow window stacks the pages with the page number between them", async () => {
@@ -139,4 +173,15 @@ test("i switches images between original and painted", async () => {
   s.mockInput.pressKey("i")
   await s.renderOnce()
   expect(s.captureCharFrame()).toContain("i original")
+})
+
+test("starts in the saved image mode and reports when i changes it", async () => {
+  const modes: string[] = []
+  setup = await createTestRenderer({ width: 80, height: 20 })
+  Viewer.mount(setup.renderer, Doc.whole("Sample", "Text"), { imageMode: "mono", onImageMode: (mode) => modes.push(mode) })
+  setup.mockInput.pressKey("?")
+  await setup.renderOnce()
+  expect(setup.captureCharFrame()).toContain("i original")
+  setup.mockInput.pressKey("i")
+  expect(modes).toEqual(["color"])
 })

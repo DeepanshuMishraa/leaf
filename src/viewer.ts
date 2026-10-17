@@ -18,6 +18,7 @@ import {
 } from "@opentui/core"
 import { Doc, type LazyImage, type RawImage } from "./doc"
 import { Mono, type Rgb } from "./mono"
+import { Progress, type ImageMode } from "./progress"
 
 type MarkdownToken = Parameters<NonNullable<MarkdownOptions["renderNode"]>>[0]
 
@@ -65,8 +66,12 @@ const theme = (renderer: CliRenderer) =>
  * column with the page number between them.
  */
 type Layout = "paged" | "scroll"
-/** How figures draw: as the image itself, or painted in the terminal's text color on a transparent ground. */
-type ImageMode = "color" | "mono"
+export type ViewerOptions = {
+  startPage?: number
+  onPage?: (page: number) => void
+  imageMode?: ImageMode
+  onImageMode?: (mode: ImageMode) => void
+}
 
 /** Terminal cell size for an image, given the column budget and pixel size. */
 const imageCells = (maxCols: number, width: number, height: number) => {
@@ -141,10 +146,20 @@ type Figure = {
 type Page = { number: number | undefined; box: BoxRenderable; separator: TextRenderable | undefined }
 
 export const Viewer = {
-  open: async (doc: Doc) => Viewer.mount(await createCliRenderer({ exitOnCtrlC: true, backgroundColor: colors.bg }), doc),
+  open: async (doc: Doc, options?: ViewerOptions) => {
+    const renderer = await createCliRenderer({ exitOnCtrlC: true, backgroundColor: colors.bg })
+    // The title names the terminal tab; on screen it would only take rows from the text.
+    renderer.setTerminalTitle(doc.title)
+    return Viewer.mount(renderer, doc, options)
+  },
 
-  /** Builds the reader UI on an existing renderer (a real terminal or a test renderer). */
-  mount: (renderer: CliRenderer, doc: Doc) => {
+  /**
+   * Builds the reader UI on an existing renderer (a real terminal or a test renderer).
+   * For paged documents, `startPage` (1-based) is where reading resumes, and
+   * `onPage` hears each page the reader settles on.
+   */
+  mount: (renderer: CliRenderer, doc: Doc, options: ViewerOptions = {}) => {
+    // `imageMode` starts figures painted or not; `onImageMode` hears each switch.
     const textWidth = () => Math.max(1, Math.min(MAX_TEXT_WIDTH, renderer.width - 4))
     const layoutFor = (): Layout =>
       doc.pageCount !== undefined && renderer.width >= PAGED_MIN_WIDTH && renderer.height >= PAGED_MIN_HEIGHT
@@ -152,10 +167,13 @@ export const Viewer = {
         : "scroll"
 
     let layout = layoutFor()
-    let imageMode: ImageMode = "color"
+    let imageMode: ImageMode = options.imageMode ?? "color"
     let showKeys = false
     /** Index into `pages` of the page being read. */
-    let current = 0
+    let current =
+      doc.pageCount === undefined || options.startPage === undefined
+        ? 0
+        : Math.max(0, Math.min(doc.pageCount, options.startPage) - 1)
     const pages: Page[] = []
     const figures: Figure[] = []
 
@@ -336,17 +354,35 @@ export const Viewer = {
       return index
     }
 
+    /** Index of the page being read; while a jump waits, the page it will land on. */
+    const pageHere = () => (layout === "paged" ? current : (pendingJump ?? pageAtTop()))
+
+    let reported: number | undefined
+    const reportPage = () => {
+      if (doc.pageCount === undefined || !options.onPage) return
+      const page = pageHere() + 1
+      if (page === reported) return
+      reported = page
+      options.onPage(page)
+    }
+
     // Switching from paged to scroll jumps to the page being read once the stack has laid out.
-    let pendingJump: number | undefined
+    // Opening at a saved page while scrolling waits the same way, for that page to arrive.
+    let pendingJump: number | undefined = layout === "scroll" && current > 0 ? current : undefined
+    /** Pages present at the previous frame, and so laid out by now. */
+    let laidOutPages = 0
     const syncLayout = () => {
-      if (layout === "scroll" && pendingJump !== undefined) {
+      if (layout === "scroll" && pendingJump !== undefined && pendingJump < laidOutPages) {
         goToPage(pendingJump)
         pendingJump = undefined
       }
+      laidOutPages = pages.length
       const next = layoutFor()
       if (next === layout) return
-      if (next === "paged") current = pageAtTop()
-      else pendingJump = current
+      if (next === "paged") {
+        current = pageHere()
+        pendingJump = undefined
+      } else pendingJump = current
       layout = next
       // Pages that just appeared (or reappeared) let their figures find their position before loading.
       for (const figure of figures) figure.laidOut = false
@@ -356,24 +392,16 @@ export const Viewer = {
 
     const toggleImages = () => {
       imageMode = imageMode === "color" ? "mono" : "color"
+      options.onImageMode?.(imageMode)
       for (const figure of figures) {
         if (figure.shown) showFigure(figure)
       }
     }
 
-    const title = new TextRenderable(renderer, {
-      id: "title",
-      content: doc.title,
-      fg: colors.dim,
-      wrapMode: "none",
-      alignSelf: "center",
-      marginY: 1,
-    })
-
     const scroll = new ScrollBoxRenderable(renderer, {
       id: "scroll",
       flexGrow: 1,
-      contentOptions: { alignItems: "center", paddingX: 2 },
+      contentOptions: { alignItems: "center", paddingX: 2, paddingTop: 1 },
     })
     // The page number in the footer says where you are; a scrollbar would only add noise.
     scroll.verticalScrollBar.visible = false
@@ -393,7 +421,8 @@ export const Viewer = {
         const max = Math.max(0, scroll.scrollHeight - scroll.viewport.height)
         footer.content = `${max === 0 ? 100 : Math.round((scroll.scrollTop / max) * 100)}%`
       } else {
-        footer.content = `${(layout === "scroll" ? pageAtTop() : current) + 1} / ${doc.pageCount}`
+        const { page, pageCount, percent } = Progress.of(pageHere() + 1, doc.pageCount)
+        footer.content = `${page} / ${pageCount} · ${percent}%`
       }
     }
 
@@ -405,7 +434,6 @@ export const Viewer = {
     })()
 
     const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%" })
-    root.add(title)
     root.add(scroll)
     root.add(footer)
     renderer.root.add(root)
@@ -414,7 +442,7 @@ export const Viewer = {
     const atBottom = () => scroll.scrollTop >= scroll.scrollHeight - scroll.viewport.height
     renderer.keyInput.on("keypress", (key: KeyEvent) => {
       const paged = layout === "paged"
-      const here = paged ? current : pageAtTop()
+      const here = pageHere()
       switch (key.name) {
         case "q":
         case "escape":
@@ -480,6 +508,7 @@ export const Viewer = {
     renderer.setFrameCallback(async () => {
       syncLayout()
       updateFooter()
+      reportPage()
       showNearbyFigures()
     })
     updateFooter()
