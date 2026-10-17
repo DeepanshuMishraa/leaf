@@ -254,3 +254,28 @@ test("a code block keeps its indentation and sits beside a rule, one blank line 
   expect(lines[at("color: blue;")]).toMatch(/┃     color: blue;/)
   expect(at("After.") - at("}")).toBe(2)
 })
+
+test("with the kitty keyboard protocol, shift+; opens go-to and shift+/ toggles help", async () => {
+  setup = await createTestRenderer({ width: 120, height: 30, kittyKeyboard: true })
+  const { loaded } = Viewer.mount(setup.renderer, book(["Alpha text", "Bravo text"]))
+  await loaded
+  await settle(setup)
+  setup.mockInput.pressKey(";", { shift: true })
+  await setup.renderOnce()
+  expect(setup.captureCharFrame()).toContain("Go to page")
+  setup.mockInput.pressEscape()
+  await settle(setup)
+  setup.mockInput.pressKey("/", { shift: true })
+  await setup.renderOnce()
+  expect(setup.captureCharFrame()).toContain("this help")
+  setup.mockInput.pressKey("/", { shift: true })
+  await setup.renderOnce()
+  expect(setup.captureCharFrame()).not.toContain("this help")
+})
+
+test("t also opens the go-to-page box", async () => {
+  const s = await mountBook(["Alpha text", "Bravo text"], 120, 30)
+  s.mockInput.pressKey("t")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).toContain("Go to page")
+})

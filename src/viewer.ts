@@ -69,6 +69,15 @@ const theme = (renderer: CliRenderer) =>
  * column with the page number between them.
  */
 type Layout = "paged" | "scroll"
+/**
+ * Shifted symbols leaf binds. With the kitty keyboard protocol, terminals can
+ * report shift+; as ";" with shift rather than ":".
+ */
+const SHIFTED: Record<string, string> = { ";": ":", "/": "?" }
+
+/** The character a key types. */
+const typed = (key: KeyEvent) => (key.shift ? SHIFTED[key.name] : undefined) ?? key.sequence
+
 /** What floats over the text: nothing, the key list, or the go-to-page box with what's typed so far. */
 type Dialog = { kind: "none" } | { kind: "help" } | { kind: "goto"; digits: string; pageCount: number }
 
@@ -495,7 +504,7 @@ export const Viewer = {
         ["d/u", "half screen down / up"],
         ["space/b", "next / previous screen"],
         ["g/G", paged ? "first / last page" : "top / bottom"],
-        ...(paged ? [[":", "go to page"] as const] : []),
+        ...(paged ? [["t  :", "go to page"] as const] : []),
         ["i", imageMode === "color" ? "paint images" : "show original images"],
         ["?", "this help"],
         ["q", "quit"],
@@ -546,7 +555,16 @@ export const Viewer = {
         return
       }
       if (dialog.kind === "help") {
-        if (key.name === "escape" || key.name === "q" || key.sequence === "?") openDialog({ kind: "none" })
+        if (key.name === "escape" || key.name === "q" || typed(key) === "?") openDialog({ kind: "none" })
+        return
+      }
+      const char = typed(key)
+      if (char === "?" || char === "/") {
+        openDialog({ kind: "help" })
+        return
+      }
+      if (char === "t" || char === ":") {
+        if (doc.pageCount !== undefined) openDialog({ kind: "goto", digits: "", pageCount: doc.pageCount })
         return
       }
       const paged = layout === "paged"
@@ -601,13 +619,6 @@ export const Viewer = {
         }
         case "i":
           toggleImages()
-          break
-        case "?":
-        case "/":
-          openDialog({ kind: "help" })
-          break
-        case ":":
-          if (doc.pageCount !== undefined) openDialog({ kind: "goto", digits: "", pageCount: doc.pageCount })
           break
         default:
           return

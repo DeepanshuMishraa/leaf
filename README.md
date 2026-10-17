@@ -5,11 +5,12 @@ Read PDFs and web articles in the terminal.
 ```sh
 bun install
 bun link            # puts `leaf` on your PATH
+ln -s (pwd)/completions/leaf.fish ~/.config/fish/completions/   # fish: tab-completes .pdf files
 leaf open paper.pdf
 leaf open https://example.com/post
 ```
 
-Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `d/u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `:` go to page, `i` original/painted images, `?` all keys, `q` quit.
+Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `d/u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `?` all keys, `q` quit.
 
 The reader uses your terminal's own colors. Painted mode draws each image in your text color with a transparent background, so diagrams sit on the terminal like text.
 

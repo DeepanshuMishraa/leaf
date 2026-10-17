@@ -8,7 +8,7 @@ import { realpathSync } from "node:fs"
 
 const USAGE = `Usage: leaf open <file.pdf | url>
 
-Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, : go to page, i painted images, ? keys, q quit`
+Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, i painted images, ? keys, q quit`
 
 class UnsupportedTarget extends TaggedError("UnsupportedTarget")<{ target: string; message: string }> {}
 
