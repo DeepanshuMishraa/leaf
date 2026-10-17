@@ -187,8 +187,14 @@ type Figure = {
   remote: RawImage | undefined
 }
 
-/** A source page (or the whole document, for sources without pages). */
-type Page = { number: number | undefined; box: BoxRenderable; separator: TextRenderable | undefined }
+/**
+ * A source page (or the whole document, for sources without pages) that is
+ * built because it is on screen or near it. `index` is 0-based.
+ */
+type Page = { index: number; box: BoxRenderable; separator: TextRenderable | undefined }
+
+/** Pages built on each side of the one being read in paged mode, so turning a page is instant. */
+const PAGED_NEIGHBORS = 1
 
 export const Viewer = {
   open: async (doc: Doc, options?: ViewerOptions) => {
@@ -213,13 +219,18 @@ export const Viewer = {
 
     let layout = layoutFor()
     let imageMode: ImageMode = options.imageMode ?? "color"
-    /** Index into `pages` of the page being read. */
+    const pageTotal = Doc.pages(doc)
+    /**
+     * The page being read: in paged mode the one shown, when scrolling the one
+     * at the top of the screen.
+     */
     let current =
       doc.pageCount === undefined || options.startPage === undefined
         ? 0
         : Math.max(0, Math.min(doc.pageCount, options.startPage) - 1)
-    const pages: Page[] = []
-    const figures: Figure[] = []
+    /** Built pages, in order and without gaps; every other page exists only as its index. */
+    let pages: Page[] = []
+    let figures: Figure[] = []
 
     // The terminal's text color, asked for once, the first time an image is painted.
     let terminalInk: Promise<Rgb> | undefined
@@ -367,26 +378,26 @@ export const Viewer = {
         },
       })
 
-    /** Shows only the current page in paged mode; when scrolling, every page with its number above it. */
-    const stylePage = (page: Page, index: number) => {
-      page.box.visible = layout === "scroll" || index === current
+    /** Shows only the current page in paged mode; when scrolling, every built page with its number above it. */
+    const stylePage = (page: Page) => {
+      page.box.visible = layout === "scroll" || page.index === current
       if (page.separator) page.separator.visible = layout === "scroll"
     }
 
-    const addPage = (markdown: string, number: number | undefined) => {
-      const index = pages.length
+    const buildPage = (index: number): Page => {
       const box = new BoxRenderable(renderer, { id: `page-${index}`, flexDirection: "column", width: "100%", maxWidth: MAX_TEXT_WIDTH })
       const separator =
-        number === undefined || index === 0
+        doc.pageCount === undefined || index === 0
           ? undefined
           : new TextRenderable(renderer, {
-              content: `·  ${number}  ·`,
+              content: `·  ${index + 1}  ·`,
               fg: colors.dim,
               alignSelf: "center",
               marginY: 1,
               selectable: false,
             })
       if (separator) box.add(separator)
+      const markdown = doc.page(index)
       if (markdown === "") {
         box.add(
           new TextRenderable(renderer, { content: "blank page", fg: colors.dim, alignSelf: "center", marginY: 1, selectable: false }),
@@ -394,74 +405,134 @@ export const Viewer = {
       } else {
         box.add(markdownView(markdown, index))
       }
-      const page = { number, box, separator }
-      pages.push(page)
-      stylePage(page, index)
-      scroll.add(box)
+      // A page above the one being read that grows (just built, or still laying out) would push
+      // the text on screen down; scroll by as much so the reader's place holds still.
+      let height = 0
+      box.onSizeChange = () => {
+        const grown = box.height - height
+        height = box.height
+        if (layout === "scroll" && index < current && grown !== 0) scroll.scrollTop += grown
+      }
+      const page = { index, box, separator }
+      stylePage(page)
+      return page
     }
 
-    /** Pages that haven't streamed in yet show once they arrive. */
+    const dropPages = (dropped: readonly Page[]) => {
+      if (dropped.length === 0) return
+      for (const page of dropped) page.box.destroyRecursively()
+      figures = figures.filter((figure) => !figure.holder.isDestroyed)
+    }
+
+    /** Builds the pages from `first` to `last` that aren't built yet, and drops the rest. */
+    const keepPages = (first: number, last: number) => {
+      const from = Math.max(0, first)
+      const to = Math.min(pageTotal - 1, last)
+      const kept = pages.filter((page) => page.index >= from && page.index <= to)
+      dropPages(pages.filter((page) => !kept.includes(page)))
+      const before: Page[] = []
+      for (let index = (kept[0]?.index ?? to + 1) - 1; index >= from; index--) {
+        const page = buildPage(index)
+        scroll.add(page.box, 0)
+        before.unshift(page)
+      }
+      const after: Page[] = []
+      for (let index = (kept.at(-1)?.index ?? from - 1) + 1; index <= to && kept.length > 0; index++) {
+        const page = buildPage(index)
+        scroll.add(page.box)
+        after.push(page)
+      }
+      pages = [...before, ...kept, ...after]
+    }
+
+    /** Set when the reader asked for the end of a page that is still laying out; holds its last seen height. */
+    let pendingBottom: { height: number } | undefined
+
     const goToPage = (index: number, at: "top" | "bottom" = "top") => {
-      const target = Math.max(0, Math.min((doc.pageCount ?? pages.length) - 1, index))
-      if (layout === "paged") {
-        const previous = pages[current]
-        if (previous) previous.box.visible = false
-        current = target
-        const next = pages[current]
-        if (next) next.box.visible = true
-        scroll.scrollTo(at === "top" ? 0 : scroll.scrollHeight)
+      current = Math.max(0, Math.min(pageTotal - 1, index))
+      keepPages(current - (layout === "paged" ? PAGED_NEIGHBORS : 0), current + (layout === "paged" ? PAGED_NEIGHBORS : 0))
+      pages.forEach(stylePage)
+      scroll.scrollTo(0)
+      pendingBottom = at === "bottom" ? { height: -1 } : undefined
+    }
+
+    /** Scrolls to the end of the current page each frame until it stops growing. */
+    const settleBottom = () => {
+      const page = pages.find((p) => p.index === current)
+      if (!pendingBottom || !page) return
+      if (page.box.height === pendingBottom.height) {
+        pendingBottom = undefined
         return
       }
-      const page = pages[target]
-      if (page) scroll.scrollTo(scroll.scrollTop + page.box.y - scroll.viewport.y)
-      else pendingJump = target
+      pendingBottom.height = page.box.height
+      scroll.scrollTo(scroll.scrollHeight)
     }
 
-    /** In scroll mode, the page under the top of the screen. */
+    /** In scroll mode, the built page under the top of the screen. */
     const pageAtTop = () => {
-      let index = 0
-      for (let i = 0; i < pages.length; i++) {
-        const page = pages[i]
-        if (page && page.box.y <= scroll.viewport.y + 1) index = i
+      let index = pages[0]?.index ?? 0
+      for (const page of pages) {
+        if (page.box.y <= scroll.viewport.y + 1) index = page.index
         else break
       }
       return index
     }
 
-    /** Index of the page being read; while a jump waits, the page it will land on. */
-    const pageHere = () => (layout === "paged" ? current : (pendingJump ?? pageAtTop()))
+    /**
+     * When scrolling, keeps about a screen of built pages above the screen and
+     * a few below, building one page each way per frame as the reader moves
+     * and dropping pages far out of sight.
+     */
+    const fillScroll = () => {
+      if (layout !== "scroll" || pendingBottom) return
+      const first = pages[0]
+      const last = pages.at(-1)
+      if (!first || !last) return
+      const top = scroll.viewport.y
+      const height = scroll.viewport.height
+      // At the very end the last page may start below the top of the screen; the book is still finished.
+      current = last.index === pageTotal - 1 && atBottom() ? last.index : pageAtTop()
+      const far = 4 * height
+      if (pages.length > 3 && first.index < current && first.box.y + first.box.height < top - far) {
+        // Its rows go away above the screen; scroll back by as many so the text stays put.
+        scroll.scrollTop -= first.box.height
+        pages.shift()
+        dropPages([first])
+        return
+      }
+      if (pages.length > 3 && last.index > current && last.box.y > top + height + far) {
+        pages.pop()
+        dropPages([last])
+        return
+      }
+      if (last.box.y + last.box.height < top + 3 * height && last.index < pageTotal - 1) {
+        const page = buildPage(last.index + 1)
+        scroll.add(page.box)
+        pages.push(page)
+      }
+      if (first.box.y > top - height && first.index > 0) {
+        const page = buildPage(first.index - 1)
+        scroll.add(page.box, 0)
+        pages.unshift(page)
+      }
+    }
 
     let reported: number | undefined
     const reportPage = () => {
       if (doc.pageCount === undefined || !options.onPage) return
-      const page = pageHere() + 1
+      const page = current + 1
       if (page === reported) return
       reported = page
       options.onPage(page)
     }
 
-    // Switching from paged to scroll jumps to the page being read once the stack has laid out.
-    // Opening at a saved page while scrolling waits the same way, for that page to arrive.
-    let pendingJump: number | undefined = layout === "scroll" && current > 0 ? current : undefined
-    /** Pages present at the previous frame, and so laid out by now. */
-    let laidOutPages = 0
     const syncLayout = () => {
-      if (layout === "scroll" && pendingJump !== undefined && pendingJump < laidOutPages) {
-        goToPage(pendingJump)
-        pendingJump = undefined
-      }
-      laidOutPages = pages.length
       const next = layoutFor()
       if (next === layout) return
-      if (next === "paged") {
-        current = pageHere()
-        pendingJump = undefined
-      } else pendingJump = current
       layout = next
       // Pages that just appeared (or reappeared) let their figures find their position before loading.
       for (const figure of figures) figure.laidOut = false
-      pages.forEach(stylePage)
-      if (layout === "paged") scroll.scrollTo(0)
+      goToPage(current)
     }
 
     const toggleImages = () => {
@@ -478,14 +549,14 @@ export const Viewer = {
     const selectedRanges = (selection: Selection) => {
       const selected = new Set(selection.selectedRenderables)
       const ranges: Highlight[] = []
-      pages.forEach((page, index) => {
+      for (const { index, box } of pages) {
         let base = 0
-        for (const block of textBlocks(page.box)) {
+        for (const block of textBlocks(box)) {
           const range = selected.has(block) ? block.getSelection() : null
           if (range) ranges.push({ page: index, start: base + range.start, end: base + range.end, text: block.getSelectedText() })
           base += block.textLength + 1
         }
-      })
+      }
       return Highlight.merge(ranges)
     }
 
@@ -523,11 +594,10 @@ export const Viewer = {
             }
           })
         }
-        pages.forEach((page, index) => {
-          const { box } = page
-          if (!box.visible || box.y >= bottom || box.y + box.height <= top) return
+        for (const { index, box } of pages) {
+          if (!box.visible || box.y >= bottom || box.y + box.height <= top) continue
           const marks = highlights.filter((highlight) => highlight.page === index)
-          if (marks.length === 0) return
+          if (marks.length === 0) continue
           let base = 0
           for (const block of textBlocks(box)) {
             for (const mark of marks) {
@@ -537,7 +607,7 @@ export const Viewer = {
             }
             base += block.textLength + 1
           }
-        })
+        }
       })
     }
 
@@ -563,17 +633,10 @@ export const Viewer = {
         const max = Math.max(0, scroll.scrollHeight - scroll.viewport.height)
         footer.content = `${max === 0 ? 100 : Math.round((scroll.scrollTop / max) * 100)}%`
       } else {
-        const { page, pageCount, percent } = Progress.of(pageHere() + 1, doc.pageCount)
+        const { page, pageCount, percent } = Progress.of(current + 1, doc.pageCount)
         footer.content = `${page} / ${pageCount} · ${percent}%`
       }
     }
-
-    const loaded = (async () => {
-      for await (const chunk of doc.chunks) {
-        if (renderer.isDestroyed) return
-        addPage(chunk.markdown, chunk.page)
-      }
-    })()
 
     const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%" })
     root.add(scroll)
@@ -687,7 +750,6 @@ export const Viewer = {
         return
       }
       const paged = layout === "paged"
-      const here = pageHere()
       switch (key.name) {
         case "escape":
           if (renderer.hasSelection) {
@@ -730,19 +792,19 @@ export const Viewer = {
         case "l":
         case "n":
         case "right":
-          goToPage(here + 1)
+          goToPage(current + 1)
           break
         case "h":
         case "p":
         case "left":
-          goToPage(here - 1)
+          goToPage(current - 1)
           break
         case "g":
         case "home":
         case "end": {
           const toEnd = key.name === "end" || key.shift
-          if (paged) goToPage(toEnd ? pages.length - 1 : 0)
-          else scroll.scrollTo(toEnd ? scroll.scrollHeight : 0)
+          if (doc.pageCount === undefined) scroll.scrollTo(toEnd ? scroll.scrollHeight : 0)
+          else goToPage(toEnd ? pageTotal - 1 : 0, toEnd && !paged ? "bottom" : "top")
           break
         }
         case "i":
@@ -769,11 +831,13 @@ export const Viewer = {
     // Resizes and mouse wheel scrolling bypass the key handler; keep everything current.
     renderer.setFrameCallback(async () => {
       syncLayout()
+      settleBottom()
+      fillScroll()
       updateFooter()
       reportPage()
       showNearbyFigures()
     })
+    goToPage(current)
     updateFooter()
-    return { loaded }
   },
 } as const

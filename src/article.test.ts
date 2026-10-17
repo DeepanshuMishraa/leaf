@@ -45,7 +45,5 @@ test("a link that serves a PDF opens as a paged PDF, whatever its URL looks like
   const doc = await Article.open(`${server.url}abs/2401.00001`)
   if (doc.isErr()) throw new Error(doc.error.message)
   expect(doc.value.pageCount).toBe(1)
-  let text = ""
-  for await (const chunk of doc.value.chunks) text += chunk.markdown
-  expect(text).toContain("Hello from a paper")
+  expect(doc.value.page(0)).toContain("Hello from a paper")
 })

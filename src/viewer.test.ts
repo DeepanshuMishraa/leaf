@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
+import { CodeRenderable, type Renderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Doc } from "./doc"
 import { Viewer } from "./viewer"
@@ -10,15 +11,34 @@ afterEach(() => {
   setup = undefined
 })
 
+/**
+ * Markdown lays out across frames, and paragraphs draw only once syntax
+ * highlighting returns from its worker; waits until the text is up and still.
+ */
+const drawn = async (s: NonNullable<typeof setup>) => {
+  const highlighting = (renderable: Renderable): CodeRenderable[] => [
+    ...(renderable instanceof CodeRenderable && renderable.isHighlighting ? [renderable] : []),
+    ...renderable.getChildren().flatMap(highlighting),
+  ]
+  let previous = ""
+  for (let tries = 0; tries < 100; tries++) {
+    await s.renderOnce()
+    const pending = highlighting(s.renderer.root)
+    if (pending.length > 0) {
+      await Promise.all(pending.map((code) => code.highlightingDone))
+      continue
+    }
+    const frame = s.captureCharFrame()
+    if (frame === previous) return s
+    previous = frame
+  }
+  return s
+}
+
 const mount = async (markdown: string) => {
   setup = await createTestRenderer({ width: 80, height: 20 })
-  const { loaded } = Viewer.mount(setup.renderer, Doc.whole("Sample", markdown))
-  await loaded
-  // Markdown lays out across frames; give it a beat before capturing.
-  await setup.renderOnce()
-  await Bun.sleep(50)
-  await setup.renderOnce()
-  return setup
+  Viewer.mount(setup.renderer, Doc.whole("Sample", markdown))
+  return drawn(setup)
 }
 
 test("shows rendered markdown without a title line, with the keys only on ?", async () => {
@@ -58,27 +78,13 @@ test("a numbered list item from a PDF keeps its number and no stray backslash", 
   expect(frame).not.toContain("\\")
 })
 
-test("streamed chunks all show up, in order", async () => {
-  setup = await createTestRenderer({ width: 80, height: 20 })
-  const doc: Doc = {
-    title: "Book",
-    pageCount: 3,
-    images: new Map(),
-    chunks: (async function* () {
-      yield { markdown: "First page", page: 1 }
-      yield { markdown: "Second page", page: 2 }
-      yield { markdown: "Third page", page: 3 }
-    })(),
-  }
-  const { loaded } = Viewer.mount(setup.renderer, doc)
-  await loaded
-  await setup.renderOnce()
-  await Bun.sleep(50)
-  await setup.renderOnce()
-  const frame = setup.captureCharFrame()
+test("in a small window, the pages below fill in, in order", async () => {
+  const s = await mountBook(["First page", "Second page", "Third page"], 80, 20)
+  await settle(s)
+  await settle(s)
+  const frame = s.captureCharFrame()
   expect(frame.indexOf("First page")).toBeLessThan(frame.indexOf("Second page"))
   expect(frame.indexOf("Second page")).toBeLessThan(frame.indexOf("Third page"))
-  expect(frame).not.toContain("loading")
 })
 
 test("j scrolls the document down", async () => {
@@ -94,19 +100,13 @@ const book = (pages: string[]): Doc => ({
   title: "Book",
   pageCount: pages.length,
   images: new Map(),
-  chunks: (async function* () {
-    for (const [i, markdown] of pages.entries()) yield { markdown, page: i + 1 }
-  })(),
+  page: (index) => pages[index] ?? "",
 })
 
 const mountBook = async (pages: string[], width: number, height: number, options?: Parameters<typeof Viewer.mount>[2]) => {
   setup = await createTestRenderer({ width, height })
-  const { loaded } = Viewer.mount(setup.renderer, book(pages), options)
-  await loaded
-  await setup.renderOnce()
-  await Bun.sleep(50)
-  await setup.renderOnce()
-  return setup
+  Viewer.mount(setup.renderer, book(pages), options)
+  return drawn(setup)
 }
 
 test("a wide window shows one page at a time, and → turns the page", async () => {
@@ -257,8 +257,7 @@ test("a code block keeps its indentation and sits beside a rule, one blank line 
 
 test("with the kitty keyboard protocol, shift+; opens go-to and shift+/ toggles help", async () => {
   setup = await createTestRenderer({ width: 120, height: 30, kittyKeyboard: true })
-  const { loaded } = Viewer.mount(setup.renderer, book(["Alpha text", "Bravo text"]))
-  await loaded
+  Viewer.mount(setup.renderer, book(["Alpha text", "Bravo text"]))
   await settle(setup)
   setup.mockInput.pressKey(";", { shift: true })
   await setup.renderOnce()
@@ -344,4 +343,75 @@ test("escape clears a selection before it quits", async () => {
   s.mockInput.pressEscape()
   await settle(s)
   expect(s.renderer.isDestroyed).toBe(true)
+})
+
+/** A long book whose pages are a few paragraphs each, with a count of the pages read. */
+const longBook = (pageCount: number) => {
+  const read = new Set<number>()
+  const doc: Doc = {
+    title: "Long",
+    pageCount,
+    images: new Map(),
+    page: (index) => {
+      read.add(index)
+      return Array.from({ length: 6 }, (_, p) => `Page ${index + 1} paragraph ${p + 1}.`).join("\n\n")
+    },
+  }
+  return { doc, read }
+}
+
+test("opening deep in a huge book reads only the pages near the screen", async () => {
+  const { doc, read } = longBook(10_000)
+  setup = await createTestRenderer({ width: 80, height: 24 })
+  Viewer.mount(setup.renderer, doc, { startPage: 7000 })
+  for (let i = 0; i < 10; i++) await settle(setup)
+  const frame = setup.captureCharFrame()
+  expect(frame).toContain("Page 7000 paragraph 1.")
+  expect(frame).toContain("7000 / 10000")
+  expect(read.size).toBeLessThan(12)
+})
+
+test("pages built above the reader don't move the text on screen", async () => {
+  const { doc } = longBook(50)
+  setup = await createTestRenderer({ width: 80, height: 24 })
+  Viewer.mount(setup.renderer, doc, { startPage: 20 })
+  await settle(setup)
+  const row = (text: string) => setup?.captureCharFrame().split("\n").findIndex((line) => line.includes(text))
+  const before = (await find(setup, "Page 20 paragraph 2.")).y
+  for (let i = 0; i < 10; i++) await settle(setup)
+  expect(row("Page 20 paragraph 2.")).toBe(before)
+  // Scrolling up reaches the page before, one row at a time.
+  for (let i = 0; i < 6; i++) setup.mockInput.pressKey("k")
+  await settle(setup)
+  expect(row("Page 20 paragraph 2.")).toBe(before + 6)
+  expect(setup.captureCharFrame()).toContain("Page 19 paragraph 6.")
+})
+
+test("G in a scrolling book goes to the end of the last page, and g back to the start", async () => {
+  const { doc } = longBook(3000)
+  setup = await createTestRenderer({ width: 80, height: 24 })
+  Viewer.mount(setup.renderer, doc)
+  await settle(setup)
+  setup.mockInput.pressKey("G")
+  for (let i = 0; i < 4; i++) await settle(setup)
+  expect(setup.captureCharFrame()).toContain("Page 3000 paragraph 6.")
+  expect(setup.captureCharFrame()).toContain("3000 / 3000 · 100%")
+  setup.mockInput.pressKey("g")
+  for (let i = 0; i < 4; i++) await settle(setup)
+  expect(setup.captureCharFrame()).toContain("Page 1 paragraph 1.")
+})
+
+test("scrolling down a long way keeps only a few pages built", async () => {
+  const { doc } = longBook(200)
+  setup = await createTestRenderer({ width: 80, height: 24 })
+  Viewer.mount(setup.renderer, doc)
+  await settle(setup)
+  for (let i = 0; i < 40; i++) {
+    setup.mockInput.pressKey("d")
+    await settle(setup)
+  }
+  const built = setup.renderer.root.getChildren()[0]?.getChildren()[0]
+  expect(setup.captureCharFrame()).not.toContain("Page 1 paragraph")
+  expect(setup.captureCharFrame()).toMatch(/Page \d+ paragraph/)
+  expect(built).toBeDefined()
 })

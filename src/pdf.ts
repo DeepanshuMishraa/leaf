@@ -2,7 +2,7 @@ import * as mupdf from "mupdf"
 import { readFileSync } from "node:fs"
 import { basename } from "node:path"
 import { Result, TaggedError } from "better-result"
-import { Doc, type DocChunk, type LazyImage, type RawImage } from "./doc"
+import { Doc, type LazyImage, type RawImage } from "./doc"
 
 export class PdfOpenFailed extends TaggedError("PdfOpenFailed")<{
   path: string
@@ -310,8 +310,6 @@ const samplePages = (total: number, count: number) => {
   return Array.from({ length: count }, (_, i) => Math.floor((i * total) / count))
 }
 
-const yieldToEventLoop = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
-
 export const Pdf = {
   /**
    * Learns body size, heading sizes, line pitch and running headers from a
@@ -455,14 +453,11 @@ export const Pdf = {
           const image = pageImages[imageIndex++]
           if (!image || block.width < MIN_IMAGE_SIZE || block.height < MIN_IMAGE_SIZE) continue
           const id = `p${i + 1}-${imageIndex}`
-          let decoded: RawImage | undefined
           images.set(id, {
             ...decodedSize(image),
-            decode: () => {
-              // An image mupdf cannot decode is left out; the text around it still shows.
-              decoded ??= Result.try(() => decodeImage(image)).unwrapOr(undefined)
-              return decoded
-            },
+            // Decoded each time it's shown rather than kept: a book's worth of pixels doesn't fit in memory.
+            // An image mupdf cannot decode is left out; the text around it still shows.
+            decode: () => Result.try(() => decodeImage(image)).unwrapOr(undefined),
           })
           blocks.push({ kind: "image", id })
         }
@@ -480,19 +475,19 @@ export const Pdf = {
 
       const layout = Pdf.analyze(samplePages(pageCount, SAMPLE_PAGES).map(safeReadPage))
 
-      // One chunk per page, so the viewer can show the document page by page.
-      const chunks = async function* (): AsyncGenerator<DocChunk> {
-        for (let i = 0; i < pageCount; i++) {
-          yield { markdown: Pdf.render([safeReadPage(i)], layout), page: i + 1 }
-          // Let the viewer draw and handle keys between pages.
-          await yieldToEventLoop()
-        }
-      }
-
+      // Markdown is small next to mupdf's page structures, so each page is read once and kept.
+      const markdown = new Map<number, string>()
       const doc: Doc = {
         title: document.getMetaData("info:Title")?.trim() || fallbackTitle,
         pageCount,
-        chunks: chunks(),
+        page: (i) => {
+          let page = markdown.get(i)
+          if (page === undefined) {
+            page = Pdf.render([safeReadPage(i)], layout)
+            markdown.set(i, page)
+          }
+          return page
+        },
         images,
       }
       return doc

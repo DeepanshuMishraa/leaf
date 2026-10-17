@@ -9,24 +9,20 @@ export type LazyImage = { width: number; height: number; decode: () => RawImage 
 
 /**
  * A readable document: markdown plus the images it references.
- * Markdown arrives in chunks so long documents show their first page at once
- * and keep filling in. Images extracted from local files (PDF) are decoded
- * only when shown, and are referenced from markdown as `![alt](leaf-image:<id>)`.
- * Remote images keep their URL.
+ * Pages are read on demand, so a book of thousands of pages opens at once and
+ * only the pages being read cost anything. Images extracted from local files
+ * (PDF) are decoded only when shown, and are referenced from markdown as
+ * `![alt](leaf-image:<id>)`. Remote images keep their URL.
  */
 export type Doc = {
   title: string
-  /** Total pages, when the source has pages. Lets the viewer show load progress. */
+  /** Total pages, when the source has pages; a source without pages is one page. */
   pageCount: number | undefined
-  chunks: AsyncIterable<DocChunk>
+  /** Markdown of the page at `index` (0-based). */
+  page: (index: number) => string
+  /** Embedded images of the pages read so far. */
   images: ReadonlyMap<string, LazyImage>
 }
-
-/**
- * A piece of markdown. Paged sources (PDF) yield one chunk per page, with its
- * 1-based page number; sources without pages yield chunks with no page.
- */
-export type DocChunk = { markdown: string; page: number | undefined }
 
 const IMAGE_SCHEME = "leaf-image:"
 
@@ -38,10 +34,11 @@ export const Doc = {
     title,
     pageCount: undefined,
     images: new Map(),
-    chunks: (async function* () {
-      yield { markdown, page: undefined }
-    })(),
+    page: () => markdown,
   }),
+
+  /** How many pages the viewer lays out. */
+  pages: (doc: Doc) => doc.pageCount ?? 1,
 
   /**
    * Resolves a markdown image href: a URL for remote images, a lazy image for
