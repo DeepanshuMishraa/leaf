@@ -1,7 +1,9 @@
 import {
   ASCIIFontRenderable,
+  bold,
   BoxRenderable,
   createCliRenderer,
+  fg,
   ImageRenderable,
   MarkdownRenderable,
   measureText,
@@ -9,6 +11,7 @@ import {
   RGBA,
   ScrollBoxRenderable,
   SyntaxStyle,
+  t,
   TextAttributes,
   TextRenderable,
   type CliRenderer,
@@ -66,6 +69,9 @@ const theme = (renderer: CliRenderer) =>
  * column with the page number between them.
  */
 type Layout = "paged" | "scroll"
+/** What floats over the text: nothing, the key list, or the go-to-page box with what's typed so far. */
+type Dialog = { kind: "none" } | { kind: "help" } | { kind: "goto"; digits: string; pageCount: number }
+
 export type ViewerOptions = {
   startPage?: number
   onPage?: (page: number) => void
@@ -168,7 +174,6 @@ export const Viewer = {
 
     let layout = layoutFor()
     let imageMode: ImageMode = options.imageMode ?? "color"
-    let showKeys = false
     /** Index into `pages` of the page being read. */
     let current =
       doc.pageCount === undefined || options.startPage === undefined
@@ -272,6 +277,21 @@ export const Viewer = {
       return box
     }
 
+    /** Code as set, in the terminal's font and colors, beside a dim rule. Long lines wrap rather than vanish. */
+    const codeBlock = (code: string) => {
+      const box = new BoxRenderable(renderer, {
+        width: "100%",
+        marginBottom: 1,
+        paddingLeft: 1,
+        border: ["left"],
+        // Heavier than the rule markdown draws beside quotes, so code and quotes read differently.
+        borderStyle: "heavy",
+        borderColor: colors.dim,
+      })
+      box.add(new TextRenderable(renderer, { content: code, fg: colors.fg, wrapMode: "char" }))
+      return box
+    }
+
     const syntaxStyle = theme(renderer)
     const markdownView = (content: string, page: number) =>
       new MarkdownRenderable(renderer, {
@@ -284,14 +304,16 @@ export const Viewer = {
           if (token.type === "heading" && "depth" in token && typeof token.depth === "number") {
             return heading(token.depth, inlineText(token.tokens ?? []))
           }
+          if (token.type === "code" && "text" in token && typeof token.text === "string") return codeBlock(token.text)
           const hrefs = imageHrefs(token)
           if (hrefs.length === 0) {
-            if (token.type !== "paragraph") return null
-            // Markdown runs consecutive paragraphs together; a blank line keeps them apart.
-            const paragraph = context.defaultRender()
-            if (!paragraph) return null
+            // Markdown spaces blocks unevenly (none after a list or code, two before code),
+            // so every block owns exactly one blank line below it.
+            const block = context.defaultRender()
+            if (!block) return null
+            block.marginBottom = 0
             const box = new BoxRenderable(renderer, { width: "100%", marginBottom: 1 })
-            box.add(paragraph)
+            box.add(block)
             return box
           }
           const box = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", marginY: 1 })
@@ -328,8 +350,9 @@ export const Viewer = {
       scroll.add(box)
     }
 
+    /** Pages that haven't streamed in yet show once they arrive. */
     const goToPage = (index: number, at: "top" | "bottom" = "top") => {
-      const target = Math.max(0, Math.min(pages.length - 1, index))
+      const target = Math.max(0, Math.min((doc.pageCount ?? pages.length) - 1, index))
       if (layout === "paged") {
         const previous = pages[current]
         if (previous) previous.box.visible = false
@@ -341,6 +364,7 @@ export const Viewer = {
       }
       const page = pages[target]
       if (page) scroll.scrollTo(scroll.scrollTop + page.box.y - scroll.viewport.y)
+      else pendingJump = target
     }
 
     /** In scroll mode, the page under the top of the screen. */
@@ -409,14 +433,6 @@ export const Viewer = {
     const footer = new TextRenderable(renderer, { id: "footer", fg: colors.dim, wrapMode: "none", alignSelf: "center", marginY: 1 })
 
     const updateFooter = () => {
-      if (showKeys) {
-        const images = imageMode === "color" ? "i painted" : "i original"
-        footer.content =
-          layout === "paged"
-            ? `←/→ page   j/k scroll   space next   ${images}   q quit`
-            : `j/k scroll   space page   ${images}   q quit`
-        return
-      }
       if (doc.pageCount === undefined) {
         const max = Math.max(0, scroll.scrollHeight - scroll.viewport.height)
         footer.content = `${max === 0 ? 100 : Math.round((scroll.scrollTop / max) * 100)}%`
@@ -438,9 +454,101 @@ export const Viewer = {
     root.add(footer)
     renderer.root.add(root)
 
+    // Dialogs float in a small bordered panel over the text.
+    const panel = new BoxRenderable(renderer, {
+      border: true,
+      borderStyle: "rounded",
+      borderColor: colors.dim,
+      titleColor: colors.dim,
+      titleAlignment: "center",
+      backgroundColor: colors.bg,
+      flexDirection: "column",
+      paddingX: 3,
+      paddingY: 1,
+    })
+    const overlay = new BoxRenderable(renderer, {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      alignItems: "center",
+      justifyContent: "center",
+      zIndex: 10,
+      visible: false,
+    })
+    overlay.add(panel)
+    renderer.root.add(overlay)
+
+    const fillPanel = (title: string, rows: Renderable[]) => {
+      for (const child of panel.getChildren()) child.destroyRecursively()
+      panel.title = ` ${title} `
+      for (const row of rows) panel.add(row)
+      overlay.visible = true
+    }
+
+    const helpRows = () => {
+      const paged = doc.pageCount !== undefined
+      const keys: (readonly [string, string])[] = [
+        ...(paged ? [["←/→  h/l", "previous / next page"] as const] : []),
+        ["j/k  ↓/↑", "scroll"],
+        ["d/u", "half screen down / up"],
+        ["space/b", "next / previous screen"],
+        ["g/G", paged ? "first / last page" : "top / bottom"],
+        ...(paged ? [[":", "go to page"] as const] : []),
+        ["i", imageMode === "color" ? "paint images" : "show original images"],
+        ["?", "this help"],
+        ["q", "quit"],
+      ]
+      return keys.map(([keys, action]) => {
+        const row = new BoxRenderable(renderer, { flexDirection: "row" })
+        row.add(new TextRenderable(renderer, { content: keys, fg: colors.fg, attributes: TextAttributes.BOLD, width: 12 }))
+        row.add(new TextRenderable(renderer, { content: action, fg: colors.dim }))
+        return row
+      })
+    }
+
+    const gotoRows = (digits: string, pageCount: number) => [
+      new TextRenderable(renderer, {
+        content: t`${bold(fg(colors.fg)(digits))}${fg(colors.fg)("▏")}${fg(colors.dim)(` / ${pageCount}`)}`,
+        alignSelf: "center",
+      }),
+      new TextRenderable(renderer, { content: "enter go · esc cancel", fg: colors.dim, alignSelf: "center", marginTop: 1 }),
+    ]
+
+    let dialog: Dialog = { kind: "none" }
+    const openDialog = (next: Dialog) => {
+      dialog = next
+      if (next.kind === "none") overlay.visible = false
+      else if (next.kind === "help") fillPanel("Keys", helpRows())
+      else fillPanel("Go to page", gotoRows(next.digits, next.pageCount))
+    }
+
+    /** Typing in the go-to box: only digits that keep it a page in the book are taken. */
+    const gotoKey = (key: KeyEvent, digits: string, pageCount: number) => {
+      if (key.name === "escape") return openDialog({ kind: "none" })
+      if (key.name === "return" || key.name === "enter") {
+        openDialog({ kind: "none" })
+        if (digits !== "") goToPage(Number(digits) - 1)
+        return
+      }
+      if (key.name === "backspace") return openDialog({ kind: "goto", digits: digits.slice(0, -1), pageCount })
+      const next = digits + key.sequence
+      if (/^[1-9][0-9]*$/.test(next) && Number(next) <= pageCount) openDialog({ kind: "goto", digits: next, pageCount })
+    }
+
     const screen = () => Math.max(1, scroll.viewport.height - 2)
     const atBottom = () => scroll.scrollTop >= scroll.scrollHeight - scroll.viewport.height
     renderer.keyInput.on("keypress", (key: KeyEvent) => {
+      if (dialog.kind === "goto") {
+        gotoKey(key, dialog.digits, dialog.pageCount)
+        updateFooter()
+        return
+      }
+      if (dialog.kind === "help") {
+        if (key.name === "escape" || key.name === "q" || key.sequence === "?") openDialog({ kind: "none" })
+        return
+      }
       const paged = layout === "paged"
       const here = pageHere()
       switch (key.name) {
@@ -496,7 +604,10 @@ export const Viewer = {
           break
         case "?":
         case "/":
-          showKeys = !showKeys
+          openDialog({ kind: "help" })
+          break
+        case ":":
+          if (doc.pageCount !== undefined) openDialog({ kind: "goto", digits: "", pageCount: doc.pageCount })
           break
         default:
           return

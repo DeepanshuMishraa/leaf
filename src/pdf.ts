@@ -10,8 +10,8 @@ export class PdfOpenFailed extends TaggedError("PdfOpenFailed")<{
   message: string
 }> {}
 
-/** One line of text. `top` is its top edge on the page, in PDF points. */
-export type PdfLine = { text: string; size: number; bold: boolean; top: number }
+/** One line of text. `top` is its top edge on the page, in PDF points; `mono` marks code. */
+export type PdfLine = { text: string; size: number; bold: boolean; top: number; mono: boolean }
 
 export type PdfBlock =
   | { kind: "text"; lines: PdfLine[] }
@@ -45,6 +45,10 @@ const SAMPLE_PAGES = 24
 
 const BULLET = /^[•◦▪▸►‣⁃●○■□–-]\s*/
 const BOLD_FONT_NAME = /bold|black|heavy|semibold/i
+/** Monospace font names; code in PDFs is set in one of these. */
+const MONO_FONT_NAME = /mono|courier|consol|menlo|monaco|inconsolata|typewriter|code|cmtt|txtt|lmtt/i
+/** A line counts as code when at least this share of its characters are monospace. */
+const MONO_SHARE = 0.8
 const PAGE_NUMBER = String.raw`(?:\d+|m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))`
 /** A page label like "xiv | Preface", "Chapter 3 | 57" or a bare "57". */
 const PAGE_LABEL = new RegExp(`^(?:${PAGE_NUMBER}\\s*\\|.{0,60}|.{0,60}\\|\\s*${PAGE_NUMBER}|${PAGE_NUMBER})$`, "i")
@@ -130,6 +134,20 @@ const paragraphMarkdown = (lines: readonly PdfLine[]) => {
   return tidy(joinLines(items.flat()))
 }
 
+/** Code lines as set: line breaks kept, trailing spaces dropped, the shared indent removed. */
+const codeText = (lines: readonly PdfLine[]) => {
+  const texts = lines.map((l) => l.text.trimEnd())
+  const indent = Math.min(...texts.map((t) => t.length - t.trimStart().length))
+  return texts.map((t) => t.slice(indent)).join("\n")
+}
+
+/** A code fence longer than any backtick run inside, so the code can't close it early. */
+const fenced = (code: string) => {
+  const longest = Math.max(0, ...[...code.matchAll(/`+/g)].map((m) => m[0].length))
+  const fence = "`".repeat(Math.max(3, longest + 1))
+  return `${fence}\n${code}\n${fence}`
+}
+
 /**
  * The most common top-to-top distance between consecutive same-size lines.
  * Lines inside paragraphs outnumber paragraph breaks, so this is the line pitch.
@@ -162,7 +180,7 @@ const mergeWrapped = (blocks: readonly PdfBlock[], pitch: number) => {
     const first = block.kind === "text" ? block.lines[0] : undefined
     if (prev?.kind === "text" && block.kind === "text" && prevLast && first) {
       const continues = /^[a-z]/.test(first.text.trim())
-      const sameStyle = prevLast.size === first.size && prevLast.bold === first.bold
+      const sameStyle = prevLast.size === first.size && prevLast.bold === first.bold && !prevLast.mono && !first.mono
       const delta = first.top - prevLast.top
       if (sameStyle && delta > 0 && delta <= pitch * (continues ? 1.6 : 1.15)) {
         merged[merged.length - 1] = { kind: "text", lines: [...prev.lines, ...block.lines] }
@@ -183,32 +201,72 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 const num = (v: unknown) => (typeof v === "number" ? v : undefined)
 const str = (v: unknown) => (typeof v === "string" ? v : undefined)
 
-type JsonBlock = { kind: "text"; lines: PdfLine[] } | { kind: "image"; width: number; height: number }
+/** `keys[i]` locates `lines[i]` on the page, to match it with the character walk. */
+type JsonBlock = { kind: "text"; lines: PdfLine[]; keys: string[] } | { kind: "image"; width: number; height: number }
+
+/** A line's place on its page: which text block, which line in it. */
+const lineKey = (textBlock: number, line: number) => `${textBlock}:${line}`
+
+/**
+ * The JSON gives each line only its first font, so a sentence that opens with
+ * an inline code word looks monospace. Counts each line's characters by font
+ * and returns the keys of lines that are mostly monospace.
+ */
+const monoLines = (stext: mupdf.StructuredText) => {
+  const counts = new Map<string, { mono: number; all: number }>()
+  let textBlock = -1
+  let line = -1
+  stext.walk({
+    beginTextBlock: () => {
+      textBlock++
+      line = -1
+    },
+    beginLine: () => void line++,
+    onChar: (c, _origin, font) => {
+      if (c.trim() === "") return
+      const key = lineKey(textBlock, line)
+      const count = counts.get(key) ?? { mono: 0, all: 0 }
+      count.all++
+      if (font.isMono() || MONO_FONT_NAME.test(font.getName())) count.mono++
+      counts.set(key, count)
+    },
+  })
+  const keys = new Set<string>()
+  for (const [key, { mono, all }] of counts) if (mono >= all * MONO_SHARE) keys.add(key)
+  return keys
+}
 
 const parsePageJson = (json: string) => {
   const parsed: unknown = JSON.parse(json)
   const blocks: JsonBlock[] = []
   if (!isRecord(parsed) || !Array.isArray(parsed.blocks)) return blocks
+  let textBlock = -1
   for (const block of parsed.blocks) {
     if (!isRecord(block) || !isRecord(block.bbox)) continue
     if (block.type === "image") {
       blocks.push({ kind: "image", width: num(block.bbox.w) ?? 0, height: num(block.bbox.h) ?? 0 })
       continue
     }
-    if (block.type !== "text" || !Array.isArray(block.lines)) continue
+    if (block.type !== "text") continue
+    textBlock++
+    if (!Array.isArray(block.lines)) continue
     const lines: PdfLine[] = []
-    for (const line of block.lines) {
+    const keys: string[] = []
+    for (const [lineIndex, line] of block.lines.entries()) {
       if (!isRecord(line) || !isRecord(line.font) || !isRecord(line.bbox)) continue
       const text = str(line.text) ?? ""
       if (text.trim() === "") continue
+      const font = str(line.font.name) ?? ""
       lines.push({
         text,
         size: round(num(line.font.size) ?? 0),
-        bold: line.font.weight === "bold" || BOLD_FONT_NAME.test(str(line.font.name) ?? ""),
+        bold: line.font.weight === "bold" || BOLD_FONT_NAME.test(font),
         top: num(line.bbox.y) ?? 0,
+        mono: MONO_FONT_NAME.test(font),
       })
+      keys.push(lineKey(textBlock, lineIndex))
     }
-    if (lines.length > 0) blocks.push({ kind: "text", lines })
+    if (lines.length > 0) blocks.push({ kind: "text", lines, keys })
   }
   return blocks
 }
@@ -294,7 +352,19 @@ export const Pdf = {
   /** Turns pages into markdown using a layout learned by `analyze`. */
   render: (pages: readonly (readonly PdfBlock[])[], layout: PdfLayout) => {
     const out: string[] = []
+    // Back-to-back code blocks gather here and print as one fence.
+    let code: string[] = []
+    const flushCode = () => {
+      if (code.length > 0) out.push(fenced(code.join("\n\n")))
+      code = []
+    }
     for (const block of mergeAll(pages, layout.pitch).flat()) {
+      // Code is set no bigger than body text; a large monospace line is a title.
+      if (block.kind === "text" && block.lines.every((l) => l.mono) && blockSize(block.lines) <= layout.body) {
+        code.push(codeText(block.lines))
+        continue
+      }
+      flushCode()
       if (block.kind === "image") {
         out.push(`![](${Doc.imageRef(block.id)})`)
         continue
@@ -315,6 +385,7 @@ export const Pdf = {
         out.push(paragraphMarkdown(block.lines))
       }
     }
+    flushCode()
     return out.join("\n\n")
   },
 
@@ -368,11 +439,17 @@ export const Pdf = {
           stext.walk({ onImageBlock: (_bbox, _transform, image) => void pageImages.push(image) })
         }
 
+        // Lines that only start in a monospace font get checked character by
+        // character; pages without any skip the slower walk.
+        const hasMono = parsed.some((b) => b.kind === "text" && b.lines.some((l) => l.mono))
+        const mono = hasMono ? monoLines(stext) : new Set<string>()
+
         const blocks: PdfBlock[] = []
         let imageIndex = 0
         for (const block of parsed) {
           if (block.kind === "text") {
-            for (const lines of splitBySize(block.lines)) blocks.push({ kind: "text", lines })
+            const lines = block.lines.map((line, j) => ({ ...line, mono: line.mono && mono.has(block.keys[j] ?? "") }))
+            for (const group of splitBySize(lines)) blocks.push({ kind: "text", lines: group })
             continue
           }
           const image = pageImages[imageIndex++]

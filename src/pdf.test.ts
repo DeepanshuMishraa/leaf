@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test"
 import { Pdf, type PdfBlock, type PdfLine } from "./pdf"
 
-const line = (text: string, top: number, size = 11, bold = false): PdfLine => ({ text, top, size, bold })
+const line = (text: string, top: number, size = 11, bold = false, mono = false): PdfLine => ({ text, top, size, bold, mono })
+const code = (text: string, top: number, bold = false) => line(text, top, 9, bold, true)
 const text = (...lines: PdfLine[]): PdfBlock => ({ kind: "text", lines })
 
 test("larger font sizes become headings ranked by size", () => {
@@ -88,4 +89,38 @@ test("table-of-contents leaders collapse and chapter numbers stay unescaped digi
 test("table-of-contents entries set apart by wide gaps get a line each", () => {
   const md = Pdf.toMarkdown([[text(line("Total Order Broadcast        348 Distributed Transactions        352", 0))]])
   expect(md).toBe("Total Order Broadcast · 348\nDistributed Transactions · 352")
+})
+
+const prose = (top: number) => text(line("Body text long enough to set the common size for the whole page here.", top))
+
+test("monospace blocks become code fences that keep their lines and indentation", () => {
+  const md = Pdf.toMarkdown([
+    [
+      prose(0),
+      text(code("for (var i = 0; i < n; i++) {", 20, true), code("    if (x) {", 30), code("        go()", 40), code("    }", 50), code("}", 60)),
+      prose(80),
+    ],
+  ])
+  expect(md).toContain("```\nfor (var i = 0; i < n; i++) {\n    if (x) {\n        go()\n    }\n}\n```")
+})
+
+test("code shared by the whole block's indent is dedented, and trailing spaces dropped", () => {
+  const md = Pdf.toMarkdown([[prose(0), text(code("  <ul>  ", 20), code("    <li>", 30), code("  </ul>", 40))]])
+  expect(md).toContain("```\n<ul>\n  <li>\n</ul>\n```")
+})
+
+test("code is never merged into the prose around it", () => {
+  const md = Pdf.toMarkdown([[prose(0), text(code("SELECT 1", 12)), text(line("then prose continues right below the code.", 24))]])
+  expect(md).toContain("```\nSELECT 1\n```")
+  expect(md).toContain("```\n\nthen prose continues")
+})
+
+test("back-to-back code blocks share one fence, with a blank line between them", () => {
+  const md = Pdf.toMarkdown([[prose(0), text(code("a = 1", 20)), text(code("b = 2", 50))]])
+  expect(md).toContain("```\na = 1\n\nb = 2\n```")
+})
+
+test("a fence longer than any backtick run in the code keeps it intact", () => {
+  const md = Pdf.toMarkdown([[prose(0), text(code("```js", 20))]])
+  expect(md).toContain("````\n```js\n````")
 })

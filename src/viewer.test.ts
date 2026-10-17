@@ -21,7 +21,7 @@ const mount = async (markdown: string) => {
   return setup
 }
 
-test("shows rendered markdown without a title line, with key hints only on ?", async () => {
+test("shows rendered markdown without a title line, with the keys only on ?", async () => {
   const s = await mount("## Intro\n\nSome **bold** words and a [link](https://example.com).")
   const frame = s.captureCharFrame()
   // The title goes to the terminal tab, not the screen.
@@ -29,10 +29,27 @@ test("shows rendered markdown without a title line, with key hints only on ?", a
   expect(frame).toContain("Intro")
   expect(frame).toContain("bold")
   expect(frame).not.toContain("**")
-  expect(frame).not.toContain("q quit")
+  expect(frame).not.toContain("quit")
   s.mockInput.pressKey("?")
   await s.renderOnce()
-  expect(s.captureCharFrame()).toContain("q quit")
+  expect(s.captureCharFrame()).toContain("quit")
+})
+
+test("? lists every key in a panel, and closes on escape, ? or q without quitting", async () => {
+  const s = await mountBook(["Alpha text", "Bravo text"], 120, 30)
+  for (const close of ["escape", "?", "q"]) {
+    s.mockInput.pressKey("?")
+    await s.renderOnce()
+    const frame = s.captureCharFrame()
+    for (const action of ["next page", "scroll", "go to page", "first / last page", "paint images", "this help", "quit"]) {
+      expect(frame).toContain(action)
+    }
+    if (close === "escape") s.mockInput.pressEscape()
+    else s.mockInput.pressKey(close)
+    await settle(s)
+    expect(s.renderer.isDestroyed).toBe(false)
+    expect(s.captureCharFrame()).not.toContain("this help")
+  }
 })
 
 test("a numbered list item from a PDF keeps its number and no stray backslash", async () => {
@@ -169,10 +186,13 @@ test("i switches images between original and painted", async () => {
   const s = await mount("Text")
   s.mockInput.pressKey("?")
   await s.renderOnce()
-  expect(s.captureCharFrame()).toContain("i painted")
+  expect(s.captureCharFrame()).toContain("paint images")
+  s.mockInput.pressEscape()
+  await settle(s)
   s.mockInput.pressKey("i")
+  s.mockInput.pressKey("?")
   await s.renderOnce()
-  expect(s.captureCharFrame()).toContain("i original")
+  expect(s.captureCharFrame()).toContain("show original images")
 })
 
 test("starts in the saved image mode and reports when i changes it", async () => {
@@ -181,7 +201,56 @@ test("starts in the saved image mode and reports when i changes it", async () =>
   Viewer.mount(setup.renderer, Doc.whole("Sample", "Text"), { imageMode: "mono", onImageMode: (mode) => modes.push(mode) })
   setup.mockInput.pressKey("?")
   await setup.renderOnce()
-  expect(setup.captureCharFrame()).toContain("i original")
+  expect(setup.captureCharFrame()).toContain("show original images")
+  setup.mockInput.pressEscape()
+  await settle(setup)
   setup.mockInput.pressKey("i")
   expect(modes).toEqual(["color"])
+})
+
+const settle = async (s: NonNullable<typeof setup>) => {
+  await s.renderOnce()
+  await Bun.sleep(50)
+  await s.renderOnce()
+}
+
+test(": opens a go-to-page box; typing a number and enter jumps there", async () => {
+  const s = await mountBook(["Alpha text", "Bravo text", "Charlie text"], 120, 30)
+  s.mockInput.pressKey(":")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).toContain("Go to page")
+  s.mockInput.pressKey("3")
+  await s.renderOnce()
+  expect(s.captureCharFrame()).toContain("3▏ / 3")
+  s.mockInput.pressEnter()
+  await settle(s)
+  const frame = s.captureCharFrame()
+  expect(frame).not.toContain("Go to page")
+  expect(frame).toContain("Charlie text")
+  expect(frame).toContain("3 / 3 · 100%")
+})
+
+test("the go-to box ignores keys that aren't a page in the book, and escape closes it in place", async () => {
+  const s = await mountBook(["Alpha text", "Bravo text", "Charlie text"], 120, 30)
+  s.mockInput.pressKey(":")
+  // 9 is past the last page, 0 can't start a page number, q must not quit.
+  for (const key of ["9", "0", "q", "j"]) s.mockInput.pressKey(key)
+  await s.renderOnce()
+  expect(s.renderer.isDestroyed).toBe(false)
+  expect(s.captureCharFrame()).toContain("Go to page")
+  s.mockInput.pressEscape()
+  await settle(s)
+  const frame = s.captureCharFrame()
+  expect(frame).not.toContain("Go to page")
+  expect(frame).toContain("Alpha text")
+})
+
+test("a code block keeps its indentation and sits beside a rule, one blank line from the text", async () => {
+  const s = await mount("Like this:\n\n```\nli.selected > p {\n    color: blue;\n}\n```\n\nAfter.")
+  const lines = s.captureCharFrame().split("\n")
+  const at = (text: string) => lines.findIndex((l) => l.includes(text))
+  expect(at("li.selected > p {") - at("Like this:")).toBe(2)
+  expect(lines[at("li.selected")]).toMatch(/┃ li\.selected > p \{/)
+  expect(lines[at("color: blue;")]).toMatch(/┃     color: blue;/)
+  expect(at("After.") - at("}")).toBe(2)
 })
