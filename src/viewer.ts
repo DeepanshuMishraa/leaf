@@ -1,4 +1,6 @@
+import { dirname, join } from "node:path"
 import {
+  addDefaultParsers,
   ASCIIFontRenderable,
   bold,
   BoxRenderable,
@@ -28,6 +30,20 @@ import { Mono, type Rgb } from "./mono"
 import { Progress, type ImageMode } from "./progress"
 
 type MarkdownToken = Parameters<NonNullable<MarkdownOptions["renderNode"]>>[0]
+
+/**
+ * OpenTUI hides the brackets of "[text]" as if it were a link, so citations
+ * like "[1]" lost theirs. Its inline markdown grammar runs with a copy of its
+ * highlights that keeps them.
+ */
+const keepBrackets = () =>
+  addDefaultParsers([
+    {
+      filetype: "markdown_inline",
+      queries: { highlights: [join(import.meta.dir, "markdown-inline.scm")] },
+      wasm: join(dirname(Bun.resolveSync("@opentui/core", import.meta.dir)), "assets/markdown_inline/tree-sitter-markdown_inline.wasm"),
+    },
+  ])
 
 /** Widest the text column gets; a book-like measure is easiest to read. */
 const MAX_TEXT_WIDTH = 76
@@ -169,6 +185,12 @@ const inlineText = (tokens: readonly MarkdownToken[]): string =>
     })
     .join("")
 
+type Align = "left" | "center"
+
+/** A block of centered lines, as PDF pages mark title pages and captions. */
+const CENTERED = /^<div align="center">\n([\s\S]*?)\n<\/div>\s*$/
+const HEADING = /^(#{1,6}) (.+)$/
+
 type FigureSource = { kind: "embedded"; lazy: LazyImage } | { kind: "remote"; url: string }
 
 /**
@@ -210,6 +232,7 @@ export const Viewer = {
    * `onPage` hears each page the reader settles on.
    */
   mount: (renderer: CliRenderer, doc: Doc, options: ViewerOptions = {}) => {
+    keepBrackets()
     // `imageMode` starts figures painted or not; `onImageMode` hears each switch.
     const textWidth = () => Math.max(1, Math.min(MAX_TEXT_WIDTH, renderer.width - 4))
     const layoutFor = (): Layout =>
@@ -310,8 +333,14 @@ export const Viewer = {
      * The terminal has one font size, so rank comes from size where it fits
      * (large letters for a short title), then weight and space.
      */
-    const heading = (depth: number, text: string) => {
-      const box = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", marginTop: 1, marginBottom: 1 })
+    const heading = (depth: number, text: string, align: Align = "left") => {
+      const box = new BoxRenderable(renderer, {
+        flexDirection: "column",
+        width: "100%",
+        alignItems: align === "center" ? "center" : "flex-start",
+        marginTop: 1,
+        marginBottom: 1,
+      })
       if (depth === 1 && measureText({ text, font: "tiny" }).width <= textWidth()) {
         box.add(new ASCIIFontRenderable(renderer, { text, font: "tiny", color: colors.fg, selectable: false }))
         return box
@@ -322,6 +351,8 @@ export const Viewer = {
           fg: depth <= 3 ? colors.fg : colors.dim,
           attributes: depth <= 3 ? TextAttributes.BOLD : TextAttributes.BOLD | TextAttributes.ITALIC,
           wrapMode: "word",
+          width: "100%",
+          textAlign: align,
         }),
       )
       showSelection(box)
@@ -344,6 +375,38 @@ export const Viewer = {
       return box
     }
 
+    /**
+     * A centered block: each line a heading or a line of text, drawn centered.
+     * A lone heading keeps a heading's spacing.
+     */
+    const centered = (content: string) => {
+      const lines = content.split("\n")
+      const [only] = lines
+      const lone = only !== undefined && lines.length === 1 ? HEADING.exec(only) : null
+      if (lone?.[1] && lone[2] !== undefined) return heading(lone[1].length, lone[2], "center")
+      const box = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", marginBottom: 1 })
+      for (const line of lines) {
+        const match = HEADING.exec(line)
+        if (match?.[1] && match[2] !== undefined) {
+          box.add(heading(match[1].length, match[2], "center"))
+          continue
+        }
+        const italic = /^\*(.+)\*$/.exec(line)?.[1]
+        box.add(
+          new TextRenderable(renderer, {
+            content: (italic ?? line).replace(/\\\*/g, "*").replace(/^- /, "• "),
+            fg: colors.fg,
+            attributes: italic === undefined ? TextAttributes.NONE : TextAttributes.ITALIC,
+            wrapMode: "word",
+            width: "100%",
+            textAlign: "center",
+          }),
+        )
+      }
+      showSelection(box)
+      return box
+    }
+
     const syntaxStyle = theme(renderer)
     const markdownView = (content: string, page: number) =>
       new MarkdownRenderable(renderer, {
@@ -357,6 +420,8 @@ export const Viewer = {
             return heading(token.depth, inlineText(token.tokens ?? []))
           }
           if (token.type === "code" && "text" in token && typeof token.text === "string") return codeBlock(token.text)
+          const center = token.type === "html" ? CENTERED.exec(token.raw)?.[1] : undefined
+          if (center !== undefined) return centered(center)
           const hrefs = imageHrefs(token)
           if (hrefs.length === 0) {
             // Markdown spaces blocks unevenly (none after a list or code, two before code),

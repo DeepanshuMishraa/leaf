@@ -1,7 +1,16 @@
 import { expect, test } from "bun:test"
 import { Pdf, type PdfBlock, type PdfLine } from "./pdf"
 
-const line = (text: string, top: number, size = 11, bold = false, mono = false): PdfLine => ({ text, top, size, bold, mono })
+const line = (text: string, top: number, size = 11, bold = false, mono = false, left = 0.1, right = 0.9): PdfLine => ({
+  text,
+  top,
+  size,
+  bold,
+  italic: false,
+  mono,
+  left,
+  right,
+})
 const code = (text: string, top: number, bold = false) => line(text, top, 9, bold, true)
 const text = (...lines: PdfLine[]): PdfBlock => ({ kind: "text", lines })
 
@@ -92,6 +101,9 @@ test("table-of-contents entries set apart by wide gaps get a line each", () => {
 })
 
 const prose = (top: number) => text(line("Body text long enough to set the common size for the whole page here.", top))
+/** Four lines of body text at a 12pt pitch, so the page has a line pitch to judge gaps by. */
+const body = (top: number) =>
+  text(...[0, 1, 2, 3].map((i) => line("Body text long enough to set the common size for the whole page here.", top + i * 12)))
 
 test("monospace blocks become code fences that keep their lines and indentation", () => {
   const md = Pdf.toMarkdown([
@@ -123,4 +135,102 @@ test("back-to-back code blocks share one fence, with a blank line between them",
 test("a fence longer than any backtick run in the code keeps it intact", () => {
   const md = Pdf.toMarkdown([[prose(0), text(code("```js", 20))]])
   expect(md).toContain("````\n```js\n````")
+})
+
+test("sizes half a point apart stay one paragraph", () => {
+  const md = Pdf.toMarkdown([[text(line("A paragraph whose font size jitters from", 0, 10), line("line to line, as some PDF tools leave it.", 12, 10.5))]])
+  expect(md).toBe("A paragraph whose font size jitters from line to line, as some PDF tools leave it.")
+})
+
+test("a gap wider than a line inside one block starts a new paragraph", () => {
+  const md = Pdf.toMarkdown([
+    [text(line("The first paragraph runs over two", 0), line("lines and then ends here.", 20), line("A second paragraph starts after a gap.", 45))],
+  ])
+  expect(md).toBe("The first paragraph runs over two lines and then ends here.\n\nA second paragraph starts after a gap.")
+})
+
+test("a heading wrapped onto two lines comes back as one", () => {
+  const md = Pdf.toMarkdown([
+    [
+      text(line("A Long Title That Wraps Onto", 0, 20, true)),
+      text(line("A Second Line", 22, 20, true)),
+      prose(60),
+      prose(80),
+    ],
+  ])
+  expect(md).toStartWith("# A Long Title That Wraps Onto A Second Line\n\n")
+})
+
+test("cells lined up in columns become a table, wrapped cells joined", () => {
+  const cell = (t: string, top: number, left: number, bold = false) => line(t, top, 8, bold, false, left, left + 0.2)
+  const md = Pdf.toMarkdown([
+    [
+      prose(0),
+      text(cell("Name", 30, 0.1, true), cell("Purpose", 30, 0.4)),
+      text(cell("Gateway", 41, 0.1, true), cell("Takes requests and", 41, 0.4), cell("returns results", 52, 0.4), cell("Queue", 63, 0.1, true), cell("Holds | work", 63, 0.4)),
+      prose(90),
+    ],
+  ])
+  expect(md).toContain(
+    "| **Name** | Purpose |\n| --- | --- |\n| **Gateway** | Takes requests and returns results |\n| **Queue** | Holds \\| work |",
+  )
+})
+
+test("numbered items become one ordered list, keeping their numbers", () => {
+  const md = Pdf.toMarkdown([
+    [
+      body(0),
+      text(line("3. Registry: keeps track of every worker", 70), line("and its health.", 82, 11, false, false, 0.12)),
+      text(line("4. Scheduler: picks a worker.", 100)),
+    ],
+  ])
+  expect(md).toContain("\n\n3. Registry: keeps track of every worker and its health.\n4. Scheduler: picks a worker.")
+})
+
+test("a list number set apart from its item joins it, not a table", () => {
+  const item = (n: number, name: string, top: number) =>
+    text(line(`${n}.`, top, 11, false, false, 0.42, 0.43), line(name, top, 11, false, false, 0.45, 0.56))
+  const md = Pdf.toMarkdown([[body(0), item(1, "Ada Lovelace", 70), item(2, "Alan Turing", 90)]])
+  expect(md).toContain("1. Ada Lovelace\n2. Alan Turing")
+  expect(md).not.toContain("|")
+})
+
+test("bullet items in separate blocks form one tight list", () => {
+  const md = Pdf.toMarkdown([[body(0), text(line("• First", 70)), text(line("• Second", 90))]])
+  expect(md).toContain("- First\n- Second")
+})
+
+test("centered lines are marked centered; full lines and left-aligned text are not", () => {
+  const md = Pdf.toMarkdown([
+    [
+      text(line("Submitted By", 0, 11, false, false, 0.44, 0.56)),
+      body(30),
+      text(line("A short left-aligned line.", 100, 11, false, false, 0.1, 0.4)),
+    ],
+  ])
+  expect(md).toStartWith('<div align="center">\nSubmitted By\n</div>\n\nBody text')
+  expect(md).toEndWith("whole page here.\n\nA short left-aligned line.")
+})
+
+test("captions are set in italics, not as headings", () => {
+  const md = Pdf.toMarkdown([[prose(0), text(line("Figure 1: Logical architecture.", 30, 8, true))]])
+  expect(md).toContain("*Figure 1: Logical architecture.*")
+  expect(md).not.toContain("#")
+})
+
+test("a URL broken across lines is mended without a space", () => {
+  const md = Pdf.toMarkdown([[text(line("See https://www.usenix.org/", 0), line("conference/osdi22 for details.", 12))]])
+  expect(md).toBe("See https://www.usenix.org/conference/osdi22 for details.")
+})
+
+test("a large title repeated on a cover and first page is not a running header", () => {
+  const title = (top: number) => text(line("The Title Of The Work", top, 20, true))
+  const bodies = ["Alpha starts the story.", "Bravo raises the stakes.", "Charlie turns it.", "Delta ends it."]
+  const pages = bodies.map((body, i) => [...(i < 2 ? [title(0)] : []), text(line(body, 100), line("It wraps onto a second line.", 120))])
+  expect(Pdf.toMarkdown(pages)).toContain("# The Title Of The Work")
+})
+
+test("a paragraph wholly in italics keeps them", () => {
+  const md = Pdf.toMarkdown([[body(0), text({ ...line("How can requests be scheduled well?", 70), italic: true })]])
+  expect(md).toContain("*How can requests be scheduled well?*")
 })

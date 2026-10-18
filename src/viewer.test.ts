@@ -415,3 +415,27 @@ test("scrolling down a long way keeps only a few pages built", async () => {
   expect(setup.captureCharFrame()).toMatch(/Page \d+ paragraph/)
   expect(built).toBeDefined()
 })
+
+test("a centered block draws its headings and lines centered", async () => {
+  const s = await mount('<div align="center">\n### Submitted By\n1. Ada Lovelace\n*Figure 1: A caption.*\n</div>\n\nLeft text.')
+  const lines = s.captureCharFrame().split("\n")
+  const indent = (text: string) => {
+    const row = lines.find((l) => l.includes(text)) ?? ""
+    return { left: row.indexOf(text), right: row.length - row.trimEnd().length }
+  }
+  for (const text of ["Submitted By", "1. Ada Lovelace", "Figure 1: A caption."]) {
+    const { left, right } = indent(text)
+    expect(Math.abs(left - right)).toBeLessThanOrEqual(1)
+  }
+  expect(indent("Left text.").left).toBeLessThan(indent("Submitted By").left - 10)
+  expect(s.captureCharFrame()).not.toContain("<div")
+  expect(s.captureCharFrame()).not.toContain("*Figure")
+})
+
+test("brackets of citations like [1] stay visible, while links still hide their syntax", async () => {
+  const s = await mount("As shown [1, 2], see [a link](https://example.com).\n\n[3] A reference.")
+  const frame = s.captureCharFrame()
+  expect(frame).toContain("As shown [1, 2]")
+  expect(frame).toContain("[3] A reference.")
+  expect(frame).not.toContain("[a link]")
+})
