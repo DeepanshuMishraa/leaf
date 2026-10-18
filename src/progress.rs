@@ -67,7 +67,11 @@ pub struct StoreFailed {
     pub cause: String,
 }
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS progress (
+/// The page is saved on every turn; a write-ahead log makes that an append
+/// without waiting on the disk. A crash still keeps it; a power cut may lose the last few.
+const SCHEMA: &str = "PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+CREATE TABLE IF NOT EXISTS progress (
   key TEXT PRIMARY KEY,
   page INTEGER NOT NULL,
   page_count INTEGER NOT NULL,

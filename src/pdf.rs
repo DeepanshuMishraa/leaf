@@ -15,6 +15,7 @@ use mupdf::{
 use regex::Regex;
 
 use crate::doc::{Doc, Source};
+use crate::memory;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -76,6 +77,11 @@ const MIN_IMAGE_SIZE: f32 = 40.0;
 const MAX_IMAGE_PIXELS_WIDE: u32 = 800;
 /// Widest an image is drawn, in pixels: a full text column on a large high-density screen.
 const MAX_RENDER_PIXELS_WIDE: u32 = 3000;
+/// Share (in percent) of mupdf's cache kept after reading a page: enough for
+/// the fonts the next page likely shares, not the whole book's.
+const PAGE_CACHE_SHARE: u32 = 50;
+/// Markdown of this many pages is kept; the ones furthest from the reader go first.
+const CACHED_PAGES: usize = 64;
 /// Pages read to learn the layout, spread evenly through the document.
 const SAMPLE_PAGES: usize = 24;
 /// Shapes in a vector drawing; thinner paths are rules, underlines and borders.
@@ -894,13 +900,21 @@ fn sample_pages(total: usize, count: usize) -> Vec<usize> {
 }
 
 /// An image a page shows: one embedded in the PDF, or a region of the page
-/// drawn as vectors. Both are drawn only when shown.
+/// drawn as vectors. Both are drawn only when shown. An embedded image is
+/// found again by its place among the page's image blocks rather than kept:
+/// mupdf holds an image's compressed data, and soon its pixels, while it lives.
 enum PdfImage {
-    Embedded { image: mupdf::Image, width: u32, height: u32 },
+    Embedded { page: usize, block: usize, width: u32, height: u32 },
     Drawing { page: usize, region: Region, width: u32, height: u32 },
 }
 
 impl PdfImage {
+    fn page(&self) -> usize {
+        match *self {
+            PdfImage::Embedded { page, .. } | PdfImage::Drawing { page, .. } => page,
+        }
+    }
+
     fn size(&self) -> (u32, u32) {
         match *self {
             PdfImage::Embedded { width, height, .. } | PdfImage::Drawing { width, height, .. } => (width, height),
@@ -1065,7 +1079,7 @@ fn read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, Pdf
                 }
                 let id = format!("p{}-{image_index}", i + 1);
                 let (width, height) = decoded_size(&image);
-                images.insert(id.clone(), PdfImage::Embedded { image, width, height });
+                images.insert(id.clone(), PdfImage::Embedded { page: i, block: image_index, width, height });
                 placed.push((top, Block::Image(id)));
             }
         }
@@ -1080,6 +1094,13 @@ fn read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, Pdf
     Ok(placed.into_iter().map(|(_, b)| b).collect())
 }
 
+/// The `block`th image (1-based) on a page, read again, counted as `read_page` counts them.
+fn embedded_image(document: &Document, page: usize, block: usize) -> Result<Option<mupdf::Image>, mupdf::Error> {
+    let text_page = document.load_page(page as i32)?.to_text_page(TextPageFlags::PRESERVE_IMAGES)?;
+    let mut images = text_page.blocks().filter(|b| b.r#type() == TextBlockType::Image).filter_map(|b| b.image());
+    Ok(images.nth(block.saturating_sub(1)))
+}
+
 /// One malformed page must not lose the whole document: note it and keep going.
 fn safe_read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, PdfImage>>) -> Vec<Block> {
     read_page(document, i, images).unwrap_or_else(|e| {
@@ -1090,9 +1111,36 @@ fn safe_read_page(document: &Document, i: usize, images: &RefCell<HashMap<String
 struct PdfSource {
     document: Document,
     layout: Layout,
-    /// Markdown is small next to mupdf's page structures, so each page is read once and kept.
+    /// Markdown of pages read lately, so turning back and forth reads nothing twice.
     pages: RefCell<HashMap<usize, Rc<str>>>,
     images: RefCell<HashMap<String, PdfImage>>,
+}
+
+impl PdfSource {
+    /// Forgets the page furthest from `index` once too many are kept, and its images.
+    fn evict(&self, index: usize) {
+        let mut pages = self.pages.borrow_mut();
+        if pages.len() < CACHED_PAGES {
+            return;
+        }
+        if let Some(&far) = pages.keys().max_by_key(|&&page| page.abs_diff(index)) {
+            pages.remove(&far);
+            self.images.borrow_mut().retain(|_, image| image.page() != far);
+        }
+    }
+
+    fn draw(&self, image: &PdfImage, width: u32) -> Result<Option<RgbaImage>, mupdf::Error> {
+        match *image {
+            PdfImage::Embedded { page, block, .. } => {
+                let Some(image) = embedded_image(&self.document, page, block)? else { return Ok(None) };
+                let (w, h) = (image.width().max(1), image.height().max(1));
+                let scale = (width as f32 / w as f32).min(1.0);
+                let size = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
+                decode_embedded(&image, size.0, size.1)
+            }
+            PdfImage::Drawing { page, region, .. } => render_region(&self.document.load_page(page as i32)?, region, width),
+        }
+    }
 }
 
 impl Source for PdfSource {
@@ -1100,8 +1148,9 @@ impl Source for PdfSource {
         if let Some(page) = self.pages.borrow().get(&index) {
             return page.clone();
         }
-        let blocks = safe_read_page(&self.document, index, &self.images);
-        let page: Rc<str> = render(&[blocks], &self.layout).into();
+        self.evict(index);
+        let page: Rc<str> = render(&[safe_read_page(&self.document, index, &self.images)], &self.layout).into();
+        memory::shrink_mupdf_cache(PAGE_CACHE_SHARE);
         self.pages.borrow_mut().insert(index, page.clone());
         page
     }
@@ -1115,26 +1164,19 @@ impl Source for PdfSource {
     // Drawings render sharp at the width they're shown; embedded images never beyond their own pixels.
     fn decode(&self, id: &str, width: u32) -> Option<RgbaImage> {
         let width = width.clamp(1, MAX_RENDER_PIXELS_WIDE);
-        let images = self.images.borrow();
-        match images.get(id)? {
-            PdfImage::Embedded { image, .. } => {
-                let (w, h) = (image.width().max(1), image.height().max(1));
-                let scale = (width as f32 / w as f32).min(1.0);
-                let size = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
-                decode_embedded(image, size.0, size.1).ok().flatten()
-            }
-            PdfImage::Drawing { page, region, .. } => {
-                let page = self.document.load_page(*page as i32).ok()?;
-                render_region(&page, *region, width).ok().flatten()
-            }
-        }
+        let drawn = self.draw(self.images.borrow().get(id)?, width);
+        // The decoded pixels are the bulk of what mupdf now holds, and are kept by the viewer while shown.
+        memory::shrink_mupdf_cache(0);
+        drawn.ok().flatten()
     }
 }
 
 /// Opens a PDF and returns at once. Only a small sample of pages is read up
 /// front, to learn the layout; the rest are read as they are shown.
 pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
-    let bytes = std::fs::read(path).map_err(|e| PdfOpenFailed {
+    // Checked up front for a clear message; mupdf then reads the file as it
+    // needs it, so a large PDF is never held in memory whole.
+    std::fs::File::open(path).map_err(|e| PdfOpenFailed {
         message: if e.kind() == std::io::ErrorKind::PermissionDenied {
             format!(
                 "macOS blocked access to {} ({e}). Allow your terminal in System Settings → Privacy & Security → Files & Folders, then restart it.",
@@ -1144,23 +1186,32 @@ pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
             format!("Could not read {} ({e}). Check that the path is right and the file exists.", path.display())
         },
     })?;
+    let source = path.display().to_string();
     let fallback = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    from_bytes(&bytes, &path.display().to_string(), &fallback)
+    from_document(Document::open(path), &source, &fallback)
 }
 
 /// `open` for PDF bytes already in hand (a download, say). `source` names the
 /// PDF in errors; `fallback_title` is used when the PDF has no title of its own.
 pub fn from_bytes(bytes: &[u8], source: &str, fallback_title: &str) -> Result<Doc, PdfOpenFailed> {
+    from_document(Document::from_bytes(bytes, "application/pdf"), source, fallback_title)
+}
+
+fn from_document(document: Result<Document, mupdf::Error>, source: &str, fallback_title: &str) -> Result<Doc, PdfOpenFailed> {
     let failed = |e: mupdf::Error| PdfOpenFailed {
         message: format!(
             "Could not open {source} as a PDF ({e}). It may be encrypted or damaged. Open it in a PDF viewer to confirm it is valid."
         ),
     };
-    let document = Document::from_bytes(bytes, "application/pdf").map_err(failed)?;
+    // Exact ICC color matching is most of the work of decoding a photo, and a terminal can't show the difference.
+    mupdf::Context::get().disable_icc();
+    let document = document.map_err(failed)?;
     let page_count = document.page_count().map_err(failed)?.max(0) as usize;
     let images = RefCell::new(HashMap::new());
     let sample: Vec<Vec<Block>> = sample_pages(page_count, SAMPLE_PAGES).into_iter().map(|i| safe_read_page(&document, i, &images)).collect();
     let layout = analyze(&sample);
+    // What the sample pages loaded is no use to the page the reader opens on.
+    memory::shrink_mupdf_cache(0);
     let title = document.metadata(MetadataName::Title).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
     Ok(Doc {
         title: title.unwrap_or_else(|| fallback_title.to_owned()),

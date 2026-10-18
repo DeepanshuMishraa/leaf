@@ -1254,6 +1254,7 @@ dependencies = [
  "image",
  "libc",
  "mupdf",
+ "mupdf-sys",
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",

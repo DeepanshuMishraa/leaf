@@ -165,7 +165,8 @@ pub struct App {
     remote: HashMap<String, Remote>,
     fetched_tx: mpsc::Sender<(String, Option<RgbaImage>)>,
     fetched_rx: mpsc::Receiver<(String, Option<RgbaImage>)>,
-    pixels: HashMap<(String, ImageMode), Rc<RgbaImage>>,
+    /// Figures' pixels while on screen; `None` for one that can't be decoded, so it isn't tried again each draw.
+    pixels: HashMap<(String, ImageMode), Option<Rc<RgbaImage>>>,
     protocols: HashMap<ProtocolKey, Drawn>,
     /// Set when kitty images are placed directly instead of through ratatui-image.
     kitty: Option<Kitty>,
@@ -414,10 +415,16 @@ impl App {
     fn figure_pixels(&mut self, href: &str, cols: u16) -> Option<Rc<RgbaImage>> {
         let key = (href.to_owned(), self.image_mode);
         if let Some(pixels) = self.pixels.get(&key) {
-            return Some(pixels.clone());
+            return pixels.clone();
         }
         let original = match Doc::image_ref(href) {
-            ImageRef::Embedded(id) => Rc::new(self.doc.source.decode(id, cols as u32 * self.picker.font_size().width as u32)?),
+            ImageRef::Embedded(id) => match self.doc.source.decode(id, cols as u32 * self.picker.font_size().width as u32) {
+                Some(image) => Rc::new(image),
+                None => {
+                    self.pixels.insert(key, None);
+                    return None;
+                }
+            },
             ImageRef::Remote(url) => match self.remote.get(url) {
                 Some(Remote::Ready(image)) => image.clone(),
                 Some(_) => return None,
@@ -439,7 +446,7 @@ impl App {
                 Rc::new(mono::paint(&original, ink))
             }
         };
-        self.pixels.insert(key, pixels.clone());
+        self.pixels.insert(key, Some(pixels.clone()));
         Some(pixels)
     }
 
@@ -582,8 +589,9 @@ impl App {
                 let (Some(&first_y), Some(&last_y)) = (visible.first(), visible.last()) else { continue };
                 let from = (screen[first_y].map_or(top, |s| s.row) - top) as u16;
                 let to = from + (last_y - first_y + 1) as u16;
-                let Some(pixels) = self.figure_pixels(&figure.href, figure.cols) else { continue };
+                let pixels = self.figure_pixels(&figure.href, figure.cols);
                 pixels_used.insert((figure.href.clone(), self.image_mode));
+                let Some(pixels) = pixels else { continue };
                 let key = ProtocolKey { href: figure.href.clone(), mode: self.image_mode, cols: figure.cols, from, to };
                 if !self.protocols.contains_key(&key) {
                     // Only the rows on screen are drawn: protocols can't clip an image's top.
@@ -940,8 +948,8 @@ impl App {
                 }
                 return Ok(());
             }
-            let timeout = if self.loading() { Duration::from_millis(100) } else { Duration::from_secs(1) };
-            if !event::poll(timeout)? {
+            // While images download, check for them often; otherwise sleep until something happens.
+            if self.loading() && !event::poll(Duration::from_millis(100))? {
                 continue;
             }
             // Handle everything already waiting before drawing again.
@@ -1095,6 +1103,33 @@ mod tests {
                 .find_map(|(y, line)| line.find(text).map(|x| (line[..x].chars().count() as u16, y as u16)))
                 .expect("text is on screen")
         }
+    }
+
+    /// A page with one figure that never decodes, counting the tries.
+    struct Broken(Rc<std::cell::Cell<usize>>);
+
+    impl crate::doc::Source for Broken {
+        fn page(&self, _: usize) -> Rc<str> {
+            "Before\n\n![](leaf-image:mask)\n\nAfter".into()
+        }
+        fn image_size(&self, _: &str) -> Option<(u32, u32)> {
+            Some((160, 80))
+        }
+        fn decode(&self, _: &str, _: u32) -> Option<RgbaImage> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+    }
+
+    #[test]
+    fn a_figure_that_cant_be_decoded_is_tried_once_while_on_screen() {
+        let tries = Rc::new(std::cell::Cell::new(0));
+        let doc = Doc { title: "Book".into(), page_count: Some(1), source: Box::new(Broken(tries.clone())) };
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        s.draw();
+        s.draw();
+        assert!(s.draw().contains("After"));
+        assert_eq!(tries.get(), 1);
     }
 
     #[test]

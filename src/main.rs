@@ -3,6 +3,7 @@ mod doc;
 mod font;
 mod highlight;
 mod kitty;
+mod memory;
 mod mono;
 mod pdf;
 mod progress;
@@ -93,6 +94,7 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
 }
 
 fn main() -> ExitCode {
+    memory::without_large_cache();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [command, target] = args.as_slice() else {
         eprintln!("{USAGE}");
