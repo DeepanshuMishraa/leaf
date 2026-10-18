@@ -1,0 +1,22 @@
+[package]
+name = "leaf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22"
+crossterm = "0.29"
+dom_smoothie = "0.18"
+htmd = "0.5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+libc = "0.2"
+mupdf = "0.8"
+pulldown-cmark = { version = "0.13", default-features = false }
+ratatui = "0.30"
+ratatui-image = { version = "12.0.0-rc.2", default-features = false, features = ["crossterm"] }
+regex = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"
+unicode-width = "0.2"
+ureq = "3"
+url = "2"

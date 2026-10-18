@@ -3,8 +3,7 @@
 Read PDFs and web articles in the terminal.
 
 ```sh
-bun install
-bun link            # puts `leaf` on your PATH
+cargo install --path .   # puts `leaf` on your PATH
 ln -s (pwd)/completions/leaf.fish ~/.config/fish/completions/   # fish: tab-completes .pdf files
 leaf open paper.pdf
 leaf open https://example.com/post
@@ -24,11 +23,13 @@ Links that serve a PDF (checked by content type, so `/pdf/2401.00001` works) ope
 
 Windows at least 100×24 show one PDF page per screen; smaller ones scroll through all pages, with the page number between them.
 
-PDFs are converted to markdown (headings from font size, paragraphs rejoined, running headers dropped) with embedded images shown inline. Articles go through Readability and keep clickable links.
+PDFs are converted to markdown (headings from font size, paragraphs rejoined, running headers dropped) with embedded images shown inline. Articles go through Readability; links show their URL.
 
-Images use the Kitty graphics protocol when the terminal supports it. Force a protocol with `OPENTUI_IMAGE_PROTOCOL=kitty|sixel|blocks`. Force OSC 8 links with `FORCE_HYPERLINK=1`.
+Images use the Kitty, iTerm2 or Sixel graphics protocol, whichever the terminal answers to, and fall back to colored half blocks.
+
+Built in Rust with ratatui and mupdf.
 
 ```sh
-bun run check   # typecheck
-bun test
+cargo test
+cargo clippy
 ```
