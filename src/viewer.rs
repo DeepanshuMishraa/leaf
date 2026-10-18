@@ -787,7 +787,7 @@ impl App {
         if paged {
             rows.push(("t  :", "go to page"));
         }
-        rows.extend([("f", "find text"), ("n/N", "next / previous match")]);
+        rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
         rows.push(("i", if self.image_mode == ImageMode::Color { "paint images" } else { "show original images" }));
         rows.extend([("drag", "select and copy text"), ("y", "highlight selection, or clear one"), ("?", "this help"), ("q", "quit")]);
         rows
@@ -992,7 +992,7 @@ impl App {
                     self.dialog = Dialog::Goto { digits: String::new(), page_count };
                 }
             }
-            Some('f') => self.dialog = Dialog::Find { typed: String::new() },
+            Some('f') | Some('F') => self.dialog = Dialog::Find { typed: String::new() },
             Some('n') if self.found_here().is_some() => self.next_match(Direction::Forward),
             Some('N') => self.next_match(Direction::Backward),
             Some('q') => self.quit = true,
