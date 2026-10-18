@@ -1,7 +1,18 @@
 [package]
-name = "leaf"
+name = "leaf-reader"
 version = "0.1.0"
 edition = "2024"
+description = "Read PDFs and web articles in the terminal"
+license = "MIT"
+repository = "https://github.com/DeepanshuMishraa/leaf"
+readme = "README.md"
+keywords = ["pdf", "reader", "terminal", "tui", "articles"]
+categories = ["command-line-utilities"]
+exclude = ["CLAUDE.md"]
+
+[[bin]]
+name = "leaf"
+path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"

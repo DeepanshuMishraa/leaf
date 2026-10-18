@@ -3,7 +3,12 @@
 Read PDFs and web articles in the terminal.
 
 ```sh
-cargo install --path .   # puts `leaf` on your PATH
+cargo install leaf-reader   # installs the `leaf` command to ~/.cargo/bin
+```
+
+If `leaf` isn't found after installing, add `~/.cargo/bin` to your PATH (fish: `fish_add_path ~/.cargo/bin`). Then:
+
+```sh
 ln -s (pwd)/completions/leaf.fish ~/.config/fish/completions/   # fish: tab-completes .pdf files
 leaf open paper.pdf
 leaf open https://example.com/post
