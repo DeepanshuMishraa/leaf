@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::event::{
@@ -25,6 +25,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::article;
 use crate::doc::{Doc, ImageRef};
+use crate::find::Query;
 use crate::highlight::{self, Highlight};
 use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
@@ -44,11 +45,16 @@ const WHEEL_STEP: isize = 3;
 const FALLBACK_INK: Rgb = [220, 220, 220];
 /// Laid-out pages kept on each side of the one being read.
 const KEPT_PAGES: usize = 4;
+/// How long a search reads pages before the screen is drawn and keys are read again.
+const SEARCH_SLICE: Duration = Duration::from_millis(30);
 
 const SELECTION: Color = Color::Indexed(8);
 // Highlighter yellow under dark ink reads the same on light and dark themes.
 const MARK: Color = Color::Rgb(250, 214, 64);
 const MARK_INK: Color = Color::Rgb(20, 20, 20);
+/// Search matches in light orange, the one the reader is on in a deeper orange.
+const FOUND: Color = Color::Rgb(255, 196, 140);
+const FOUND_HERE: Color = Color::Rgb(255, 128, 48);
 
 /// `Paged` shows one source page per screen; `Scroll` stacks every page in
 /// one column with the page number between them.
@@ -58,12 +64,55 @@ enum Mode {
     Scroll,
 }
 
-/// What floats over the text: nothing, the key list, or the go-to-page box with what's typed so far.
+/// What floats over the text: nothing, the key list, the go-to-page box or
+/// the find box, with what's typed so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Dialog {
     None,
     Help,
     Goto { digits: String, page_count: usize },
+    Find { typed: String },
+}
+
+/// Which way a search moves through the pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+impl Direction {
+    /// The page looked at `step` pages on from `from`, wrapping round the end.
+    fn page(self, from: usize, step: usize, pages: usize) -> usize {
+        match self {
+            Direction::Forward => (from + step) % pages,
+            Direction::Backward => (from + pages - step % pages) % pages,
+        }
+    }
+}
+
+/// Where the query was found: characters `start..end` of a page's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Match {
+    page: usize,
+    start: usize,
+    end: usize,
+}
+
+/// How far a search has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seek {
+    /// Reading pages for the next match. Matches on `from`'s page count from
+    /// its offset on (or, going back, before it); `step` pages have been read.
+    /// The search wraps round, ending on the part of `from`'s page it skipped.
+    Seeking { direction: Direction, from: TextPos, step: usize },
+    Found(Match),
+    Missing,
+}
+
+struct Search {
+    query: Query,
+    seek: Seek,
 }
 
 /// A place in a page's text.
@@ -105,6 +154,15 @@ struct ProtocolKey {
     cols: u16,
     from: u16,
     to: u16,
+}
+
+/// What is marked on a row besides its own styling: the selection, the
+/// search's matches on its page, and the match the reader is on.
+#[derive(Clone, Copy)]
+struct Marks<'a> {
+    selection: Option<(TextPos, TextPos)>,
+    found: &'a [(usize, usize)],
+    here: Option<Match>,
 }
 
 /// What a row on screen shows.
@@ -177,6 +235,7 @@ pub struct App {
     screen: Vec<Option<ScreenRow>>,
     reported: Option<usize>,
     copy: Option<String>,
+    search: Option<Search>,
     quit: bool,
 }
 
@@ -227,6 +286,7 @@ impl App {
             screen: Vec::new(),
             reported: None,
             copy: None,
+            search: None,
             quit: false,
         }
     }
@@ -361,6 +421,21 @@ impl App {
     }
 
     fn footer(&mut self) -> String {
+        let place = self.place();
+        let Some(search) = &self.search else { return place };
+        let query = search.query.typed();
+        match search.seek {
+            Seek::Seeking { direction, from, step } => {
+                let page = direction.page(from.page, step.min(self.pages()), self.pages().max(1)) + 1;
+                format!("searching \"{query}\" · page {page} / {}", self.pages())
+            }
+            Seek::Found(_) => format!("{place} · \"{query}\" n/N"),
+            Seek::Missing => format!("{place} · \"{query}\" not found"),
+        }
+    }
+
+    /// Where the reader is: the page and how far through, or how far down a page-less document.
+    fn place(&mut self) -> String {
         match self.doc.page_count {
             None => {
                 let max = self.height(0).saturating_sub(self.view());
@@ -501,9 +576,11 @@ impl App {
 
         let selection = self.selection.map(Selection::range);
         let screen = self.screen.clone();
+        let found = self.matches_on(&screen);
         for (y, slot) in screen.iter().enumerate() {
             let Some(ScreenRow { page, row }) = *slot else { continue };
-            self.draw_row(f, page, row, self.column.y + y as u16, selection);
+            let marks = Marks { selection, found: found.get(&page).map_or(&[], Vec::as_slice), here: self.found_here() };
+            self.draw_row(f, page, row, self.column.y + y as u16, marks);
         }
         self.draw_figures(f, &screen);
 
@@ -515,6 +592,7 @@ impl App {
             Dialog::None => None,
             Dialog::Help => Some(self.draw_help(f, area)),
             Dialog::Goto { digits, page_count } => Some(self.draw_goto(f, area, &digits, page_count)),
+            Dialog::Find { typed } => Some(self.draw_find(f, area, &typed)),
         };
         // Kitty images sit above the text, so any under a panel would hide it.
         if let Some(panel) = panel {
@@ -522,7 +600,24 @@ impl App {
         }
     }
 
-    fn draw_row(&mut self, f: &mut Frame, page: usize, row: usize, y: u16, selection: Option<(TextPos, TextPos)>) {
+    /// Every match of the search on the pages on screen.
+    fn matches_on(&mut self, screen: &[Option<ScreenRow>]) -> HashMap<usize, Vec<(usize, usize)>> {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else { return HashMap::new() };
+        let mut found = HashMap::new();
+        for page in screen.iter().flatten().map(|s| s.page) {
+            found.entry(page).or_insert_with(|| query.matches(&self.laid(page).text));
+        }
+        found
+    }
+
+    fn found_here(&self) -> Option<Match> {
+        match self.search.as_ref()?.seek {
+            Seek::Found(here) => Some(here),
+            _ => None,
+        }
+    }
+
+    fn draw_row(&mut self, f: &mut Frame, page: usize, row: usize, y: u16, marks: Marks) {
         let prefix = self.prefix(page);
         let column = self.column;
         let buf = f.buffer_mut();
@@ -543,7 +638,7 @@ impl App {
             return;
         }
         let Some(line) = laid.rows.get(row - prefix) else { return };
-        let marks: Vec<&Highlight> = self.highlights.iter().filter(|h| h.page == page).collect();
+        let highlights: Vec<&Highlight> = self.highlights.iter().filter(|h| h.page == page).collect();
         let buf = f.buffer_mut();
         for seg in &line.segs {
             let mut x = column.x + seg.x;
@@ -551,10 +646,14 @@ impl App {
                 let mut style = seg.style;
                 if let Some(offset) = seg.offset.map(|o| o + i) {
                     let at = TextPos { page, offset };
-                    if marks.iter().any(|h| h.start <= offset && offset < h.end) {
+                    if highlights.iter().any(|h| h.start <= offset && offset < h.end) {
                         style = style.bg(MARK).fg(MARK_INK);
                     }
-                    if selection.is_some_and(|(start, end)| start <= at && at < end) {
+                    if marks.found.iter().any(|&(start, end)| start <= offset && offset < end) {
+                        let here = marks.here.is_some_and(|m| m.page == page && m.start <= offset && offset < m.end);
+                        style = style.bg(if here { FOUND_HERE } else { FOUND }).fg(MARK_INK);
+                    }
+                    if marks.selection.is_some_and(|(start, end)| start <= at && at < end) {
                         style = style.bg(SELECTION).fg(Color::Reset);
                     }
                 }
@@ -688,6 +787,7 @@ impl App {
         if paged {
             rows.push(("t  :", "go to page"));
         }
+        rows.extend([("f", "find text"), ("n/N", "next / previous match")]);
         rows.push(("i", if self.image_mode == ImageMode::Color { "paint images" } else { "show original images" }));
         rows.extend([("drag", "select and copy text"), ("y", "highlight selection, or clear one"), ("?", "this help"), ("q", "quit")]);
         rows
@@ -723,6 +823,100 @@ impl App {
         Self::panel(f, area, "Go to page", lines, hint.chars().count() as u16)
     }
 
+    fn draw_find(&self, f: &mut Frame, area: Rect, typed: &str) -> Rect {
+        let hint = "enter find · esc cancel";
+        let lines = vec![
+            Line::from(vec![Span::styled(typed.to_owned(), Style::default().add_modifier(Modifier::BOLD)), Span::raw("▏")]),
+            Line::default(),
+            Line::from(Span::styled(hint, Style::default().fg(DIM))).centered(),
+        ];
+        let width = (hint.chars().count() as u16).max(typed.chars().count() as u16 + 1);
+        Self::panel(f, area, "Find", lines, width)
+    }
+
+    // -----------------------------------------------------------------------
+    // Search.
+
+    fn seeking(&self) -> bool {
+        self.search.as_ref().is_some_and(|s| matches!(s.seek, Seek::Seeking { .. }))
+    }
+
+    /// Searches from `from`, reading pages for a while.
+    fn seek(&mut self, query: Query, direction: Direction, from: TextPos) {
+        self.search = Some(Search { query, seek: Seek::Seeking { direction, from, step: 0 } });
+        self.advance_search(SEARCH_SLICE);
+    }
+
+    /// Reads pages for the next match until one is found, every page has
+    /// been read, or `budget` runs out; the event loop carries on from there.
+    fn advance_search(&mut self, budget: Duration) {
+        let Some(search) = self.search.take() else { return };
+        let Seek::Seeking { direction, from, mut step } = search.seek else {
+            self.search = Some(search);
+            return;
+        };
+        let started = Instant::now();
+        let pages = self.pages();
+        let seek = loop {
+            if pages == 0 || step > pages {
+                break Seek::Missing;
+            }
+            let page = direction.page(from.page, step, pages);
+            let keep = |start: usize| match direction {
+                Direction::Forward if step == 0 => start >= from.offset,
+                Direction::Forward if step == pages => start < from.offset,
+                Direction::Backward if step == 0 => start < from.offset,
+                Direction::Backward if step == pages => start >= from.offset,
+                _ => true,
+            };
+            let mut ranges = search.query.matches(&self.laid(page).text).into_iter().filter(|&(start, _)| keep(start));
+            let hit = match direction {
+                Direction::Forward => ranges.next(),
+                Direction::Backward => ranges.next_back(),
+            };
+            if let Some((start, end)) = hit {
+                break Seek::Found(Match { page, start, end });
+            }
+            step += 1;
+            if started.elapsed() >= budget {
+                break Seek::Seeking { direction, from, step };
+            }
+        };
+        if let Seek::Found(found) = seek {
+            self.reveal(found);
+        }
+        self.search = Some(Search { seek, ..search });
+    }
+
+    /// The match after (or before) the one the reader is on.
+    fn next_match(&mut self, direction: Direction) {
+        let Some(Search { query, seek: Seek::Found(here) }) = &self.search else { return };
+        let offset = match direction {
+            Direction::Forward => here.start + 1,
+            Direction::Backward => here.start,
+        };
+        self.seek(query.clone(), direction, TextPos { page: here.page, offset });
+    }
+
+    /// Turns to a match's page and, if it is below the first screen, scrolls
+    /// it a third of the way down.
+    fn reveal(&mut self, found: Match) {
+        self.go_to_page(found.page, false);
+        let laid = self.laid(found.page);
+        let holds = |seg: &render::Seg| seg.offset.is_some_and(|o| o <= found.start && found.start < o + seg.text.chars().count());
+        let row = laid.rows.iter().position(|row| row.segs.iter().any(holds)).unwrap_or(0) + self.prefix(found.page);
+        if row >= self.view() {
+            let offset = row.saturating_sub(self.view() / 3);
+            self.offset = match self.mode {
+                Mode::Paged => offset.min(self.max_offset()),
+                Mode::Scroll => offset,
+            };
+            if self.mode == Mode::Scroll {
+                self.clamp_end();
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Input.
 
@@ -755,12 +949,33 @@ impl App {
         }
     }
 
+    /// Typing in the find box; enter searches from the page being read.
+    fn find_key(&mut self, key: &KeyEvent, typed: String) {
+        match key.code {
+            KeyCode::Esc => self.dialog = Dialog::None,
+            KeyCode::Enter => {
+                self.dialog = Dialog::None;
+                if let Some(query) = Query::new(&typed) {
+                    self.seek(query, Direction::Forward, TextPos { page: self.current, offset: 0 });
+                }
+            }
+            KeyCode::Backspace => {
+                let mut typed = typed;
+                typed.pop();
+                self.dialog = Dialog::Find { typed };
+            }
+            KeyCode::Char(c) => self.dialog = Dialog::Find { typed: format!("{typed}{c}") },
+            _ => {}
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
         match self.dialog.clone() {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
+            Dialog::Find { typed } => return self.find_key(&key, typed),
             Dialog::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
                     self.dialog = Dialog::None;
@@ -777,6 +992,9 @@ impl App {
                     self.dialog = Dialog::Goto { digits: String::new(), page_count };
                 }
             }
+            Some('f') => self.dialog = Dialog::Find { typed: String::new() },
+            Some('n') if self.found_here().is_some() => self.next_match(Direction::Forward),
+            Some('N') => self.next_match(Direction::Backward),
             Some('q') => self.quit = true,
             Some('y') => self.toggle_highlight(),
             Some('j') => self.scroll_by(1),
@@ -791,8 +1009,9 @@ impl App {
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
             _ => match key.code {
+                // Esc lets go of a selection, then a search, then quits.
                 KeyCode::Esc => {
-                    if self.selection.take().is_none() {
+                    if self.selection.take().is_none() && self.search.take().is_none() {
                         self.quit = true;
                     }
                 }
@@ -931,6 +1150,7 @@ impl App {
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         loop {
             self.receive_images();
+            self.advance_search(SEARCH_SLICE);
             terminal.draw(|f| self.draw(f))?;
             if let Some(kitty) = &mut self.kitty {
                 kitty.flush(&mut io::stdout(), &self.placements)?;
@@ -948,8 +1168,12 @@ impl App {
                 }
                 return Ok(());
             }
-            // While images download, check for them often; otherwise sleep until something happens.
-            if self.loading() && !event::poll(Duration::from_millis(100))? {
+            // A search keeps reading pages between keys, and images
+            // downloading are checked for often; otherwise sleep until something happens.
+            let wait = if self.seeking() { Some(Duration::ZERO) } else { self.loading().then_some(Duration::from_millis(100)) };
+            if let Some(wait) = wait
+                && !event::poll(wait)?
+            {
                 continue;
             }
             // Handle everything already waiting before drawing again.
@@ -1238,6 +1462,79 @@ mod tests {
         assert!(!s.app.quit && s.app.selection.is_none());
         s.press(KeyCode::Esc);
         assert!(s.app.quit);
+    }
+
+    fn search(s: &mut Screen, query: &str) -> String {
+        s.press(KeyCode::Char('f'));
+        for c in query.chars() {
+            s.press(KeyCode::Char(c));
+        }
+        s.press(KeyCode::Enter)
+    }
+
+    #[test]
+    fn find_turns_to_the_page_with_the_term_and_marks_it() {
+        let mut s = Screen::new(book(&["Alpha text", "Bravo text", "Charlie text", "Delta text"]), 120, 30, ViewerOptions::default());
+        let frame = search(&mut s, "charLIE");
+        assert!(frame.contains("Charlie text") && frame.contains("3 / 4"), "{frame}");
+        assert!(frame.contains("\"charLIE\" n/N"), "{frame}");
+        let (x, y) = s.find("Charlie");
+        let buffer = s.terminal.backend().buffer();
+        assert_eq!(buffer[(x, y)].bg, FOUND_HERE);
+        assert_eq!(buffer[(x + 7, y)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn a_match_far_down_a_page_is_scrolled_into_view() {
+        let long: String = (1..=80).map(|i| format!("Filler paragraph {i}.\n\n")).collect::<String>() + "The needle is here.";
+        let mut s = Screen::new(book(&[&long]), 120, 30, ViewerOptions::default());
+        assert!(!s.draw().contains("needle"));
+        assert!(search(&mut s, "needle").contains("The needle is here."));
+    }
+
+    #[test]
+    fn n_and_shift_n_step_through_matches_wrapping_round() {
+        let mut s = Screen::new(book(&["Alpha raft", "Bravo", "Raft one, raft two", "Delta"]), 120, 30, ViewerOptions::default());
+        search(&mut s, "raft");
+        let at = |s: &Screen| s.app.found_here().map(|m| (m.page, m.start));
+        assert_eq!(at(&s), Some((0, 6)));
+        s.press(KeyCode::Char('n'));
+        assert_eq!(at(&s), Some((2, 0)));
+        s.press(KeyCode::Char('n'));
+        assert_eq!(at(&s), Some((2, 10)));
+        s.press(KeyCode::Char('n'));
+        assert_eq!(at(&s), Some((0, 6)));
+        s.press(KeyCode::Char('N'));
+        assert_eq!(at(&s), Some((2, 10)));
+        assert!(s.draw().contains("3 / 4"));
+    }
+
+    #[test]
+    fn a_term_nowhere_in_the_book_says_so_and_n_turns_pages_again() {
+        let mut s = Screen::new(book(&["Alpha text", "Bravo text"]), 120, 30, ViewerOptions::default());
+        let frame = search(&mut s, "zulu");
+        assert!(frame.contains("1 / 2") && frame.contains("\"zulu\" not found"), "{frame}");
+        assert!(s.press(KeyCode::Char('n')).contains("Bravo text"));
+    }
+
+    #[test]
+    fn escape_clears_a_search_before_quitting() {
+        let mut s = Screen::new(book(&["Alpha text"]), 120, 30, ViewerOptions::default());
+        search(&mut s, "alpha");
+        let frame = s.press(KeyCode::Esc);
+        assert!(!s.app.quit && !frame.contains("\"alpha\""), "{frame}");
+        s.press(KeyCode::Esc);
+        assert!(s.app.quit);
+    }
+
+    #[test]
+    fn escape_in_the_find_box_closes_it_without_searching() {
+        let mut s = Screen::new(book(&["Alpha text", "Bravo text"]), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('f'));
+        s.press(KeyCode::Char('b'));
+        assert!(s.draw().contains("Find"));
+        let frame = s.press(KeyCode::Esc);
+        assert!(!frame.contains("Find") && frame.contains("Alpha text") && s.app.search.is_none(), "{frame}");
     }
 
     #[test]

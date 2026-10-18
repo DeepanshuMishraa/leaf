@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
@@ -80,6 +80,11 @@ const MAX_RENDER_PIXELS_WIDE: u32 = 3000;
 /// Share (in percent) of mupdf's cache kept after reading a page: enough for
 /// the fonts the next page likely shares, not the whole book's.
 const PAGE_CACHE_SHARE: u32 = 50;
+/// Pages read before a PDF opened from a file is opened afresh. mupdf keeps
+/// every object it has parsed until the document closes, so a search through
+/// a whole book would otherwise hold all of them; opening a huge book takes
+/// a fifth of a second, so this is rare.
+const REOPEN_AFTER: usize = 512;
 /// Markdown of this many pages is kept; the ones furthest from the reader go first.
 const CACHED_PAGES: usize = 64;
 /// Pages read to learn the layout, spread evenly through the document.
@@ -1109,7 +1114,10 @@ fn safe_read_page(document: &Document, i: usize, images: &RefCell<HashMap<String
 }
 
 struct PdfSource {
-    document: Document,
+    /// The file to open afresh, for a PDF that came from one.
+    path: Option<PathBuf>,
+    /// The document pages are read from, and how many pages it has read.
+    document: RefCell<(Document, usize)>,
     layout: Layout,
     /// Markdown of pages read lately, so turning back and forth reads nothing twice.
     pages: RefCell<HashMap<usize, Rc<str>>>,
@@ -1117,6 +1125,20 @@ struct PdfSource {
 }
 
 impl PdfSource {
+    fn read(&self, index: usize) -> Vec<Block> {
+        let mut document = self.document.borrow_mut();
+        if document.1 >= REOPEN_AFTER
+            && let Some(path) = &self.path
+        {
+            // If it fails to open again, the open one carries on.
+            if let Ok(fresh) = Document::open(path.as_path()) {
+                *document = (fresh, 0);
+            }
+        }
+        document.1 += 1;
+        safe_read_page(&document.0, index, &self.images)
+    }
+
     /// Forgets the page furthest from `index` once too many are kept, and its images.
     fn evict(&self, index: usize) {
         let mut pages = self.pages.borrow_mut();
@@ -1132,13 +1154,13 @@ impl PdfSource {
     fn draw(&self, image: &PdfImage, width: u32) -> Result<Option<RgbaImage>, mupdf::Error> {
         match *image {
             PdfImage::Embedded { page, block, .. } => {
-                let Some(image) = embedded_image(&self.document, page, block)? else { return Ok(None) };
+                let Some(image) = embedded_image(&self.document.borrow().0, page, block)? else { return Ok(None) };
                 let (w, h) = (image.width().max(1), image.height().max(1));
                 let scale = (width as f32 / w as f32).min(1.0);
                 let size = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
                 decode_embedded(&image, size.0, size.1)
             }
-            PdfImage::Drawing { page, region, .. } => render_region(&self.document.load_page(page as i32)?, region, width),
+            PdfImage::Drawing { page, region, .. } => render_region(&self.document.borrow().0.load_page(page as i32)?, region, width),
         }
     }
 }
@@ -1149,7 +1171,7 @@ impl Source for PdfSource {
             return page.clone();
         }
         self.evict(index);
-        let page: Rc<str> = render(&[safe_read_page(&self.document, index, &self.images)], &self.layout).into();
+        let page: Rc<str> = render(&[self.read(index)], &self.layout).into();
         memory::shrink_mupdf_cache(PAGE_CACHE_SHARE);
         self.pages.borrow_mut().insert(index, page.clone());
         page
@@ -1188,16 +1210,21 @@ pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
     })?;
     let source = path.display().to_string();
     let fallback = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    from_document(Document::open(path), &source, &fallback)
+    from_document(Document::open(path), Some(path.to_owned()), &source, &fallback)
 }
 
 /// `open` for PDF bytes already in hand (a download, say). `source` names the
 /// PDF in errors; `fallback_title` is used when the PDF has no title of its own.
 pub fn from_bytes(bytes: &[u8], source: &str, fallback_title: &str) -> Result<Doc, PdfOpenFailed> {
-    from_document(Document::from_bytes(bytes, "application/pdf"), source, fallback_title)
+    from_document(Document::from_bytes(bytes, "application/pdf"), None, source, fallback_title)
 }
 
-fn from_document(document: Result<Document, mupdf::Error>, source: &str, fallback_title: &str) -> Result<Doc, PdfOpenFailed> {
+fn from_document(
+    document: Result<Document, mupdf::Error>,
+    path: Option<PathBuf>,
+    source: &str,
+    fallback_title: &str,
+) -> Result<Doc, PdfOpenFailed> {
     let failed = |e: mupdf::Error| PdfOpenFailed {
         message: format!(
             "Could not open {source} as a PDF ({e}). It may be encrypted or damaged. Open it in a PDF viewer to confirm it is valid."
@@ -1216,7 +1243,7 @@ fn from_document(document: Result<Document, mupdf::Error>, source: &str, fallbac
     Ok(Doc {
         title: title.unwrap_or_else(|| fallback_title.to_owned()),
         page_count: Some(page_count),
-        source: Box::new(PdfSource { document, layout, pages: RefCell::new(HashMap::new()), images }),
+        source: Box::new(PdfSource { path, document: RefCell::new((document, 0)), layout, pages: RefCell::new(HashMap::new()), images }),
     })
 }
 
