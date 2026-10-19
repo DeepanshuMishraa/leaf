@@ -4,6 +4,7 @@ mod find;
 mod font;
 mod highlight;
 mod kitty;
+mod markdown;
 mod memory;
 mod mono;
 mod pdf;
@@ -20,7 +21,7 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf open <file.pdf | url>
+const USAGE: &str = "Usage: leaf open <file.pdf | file.md | url>
 
 Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
 
@@ -33,14 +34,18 @@ fn load(target: &str) -> Result<Doc, String> {
     if is_url(target) {
         return article::open(target).map_err(|e| e.to_string());
     }
-    if target.to_ascii_lowercase().ends_with(".pdf") {
+    let lower = target.to_ascii_lowercase();
+    if lower.ends_with(".pdf") {
         return pdf::open(Path::new(target)).map_err(|e| e.to_string());
     }
-    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf) and web pages (http:// or https:// URLs)."))
+    if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        return markdown::open(Path::new(target)).map_err(|e| e.to_string());
+    }
+    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), markdown files (.md) and web pages (http:// or https:// URLs)."))
 }
 
-/// Remembers the image mode, each document's highlights, and where each PDF
-/// (file or link) was left, so they come back next time. Progress that can't
+/// Remembers the image mode, each document's highlights, and where each
+/// document (file or link) was left, so they come back next time. Progress that can't
 /// be read or saved is reported after the reader closes; reading goes on.
 fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<String>>>) -> ViewerOptions {
     let store = match Store::open(&progress::default_path()) {
@@ -78,6 +83,11 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
             Ok(saved) => options.start_page = saved.map(|p| p.page),
             Err(e) => record(Err(e)),
         }
+    } else {
+        match store.borrow().load_scroll(&key) {
+            Ok(saved) => options.start_anchor = saved.map(|s| s.anchor),
+            Err(e) => record(Err(e)),
+        }
     }
 
     options.on_image_mode = {
@@ -88,8 +98,9 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
         let (store, record, key) = (store.clone(), record.clone(), key.clone());
         Box::new(move |highlights| record(store.borrow_mut().save_highlights(&key, highlights)))
     };
-    if let Some(count) = page_count {
-        options.on_page = Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count))));
+    match page_count {
+        Some(count) => options.on_page = Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count)))),
+        None => options.on_scroll = Box::new(move |scroll| record(store.borrow().save_scroll(&key, scroll))),
     }
     options
 }

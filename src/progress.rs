@@ -23,6 +23,15 @@ impl Progress {
     }
 }
 
+/// Where a reader is in a document without pages (a markdown file or an
+/// article). `anchor` is the place in the page text of the line at the top of
+/// the screen, so the place holds at any window width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scroll {
+    pub anchor: usize,
+    pub percent: usize,
+}
+
 /// How figures draw: as the image itself, or painted in the terminal's text
 /// color on a transparent ground.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,6 +87,12 @@ CREATE TABLE IF NOT EXISTS progress (
   percent INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scroll (
+  key TEXT PRIMARY KEY,
+  anchor INTEGER NOT NULL,
+  percent INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -108,6 +123,10 @@ pub fn default_path() -> PathBuf {
             home.join(".local").join("share")
         });
     data.join("leaf").join("leaf.db")
+}
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// A stored count, or `None` if it isn't one we wrote.
@@ -148,13 +167,32 @@ impl Store {
     }
 
     pub fn save(&self, key: &str, progress: Progress) -> Result<(), StoreFailed> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
         self.db
             .execute(
                 "INSERT INTO progress (key, page, page_count, percent, updated_at) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(key) DO UPDATE SET page = excluded.page, page_count = excluded.page_count,
                    percent = excluded.percent, updated_at = excluded.updated_at",
-                params![key, progress.page as i64, progress.page_count as i64, progress.percent as i64, now],
+                params![key, progress.page as i64, progress.page_count as i64, progress.percent as i64, now()],
+            )
+            .map(drop)
+            .map_err(self.failed(Operation::Save))
+    }
+
+    pub fn load_scroll(&self, key: &str) -> Result<Option<Scroll>, StoreFailed> {
+        let row = self
+            .db
+            .query_row("SELECT anchor, percent FROM scroll WHERE key = ?", [key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .optional()
+            .map_err(self.failed(Operation::Read))?;
+        Ok(row.and_then(|(anchor, percent)| Some(Scroll { anchor: count(anchor)?, percent: count(percent)? })))
+    }
+
+    pub fn save_scroll(&self, key: &str, scroll: Scroll) -> Result<(), StoreFailed> {
+        self.db
+            .execute(
+                "INSERT INTO scroll (key, anchor, percent, updated_at) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET anchor = excluded.anchor, percent = excluded.percent, updated_at = excluded.updated_at",
+                params![key, scroll.anchor as i64, scroll.percent as i64, now()],
             )
             .map(drop)
             .map_err(self.failed(Operation::Save))
@@ -241,6 +279,17 @@ mod tests {
         assert_eq!(store.load("/a.pdf").unwrap(), Some(Progress { page: 15, page_count: 613, percent: 2 }));
         store.save("/a.pdf", Progress::of(40, 613)).unwrap();
         assert_eq!(store.load("/a.pdf").unwrap().map(|p| p.page), Some(40));
+    }
+
+    #[test]
+    fn a_scroll_place_comes_back_for_that_document_only() {
+        let store = memory();
+        assert_eq!(store.load_scroll("/a.md").unwrap(), None);
+        store.save_scroll("/a.md", Scroll { anchor: 120, percent: 7 }).unwrap();
+        store.save_scroll("https://x.org/b", Scroll { anchor: 5, percent: 1 }).unwrap();
+        store.save_scroll("/a.md", Scroll { anchor: 900, percent: 40 }).unwrap();
+        assert_eq!(store.load_scroll("/a.md").unwrap(), Some(Scroll { anchor: 900, percent: 40 }));
+        assert_eq!(store.load("/a.md").unwrap(), None);
     }
 
     #[test]

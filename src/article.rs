@@ -1,4 +1,4 @@
-//! Web pages as readable articles; links that serve a PDF open as PDFs.
+//! Web pages as readable articles; links that serve a PDF or markdown open as such.
 
 use std::sync::LazyLock;
 
@@ -9,7 +9,7 @@ use ureq::ResponseExt;
 use url::Url;
 
 use crate::doc::Doc;
-use crate::pdf;
+use crate::{markdown, pdf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArticleFailed {
@@ -47,12 +47,30 @@ pub fn paper_url(link: &str) -> String {
     }
 }
 
-/// A title for a PDF without one: the file name from its URL, or the host.
-fn pdf_title(url: &str) -> String {
+/// A GitHub page showing a markdown file is mostly site chrome; read the file itself.
+pub fn raw_markdown_url(link: &str) -> String {
+    let Ok(url) = Url::parse(link) else { return link.to_owned() };
+    let segments: Vec<&str> = url.path_segments().map(Iterator::collect).unwrap_or_default();
+    match (url.host_str(), segments.as_slice()) {
+        (Some("github.com"), [owner, repo, "blob", rest @ ..]) if is_markdown_path(url.path()) && !rest.is_empty() => {
+            format!("https://raw.githubusercontent.com/{owner}/{repo}/{}", rest.join("/"))
+        }
+        _ => link.to_owned(),
+    }
+}
+
+fn is_markdown_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".md") || path.ends_with(".markdown")
+}
+
+/// A title for a document without one: the file name from its URL, or the host.
+fn link_title(url: &str) -> String {
     let Ok(parsed) = Url::parse(url) else { return url.to_owned() };
     let last = parsed.path_segments().and_then(|mut s| s.rfind(|p| !p.is_empty())).unwrap_or("");
     let decoded = percent_decode(last);
-    let name = decoded.strip_suffix(".pdf").or_else(|| decoded.strip_suffix(".PDF")).unwrap_or(&decoded);
+    let lower = decoded.to_ascii_lowercase();
+    let name = [".pdf", ".md", ".markdown"].iter().find(|ext| lower.ends_with(*ext)).map_or(decoded.as_str(), |ext| &decoded[..decoded.len() - ext.len()]);
     if name.is_empty() { parsed.host_str().unwrap_or(url).to_owned() } else { name.to_owned() }
 }
 
@@ -74,12 +92,24 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn media_type(content_type: Option<&str>) -> Option<String> {
+    content_type.and_then(|t| t.split(';').next()).map(|t| t.trim().to_ascii_lowercase())
+}
+
 fn is_pdf(content_type: Option<&str>, url: &str) -> bool {
-    let kind = content_type.and_then(|t| t.split(';').next()).map(|t| t.trim().to_ascii_lowercase());
-    match kind.as_deref() {
+    match media_type(content_type).as_deref() {
         Some("application/pdf") => true,
         // Some servers label PDFs as generic binary; fall back to the extension.
         Some("application/octet-stream") => Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(".pdf")),
+        _ => false,
+    }
+}
+
+fn is_markdown(content_type: Option<&str>, url: &str) -> bool {
+    match media_type(content_type).as_deref() {
+        Some("text/markdown" | "text/x-markdown") => true,
+        // Raw file hosts serve markdown as plain text or binary; trust the extension.
+        Some("text/plain" | "application/octet-stream") | None => Url::parse(url).is_ok_and(|u| is_markdown_path(u.path())),
         _ => false,
     }
 }
@@ -110,7 +140,7 @@ pub fn from_html(html: &str, url: &str) -> Result<(String, String), ArticleFaile
 }
 
 pub fn open(link: &str) -> Result<Doc, ArticleFailed> {
-    let url = paper_url(link);
+    let url = raw_markdown_url(&paper_url(link));
     let response = ureq::get(&url)
         .header("user-agent", "Mozilla/5.0 (leaf reader)")
         .call()
@@ -125,7 +155,12 @@ pub fn open(link: &str) -> Result<Doc, ArticleFailed> {
     // Paper links often serve a PDF from a URL without ".pdf"; trust the content type.
     if is_pdf(content_type.as_deref(), &final_url) {
         let bytes = body.with_config().limit(MAX_DOWNLOAD_BYTES).read_to_vec().map_err(download)?;
-        return Ok(pdf::from_bytes(&bytes, &url, &pdf_title(&final_url))?);
+        return Ok(pdf::from_bytes(&bytes, &url, &link_title(&final_url))?);
+    }
+    if is_markdown(content_type.as_deref(), &final_url) {
+        let bytes = body.with_config().limit(MAX_DOWNLOAD_BYTES).read_to_vec().map_err(download)?;
+        let base = Url::parse(&final_url).map_err(|e| ArticleFailed::Fetch { url: final_url.clone(), cause: e.to_string() })?;
+        return Ok(markdown::from_url(link_title(&final_url), &String::from_utf8_lossy(&bytes), &base));
     }
     let html = body.with_config().limit(MAX_DOWNLOAD_BYTES).read_to_string().map_err(download)?;
     let (title, markdown) = from_html(&html, &final_url)?;
@@ -170,8 +205,27 @@ mod tests {
     }
 
     #[test]
-    fn pdf_titles_come_from_the_file_name_or_host() {
-        assert_eq!(pdf_title("https://x.org/papers/My%20Paper.pdf"), "My Paper");
-        assert_eq!(pdf_title("https://x.org/"), "x.org");
+    fn link_titles_come_from_the_file_name_or_host() {
+        assert_eq!(link_title("https://x.org/papers/My%20Paper.pdf"), "My Paper");
+        assert_eq!(link_title("https://x.org/docs/GUIDE.MD"), "GUIDE");
+        assert_eq!(link_title("https://x.org/"), "x.org");
+    }
+
+    #[test]
+    fn a_github_markdown_page_reads_the_raw_file() {
+        assert_eq!(
+            raw_markdown_url("https://github.com/o/r/blob/main/docs/README.md"),
+            "https://raw.githubusercontent.com/o/r/main/docs/README.md"
+        );
+        assert_eq!(raw_markdown_url("https://github.com/o/r/blob/main/src/lib.rs"), "https://github.com/o/r/blob/main/src/lib.rs");
+        assert_eq!(raw_markdown_url("https://github.com/o/r"), "https://github.com/o/r");
+    }
+
+    #[test]
+    fn markdown_is_known_by_type_or_by_extension_on_plain_text() {
+        assert!(is_markdown(Some("text/markdown; charset=utf-8"), "https://x.org/notes"));
+        assert!(is_markdown(Some("text/plain; charset=utf-8"), "https://raw.githubusercontent.com/o/r/main/README.md"));
+        assert!(!is_markdown(Some("text/html"), "https://x.org/post.md"));
+        assert!(!is_markdown(Some("text/plain"), "https://x.org/notes.txt"));
     }
 }

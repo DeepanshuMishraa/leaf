@@ -29,7 +29,7 @@ use crate::find::Query;
 use crate::highlight::{self, Highlight};
 use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
-use crate::progress::{ImageMode, Progress};
+use crate::progress::{ImageMode, Progress, Scroll};
 use crate::render::{self, DIM, Laid};
 
 /// Widest the text column gets; a book-like measure is easiest to read.
@@ -182,6 +182,10 @@ pub struct ViewerOptions {
     pub highlights: Vec<Highlight>,
     /// Hears each page the reader settles on (1-based).
     pub on_page: Box<dyn FnMut(usize)>,
+    /// For documents without pages, where reading resumes: a place in the page text.
+    pub start_anchor: Option<usize>,
+    /// Hears the place in a document without pages as each percent goes by, and on quitting.
+    pub on_scroll: Box<dyn FnMut(Scroll)>,
     pub on_image_mode: Box<dyn FnMut(ImageMode)>,
     /// Hears every highlight there is, each time one is added or cleared.
     pub on_highlights: HighlightsListener,
@@ -194,6 +198,8 @@ impl Default for ViewerOptions {
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
             on_page: Box::new(|_| {}),
+            start_anchor: None,
+            on_scroll: Box::new(|_| {}),
             on_image_mode: Box::new(|_| {}),
             on_highlights: Box::new(|_| {}),
         }
@@ -234,6 +240,9 @@ pub struct App {
     column: Rect,
     screen: Vec<Option<ScreenRow>>,
     reported: Option<usize>,
+    /// A place in a page-less document to scroll to at the next draw, once its layout is known.
+    anchor: Option<usize>,
+    reported_scroll: Option<Scroll>,
     copy: Option<String>,
     search: Option<Search>,
     quit: bool,
@@ -257,8 +266,9 @@ impl App {
             (Some(count), Some(start)) => start.clamp(1, count.max(1)) - 1,
             _ => 0,
         };
+        let (doc_paged, options_anchor) = (doc.page_count.is_some(), options.start_anchor);
         let (fetched_tx, fetched_rx) = mpsc::channel();
-        let kitty = (picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected()).then(Kitty::default);
+        let kitty =(picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected()).then(Kitty::default);
         App {
             image_mode: options.image_mode,
             highlights: options.highlights.clone(),
@@ -285,6 +295,8 @@ impl App {
             column: Rect::default(),
             screen: Vec::new(),
             reported: None,
+            anchor: if doc_paged { None } else { options_anchor },
+            reported_scroll: None,
             copy: None,
             search: None,
             quit: false,
@@ -437,11 +449,7 @@ impl App {
     /// Where the reader is: the page and how far through, or how far down a page-less document.
     fn place(&mut self) -> String {
         match self.doc.page_count {
-            None => {
-                let max = self.height(0).saturating_sub(self.view());
-                let percent = (self.offset * 100).checked_div(max).unwrap_or(100);
-                format!("{percent}%")
-            }
+            None => format!("{}%", self.scrolled()),
             Some(count) => {
                 let progress = Progress::of(self.reading() + 1, count);
                 format!("{} / {} · {}%", progress.page, progress.page_count, progress.percent)
@@ -449,9 +457,51 @@ impl App {
         }
     }
 
+    /// How far down a page-less document the screen is.
+    fn scrolled(&mut self) -> usize {
+        let max = self.height(0).saturating_sub(self.view());
+        (self.offset * 100).checked_div(max).unwrap_or(100)
+    }
+
+    /// Where in a page-less document's text the top line of the screen sits.
+    fn top_anchor(&mut self) -> usize {
+        let laid = self.laid(0);
+        let top = self.offset.saturating_sub(self.prefix(0)).min(laid.rows.len());
+        laid.rows[top..].iter().flat_map(|row| &row.segs).find_map(|seg| seg.offset).unwrap_or(laid.text.len())
+    }
+
+    /// Scrolls a page-less document so the line holding `anchor` is at the top.
+    fn scroll_to_anchor(&mut self, anchor: usize) {
+        let laid = self.laid(0);
+        let holds = |seg: &render::Seg| seg.offset.is_some_and(|o| o + seg.text.chars().count() > anchor);
+        let row = laid.rows.iter().position(|row| row.segs.iter().any(holds)).unwrap_or(laid.rows.len());
+        self.offset = if row == 0 { 0 } else { row + self.prefix(0) };
+    }
+
+    /// Keeps a page-less document's top line in place while it lays out again.
+    fn hold_anchor(&mut self) {
+        if self.doc.page_count.is_none() && self.width > 0 && self.anchor.is_none() {
+            self.anchor = Some(self.top_anchor());
+        }
+    }
+
+    /// Reports the place in a page-less document when its percent changes, or
+    /// on `settling` (quitting) whenever it moved at all.
+    fn report_scroll(&mut self, settling: bool) {
+        let scroll = Scroll { anchor: self.top_anchor(), percent: self.scrolled() };
+        let due = match self.reported_scroll {
+            None => true,
+            Some(last) => last.percent != scroll.percent || (settling && last != scroll),
+        };
+        if due {
+            self.reported_scroll = Some(scroll);
+            (self.options.on_scroll)(scroll);
+        }
+    }
+
     fn report_page(&mut self) {
         if self.doc.page_count.is_none() {
-            return;
+            return self.report_scroll(false);
         }
         let page = self.reading() + 1;
         if self.reported != Some(page) {
@@ -474,6 +524,7 @@ impl App {
         }
         // A remote image's size is known once it arrives, so pages lay out again.
         if arrived {
+            self.hold_anchor();
             self.laid.clear();
         }
     }
@@ -537,6 +588,7 @@ impl App {
             Mode::Scroll
         };
         if width != self.width || mode != self.mode {
+            self.hold_anchor();
             self.width = width;
             self.laid.clear();
             self.retain_protocols(|_| false);
@@ -547,6 +599,9 @@ impl App {
             }
         }
         self.view_height = area.height.saturating_sub(FOOTER_ROWS).max(1);
+        if let Some(anchor) = self.anchor.take() {
+            self.scroll_to_anchor(anchor);
+        }
         self.offset = match self.mode {
             Mode::Paged => self.offset.min(self.max_offset()),
             Mode::Scroll => self.offset.min(self.height(self.current).saturating_sub(1)),
@@ -1163,6 +1218,9 @@ impl App {
             }
             self.report_page();
             if self.quit {
+                if self.doc.page_count.is_none() {
+                    self.report_scroll(true);
+                }
                 if let Some(kitty) = &mut self.kitty {
                     kitty.flush(&mut io::stdout(), &[])?;
                 }
@@ -1384,6 +1442,26 @@ mod tests {
         assert!(s.draw().contains("Bravo"));
         s.press(KeyCode::Char('l'));
         assert_eq!(*pages.borrow(), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_document_without_pages_resumes_at_its_line_at_any_width() {
+        let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
+        let places = Rc::new(RefCell::new(Vec::new()));
+        let heard = places.clone();
+        let options = ViewerOptions { on_scroll: Box::new(move |p| heard.borrow_mut().push(p)), ..ViewerOptions::default() };
+        let mut s = Screen::new(Doc::whole("Notes", text.clone()), 120, 30, options);
+        s.press(KeyCode::Char(' '));
+        let frame = s.draw();
+        let top = frame.lines().find(|l| !l.trim().is_empty()).expect("a line shows").trim().to_owned();
+        s.app.report_scroll(true);
+        let place = *places.borrow().last().expect("a place was heard");
+        assert!(place.percent > 0, "{place:?}");
+
+        let options = ViewerOptions { start_anchor: Some(place.anchor), ..ViewerOptions::default() };
+        let mut again = Screen::new(Doc::whole("Notes", text), 80, 30, options);
+        let frame = again.draw();
+        assert_eq!(frame.lines().find(|l| !l.trim().is_empty()).map(str::trim), Some(top.as_str()), "{frame}");
     }
 
     #[test]

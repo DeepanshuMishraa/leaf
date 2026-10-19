@@ -6,7 +6,7 @@
 
 use std::sync::LazyLock;
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use regex::Regex;
 use unicode_width::UnicodeWidthChar;
@@ -24,6 +24,18 @@ pub const CODE: Color = Color::Indexed(3);
 /// A block of centered lines, as PDF pages mark title pages and captions.
 static CENTERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)^<div align="center">\n(.*?)\n</div>\s*$"#).expect("pattern is valid"));
 static HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6}) (.+)$").expect("pattern is valid"));
+static HTML_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</?[A-Za-z][^>]*>").expect("pattern is valid"));
+static LINE_BREAK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^<br\s*/?>$").expect("pattern is valid"));
+
+/// The markdown leaf reads: CommonMark with GitHub's extensions (tables,
+/// task lists, strikethrough, footnotes, alerts), definition lists and math.
+pub const MARKDOWN: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_FOOTNOTES)
+    .union(Options::ENABLE_GFM)
+    .union(Options::ENABLE_DEFINITION_LIST)
+    .union(Options::ENABLE_MATH);
 
 /// A run of same-styled text at column `x`. `offset` is where its first
 /// character sits in the page text; decorations (list markers, borders,
@@ -88,12 +100,17 @@ type Inlines = Vec<Run>;
 enum Node {
     Paragraph(Inlines),
     Heading(u8, Inlines),
-    Quote(Vec<Node>),
+    /// A block quote, or a GitHub alert (`> [!NOTE]`) when it has a kind.
+    Quote(Option<BlockQuoteKind>, Vec<Node>),
     Code(String),
     List { start: Option<u64>, items: Vec<Vec<Node>>, tight: bool },
     Table { head: Vec<Inlines>, rows: Vec<Vec<Inlines>> },
     Figures(Vec<String>),
     Centered(String),
+    Footnote(String, Vec<Node>),
+    /// Terms (bold paragraphs) and their definitions.
+    Definitions(Vec<Node>),
+    Definition(Vec<Node>),
     Rule,
 }
 
@@ -111,6 +128,8 @@ struct Builder {
     code: Option<String>,
     html: Option<String>,
     table: Option<TableParts>,
+    /// Whether HTML blocks are converted to markdown and read; off while reading a converted block.
+    read_html: bool,
 }
 
 /// A table being read: its head, the rows so far, and the cells of the row in progress.
@@ -123,15 +142,23 @@ struct TableParts {
 
 enum Frame {
     Root(Vec<Node>),
-    Quote(Vec<Node>),
+    Quote(Option<BlockQuoteKind>, Vec<Node>),
     List { start: Option<u64>, items: Vec<Vec<Node>>, tight: bool },
     Item(Vec<Node>),
+    Footnote(String, Vec<Node>),
+    Definitions(Vec<Node>),
+    Definition(Vec<Node>),
 }
 
 impl Frame {
     fn blocks(&mut self) -> &mut Vec<Node> {
         match self {
-            Frame::Root(b) | Frame::Quote(b) | Frame::Item(b) => b,
+            Frame::Root(b)
+            | Frame::Quote(_, b)
+            | Frame::Item(b)
+            | Frame::Footnote(_, b)
+            | Frame::Definitions(b)
+            | Frame::Definition(b) => b,
             Frame::List { items, .. } => {
                 if items.is_empty() {
                     items.push(Vec::new());
@@ -179,7 +206,7 @@ impl Builder {
     }
 }
 
-fn parse(markdown: &str) -> Vec<Node> {
+fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
     let mut b = Builder {
         stack: vec![Frame::Root(Vec::new())],
         styles: Vec::new(),
@@ -189,17 +216,30 @@ fn parse(markdown: &str) -> Vec<Node> {
         code: None,
         html: None,
         table: None,
+        read_html,
     };
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut image_depth = 0usize;
-    for event in Parser::new_ext(markdown, options) {
+    for event in Parser::new_ext(markdown, MARKDOWN) {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => b.flush_paragraph(),
                 Tag::Heading { .. } => b.flush_paragraph(),
-                Tag::BlockQuote(_) => {
+                Tag::BlockQuote(kind) => {
                     b.flush_paragraph();
-                    b.stack.push(Frame::Quote(Vec::new()));
+                    b.stack.push(Frame::Quote(kind, Vec::new()));
+                }
+                Tag::FootnoteDefinition(label) => {
+                    b.flush_paragraph();
+                    b.stack.push(Frame::Footnote(label.to_string(), Vec::new()));
+                }
+                Tag::DefinitionList => {
+                    b.flush_paragraph();
+                    b.stack.push(Frame::Definitions(Vec::new()));
+                }
+                Tag::DefinitionListTitle => b.flush_paragraph(),
+                Tag::DefinitionListDefinition => {
+                    b.flush_paragraph();
+                    b.stack.push(Frame::Definition(Vec::new()));
                 }
                 Tag::CodeBlock(_) => {
                     b.flush_paragraph();
@@ -262,8 +302,32 @@ fn parse(markdown: &str) -> Vec<Node> {
                 }
                 TagEnd::BlockQuote(_) => {
                     b.flush_paragraph();
-                    if let Some(Frame::Quote(blocks)) = b.stack.pop() {
-                        b.emit(Node::Quote(blocks));
+                    if let Some(Frame::Quote(kind, blocks)) = b.stack.pop() {
+                        b.emit(Node::Quote(kind, blocks));
+                    }
+                }
+                TagEnd::FootnoteDefinition => {
+                    b.flush_paragraph();
+                    if let Some(Frame::Footnote(label, blocks)) = b.stack.pop() {
+                        b.emit(Node::Footnote(label, blocks));
+                    }
+                }
+                TagEnd::DefinitionList => {
+                    b.flush_paragraph();
+                    if let Some(Frame::Definitions(blocks)) = b.stack.pop() {
+                        b.emit(Node::Definitions(blocks));
+                    }
+                }
+                TagEnd::DefinitionListTitle => {
+                    for run in &mut b.inlines {
+                        run.style = run.style.add_modifier(Modifier::BOLD);
+                    }
+                    b.flush_paragraph();
+                }
+                TagEnd::DefinitionListDefinition => {
+                    b.flush_paragraph();
+                    if let Some(Frame::Definition(blocks)) = b.stack.pop() {
+                        b.emit(Node::Definition(blocks));
                     }
                 }
                 TagEnd::CodeBlock => {
@@ -272,10 +336,16 @@ fn parse(markdown: &str) -> Vec<Node> {
                     }
                 }
                 TagEnd::HtmlBlock => {
-                    if let Some(html) = b.html.take()
-                        && let Some(inner) = CENTERED.captures(&html).and_then(|c| c.get(1))
-                    {
-                        b.emit(Node::Centered(inner.as_str().to_owned()));
+                    let Some(html) = b.html.take() else { continue };
+                    match CENTERED.captures(&html).and_then(|c| c.get(1)) {
+                        Some(inner) if !HTML_TAG.is_match(inner.as_str()) => b.emit(Node::Centered(inner.as_str().to_owned())),
+                        // Other HTML (a README's centered logo, <details>) is read as the markdown it stands for.
+                        _ if b.read_html => {
+                            for node in htmd::convert(&html).map(|md| parse(&md, false)).unwrap_or_default() {
+                                b.emit(node);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 TagEnd::List(_) => {
@@ -347,6 +417,26 @@ fn parse(markdown: &str) -> Vec<Node> {
                     block.push_str(&html);
                 }
             }
+            Event::InlineHtml(html) => {
+                if LINE_BREAK.is_match(&html) {
+                    b.text("\n");
+                }
+            }
+            Event::FootnoteReference(label) => {
+                b.push_style(|s| s.fg(DIM));
+                b.text(&format!("[{label}]"));
+                b.styles.pop();
+            }
+            Event::InlineMath(math) => {
+                b.push_style(|s| s.fg(CODE));
+                b.text(&format!("${math}$"));
+                b.styles.pop();
+            }
+            Event::DisplayMath(math) => {
+                b.push_style(|s| s.fg(CODE));
+                b.text(&format!("$${math}$$"));
+                b.styles.pop();
+            }
             Event::SoftBreak => b.text(" "),
             Event::HardBreak => b.text("\n"),
             Event::Rule => {
@@ -354,7 +444,6 @@ fn parse(markdown: &str) -> Vec<Node> {
                 b.emit(Node::Rule);
             }
             Event::TaskListMarker(done) => b.text(if done { "[x] " } else { "[ ] " }),
-            _ => {}
         }
     }
     b.flush_paragraph();
@@ -520,25 +609,48 @@ impl Ctx<'_> {
             if i > 0 && !tight {
                 self.blank();
             }
-            let first = self.laid.rows.len();
-            let inner = x + marker_width + 1;
-            self.children(item, inner, width.saturating_sub(marker_width + 1).max(1), !tight);
-            if self.laid.rows.len() == first {
-                self.blank();
-            }
-            let marker = Seg { x, text: marker.clone(), style: Style::default().fg(DIM), offset: None };
-            self.laid.rows[first].segs.insert(0, marker);
+            self.hanging(marker, marker_width, item, x, width, !tight);
         }
     }
 
-    fn quote(&mut self, blocks: &[Node], x: u16, width: u16) {
+    /// Blocks hung beside a dim marker `marker_width` wide, as a list item or footnote.
+    fn hanging(&mut self, marker: &str, marker_width: u16, blocks: &[Node], x: u16, width: u16, spaced: bool) {
         let first = self.laid.rows.len();
+        self.children(blocks, x + marker_width + 1, width.saturating_sub(marker_width + 1).max(1), spaced);
+        if self.laid.rows.len() == first {
+            self.blank();
+        }
+        let marker = Seg { x, text: marker.to_owned(), style: Style::default().fg(DIM), offset: None };
+        self.laid.rows[first].segs.insert(0, marker);
+    }
+
+    /// A quote is dim and italic beside a dim bar. An alert keeps its text
+    /// plain under its kind, beside a bar in the text color.
+    fn quote(&mut self, kind: Option<BlockQuoteKind>, blocks: &[Node], x: u16, width: u16) {
+        let first = self.laid.rows.len();
+        if let Some(kind) = kind {
+            let label = match kind {
+                BlockQuoteKind::Note => "Note",
+                BlockQuoteKind::Tip => "Tip",
+                BlockQuoteKind::Important => "Important",
+                BlockQuoteKind::Warning => "Warning",
+                BlockQuoteKind::Caution => "Caution",
+            };
+            let style = Style::default().add_modifier(Modifier::BOLD);
+            self.laid.rows.push(Row { segs: vec![Seg { x: x + 2, text: label.into(), style, offset: None }] });
+        }
+        let body = self.laid.rows.len();
         self.children(blocks, x + 2, width.saturating_sub(2).max(1), true);
-        for row in &mut self.laid.rows[first..] {
-            for seg in &mut row.segs {
-                seg.style = seg.style.fg(DIM).add_modifier(Modifier::ITALIC);
+        if kind.is_none() {
+            for row in &mut self.laid.rows[body..] {
+                for seg in &mut row.segs {
+                    seg.style = seg.style.fg(DIM).add_modifier(Modifier::ITALIC);
+                }
             }
-            row.segs.insert(0, Seg { x, text: "│".into(), style: Style::default().fg(DIM), offset: None });
+        }
+        let bar = if kind.is_some() { Style::default() } else { Style::default().fg(DIM) };
+        for row in &mut self.laid.rows[first..] {
+            row.segs.insert(0, Seg { x, text: "│".into(), style: bar, offset: None });
         }
     }
 
@@ -608,7 +720,7 @@ impl Ctx<'_> {
                 self.flow(&cells, x, width, Align::Left, Wrap::Word);
             }
             Node::Heading(depth, runs) => self.heading(*depth, runs, x, width, Align::Left),
-            Node::Quote(blocks) => self.quote(blocks, x, width),
+            Node::Quote(kind, blocks) => self.quote(*kind, blocks, x, width),
             Node::Code(code) => self.code(code, x, width),
             Node::List { start, items, tight } => self.list(*start, items, *tight, x, width),
             Node::Table { head, rows } => self.table(head, rows, x, width),
@@ -624,6 +736,13 @@ impl Ctx<'_> {
                     _ => self.centered(content, x, width),
                 }
             }
+            Node::Footnote(label, blocks) => {
+                let marker = format!("[{label}]");
+                let marker_width = marker.chars().map(char_width).sum();
+                self.hanging(&marker, marker_width, blocks, x, width, true);
+            }
+            Node::Definitions(blocks) => self.children(blocks, x, width, false),
+            Node::Definition(blocks) => self.children(blocks, x + 4, width.saturating_sub(4).max(1), true),
             Node::Rule => {
                 self.laid.rows.push(Row { segs: vec![Seg { x, text: "─".repeat(width as usize), style: Style::default().fg(DIM), offset: None }] });
             }
@@ -755,7 +874,7 @@ fn segs(line: &[Cell], x: u16) -> Vec<Seg> {
 /// row below it; headings and figures have one above too.
 pub fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
     let mut ctx = Ctx { laid: Laid::default(), image_sizes, cell };
-    for node in parse(markdown) {
+    for node in parse(markdown, true) {
         if spaced_above(&node) {
             ctx.blank();
         }
@@ -847,6 +966,35 @@ mod tests {
         assert_eq!(text, "Hello world\nNext\n");
         let world = &laid.rows[1].segs[0];
         assert_eq!((world.text.as_str(), world.offset), ("world", Some(6)));
+    }
+
+    #[test]
+    fn footnotes_keep_their_label_in_text_and_hang_beside_it() {
+        assert_eq!(draw("Fact[^1].\n\n[^1]: Source here.", 40), vec!["Fact[1].", "", "[1] Source here.", ""]);
+    }
+
+    #[test]
+    fn alerts_show_their_kind_and_quotes_a_bar() {
+        assert_eq!(draw("> [!WARNING]\n> Hot.", 20), vec!["│ Warning", "│ Hot.", ""]);
+        assert_eq!(draw("> said", 20), vec!["│ said", ""]);
+    }
+
+    #[test]
+    fn definitions_sit_under_their_term() {
+        assert_eq!(draw("Term\n: Meaning", 20), vec!["Term", "    Meaning", ""]);
+    }
+
+    #[test]
+    fn math_keeps_its_source_and_br_breaks_the_line() {
+        assert_eq!(draw("Area $a^2$ here<br>next", 40), vec!["Area $a^2$ here", "next", ""]);
+    }
+
+    #[test]
+    fn html_blocks_are_read_as_markdown() {
+        assert_eq!(draw("<details>\n<summary>More</summary>\n<p>Hidden <b>text</b></p>\n</details>", 40)[..2], ["More", ""]);
+        let sizes = |_: &str| Some((160, 80));
+        let laid = layout("<p align=\"center\"><img src=\"leaf-image:0\"></p>", 40, (8, 16), &sizes);
+        assert_eq!(laid.figures.len(), 1);
     }
 
     #[test]
