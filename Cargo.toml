@@ -8,7 +8,7 @@ repository = "https://github.com/DeepanshuMishraa/leaf"
 readme = "README.md"
 keywords = ["pdf", "reader", "terminal", "tui", "articles"]
 categories = ["command-line-utilities"]
-exclude = ["CLAUDE.md"]
+exclude = ["CLAUDE.md", "site"]
 
 [[bin]]
 name = "leaf"
