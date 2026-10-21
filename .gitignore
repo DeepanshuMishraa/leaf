@@ -1,5 +1,5 @@
 /target
-
+/result
 # dependencies (bun install)
 node_modules
 
