@@ -1,5 +1,5 @@
 {
-  description = "A very basic flake";
+  description = "Leaf - Read PDFs, markdown files and web articles in the terminal.";
 
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
@@ -27,6 +27,7 @@
           cargo
           rust-analyzer
           clippy
+          rustfmt
         ];
       };
     }) inputs.nixpkgs.legacyPackages;
