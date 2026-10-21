@@ -73,6 +73,22 @@
   .hero .note { margin: -.2rem 0 0; color: var(--faint); font-size: .75rem; }
   .hero .note code { font: inherit; color: var(--muted); }
 
+  /* The recording sits in the hero as the proof, in the same frame as the demo below. */
+  .clip { width: 100%; margin-top: .5rem; display: grid; gap: .75rem; justify-items: center; }
+  .clip .term { width: 100%; }
+  .clip video { display: block; width: 100%; height: auto; aspect-ratio: 1412 / 958; background: #262336; }
+  .clip .toggle {
+    justify-self: end;
+    padding: .15rem 0;
+    border: 0; background: none;
+    font: inherit; font-size: .6875rem; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); cursor: pointer;
+    transition: color .25s var(--ease);
+  }
+  .clip .toggle:hover { color: var(--ink); }
+  .clip figcaption { margin: 0; color: var(--muted); font-size: .75rem; text-wrap: balance; }
+  .clip figcaption code { font: inherit; color: var(--ink); }
+
   .facts {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -213,6 +229,21 @@
       </button>
     </div>
     <p class="note">Needs Rust. Installs the <code>leaf</code> command to ~/.cargo/bin.</p>
+
+    <figure class="clip">
+      <div class="term">
+        <div class="bar">
+          <div class="dots"><i></i><i></i><i></i></div>
+          <span>Designing Data-Intensive Applications.pdf</span>
+          <button class="toggle" id="demo-toggle" type="button" aria-label="Pause demo">pause</button>
+        </div>
+        <video id="demo-video" width="1412" height="958" autoplay muted loop playsinline preload="metadata" poster="demo-poster.jpg" aria-describedby="demo-caption">
+          <source src="demo.mp4" type="video/mp4">
+          <p>Your browser can’t play this video. <a href="demo.mp4">Download it</a>.</p>
+        </video>
+      </div>
+      <figcaption id="demo-caption">A real 613-page PDF, opened with <code>leaf open</code>. 19 seconds, no sound.</figcaption>
+    </figure>
   </header>
 
   <section class="demo" aria-label="What leaf does">
@@ -289,6 +320,22 @@
   const view = $("view"), title = $("title"), status = $("status"), count = $("count"), caption = $("caption");
   const tabs = [...document.querySelectorAll(".tab")];
   const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // The recording autoplays; reduced motion starts it paused. The bar button toggles either way.
+  const video = $("demo-video"), toggle = $("demo-toggle");
+  const syncToggle = () => {
+    const paused = video.paused;
+    toggle.textContent = paused ? "play" : "pause";
+    toggle.setAttribute("aria-label", paused ? "Play demo" : "Pause demo");
+  };
+  if (still) { video.removeAttribute("autoplay"); video.pause(); }
+  video.addEventListener("play", syncToggle);
+  video.addEventListener("pause", syncToggle);
+  toggle.addEventListener("click", () => {
+    if (video.paused) video.play().catch(() => {});
+    else video.pause();
+  });
+  syncToggle();
 
   const WALDEN_1 = `<div class="doc"><h2>Economy</h2><p>When I wrote the following pages, or rather the bulk of them, I lived alone, in the woods, a mile from any neighbor, in a house which I had built myself, on the shore of Walden <span class="match">Pond</span>, in Concord, Massachusetts, and earned my living by the labor of my hands only. <span class="sel">I lived there two years and two months.</span></p></div>`;
   const WALDEN_2 = `<div class="doc"><p>I should not obtrude my affairs so much on the notice of my readers if very particular inquiries had not been made by my townsmen concerning my mode of life, which some would call impertinent, though they do not appear to me at all impertinent, but, considering the circumstances, very natural and pertinent.</p></div>`;
