@@ -43,6 +43,8 @@ const FOOTER_ROWS: u16 = 3;
 const WHEEL_STEP: isize = 3;
 /// Ink for painted images when the terminal doesn't report its text color.
 const FALLBACK_INK: Rgb = [220, 220, 220];
+/// Paper under diagrams when the terminal doesn't report its background.
+const FALLBACK_PAPER: Rgb = [30, 30, 30];
 /// Laid-out pages kept on each side of the one being read.
 const KEPT_PAGES: usize = 4;
 /// How long a search reads pages before the screen is drawn and keys are read again.
@@ -222,6 +224,7 @@ pub struct App {
     view_height: u16,
     image_mode: ImageMode,
     ink: Option<Rgb>,
+    paper: Option<Rgb>,
     highlights: Vec<Highlight>,
     selection: Option<Selection>,
     dragging: bool,
@@ -282,6 +285,7 @@ impl App {
             offset: 0,
             view_height: 1,
             ink: None,
+            paper: None,
             selection: None,
             dragging: false,
             dialog: Dialog::None,
@@ -534,7 +538,11 @@ impl App {
     }
 
     fn ink(&mut self) -> Rgb {
-        *self.ink.get_or_insert_with(|| query_foreground().unwrap_or(FALLBACK_INK))
+        *self.ink.get_or_insert_with(|| query_color(10).unwrap_or(FALLBACK_INK))
+    }
+
+    fn paper(&mut self) -> Rgb {
+        *self.paper.get_or_insert_with(|| query_color(11).unwrap_or(FALLBACK_PAPER))
     }
 
     /// The pixels of a figure in the current image mode, decoding or fetching as needed.
@@ -543,8 +551,16 @@ impl App {
         if let Some(pixels) = self.pixels.get(&key) {
             return pixels.clone();
         }
+        let width = cols as u32 * self.picker.font_size().width as u32;
         let original = match Doc::image_ref(href) {
-            ImageRef::Embedded(id) => match self.doc.source.decode(id, cols as u32 * self.picker.font_size().width as u32) {
+            // A diagram is drawn in the terminal's colors, so it isn't painted.
+            ImageRef::Embedded(id) if self.doc.source.is_diagram(id) => {
+                let (ink, paper) = (self.ink(), self.paper());
+                let pixels = self.doc.source.draw(id, width, ink, paper).map(Rc::new);
+                self.pixels.insert(key, pixels.clone());
+                return pixels;
+            }
+            ImageRef::Embedded(id) => match self.doc.source.decode(id, width) {
                 Some(image) => Rc::new(image),
                 None => {
                     self.pixels.insert(key, None);
@@ -1255,10 +1271,11 @@ impl App {
     }
 }
 
-/// Asks the terminal for its text color (OSC 10), so painted images match the text.
-fn query_foreground() -> Option<Rgb> {
+/// Asks the terminal for its text (OSC 10) or background (OSC 11) color, so
+/// painted images and diagrams match the text.
+fn query_color(code: u8) -> Option<Rgb> {
     let mut out = io::stdout();
-    write!(out, "\x1b]10;?\x1b\\").ok()?;
+    write!(out, "\x1b]{code};?\x1b\\").ok()?;
     out.flush().ok()?;
     let mut reply = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_millis(500);

@@ -1,5 +1,5 @@
 //! Markdown files and links, read as written. Images beside the file (or
-//! relative to the link) show inline.
+//! relative to the link) show inline, and so do Mermaid diagrams.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -9,11 +9,13 @@ use std::rc::Rc;
 use std::sync::LazyLock;
 
 use image::RgbaImage;
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use regex::Regex;
 use url::Url;
 
 use crate::doc::{Doc, Source};
+use crate::mermaid::{self, Diagram};
+use crate::mono::Rgb;
 use crate::render;
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +70,46 @@ fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
             _ => {}
         }
     }
+    (splice(markdown, edits), files)
+}
+
+/// The id of the `index`th diagram in a document.
+const DIAGRAM: &str = "mermaid-";
+
+/// Replaces each ```mermaid block that can be drawn with a figure of the
+/// drawing. Returns the markdown and the diagrams, by index.
+fn diagrams(markdown: &str, draw: impl FnOnce(&[String]) -> Vec<Option<Diagram>>) -> (String, Vec<Diagram>) {
+    let mut blocks: Vec<(Range<usize>, String)> = Vec::new();
+    let mut open: Option<(Range<usize>, String)> = None;
+    for (event, range) in Parser::new_ext(markdown, render::MARKDOWN).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if info.split_whitespace().next() == Some("mermaid") => open = Some((range, String::new())),
+            Event::Text(text) => {
+                if let Some((_, source)) = &mut open {
+                    source.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => blocks.extend(open.take()),
+            _ => {}
+        }
+    }
+    if blocks.is_empty() {
+        return (markdown.to_owned(), Vec::new());
+    }
+    let drawn = draw(&blocks.iter().map(|(_, source)| source.clone()).collect::<Vec<_>>());
+    let mut found = Vec::new();
+    let mut edits = Vec::new();
+    for ((range, _), diagram) in blocks.into_iter().zip(drawn) {
+        let Some(diagram) = diagram else { continue };
+        // On its own line, so it's a figure and not part of the paragraph before.
+        edits.push((range, format!("\n![]({})", Doc::image_href(&format!("{DIAGRAM}{}", found.len())))));
+        found.push(diagram);
+    }
+    (splice(markdown, edits), found)
+}
+
+/// `markdown` with each range replaced by its text.
+fn splice(markdown: &str, edits: Vec<(Range<usize>, String)>) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut at = 0;
     for (range, text) in edits {
@@ -80,12 +122,13 @@ fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
         at = range.end;
     }
     out.push_str(&markdown[at..]);
-    (out, files)
+    out
 }
 
 struct MarkdownSource {
     text: Rc<str>,
     images: Vec<PathBuf>,
+    diagrams: Vec<Diagram>,
     /// Pixel sizes read from file headers, asked for on every layout.
     sizes: RefCell<HashMap<usize, Option<(u32, u32)>>>,
 }
@@ -94,6 +137,10 @@ impl MarkdownSource {
     fn path(&self, id: &str) -> Option<(usize, &Path)> {
         let index: usize = id.parse().ok()?;
         Some((index, self.images.get(index)?))
+    }
+
+    fn diagram(&self, id: &str) -> Option<&Diagram> {
+        self.diagrams.get(id.strip_prefix(DIAGRAM)?.parse::<usize>().ok()?)
     }
 }
 
@@ -105,6 +152,9 @@ impl Source for MarkdownSource {
     // An image that's missing or in a format leaf can't decode (SVG) is left
     // out; the text around it still shows.
     fn image_size(&self, id: &str) -> Option<(u32, u32)> {
+        if let Some(diagram) = self.diagram(id) {
+            return Some(diagram.size);
+        }
         let (index, path) = self.path(id)?;
         *self.sizes.borrow_mut().entry(index).or_insert_with(|| image::image_dimensions(path).ok())
     }
@@ -113,6 +163,14 @@ impl Source for MarkdownSource {
         let image = image::open(self.path(id)?.1).ok()?;
         let image = if image.width() > width.max(1) { image.resize(width.max(1), u32::MAX, image::imageops::FilterType::Triangle) } else { image };
         Some(image.to_rgba8())
+    }
+
+    fn is_diagram(&self, id: &str) -> bool {
+        self.diagram(id).is_some()
+    }
+
+    fn draw(&self, id: &str, width: u32, ink: Rgb, paper: Rgb) -> Option<RgbaImage> {
+        self.diagram(id)?.rasterize(width, ink, paper)
     }
 }
 
@@ -132,7 +190,8 @@ pub fn from_url(title: String, text: &str, url: &Url) -> Doc {
 
 fn document(title: String, text: &str, base: Base) -> Doc {
     let (markdown, images) = localize(&FRONT_MATTER.replace(text, ""), base);
-    Doc { title, page_count: None, source: Box::new(MarkdownSource { text: markdown.into(), images, sizes: RefCell::default() }) }
+    let (markdown, diagrams) = diagrams(&markdown, mermaid::render);
+    Doc { title, page_count: None, source: Box::new(MarkdownSource { text: markdown.into(), images, diagrams, sizes: RefCell::default() }) }
 }
 
 #[cfg(test)]
@@ -159,6 +218,19 @@ mod tests {
         let (out, files) = localize("![](img/a.png) <img src=\"../b.png\">", Base::Url(&url));
         assert_eq!(out, "![](https://raw.githubusercontent.com/o/r/main/docs/img/a.png) <img src=\"https://raw.githubusercontent.com/o/r/main/b.png\">");
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn mermaid_blocks_that_draw_become_figures() {
+        let md = "Text\n```mermaid\ngraph LR\n  A-->B\n```\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n";
+        let mut asked = Vec::new();
+        let (out, found) = diagrams(md, |sources| {
+            asked = sources.to_vec();
+            vec![Diagram::new(r#"<svg width="10" height="5"></svg>"#), None]
+        });
+        assert_eq!(asked, vec!["graph LR\n  A-->B\n", "not a diagram\n"]);
+        assert_eq!(out, "Text\n\n![](leaf-image:mermaid-0)\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n");
+        assert_eq!(found.len(), 1);
     }
 
     #[test]

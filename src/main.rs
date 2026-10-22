@@ -6,6 +6,7 @@ mod highlight;
 mod kitty;
 mod markdown;
 mod memory;
+mod mermaid;
 mod mono;
 mod pdf;
 mod progress;

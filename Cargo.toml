@@ -27,6 +27,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30"
 ratatui-image = { version = "12.0.0-rc.2", default-features = false, features = ["crossterm"] }
 regex = "1"
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 unicode-width = "0.2"

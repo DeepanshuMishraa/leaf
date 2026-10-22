@@ -4,6 +4,8 @@ use std::rc::Rc;
 
 use image::RgbaImage;
 
+use crate::mono::Rgb;
+
 const IMAGE_SCHEME: &str = "leaf-image:";
 
 /// Where a markdown image href points.
@@ -25,6 +27,14 @@ pub trait Source {
     /// The pixels of an embedded image, at most `width` pixels wide, or `None`
     /// if it can't be decoded.
     fn decode(&self, id: &str, width: u32) -> Option<RgbaImage>;
+    /// Whether an embedded image is a diagram, drawn in the terminal's colors.
+    fn is_diagram(&self, _id: &str) -> bool {
+        false
+    }
+    /// A diagram drawn in `ink` on a transparent `paper`, at most `width` pixels wide.
+    fn draw(&self, _id: &str, _width: u32, _ink: Rgb, _paper: Rgb) -> Option<RgbaImage> {
+        None
+    }
 }
 
 pub struct Doc {
