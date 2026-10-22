@@ -3,9 +3,10 @@
 //! Without a runtime, or when Pele can't read a diagram, it stays a code block.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, LazyLock};
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, LazyLock, mpsc};
+use std::time::Duration;
 
 use image::RgbaImage;
 use regex::Regex;
@@ -16,8 +17,10 @@ use crate::mono::Rgb;
 const PELE: &str = include_str!("../vendor/pele/pele.global.js");
 /// Draws each source in `SOURCES`, printing the SVGs split by NULs; one Pele can't read is empty.
 const DRIVER: &str = r#";process.stdout.write(SOURCES.map(s => { try { return pele.render(s).svg; } catch { return ""; } }).join("\0"));"#;
-/// Runtimes tried in turn, each reading the script from stdin.
+/// Runtimes tried in turn until one is installed, each reading the script from stdin.
 const RUNTIMES: &[&str] = &["bun", "node"];
+/// Longest the runtime may take over a document's diagrams; Pele sets no time limit of its own.
+const DEADLINE: Duration = Duration::from_secs(10);
 /// Diagrams are drawn sharp at up to this many times the size Pele laid them out at.
 const MAX_SCALE: u32 = 4;
 /// Families tried for Pele's `sans-serif`, the first one installed wins.
@@ -52,7 +55,9 @@ pub fn render(sources: &[String]) -> Vec<Option<Diagram>> {
         return Vec::new();
     }
     let script = format!("const SOURCES = [{}];\n{PELE}\n{DRIVER}", sources.iter().map(|s| js_string(s)).collect::<Vec<_>>().join(","));
-    let Some(out) = RUNTIMES.iter().find_map(|runtime| run(runtime, &script)) else { return none() };
+    let spawn = |runtime: &&str| Command::new(runtime).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok();
+    let Some(child) = RUNTIMES.iter().find_map(spawn) else { return none() };
+    let Some(out) = finish(child, &script, DEADLINE) else { return none() };
     let svgs: Vec<&str> = out.split('\0').collect();
     if svgs.len() != sources.len() {
         return none();
@@ -60,11 +65,26 @@ pub fn render(sources: &[String]) -> Vec<Option<Diagram>> {
     svgs.into_iter().map(Diagram::new).collect()
 }
 
-fn run(runtime: &str, script: &str) -> Option<String> {
-    let mut child = Command::new(runtime).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// Feeds `script` to the runtime and returns what it printed, or `None` if
+/// it fails or is still running at `deadline` (then it's killed).
+fn finish(mut child: Child, script: &str, deadline: Duration) -> Option<String> {
+    let (mut stdin, mut stdout) = (child.stdin.take()?, child.stdout.take()?);
+    // Written and read on their own threads, so a runtime that stalls on
+    // either pipe still stops at the deadline. A failed write shows as a
+    // failed run or a short answer.
+    let script = script.to_owned();
+    std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = tx.send(stdout.read_to_end(&mut out).map(|_| out));
+    });
+    let Ok(Ok(out)) = rx.recv_timeout(deadline) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    child.wait().ok()?.success().then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
 /// `text` as a JavaScript string literal.
@@ -159,6 +179,8 @@ impl Diagram {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
@@ -172,6 +194,20 @@ mod tests {
     fn colors_mix_toward_each_other() {
         assert_eq!(mix([0, 0, 0], [255, 255, 255], 0.5), "#808080");
         assert_eq!(hex([10, 20, 30]), "#0a141e");
+    }
+
+    #[test]
+    fn a_runtime_past_its_deadline_is_stopped() {
+        let child = Command::new("sh").args(["-c", "sleep 5"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().expect("sh runs");
+        let start = Instant::now();
+        assert_eq!(finish(child, "", Duration::from_millis(100)), None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_runtime_that_finishes_returns_its_output() {
+        let child = Command::new("sh").args(["-c", "cat"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().expect("sh runs");
+        assert_eq!(finish(child, "svg", DEADLINE).as_deref(), Some("svg"));
     }
 
     #[test]

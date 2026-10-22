@@ -101,8 +101,8 @@ fn diagrams(markdown: &str, draw: impl FnOnce(&[String]) -> Vec<Option<Diagram>>
     let mut edits = Vec::new();
     for ((range, _), diagram) in blocks.into_iter().zip(drawn) {
         let Some(diagram) = diagram else { continue };
-        // On its own line, so it's a figure and not part of the paragraph before.
-        edits.push((range, format!("\n![]({})", Doc::image_href(&format!("{DIAGRAM}{}", found.len())))));
+        // A paragraph of its own, so it's a figure and not part of the text before or after.
+        edits.push((range, format!("\n![]({})\n", Doc::image_href(&format!("{DIAGRAM}{}", found.len())))));
         found.push(diagram);
     }
     (splice(markdown, edits), found)
@@ -222,14 +222,14 @@ mod tests {
 
     #[test]
     fn mermaid_blocks_that_draw_become_figures() {
-        let md = "Text\n```mermaid\ngraph LR\n  A-->B\n```\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n";
+        let md = "Text\n```mermaid\ngraph LR\n  A-->B\n```\nMore text\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n";
         let mut asked = Vec::new();
         let (out, found) = diagrams(md, |sources| {
             asked = sources.to_vec();
             vec![Diagram::new(r#"<svg width="10" height="5"></svg>"#), None]
         });
         assert_eq!(asked, vec!["graph LR\n  A-->B\n", "not a diagram\n"]);
-        assert_eq!(out, "Text\n\n![](leaf-image:mermaid-0)\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n");
+        assert_eq!(out, "Text\n\n![](leaf-image:mermaid-0)\n\nMore text\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n");
         assert_eq!(found.len(), 1);
     }
 
