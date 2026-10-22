@@ -233,6 +233,32 @@ mod tests {
         assert_eq!(found.len(), 1);
     }
 
+    /// Runs `examples/mermaid.md` through the real runtime and rasterizer.
+    /// Skipped when neither bun nor node is installed.
+    #[test]
+    fn sample_diagrams_draw_and_rasterize() {
+        let runtime = ["bun", "node"].iter().any(|r| std::process::Command::new(r).arg("--version").output().is_ok_and(|o| o.status.success()));
+        if !runtime {
+            eprintln!("skipped: no bun or node on PATH");
+            return;
+        }
+        let md = include_str!("../examples/mermaid.md");
+        let (out, found) = diagrams(md, mermaid::render);
+        // 10 mermaid blocks; only the invalid one stays as code.
+        assert_eq!(found.len(), 9, "markdown after drawing:\n{out}");
+        assert!(out.contains("```mermaid\nthis is not a diagram at all\n```"));
+        assert!(out.contains("```rust\nfn main() {"));
+        assert!(out.contains("\n\nThis line must still show"), "text after a diagram merged into it:\n{out}");
+        let (ink, paper) = ([230, 230, 230], [20, 20, 20]);
+        for (i, diagram) in found.iter().enumerate() {
+            assert!(diagram.size.0 > 0 && diagram.size.1 > 0, "diagram {i} has no size");
+            let image = diagram.rasterize(800, ink, paper).unwrap_or_else(|| panic!("diagram {i} did not rasterize"));
+            assert!(image.width() <= 800);
+            let inked = image.pixels().filter(|p| p[3] > 128 && p[0] > 180).count();
+            assert!(inked > 50, "diagram {i} has almost no ink-colored pixels ({inked})");
+        }
+    }
+
     #[test]
     fn front_matter_is_not_shown() {
         assert_eq!(FRONT_MATTER.replace("---\ntitle: x\n---\n# Hi", ""), "# Hi");
