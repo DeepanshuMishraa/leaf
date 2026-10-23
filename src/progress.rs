@@ -104,7 +104,21 @@ CREATE TABLE IF NOT EXISTS highlights (
   end INTEGER NOT NULL,
   text TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS highlights_key ON highlights (key)";
+CREATE INDEX IF NOT EXISTS highlights_key ON highlights (key);
+CREATE TABLE IF NOT EXISTS bookmarks (
+  key TEXT NOT NULL,
+  page INTEGER NOT NULL,
+  label TEXT NOT NULL,
+  PRIMARY KEY (key, page)
+)";
+
+/// A page the reader marked to come back to. `page` is 0-based; `label` is
+/// the start of the page's text, so the list says what's there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    pub page: usize,
+    pub label: String,
+}
 
 /// Saved reading places and highlights, per document key (a PDF's real path
 /// or a URL), plus the image mode for every document.
@@ -253,6 +267,31 @@ impl Store {
         }
         tx.commit().map_err(failed)
     }
+
+    pub fn load_bookmarks(&self, key: &str) -> Result<Vec<Bookmark>, StoreFailed> {
+        let mut query = self.db.prepare("SELECT page, label FROM bookmarks WHERE key = ? ORDER BY page").map_err(self.failed(Operation::Read))?;
+        let rows = query.query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(self.failed(Operation::Read))?;
+        let mut bookmarks = Vec::new();
+        for row in rows {
+            let (page, label) = row.map_err(self.failed(Operation::Read))?;
+            if let Some(page) = count(page) {
+                bookmarks.push(Bookmark { page, label });
+            }
+        }
+        Ok(bookmarks)
+    }
+
+    /// Replaces every bookmark of `key` with `bookmarks`.
+    pub fn save_bookmarks(&mut self, key: &str, bookmarks: &[Bookmark]) -> Result<(), StoreFailed> {
+        let path = self.path.clone();
+        let failed = |e: rusqlite::Error| StoreFailed { operation: Operation::Save, path: path.clone(), cause: e.to_string() };
+        let tx = self.db.transaction().map_err(failed)?;
+        tx.execute("DELETE FROM bookmarks WHERE key = ?", [key]).map_err(failed)?;
+        for b in bookmarks {
+            tx.execute("INSERT OR REPLACE INTO bookmarks (key, page, label) VALUES (?, ?, ?)", params![key, b.page as i64, b.label]).map_err(failed)?;
+        }
+        tx.commit().map_err(failed)
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +349,18 @@ mod tests {
         store.save_highlights("/a.pdf", std::slice::from_ref(&second)).unwrap();
         assert_eq!(store.load_highlights("/a.pdf").unwrap(), vec![second]);
         assert_eq!(store.load_highlights("/b.pdf").unwrap(), vec![first]);
+    }
+
+    #[test]
+    fn bookmarks_come_back_per_document_in_page_order() {
+        let mut store = memory();
+        let (late, early) = (Bookmark { page: 9, label: "Chapter 2".into() }, Bookmark { page: 1, label: "Preface".into() });
+        store.save_bookmarks("/a.epub", &[late.clone(), early.clone()]).unwrap();
+        store.save_bookmarks("/b.epub", std::slice::from_ref(&late)).unwrap();
+        assert_eq!(store.load_bookmarks("/a.epub").unwrap(), vec![early.clone(), late.clone()]);
+        store.save_bookmarks("/a.epub", &[]).unwrap();
+        assert!(store.load_bookmarks("/a.epub").unwrap().is_empty());
+        assert_eq!(store.load_bookmarks("/b.epub").unwrap(), vec![late]);
     }
 
     #[test]

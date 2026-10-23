@@ -29,7 +29,7 @@ use crate::find::Query;
 use crate::highlight::{self, Highlight};
 use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
-use crate::progress::{ImageMode, Progress, Scroll};
+use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::render::{self, DIM, Laid};
 
 /// Widest the text column gets; a book-like measure is easiest to read.
@@ -47,6 +47,8 @@ const FALLBACK_INK: Rgb = [220, 220, 220];
 const FALLBACK_PAPER: Rgb = [30, 30, 30];
 /// Laid-out pages kept on each side of the one being read.
 const KEPT_PAGES: usize = 4;
+/// How much of a page's first line names its bookmark.
+const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
 
@@ -66,14 +68,15 @@ enum Mode {
     Scroll,
 }
 
-/// What floats over the text: nothing, the key list, the go-to-page box or
-/// the find box, with what's typed so far.
+/// What floats over the text: nothing, the key list, the go-to-page box,
+/// the find box with what's typed so far, or the bookmark list with the one picked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Dialog {
     None,
     Help,
     Goto { digits: String, page_count: usize },
     Find { typed: String },
+    Bookmarks { selected: usize },
 }
 
 /// Which way a search moves through the pages.
@@ -176,6 +179,7 @@ struct ScreenRow {
 
 /// Hears the full set of highlights after each change.
 pub type HighlightsListener = Box<dyn FnMut(&[Highlight])>;
+pub type BookmarksListener = Box<dyn FnMut(&[Bookmark])>;
 
 pub struct ViewerOptions {
     /// For paged documents, where reading resumes (1-based).
@@ -191,6 +195,10 @@ pub struct ViewerOptions {
     pub on_image_mode: Box<dyn FnMut(ImageMode)>,
     /// Hears every highlight there is, each time one is added or cleared.
     pub on_highlights: HighlightsListener,
+    /// For paged documents, the pages marked to come back to, in page order.
+    pub bookmarks: Vec<Bookmark>,
+    /// Hears every bookmark there is, each time one is added or removed.
+    pub on_bookmarks: BookmarksListener,
 }
 
 impl Default for ViewerOptions {
@@ -204,6 +212,8 @@ impl Default for ViewerOptions {
             on_scroll: Box::new(|_| {}),
             on_image_mode: Box::new(|_| {}),
             on_highlights: Box::new(|_| {}),
+            bookmarks: Vec::new(),
+            on_bookmarks: Box::new(|_| {}),
         }
     }
 }
@@ -226,6 +236,7 @@ pub struct App {
     ink: Option<Rgb>,
     paper: Option<Rgb>,
     highlights: Vec<Highlight>,
+    bookmarks: Vec<Bookmark>,
     selection: Option<Selection>,
     dragging: bool,
     dialog: Dialog,
@@ -275,6 +286,7 @@ impl App {
         App {
             image_mode: options.image_mode,
             highlights: options.highlights.clone(),
+            bookmarks: options.bookmarks.clone(),
             doc,
             options,
             picker,
@@ -455,8 +467,10 @@ impl App {
         match self.doc.page_count {
             None => format!("{}%", self.scrolled()),
             Some(count) => {
-                let progress = Progress::of(self.reading() + 1, count);
-                format!("{} / {} · {}%", progress.page, progress.page_count, progress.percent)
+                let reading = self.reading();
+                let progress = Progress::of(reading + 1, count);
+                let marked = if self.bookmarked(reading) { " · bookmarked" } else { "" };
+                format!("{} / {} · {}%{marked}", progress.page, progress.page_count, progress.percent)
             }
         }
     }
@@ -664,6 +678,7 @@ impl App {
             Dialog::Help => Some(self.draw_help(f, area)),
             Dialog::Goto { digits, page_count } => Some(self.draw_goto(f, area, &digits, page_count)),
             Dialog::Find { typed } => Some(self.draw_find(f, area, &typed)),
+            Dialog::Bookmarks { selected } => Some(self.draw_bookmarks(f, area, selected)),
         };
         // Kitty images sit above the text, so any under a panel would hide it.
         if let Some(panel) = panel {
@@ -857,6 +872,7 @@ impl App {
         rows.push(("g/G", if paged { "first / last page" } else { "top / bottom" }));
         if paged {
             rows.push(("t  :", "go to page"));
+            rows.extend([("m", "bookmark this page, or remove it"), ("'", "bookmarks")]);
         }
         rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
         rows.push(("i", if self.image_mode == ImageMode::Color { "paint images" } else { "show original images" }));
@@ -903,6 +919,92 @@ impl App {
         ];
         let width = (hint.chars().count() as u16).max(typed.chars().count() as u16 + 1);
         Self::panel(f, area, "Find", lines, width)
+    }
+
+    fn draw_bookmarks(&self, f: &mut Frame, area: Rect, selected: usize) -> Rect {
+        let hint = "enter go · x remove · esc close";
+        if self.bookmarks.is_empty() {
+            let lines = vec![Line::from(Span::styled("No bookmarks yet. Press m to mark a page.", Style::default().fg(DIM))).centered()];
+            return Self::panel(f, area, "Bookmarks", lines, 42);
+        }
+        // As many as fit, keeping the picked one in view.
+        let room = (area.height as usize).saturating_sub(8).max(1);
+        let first = selected.saturating_sub(room - 1).min(self.bookmarks.len().saturating_sub(room));
+        let number_width = self.pages().to_string().len();
+        let mut lines: Vec<Line> = self.bookmarks[first..]
+            .iter()
+            .take(room)
+            .enumerate()
+            .map(|(i, b)| {
+                let picked = first + i == selected;
+                let style = if picked { Style::default().add_modifier(Modifier::BOLD) } else { Style::default().fg(DIM) };
+                Line::from(vec![
+                    Span::styled(if picked { "› " } else { "  " }, style),
+                    Span::styled(format!("{:>number_width$}  ", b.page + 1), Style::default().fg(DIM)),
+                    Span::styled(b.label.clone(), style),
+                ])
+            })
+            .collect();
+        let width = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(hint.chars().count() as u16);
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
+        Self::panel(f, area, "Bookmarks", lines, width)
+    }
+
+    // -----------------------------------------------------------------------
+    // Bookmarks.
+
+    fn bookmarked(&self, page: usize) -> bool {
+        self.bookmarks.iter().any(|b| b.page == page)
+    }
+
+    /// The start of a page's text, for the bookmark list.
+    fn page_label(&mut self, page: usize) -> String {
+        let text: String = self.laid(page).text.iter().collect();
+        let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        let mut label: String = line.chars().take(BOOKMARK_LABEL_CHARS).collect();
+        if line.chars().count() > BOOKMARK_LABEL_CHARS {
+            label.push('…');
+        }
+        label
+    }
+
+    /// Bookmarks the page being read, or removes its bookmark.
+    fn toggle_bookmark(&mut self) {
+        if self.doc.page_count.is_none() {
+            return;
+        }
+        let page = self.reading();
+        if self.bookmarked(page) {
+            self.bookmarks.retain(|b| b.page != page);
+        } else {
+            let label = self.page_label(page);
+            let at = self.bookmarks.partition_point(|b| b.page < page);
+            self.bookmarks.insert(at, Bookmark { page, label });
+        }
+        (self.options.on_bookmarks)(&self.bookmarks);
+    }
+
+    /// Moving through the bookmark list; enter turns to the picked page.
+    fn bookmarks_key(&mut self, key: &KeyEvent, selected: usize) {
+        let last = self.bookmarks.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('\'') => self.dialog = Dialog::None,
+            KeyCode::Down | KeyCode::Char('j') => self.dialog = Dialog::Bookmarks { selected: (selected + 1).min(last) },
+            KeyCode::Up | KeyCode::Char('k') => self.dialog = Dialog::Bookmarks { selected: selected.saturating_sub(1) },
+            KeyCode::Enter => {
+                self.dialog = Dialog::None;
+                if let Some(page) = self.bookmarks.get(selected).map(|b| b.page) {
+                    self.go_to_page(page, false);
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if selected <= last && !self.bookmarks.is_empty() => {
+                self.bookmarks.remove(selected);
+                (self.options.on_bookmarks)(&self.bookmarks);
+                self.dialog = Dialog::Bookmarks { selected: selected.min(self.bookmarks.len().saturating_sub(1)) };
+            }
+            _ => {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1047,6 +1149,7 @@ impl App {
         match self.dialog.clone() {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
             Dialog::Find { typed } => return self.find_key(&key, typed),
+            Dialog::Bookmarks { selected } => return self.bookmarks_key(&key, selected),
             Dialog::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
                     self.dialog = Dialog::None;
@@ -1062,6 +1165,13 @@ impl App {
                 if let Some(page_count) = self.doc.page_count {
                     self.dialog = Dialog::Goto { digits: String::new(), page_count };
                 }
+            }
+            Some('m') => self.toggle_bookmark(),
+            Some('\'') if self.doc.page_count.is_some() => {
+                // Opens on the bookmark at or before the page being read.
+                let reading = self.reading();
+                let selected = self.bookmarks.partition_point(|b| b.page <= reading).saturating_sub(1);
+                self.dialog = Dialog::Bookmarks { selected };
             }
             Some('f') | Some('F') => self.dialog = Dialog::Find { typed: String::new() },
             Some('n') if self.found_here().is_some() => self.next_match(Direction::Forward),
@@ -1497,6 +1607,43 @@ mod tests {
         assert!(frame.contains("Next page"), "{frame}");
         let frame = s.press(KeyCode::Char('b'));
         assert!(frame.contains("Line 60"), "b goes back to the end of the previous page: {frame}");
+    }
+
+    #[test]
+    fn m_bookmarks_the_page_and_the_list_turns_back_to_it() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions { on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()), ..ViewerOptions::default() };
+        let mut s = Screen::new(book(&["Alpha", "Bravo text", "Charlie"]), 120, 30, options);
+        s.draw();
+        s.press(KeyCode::Char('l'));
+        assert!(s.press(KeyCode::Char('m')).contains("bookmarked"));
+        assert_eq!(*saved.borrow(), vec![Bookmark { page: 1, label: "Bravo text".into() }]);
+        s.press(KeyCode::Char('G'));
+        let list = s.press(KeyCode::Char('\''));
+        assert!(list.contains("Bookmarks") && list.contains("Bravo text"), "{list}");
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("Bravo text") && frame.contains("2 / 3"), "{frame}");
+        s.press(KeyCode::Char('m'));
+        assert!(saved.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_bookmark_is_removed_from_the_list_with_x() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            bookmarks: vec![Bookmark { page: 0, label: "Alpha".into() }, Bookmark { page: 2, label: "Charlie".into() }],
+            on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Alpha", "Bravo", "Charlie"]), 120, 30, options);
+        s.draw();
+        s.press(KeyCode::Char('\''));
+        s.press(KeyCode::Char('j'));
+        let list = s.press(KeyCode::Char('x'));
+        assert_eq!(*saved.borrow(), vec![Bookmark { page: 0, label: "Alpha".into() }]);
+        assert!(!list.contains("Charlie"), "{list}");
     }
 
     #[test]

@@ -24,7 +24,7 @@ use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf open <file.pdf | file.epub | file.md | url>
 
-Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
+Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
 
 fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
@@ -52,7 +52,7 @@ fn load(target: &str) -> Result<Doc, String> {
     Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."))
 }
 
-/// Remembers the image mode, each document's highlights, and where each
+/// Remembers the image mode, each document's highlights and bookmarks, and where each
 /// document (file or link) was left, so they come back next time. Progress that can't
 /// be read or saved is reported after the reader closes; reading goes on.
 fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<String>>>) -> ViewerOptions {
@@ -86,6 +86,10 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
         Ok(highlights) => options.highlights = highlights,
         Err(e) => record(Err(e)),
     }
+    match store.borrow().load_bookmarks(&key) {
+        Ok(bookmarks) => options.bookmarks = bookmarks,
+        Err(e) => record(Err(e)),
+    }
     if page_count.is_some() {
         match store.borrow().load(&key) {
             Ok(saved) => options.start_page = saved.map(|p| p.page),
@@ -105,6 +109,10 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
     options.on_highlights = {
         let (store, record, key) = (store.clone(), record.clone(), key.clone());
         Box::new(move |highlights| record(store.borrow_mut().save_highlights(&key, highlights)))
+    };
+    options.on_bookmarks = {
+        let (store, record, key) = (store.clone(), record.clone(), key.clone());
+        Box::new(move |bookmarks| record(store.borrow_mut().save_bookmarks(&key, bookmarks)))
     };
     match page_count {
         Some(count) => options.on_page = Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count)))),
