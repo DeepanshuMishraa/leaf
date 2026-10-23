@@ -1193,8 +1193,9 @@ impl Source for PdfSource {
     }
 }
 
-/// Opens a PDF or EPUB and returns at once. Only a small sample of pages is read up
-/// front, to learn the layout; the rest are read as they are shown.
+/// Opens a PDF or EPUB. Only a small sample of pages is read up front, to learn
+/// the layout; the rest are read as they are shown. A PDF returns at once; an
+/// EPUB first lays out the whole book to count its pages.
 pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
     // Checked up front for a clear message; mupdf then reads the file as it
     // needs it, so a large PDF is never held in memory whole.
@@ -1240,6 +1241,9 @@ fn from_document(
     // What the sample pages loaded is no use to the page the reader opens on.
     memory::shrink_mupdf_cache(0);
     let title = document.metadata(MetadataName::Title).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    // A reflowable book (EPUB) lays itself out again on every open, which takes
+    // seconds for a long one, so it is never opened afresh.
+    let path = path.filter(|_| !document.is_reflowable().unwrap_or(false));
     Ok(Doc {
         title: title.unwrap_or_else(|| fallback_title.to_owned()),
         page_count: Some(page_count),

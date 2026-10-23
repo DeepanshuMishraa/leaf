@@ -998,7 +998,10 @@ impl App {
                     self.go_to_page(page, false);
                 }
             }
-            KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if selected <= last && !self.bookmarks.is_empty() => {
+            // A held key would remove one bookmark after another.
+            KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace
+                if key.kind == KeyEventKind::Press && selected <= last && !self.bookmarks.is_empty() =>
+            {
                 self.bookmarks.remove(selected);
                 (self.options.on_bookmarks)(&self.bookmarks);
                 self.dialog = Dialog::Bookmarks { selected: selected.min(self.bookmarks.len().saturating_sub(1)) };
@@ -1166,7 +1169,7 @@ impl App {
                     self.dialog = Dialog::Goto { digits: String::new(), page_count };
                 }
             }
-            Some('m') => self.toggle_bookmark(),
+            Some('m') if key.kind == KeyEventKind::Press => self.toggle_bookmark(),
             Some('\'') if self.doc.page_count.is_some() => {
                 // Opens on the bookmark at or before the page being read.
                 let reading = self.reading();
@@ -1644,6 +1647,23 @@ mod tests {
         let list = s.press(KeyCode::Char('x'));
         assert_eq!(*saved.borrow(), vec![Bookmark { page: 0, label: "Alpha".into() }]);
         assert!(!list.contains("Charlie"), "{list}");
+    }
+
+    #[test]
+    fn holding_x_removes_only_one_bookmark() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            bookmarks: vec![Bookmark { page: 0, label: "Alpha".into() }, Bookmark { page: 2, label: "Charlie".into() }],
+            on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Alpha", "Bravo", "Charlie"]), 120, 30, options);
+        s.draw();
+        s.press(KeyCode::Char('\''));
+        s.press(KeyCode::Char('x'));
+        s.app.key(KeyEvent { code: KeyCode::Char('x'), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Repeat, state: KeyEventState::NONE });
+        assert_eq!(*saved.borrow(), vec![Bookmark { page: 2, label: "Charlie".into() }]);
     }
 
     #[test]

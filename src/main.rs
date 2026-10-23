@@ -14,6 +14,7 @@ mod render;
 mod viewer;
 
 use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -38,9 +39,14 @@ fn load(target: &str) -> Result<Doc, String> {
     let lower = target.to_ascii_lowercase();
     if lower.ends_with(".epub") {
         // mupdf lays out the whole book to count its pages, which takes seconds for a long one.
-        eprint!("Laying out {target}…");
+        let terminal = std::io::stderr().is_terminal();
+        if terminal {
+            eprint!("Laying out {target}…");
+        }
         let doc = pdf::open(Path::new(target)).map_err(|e| e.to_string());
-        eprint!("\r\x1b[K");
+        if terminal {
+            eprint!("\r\x1b[K");
+        }
         return doc;
     }
     if lower.ends_with(".pdf") {
@@ -86,9 +92,12 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
         Ok(highlights) => options.highlights = highlights,
         Err(e) => record(Err(e)),
     }
-    match store.borrow().load_bookmarks(&key) {
-        Ok(bookmarks) => options.bookmarks = bookmarks,
-        Err(e) => record(Err(e)),
+    if let Some(count) = page_count {
+        // A bookmark past the end was made in a longer copy of the file; it points nowhere now.
+        match store.borrow().load_bookmarks(&key) {
+            Ok(bookmarks) => options.bookmarks = bookmarks.into_iter().filter(|b| b.page < count).collect(),
+            Err(e) => record(Err(e)),
+        }
     }
     if page_count.is_some() {
         match store.borrow().load(&key) {
