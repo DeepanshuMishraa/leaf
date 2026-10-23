@@ -1193,7 +1193,7 @@ impl Source for PdfSource {
     }
 }
 
-/// Opens a PDF and returns at once. Only a small sample of pages is read up
+/// Opens a PDF or EPUB and returns at once. Only a small sample of pages is read up
 /// front, to learn the layout; the rest are read as they are shown.
 pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
     // Checked up front for a clear message; mupdf then reads the file as it
@@ -1227,7 +1227,7 @@ fn from_document(
 ) -> Result<Doc, PdfOpenFailed> {
     let failed = |e: mupdf::Error| PdfOpenFailed {
         message: format!(
-            "Could not open {source} as a PDF ({e}). It may be encrypted or damaged. Open it in a PDF viewer to confirm it is valid."
+            "Could not open {source} ({e}). It may be encrypted or damaged. Open it in another reader to confirm it is valid."
         ),
     };
     // Exact ICC color matching is most of the work of decoding a photo, and a terminal can't show the difference.
@@ -1517,5 +1517,21 @@ mod tests {
         let out = md(vec![body(0.0), item("Strings", 70.0), item("Lists", 90.0)]);
         assert!(out.contains("- Strings
 - Lists"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod epub_tests {
+    use super::*;
+
+    #[test]
+    fn an_epub_opens_and_its_text_reads() {
+        let path = std::env::temp_dir().join(format!("leaf-test-{}.epub", std::process::id()));
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sample.epub"), &path).expect("sample copies");
+        let doc = open(&path).expect("epub opens");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(doc.title, "Test Book");
+        let text: String = (0..doc.pages()).map(|i| doc.source.page(i).to_string()).collect();
+        assert!(text.contains("Chapter One") && text.contains("Hello from an epub"), "got: {text}");
     }
 }

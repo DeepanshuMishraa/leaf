@@ -22,7 +22,7 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf open <file.pdf | file.md | url>
+const USAGE: &str = "Usage: leaf open <file.pdf | file.epub | file.md | url>
 
 Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
 
@@ -36,13 +36,20 @@ fn load(target: &str) -> Result<Doc, String> {
         return article::open(target).map_err(|e| e.to_string());
     }
     let lower = target.to_ascii_lowercase();
+    if lower.ends_with(".epub") {
+        // mupdf lays out the whole book to count its pages, which takes seconds for a long one.
+        eprint!("Laying out {target}…");
+        let doc = pdf::open(Path::new(target)).map_err(|e| e.to_string());
+        eprint!("\r\x1b[K");
+        return doc;
+    }
     if lower.ends_with(".pdf") {
         return pdf::open(Path::new(target)).map_err(|e| e.to_string());
     }
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(Path::new(target)).map_err(|e| e.to_string());
     }
-    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), markdown files (.md) and web pages (http:// or https:// URLs)."))
+    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."))
 }
 
 /// Remembers the image mode, each document's highlights, and where each

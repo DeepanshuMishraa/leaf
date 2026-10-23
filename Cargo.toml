@@ -21,8 +21,8 @@ dom_smoothie = "0.18"
 htmd = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libc = "0.2"
-mupdf = { version = "0.8", default-features = false, features = ["base14-fonts", "system-fonts"] }
-mupdf-sys = { version = "0.8.0", default-features = false }
+mupdf = { version = "0.8", default-features = false, features = ["base14-fonts", "system-fonts", "epub", "svg"] }
+mupdf-sys = { version = "0.8.0", default-features = false, features = ["epub", "svg"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30"
 ratatui-image = { version = "12.0.0-rc.2", default-features = false, features = ["crossterm"] }
