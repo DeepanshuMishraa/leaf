@@ -1193,8 +1193,9 @@ impl Source for PdfSource {
     }
 }
 
-/// Opens a PDF and returns at once. Only a small sample of pages is read up
-/// front, to learn the layout; the rest are read as they are shown.
+/// Opens a PDF or EPUB. Only a small sample of pages is read up front, to learn
+/// the layout; the rest are read as they are shown. A PDF returns at once; an
+/// EPUB first lays out the whole book to count its pages.
 pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
     // Checked up front for a clear message; mupdf then reads the file as it
     // needs it, so a large PDF is never held in memory whole.
@@ -1227,7 +1228,7 @@ fn from_document(
 ) -> Result<Doc, PdfOpenFailed> {
     let failed = |e: mupdf::Error| PdfOpenFailed {
         message: format!(
-            "Could not open {source} as a PDF ({e}). It may be encrypted or damaged. Open it in a PDF viewer to confirm it is valid."
+            "Could not open {source} ({e}). It may be encrypted or damaged. Open it in another reader to confirm it is valid."
         ),
     };
     // Exact ICC color matching is most of the work of decoding a photo, and a terminal can't show the difference.
@@ -1240,6 +1241,9 @@ fn from_document(
     // What the sample pages loaded is no use to the page the reader opens on.
     memory::shrink_mupdf_cache(0);
     let title = document.metadata(MetadataName::Title).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    // A reflowable book (EPUB) lays itself out again on every open, which takes
+    // seconds for a long one, so it is never opened afresh.
+    let path = path.filter(|_| !document.is_reflowable().unwrap_or(false));
     Ok(Doc {
         title: title.unwrap_or_else(|| fallback_title.to_owned()),
         page_count: Some(page_count),
@@ -1517,5 +1521,21 @@ mod tests {
         let out = md(vec![body(0.0), item("Strings", 70.0), item("Lists", 90.0)]);
         assert!(out.contains("- Strings
 - Lists"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod epub_tests {
+    use super::*;
+
+    #[test]
+    fn an_epub_opens_and_its_text_reads() {
+        let path = std::env::temp_dir().join(format!("leaf-test-{}.epub", std::process::id()));
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sample.epub"), &path).expect("sample copies");
+        let doc = open(&path).expect("epub opens");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(doc.title, "Test Book");
+        let text: String = (0..doc.pages()).map(|i| doc.source.page(i).to_string()).collect();
+        assert!(text.contains("Chapter One") && text.contains("Hello from an epub"), "got: {text}");
     }
 }

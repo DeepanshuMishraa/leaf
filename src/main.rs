@@ -14,6 +14,7 @@ mod render;
 mod viewer;
 
 use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -22,9 +23,9 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf open <file.pdf | file.md | url>
+const USAGE: &str = "Usage: leaf open <file.pdf | file.epub | file.md | url>
 
-Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
+Keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
 
 fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
@@ -36,16 +37,28 @@ fn load(target: &str) -> Result<Doc, String> {
         return article::open(target).map_err(|e| e.to_string());
     }
     let lower = target.to_ascii_lowercase();
+    if lower.ends_with(".epub") {
+        // mupdf lays out the whole book to count its pages, which takes seconds for a long one.
+        let terminal = std::io::stderr().is_terminal();
+        if terminal {
+            eprint!("Laying out {target}…");
+        }
+        let doc = pdf::open(Path::new(target)).map_err(|e| e.to_string());
+        if terminal {
+            eprint!("\r\x1b[K");
+        }
+        return doc;
+    }
     if lower.ends_with(".pdf") {
         return pdf::open(Path::new(target)).map_err(|e| e.to_string());
     }
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(Path::new(target)).map_err(|e| e.to_string());
     }
-    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), markdown files (.md) and web pages (http:// or https:// URLs)."))
+    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."))
 }
 
-/// Remembers the image mode, each document's highlights, and where each
+/// Remembers the image mode, each document's highlights and bookmarks, and where each
 /// document (file or link) was left, so they come back next time. Progress that can't
 /// be read or saved is reported after the reader closes; reading goes on.
 fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<String>>>) -> ViewerOptions {
@@ -79,6 +92,13 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
         Ok(highlights) => options.highlights = highlights,
         Err(e) => record(Err(e)),
     }
+    if let Some(count) = page_count {
+        // A bookmark past the end was made in a longer copy of the file; it points nowhere now.
+        match store.borrow().load_bookmarks(&key) {
+            Ok(bookmarks) => options.bookmarks = bookmarks.into_iter().filter(|b| b.page < count).collect(),
+            Err(e) => record(Err(e)),
+        }
+    }
     if page_count.is_some() {
         match store.borrow().load(&key) {
             Ok(saved) => options.start_page = saved.map(|p| p.page),
@@ -98,6 +118,10 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
     options.on_highlights = {
         let (store, record, key) = (store.clone(), record.clone(), key.clone());
         Box::new(move |highlights| record(store.borrow_mut().save_highlights(&key, highlights)))
+    };
+    options.on_bookmarks = {
+        let (store, record, key) = (store.clone(), record.clone(), key.clone());
+        Box::new(move |bookmarks| record(store.borrow_mut().save_bookmarks(&key, bookmarks)))
     };
     match page_count {
         Some(count) => options.on_page = Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count)))),
