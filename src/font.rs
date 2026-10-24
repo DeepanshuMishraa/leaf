@@ -62,7 +62,10 @@ const GLYPHS: &[(char, [&str; 2])] = &[
 
 fn glyph(c: char) -> Option<[&'static str; 2]> {
     let upper = c.to_uppercase().next().unwrap_or(c);
-    GLYPHS.iter().find(|(g, _)| *g == upper).map(|(_, rows)| *rows)
+    GLYPHS
+        .iter()
+        .find(|(g, _)| *g == upper)
+        .map(|(_, rows)| *rows)
 }
 
 /// Width in columns of `text` set in the font. Letters are a column apart;

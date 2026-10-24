@@ -67,7 +67,10 @@ impl Kitty {
 
     /// Sends queued uploads, then makes `wanted` the images on screen.
     pub fn flush(&mut self, out: &mut impl Write, wanted: &[(Image, Rect)]) -> io::Result<()> {
-        let wanted: Vec<(u32, Rect)> = wanted.iter().map(|(image, rect)| (image.id, *rect)).collect();
+        let wanted: Vec<(u32, Rect)> = wanted
+            .iter()
+            .map(|(image, rect)| (image.id, *rect))
+            .collect();
         if wanted != self.placed {
             // Placements outlive the text drawn over them, so the old ones go first.
             self.pending.extend_from_slice(b"\x1b_Ga=d,d=a,q=2\x1b\\");
@@ -110,7 +113,10 @@ mod tests {
         let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1).unwrap();
         let rect = Rect::new(3, 5, 2, 1);
         let first = flushed(&mut kitty, &[(image, rect)]);
-        let (upload, place) = (first.find("a=t,f=100,i=1").unwrap(), first.find("\x1b[6;4H\x1b_Ga=p,i=1,c=2,r=1").unwrap());
+        let (upload, place) = (
+            first.find("a=t,f=100,i=1").unwrap(),
+            first.find("\x1b[6;4H\x1b_Ga=p,i=1,c=2,r=1").unwrap(),
+        );
         assert!(upload < place);
         assert_eq!(flushed(&mut kitty, &[(image, rect)]), "");
     }

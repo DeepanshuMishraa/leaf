@@ -1,6 +1,6 @@
 [package]
 name = "leaf-reader"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Read PDFs, markdown files and web articles in the terminal"
 license = "MIT"
@@ -30,6 +30,8 @@ regex = "1"
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
+unicode-ident = "1.0.27"
 unicode-width = "0.2"
 ureq = "3"
 url = "2"
+wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "runtime", "std"] }

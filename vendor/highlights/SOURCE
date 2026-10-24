@@ -1,0 +1,3 @@
+highlights.wasm is the lexer module from @pierre/highlights 0.2.0
+(https://github.com/pierrecomputer/pierre/tree/main/packages/highlights),
+Apache-2.0. See LICENSE.

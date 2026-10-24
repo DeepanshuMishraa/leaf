@@ -24,18 +24,36 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// Diagrams are drawn sharp at up to this many times the size Pele laid them out at.
 const MAX_SCALE: u32 = 4;
 /// Families tried for Pele's `sans-serif`, the first one installed wins.
-const SANS: &[&str] = &["Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "Noto Sans"];
+const SANS: &[&str] = &[
+    "Helvetica",
+    "Arial",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Noto Sans",
+];
 
-static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*?))?\s*\)").expect("pattern is valid"));
-static DECL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(--[\w-]+)\s*:\s*([^;"]+)"#).expect("pattern is valid"));
-static STYLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"style="([^"]*)""#).expect("pattern is valid"));
-static CUSTOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"--[\w-]+\s*:[^;]*;?").expect("pattern is valid"));
-static SIZE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<svg\b[^>]*?\bwidth="([\d.]+)"[^>]*?\bheight="([\d.]+)""#).expect("pattern is valid"));
+static VAR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*?))?\s*\)").expect("pattern is valid")
+});
+static DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(--[\w-]+)\s*:\s*([^;"]+)"#).expect("pattern is valid"));
+static STYLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"style="([^"]*)""#).expect("pattern is valid"));
+static CUSTOM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"--[\w-]+\s*:[^;]*;?").expect("pattern is valid"));
+static SIZE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<svg\b[^>]*?\bwidth="([\d.]+)"[^>]*?\bheight="([\d.]+)""#)
+        .expect("pattern is valid")
+});
 
 static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
     let mut fonts = usvg::fontdb::Database::new();
     fonts.load_system_fonts();
-    let installed = |family: &&&str| fonts.faces().any(|face| face.families.iter().any(|(name, _)| name == **family));
+    let installed = |family: &&&str| {
+        fonts
+            .faces()
+            .any(|face| face.families.iter().any(|(name, _)| name == **family))
+    };
     if let Some(family) = SANS.iter().find(installed) {
         fonts.set_sans_serif_family(*family);
     }
@@ -54,10 +72,29 @@ pub fn render(sources: &[String]) -> Vec<Option<Diagram>> {
     if sources.is_empty() {
         return Vec::new();
     }
-    let script = format!("const SOURCES = [{}];\n{PELE}\n{DRIVER}", sources.iter().map(|s| js_string(s)).collect::<Vec<_>>().join(","));
-    let spawn = |runtime: &&str| Command::new(runtime).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok();
-    let Some(child) = RUNTIMES.iter().find_map(spawn) else { return none() };
-    let Some(out) = finish(child, &script, DEADLINE) else { return none() };
+    let script = format!(
+        "const SOURCES = [{}];\n{PELE}\n{DRIVER}",
+        sources
+            .iter()
+            .map(|s| js_string(s))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let spawn = |runtime: &&str| {
+        Command::new(runtime)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    };
+    let Some(child) = RUNTIMES.iter().find_map(spawn) else {
+        return none();
+    };
+    let Some(out) = finish(child, &script, DEADLINE) else {
+        return none();
+    };
     let svgs: Vec<&str> = out.split('\0').collect();
     if svgs.len() != sources.len() {
         return none();
@@ -84,7 +121,11 @@ fn finish(mut child: Child, script: &str, deadline: Duration) -> Option<String> 
         let _ = child.wait();
         return None;
     };
-    child.wait().ok()?.success().then(|| String::from_utf8_lossy(&out).into_owned())
+    child
+        .wait()
+        .ok()?
+        .success()
+        .then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
 /// `text` as a JavaScript string literal.
@@ -95,7 +136,9 @@ fn js_string(text: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -140,35 +183,55 @@ fn resolve_vars(svg: &str, set: &[(&str, String)]) -> String {
             .filter(|(_, value)| !value.contains("var("))
             .collect();
         known.extend(set.iter().map(|(name, value)| (*name, value.as_str())));
-        let next = VAR.replace_all(&svg, |c: &regex::Captures| match (known.get(&c[1]), c.get(2)) {
-            (Some(value), _) => (*value).to_owned(),
-            (None, Some(fallback)) => fallback.as_str().to_owned(),
-            (None, None) => c[0].to_owned(),
+        let next = VAR.replace_all(&svg, |c: &regex::Captures| {
+            match (known.get(&c[1]), c.get(2)) {
+                (Some(value), _) => (*value).to_owned(),
+                (None, Some(fallback)) => fallback.as_str().to_owned(),
+                (None, None) => c[0].to_owned(),
+            }
         });
         if next == svg {
             break;
         }
         svg = next.into_owned();
     }
-    STYLE.replace_all(&svg, |c: &regex::Captures| format!(r#"style="{}""#, CUSTOM.replace_all(&c[1], ""))).into_owned()
+    STYLE
+        .replace_all(&svg, |c: &regex::Captures| {
+            format!(r#"style="{}""#, CUSTOM.replace_all(&c[1], ""))
+        })
+        .into_owned()
 }
 
 impl Diagram {
     pub fn new(svg: &str) -> Option<Diagram> {
         let size = SIZE.captures(svg)?;
-        let size = (size[1].parse::<f32>().ok()?.ceil() as u32, size[2].parse::<f32>().ok()?.ceil() as u32);
-        Some(Diagram { svg: svg.to_owned(), size })
+        let size = (
+            size[1].parse::<f32>().ok()?.ceil() as u32,
+            size[2].parse::<f32>().ok()?.ceil() as u32,
+        );
+        Some(Diagram {
+            svg: svg.to_owned(),
+            size,
+        })
     }
 
     /// The diagram in `ink` on a transparent `paper`, at most `width` pixels wide.
     pub fn rasterize(&self, width: u32, ink: Rgb, paper: Rgb) -> Option<RgbaImage> {
         let width = width.min(self.size.0 * MAX_SCALE);
-        let options = usvg::Options { fontdb: FONTS.clone(), ..Default::default() };
-        let tree = usvg::Tree::from_str(&resolve_vars(&self.svg, &palette(ink, paper)), &options).ok()?;
+        let options = usvg::Options {
+            fontdb: FONTS.clone(),
+            ..Default::default()
+        };
+        let tree =
+            usvg::Tree::from_str(&resolve_vars(&self.svg, &palette(ink, paper)), &options).ok()?;
         let scale = width.max(1) as f32 / tree.size().width();
         let height = (tree.size().height() * scale).ceil() as u32;
         let mut pixmap = tiny_skia::Pixmap::new(width.max(1), height.max(1))?;
-        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
         let pixels = pixmap.pixels().iter().flat_map(|p| {
             let c = p.demultiply();
             [c.red(), c.green(), c.blue(), c.alpha()]
@@ -186,8 +249,14 @@ mod tests {
     #[test]
     fn variables_resolve_through_their_fallbacks() {
         let svg = r##"<svg style="--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);" fill="var(--_fg)"><rect fill="var(--_bg)" stroke="var(--unknown)"/></svg>"##;
-        assert_eq!(resolve_vars(svg, &[]), r##"<svg style="" fill="#1f1f1f"><rect fill="#fff" stroke="var(--unknown)"/></svg>"##);
-        assert_eq!(resolve_vars(svg, &[("--pele-fg", "#eee".into())]), r##"<svg style="" fill="#eee"><rect fill="#fff" stroke="var(--unknown)"/></svg>"##);
+        assert_eq!(
+            resolve_vars(svg, &[]),
+            r##"<svg style="" fill="#1f1f1f"><rect fill="#fff" stroke="var(--unknown)"/></svg>"##
+        );
+        assert_eq!(
+            resolve_vars(svg, &[("--pele-fg", "#eee".into())]),
+            r##"<svg style="" fill="#eee"><rect fill="#fff" stroke="var(--unknown)"/></svg>"##
+        );
     }
 
     #[test]
@@ -198,7 +267,12 @@ mod tests {
 
     #[test]
     fn a_runtime_past_its_deadline_is_stopped() {
-        let child = Command::new("sh").args(["-c", "sleep 5"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().expect("sh runs");
+        let child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sh runs");
         let start = Instant::now();
         assert_eq!(finish(child, "", Duration::from_millis(100)), None);
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -206,7 +280,12 @@ mod tests {
 
     #[test]
     fn a_runtime_that_finishes_returns_its_output() {
-        let child = Command::new("sh").args(["-c", "cat"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().expect("sh runs");
+        let child = Command::new("sh")
+            .args(["-c", "cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sh runs");
         assert_eq!(finish(child, "svg", DEADLINE).as_deref(), Some("svg"));
     }
 
@@ -215,4 +294,3 @@ mod tests {
         assert_eq!(js_string("a\"b\\c\nd"), r#""a\"b\\c\u000ad""#);
     }
 }
-

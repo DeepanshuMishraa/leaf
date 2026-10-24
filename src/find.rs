@@ -15,11 +15,17 @@ fn fold(c: char) -> char {
 impl Query {
     /// `None` for a query of nothing but whitespace.
     pub fn new(typed: &str) -> Option<Query> {
-        let words: Vec<String> = typed.split_whitespace().map(|w| w.chars().map(fold).collect()).collect();
+        let words: Vec<String> = typed
+            .split_whitespace()
+            .map(|w| w.chars().map(fold).collect())
+            .collect();
         if words.is_empty() {
             return None;
         }
-        Some(Query { typed: typed.trim().to_owned(), folded: words.join(" ").chars().collect() })
+        Some(Query {
+            typed: typed.trim().to_owned(),
+            folded: words.join(" ").chars().collect(),
+        })
     }
 
     /// The query as typed, trimmed.
@@ -74,7 +80,9 @@ mod tests {
     }
 
     fn found(query: &str, text: &str) -> Vec<(usize, usize)> {
-        Query::new(query).expect("query has text").matches(&chars(text))
+        Query::new(query)
+            .expect("query has text")
+            .matches(&chars(text))
     }
 
     #[test]
@@ -84,12 +92,18 @@ mod tests {
 
     #[test]
     fn matching_ignores_case_and_finds_every_occurrence() {
-        assert_eq!(found("raft", "Raft and RAFT, not rafters? raft"), vec![(0, 4), (9, 13), (19, 23), (28, 32)]);
+        assert_eq!(
+            found("raft", "Raft and RAFT, not rafters? raft"),
+            vec![(0, 4), (9, 13), (19, 23), (28, 32)]
+        );
     }
 
     #[test]
     fn a_space_matches_a_line_break_or_several_spaces() {
-        assert_eq!(found("total  order", "Total\norder and total   order"), vec![(0, 11), (16, 29)]);
+        assert_eq!(
+            found("total  order", "Total\norder and total   order"),
+            vec![(0, 11), (16, 29)]
+        );
     }
 
     #[test]
@@ -104,6 +118,9 @@ mod tests {
 
     #[test]
     fn the_typed_query_is_kept_trimmed() {
-        assert_eq!(Query::new("  Leader Election ").map(|q| q.typed().to_owned()), Some("Leader Election".to_owned()));
+        assert_eq!(
+            Query::new("  Leader Election ").map(|q| q.typed().to_owned()),
+            Some("Leader Election".to_owned())
+        );
     }
 }

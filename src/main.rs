@@ -11,6 +11,7 @@ mod mono;
 mod pdf;
 mod progress;
 mod render;
+mod syntax;
 mod viewer;
 
 use std::cell::RefCell;
@@ -55,13 +56,19 @@ fn load(target: &str) -> Result<Doc, String> {
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(Path::new(target)).map_err(|e| e.to_string());
     }
-    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."))
+    Err(format!(
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."
+    ))
 }
 
 /// Remembers the image mode, each document's highlights and bookmarks, and where each
 /// document (file or link) was left, so they come back next time. Progress that can't
 /// be read or saved is reported after the reader closes; reading goes on.
-fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<String>>>) -> ViewerOptions {
+fn resume(
+    target: &str,
+    page_count: Option<usize>,
+    failure: &Rc<RefCell<Option<String>>>,
+) -> ViewerOptions {
     let store = match Store::open(&progress::default_path()) {
         Ok(store) => Rc::new(RefCell::new(store)),
         Err(e) => {
@@ -80,7 +87,9 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
     let key = if is_url(target) {
         target.to_owned()
     } else {
-        std::fs::canonicalize(target).map(|p| p.display().to_string()).unwrap_or_else(|_| target.to_owned())
+        std::fs::canonicalize(target)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| target.to_owned())
     };
 
     let mut options = ViewerOptions::default();
@@ -95,7 +104,9 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
     if let Some(count) = page_count {
         // A bookmark past the end was made in a longer copy of the file; it points nowhere now.
         match store.borrow().load_bookmarks(&key) {
-            Ok(bookmarks) => options.bookmarks = bookmarks.into_iter().filter(|b| b.page < count).collect(),
+            Ok(bookmarks) => {
+                options.bookmarks = bookmarks.into_iter().filter(|b| b.page < count).collect()
+            }
             Err(e) => record(Err(e)),
         }
     }
@@ -124,8 +135,14 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
         Box::new(move |bookmarks| record(store.borrow_mut().save_bookmarks(&key, bookmarks)))
     };
     match page_count {
-        Some(count) => options.on_page = Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count)))),
-        None => options.on_scroll = Box::new(move |scroll| record(store.borrow().save_scroll(&key, scroll))),
+        Some(count) => {
+            options.on_page =
+                Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count))))
+        }
+        None => {
+            options.on_scroll =
+                Box::new(move |scroll| record(store.borrow().save_scroll(&key, scroll)))
+        }
     }
     options
 }
@@ -141,6 +158,7 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
+    std::thread::spawn(syntax::warm);
     let doc = match load(target) {
         Ok(doc) => doc,
         Err(message) => {
@@ -157,7 +175,9 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("leaf: the terminal failed ({e}). Your place and highlights up to now are saved.");
+            eprintln!(
+                "leaf: the terminal failed ({e}). Your place and highlights up to now are saved."
+            );
             ExitCode::from(1)
         }
     }
