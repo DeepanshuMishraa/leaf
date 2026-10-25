@@ -1,6 +1,6 @@
 # leaf
 
-Read PDFs, markdown files and web articles in the terminal.
+Read PDFs, markdown files and web articles in the terminal, and review diffs.
 
 ```sh
 cargo install leaf-reader   # installs the `leaf` command to ~/.cargo/bin
@@ -40,6 +40,28 @@ Markdown files (`.md`, `.markdown`) show as written, with GitHub's extensions: t
 Code is colored with [Highlights](https://diffs.com/highlights), whose lexers are WebAssembly. A fence's language is used. PDF and EPUB blocks have no language, so they are colored only when the source is clearly one language; anything uncertain stays plain. Colors are the terminal's own palette.
 
 Images use the Kitty, iTerm2 or Sixel graphics protocol, whichever the terminal answers to, and fall back to colored half blocks.
+
+## Diffs
+
+`leaf diff` shows the working tree's changes. Pass a path, revision, range, patch file or GitHub link to review something else:
+
+```sh
+leaf diff                          # unstaged changes
+leaf diff --staged                 # staged changes
+leaf diff --branch                 # this branch against its base
+leaf diff main...HEAD              # any revision or range
+leaf diff src/viewer.rs            # one file
+leaf diff changes.patch            # a .diff or .patch file, anywhere
+leaf diff https://github.com/owner/repo/pull/12
+```
+
+Local diffs need a Git repository. A patch file and a GitHub pull request, commit or comparison link open without one. `o` flips between the working tree and the base branch, and `r` reloads.
+
+Only the rows on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The gutter shows both line numbers; added and removed lines are tinted across the width, with the changed words picked out.
+
+Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `[`/`]` files, `g/G` first/last. `v` starts a selection and moving extends it, `c` comments on it. Type the comment and press enter to paste it into an agent running in another tmux pane; `alt+enter` adds a line and `esc` keeps a draft. The paste is the path and line range, the patch lines in a fenced block, then the comment. `C` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment.
+
+An agent pane is found from `LEAF_AGENT_PANE=%3`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini` or another known agent. Pasting is bracketed, so it fills the prompt without submitting it. With no agent or no tmux, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
 Built in Rust with ratatui and mupdf.
 

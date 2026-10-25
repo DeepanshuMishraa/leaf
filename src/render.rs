@@ -252,7 +252,7 @@ fn fence_lang(info: &str) -> Option<String> {
     Some(name.to_owned())
 }
 
-fn code_style(kind: syntax::Kind) -> Style {
+pub(crate) fn code_style(kind: syntax::Kind) -> Style {
     match kind {
         syntax::Kind::Plain => Style::default(),
         syntax::Kind::Comment => Style::default().fg(DIM).add_modifier(Modifier::ITALIC),

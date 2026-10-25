@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::comment::{Anchor, Comment, Side, State};
 use crate::highlight::Highlight;
 
 /// Where a reader is in a paged document. `page` is 1-based.
@@ -114,7 +115,19 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   page INTEGER NOT NULL,
   label TEXT NOT NULL,
   PRIMARY KEY (key, page)
-)";
+);
+CREATE TABLE IF NOT EXISTS diff_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT NOT NULL,
+  file TEXT NOT NULL,
+  side TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS diff_comments_key ON diff_comments (key)";
 
 /// A page the reader marked to come back to. `page` is 0-based; `label` is
 /// the start of the page's text, so the list says what's there.
@@ -122,6 +135,13 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 pub struct Bookmark {
     pub page: usize,
     pub label: String,
+}
+
+/// A review comment and the row it can be changed or removed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedComment {
+    pub id: i64,
+    pub comment: Comment,
 }
 
 /// Saved reading places and highlights, per document key (a PDF's real path
@@ -379,6 +399,98 @@ impl Store {
         }
         tx.commit().map_err(failed)
     }
+
+    pub fn load_diff_comments(&self, key: &str) -> Result<Vec<SavedComment>, StoreFailed> {
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT id, file, side, start_line, end_line, body, state
+                 FROM diff_comments WHERE key = ? ORDER BY id",
+            )
+            .map_err(self.failed(Operation::Read))?;
+        let rows = query
+            .query_map([key], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(self.failed(Operation::Read))?;
+        let mut comments = Vec::new();
+        for row in rows {
+            let (id, file, side, start, end, body, state) =
+                row.map_err(self.failed(Operation::Read))?;
+            // Rows written by another version are skipped, not guessed at.
+            let (Some(side), Some(state), Some(start), Some(end)) = (
+                Side::parse(&side),
+                State::parse(&state),
+                count(start),
+                count(end),
+            ) else {
+                continue;
+            };
+            if start == 0 || end < start {
+                continue;
+            }
+            comments.push(SavedComment {
+                id,
+                comment: Comment {
+                    anchor: Anchor {
+                        file,
+                        side,
+                        start_line: start as u32,
+                        end_line: end as u32,
+                    },
+                    body,
+                    state,
+                },
+            });
+        }
+        Ok(comments)
+    }
+
+    pub fn insert_diff_comment(&self, key: &str, comment: &Comment) -> Result<i64, StoreFailed> {
+        self.db
+            .execute(
+                "INSERT INTO diff_comments
+                   (key, file, side, start_line, end_line, body, state, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    key,
+                    comment.anchor.file,
+                    comment.anchor.side.as_str(),
+                    comment.anchor.start_line as i64,
+                    comment.anchor.end_line as i64,
+                    comment.body,
+                    comment.state.as_str(),
+                    now()
+                ],
+            )
+            .map_err(self.failed(Operation::Save))?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn set_diff_comment_state(&self, id: i64, state: State) -> Result<(), StoreFailed> {
+        self.db
+            .execute(
+                "UPDATE diff_comments SET state = ? WHERE id = ?",
+                params![state.as_str(), id],
+            )
+            .map(drop)
+            .map_err(self.failed(Operation::Save))
+    }
+
+    pub fn delete_diff_comment(&self, id: i64) -> Result<(), StoreFailed> {
+        self.db
+            .execute("DELETE FROM diff_comments WHERE id = ?", [id])
+            .map(drop)
+            .map_err(self.failed(Operation::Save))
+    }
 }
 
 #[cfg(test)]
@@ -534,5 +646,29 @@ mod tests {
         assert_eq!(store.load_image_mode().unwrap(), None);
         store.save_image_mode(ImageMode::Mono).unwrap();
         assert_eq!(store.load_image_mode().unwrap(), Some(ImageMode::Mono));
+    }
+
+    #[test]
+    fn diff_comments_keep_their_anchor_and_state() {
+        let store = memory();
+        let comment = Comment {
+            anchor: Anchor {
+                file: "src/main.rs".into(),
+                side: Side::New,
+                start_line: 12,
+                end_line: 14,
+            },
+            body: "Why skip?".into(),
+            state: State::Draft,
+        };
+        let id = store.insert_diff_comment("diff:a", &comment).unwrap();
+        assert_eq!(store.load_diff_comments("diff:a").unwrap().len(), 1);
+        store.set_diff_comment_state(id, State::Github).unwrap();
+        let saved = store.load_diff_comments("diff:a").unwrap();
+        assert_eq!(saved[0].comment.state, State::Github);
+        assert_eq!(saved[0].comment.label(), "src/main.rs L12-L14");
+        assert!(store.load_diff_comments("diff:b").unwrap().is_empty());
+        store.delete_diff_comment(id).unwrap();
+        assert!(store.load_diff_comments("diff:a").unwrap().is_empty());
     }
 }

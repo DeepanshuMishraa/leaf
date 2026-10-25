@@ -1755,7 +1755,7 @@ impl App {
 
 /// Asks the terminal for its text (OSC 10) or background (OSC 11) color, so
 /// painted images and diagrams match the text.
-fn query_color(code: u8) -> Option<Rgb> {
+pub(crate) fn query_color(code: u8) -> Option<Rgb> {
     let mut out = io::stdout();
     write!(out, "\x1b]{code};?\x1b\\").ok()?;
     out.flush().ok()?;
