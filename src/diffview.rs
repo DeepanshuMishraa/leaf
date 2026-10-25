@@ -21,12 +21,12 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::agent;
 use crate::comment::{Anchor, Comment, Side, State};
-use crate::diff::{self, Diff, Kind as RowKind, Loaded, Request};
+use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
 use crate::github;
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::render::DIM;
@@ -35,7 +35,6 @@ use crate::syntax;
 const ACCENT: Color = Color::Indexed(12);
 const ADDED_FG: Color = Color::Indexed(2);
 const REMOVED_FG: Color = Color::Indexed(1);
-const NOTE: Color = Color::Indexed(3);
 /// How many hunks may be lexed in one frame; the rest stay plain until the
 /// reader pauses. Keeps a fast scroll from spending the frame in the lexer.
 const HIGHLIGHT_BUDGET: u8 = 1;
@@ -45,8 +44,6 @@ const HIGHLIGHT_CACHE: usize = 64;
 const HIGHLIGHT_BYTES: usize = 128 * 1024;
 /// How many rows one wheel notch moves.
 const WHEEL_ROWS: usize = 3;
-/// Width below which only one line-number column fits.
-const FULL_GUTTER_MIN: u16 = 60;
 
 /// Warm backgrounds chosen for the terminal's paper, so text keeps its contrast.
 struct Palette {
@@ -55,6 +52,8 @@ struct Palette {
     added_word: Color,
     removed_word: Color,
     file: Color,
+    focus: Color,
+    cursor: Color,
 }
 
 impl Palette {
@@ -77,6 +76,8 @@ impl Palette {
                 added_word: Color::Indexed(157),
                 removed_word: Color::Indexed(217),
                 file: Color::Indexed(254),
+                focus: Color::Indexed(153),
+                cursor: Color::Indexed(253),
             }
         } else {
             Palette {
@@ -85,6 +86,8 @@ impl Palette {
                 added_word: Color::Indexed(28),
                 removed_word: Color::Indexed(88),
                 file: Color::Indexed(236),
+                focus: Color::Indexed(24),
+                cursor: Color::Indexed(237),
             }
         }
     }
@@ -101,6 +104,8 @@ impl Palette {
             added_word: Color::Indexed(28),
             removed_word: Color::Indexed(88),
             file: Color::Indexed(236),
+            focus: Color::Indexed(24),
+            cursor: Color::Indexed(237),
         }
     }
 }
@@ -127,6 +132,7 @@ impl Default for Options {
 enum DialogKind {
     Help,
     Comments,
+    Files,
     Error,
     Confirm,
     Loading,
@@ -144,6 +150,7 @@ enum Dialog {
     None,
     Help,
     Comments { selected: usize },
+    Files { selected: usize },
     Error(String),
     Confirm(Confirm),
     Loading(String),
@@ -155,6 +162,7 @@ impl Dialog {
             Dialog::None => unreachable!(),
             Dialog::Help => DialogKind::Help,
             Dialog::Comments { .. } => DialogKind::Comments,
+            Dialog::Files { .. } => DialogKind::Files,
             Dialog::Error(_) => DialogKind::Error,
             Dialog::Confirm(_) => DialogKind::Confirm,
             Dialog::Loading(_) => DialogKind::Loading,
@@ -225,13 +233,207 @@ enum Done {
 /// Sends comment text to an agent, returning the pane it reached.
 type Deliver = Box<dyn FnMut(&str) -> Result<agent::Agent, agent::AgentFailed>>;
 
+/// One line on screen in the split view. Changed blocks are paired left-to-right;
+/// headings and notes span both sides.
+#[derive(Debug, Clone, Copy)]
+struct SplitRow {
+    left: Option<usize>,
+    right: Option<usize>,
+    band: Option<usize>,
+}
+
+/// What a split line is going through this frame.
+#[derive(Clone, Copy)]
+struct SideState {
+    current: bool,
+    selected: bool,
+    focused: bool,
+}
+
+impl SplitRow {
+    fn is_content(self) -> bool {
+        self.left.is_some() || self.right.is_some()
+    }
+
+    /// The side the cursor and a new comment prefer: the new side.
+    fn focus_row(self) -> Option<usize> {
+        self.right.or(self.left).or(self.band)
+    }
+
+    fn rows(self) -> impl Iterator<Item = usize> {
+        [self.left, self.right, self.band].into_iter().flatten()
+    }
+
+    fn first_row(self) -> Option<usize> {
+        self.rows().min()
+    }
+
+    fn last_row(self) -> Option<usize> {
+        self.rows().max()
+    }
+}
+
+/// The split view's lines, and the line each diff row is drawn on.
+struct Split {
+    lines: Vec<SplitRow>,
+    line_of_row: Vec<usize>,
+}
+
+impl Split {
+    fn new(diff: &Diff) -> Self {
+        let rows = diff.rows();
+        let mut lines = Vec::new();
+        let mut line_of_row = vec![0; rows.len()];
+        let mut push = |line: SplitRow, line_of_row: &mut Vec<usize>| {
+            let index = lines.len();
+            for row in line.rows() {
+                if let Some(slot) = line_of_row.get_mut(row) {
+                    *slot = index;
+                }
+            }
+            lines.push(line);
+        };
+        let mut at = 0;
+        while at < rows.len() {
+            match rows[at].kind {
+                RowKind::Context => {
+                    push(
+                        SplitRow {
+                            left: Some(at),
+                            right: Some(at),
+                            band: None,
+                        },
+                        &mut line_of_row,
+                    );
+                    at += 1;
+                }
+                RowKind::Removed => {
+                    let old_start = at;
+                    while at < rows.len() && rows[at].kind == RowKind::Removed {
+                        at += 1;
+                    }
+                    let new_start = at;
+                    while at < rows.len() && rows[at].kind == RowKind::Added {
+                        at += 1;
+                    }
+                    let old = new_start - old_start;
+                    let new = at - new_start;
+                    for pair in 0..old.max(new) {
+                        push(
+                            SplitRow {
+                                left: (pair < old).then_some(old_start + pair),
+                                right: (pair < new).then_some(new_start + pair),
+                                band: None,
+                            },
+                            &mut line_of_row,
+                        );
+                    }
+                }
+                RowKind::Added => {
+                    let start = at;
+                    while at < rows.len() && rows[at].kind == RowKind::Added {
+                        at += 1;
+                    }
+                    for row in start..at {
+                        push(
+                            SplitRow {
+                                left: None,
+                                right: Some(row),
+                                band: None,
+                            },
+                            &mut line_of_row,
+                        );
+                    }
+                }
+                RowKind::File | RowKind::Hunk | RowKind::Meta | RowKind::NoNewline => {
+                    push(
+                        SplitRow {
+                            left: None,
+                            right: None,
+                            band: Some(at),
+                        },
+                        &mut line_of_row,
+                    );
+                    at += 1;
+                }
+            }
+        }
+        Split { lines, line_of_row }
+    }
+
+    fn lines(&self) -> &[SplitRow] {
+        &self.lines
+    }
+
+    fn line_for_row(&self, row: usize) -> Option<usize> {
+        self.line_of_row.get(row).copied()
+    }
+
+    /// The display lines for a pair of diff rows, in reading order.
+    fn lines_for_rows(&self, first: usize, last: usize) -> Option<(usize, usize)> {
+        let first = self.line_for_row(first)?;
+        let last = self.line_for_row(last)?;
+        Some((first.min(last), first.max(last)))
+    }
+
+    /// The diff rows a range of display lines covers.
+    fn rows_between(&self, first: usize, last: usize) -> Option<(usize, usize)> {
+        let (first, last) = (first.min(last), first.max(last));
+        let mut rows = self.lines.get(first..=last)?.iter().flat_map(|line| {
+            let start = line.first_row();
+            let end = line.last_row();
+            start.into_iter().chain(end)
+        });
+        let first = rows.next()?;
+        Some(rows.fold((first, first), |(low, high), row| {
+            (low.min(row), high.max(row))
+        }))
+    }
+
+    fn first_content(&self) -> Option<usize> {
+        self.lines.iter().position(|line| line.is_content())
+    }
+
+    fn last_content(&self) -> Option<usize> {
+        self.lines.iter().rposition(|line| line.is_content())
+    }
+
+    fn next_content(&self, line: usize, forward: bool) -> Option<usize> {
+        if forward {
+            (line + 1..self.lines.len()).find(|&i| self.lines[i].is_content())
+        } else {
+            (0..line.min(self.lines.len()))
+                .rev()
+                .find(|&i| self.lines[i].is_content())
+        }
+    }
+
+    fn snap(&self, line: usize) -> usize {
+        if self.lines.get(line).is_some_and(|line| line.is_content()) {
+            return line;
+        }
+        self.next_content(line, true)
+            .or_else(|| self.next_content(line, false))
+            .unwrap_or(line.min(self.lines.len().saturating_sub(1)))
+    }
+}
+
 struct App {
     loaded: Loaded,
     palette: Palette,
+    /// The split line the cursor is on.
     cursor: usize,
+    /// First split line on screen.
     scroll: usize,
     left: u16,
+    /// The split line where a visual selection started.
     selection: Option<usize>,
+    /// Vim-style visual mode: movement extends the selection. Leaving visual
+    /// mode keeps the range so `C` can still comment on it.
+    visual: bool,
+    /// The split lines of the comment just jumped to, highlighted until the
+    /// reader moves.
+    focus: Option<(usize, usize)>,
     drag_origin: Option<usize>,
     composer: Option<Composer>,
     dialog: Dialog,
@@ -245,7 +447,8 @@ struct App {
     job: Option<Job>,
     copy: Option<String>,
     quit: bool,
-    /// The diff's rows on screen.
+    split: Split,
+    /// The diff's lines on screen.
     view: Rect,
     /// Rows inside the comment box, for moving the cursor.
     composer_view: u16,
@@ -256,7 +459,8 @@ struct App {
 
 impl App {
     fn new(loaded: Loaded, options: Options) -> Self {
-        let cursor = loaded.diff.first_row().unwrap_or(0);
+        let split = Split::new(&loaded.diff);
+        let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
         let mut app = App {
             loaded,
@@ -265,6 +469,8 @@ impl App {
             scroll: 0,
             left: 0,
             selection: None,
+            visual: false,
+            focus: None,
             drag_origin: None,
             composer: None,
             dialog: Dialog::None,
@@ -277,6 +483,7 @@ impl App {
             job: None,
             copy: None,
             quit: false,
+            split,
             view: Rect::default(),
             composer_view: 0,
             highlight: HashMap::new(),
@@ -402,15 +609,18 @@ impl App {
                     let same_key = loaded.key == self.key;
                     self.loaded = loaded;
                     self.key = self.loaded.key.clone();
+                    self.split = Split::new(&self.loaded.diff);
                     if !same_key {
                         self.load_comments();
                     }
                     self.cursor = remember
                         .and_then(|(file, side, line)| self.loaded.diff.row_for(&file, side, line))
-                        .or_else(|| self.loaded.diff.first_row())
+                        .and_then(|row| self.split.line_for_row(row))
+                        .or_else(|| self.split.first_content())
                         .unwrap_or(0);
                     self.scroll = self.cursor.saturating_sub(self.view.height as usize / 2);
                     self.selection = None;
+                    self.focus = None;
                     self.composer = None;
                     self.left = 0;
                     self.highlight.clear();
@@ -573,8 +783,9 @@ fn payload(diff: &Diff, anchor: &Anchor, first: usize, last: usize, body: &str) 
 
 enum Edit {
     None,
-    Send,
-    Draft,
+    Save,
+    Cancel,
+    Agent,
     Github,
 }
 
@@ -702,6 +913,7 @@ impl Composer {
     fn edit(&mut self, key: KeyEvent) -> Edit {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
+                KeyCode::Enter => Edit::Agent,
                 KeyCode::Char('g') => Edit::Github,
                 KeyCode::Char('j') => {
                     self.insert("\n");
@@ -724,8 +936,8 @@ impl Composer {
                 self.insert("\n");
                 Edit::None
             }
-            KeyCode::Enter => Edit::Send,
-            KeyCode::Esc => Edit::Draft,
+            KeyCode::Enter => Edit::Save,
+            KeyCode::Esc => Edit::Cancel,
             KeyCode::Backspace => {
                 self.backspace();
                 Edit::None
@@ -781,7 +993,14 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => {
+                if self.visual {
+                    self.visual = false;
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(false),
@@ -797,9 +1016,10 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.go_edge(true),
             KeyCode::Char(']') | KeyCode::Char('n') => self.next_file(true),
             KeyCode::Char('[') | KeyCode::Char('N') => self.next_file(false),
+            KeyCode::Char('F') | KeyCode::Char('f') => self.show_files(),
             KeyCode::Char('v') => self.toggle_selection(),
-            KeyCode::Char('c') => self.compose(),
-            KeyCode::Char('C') => self.show_comments(),
+            KeyCode::Char('C') => self.compose(),
+            KeyCode::Char('m') => self.show_comments(),
             KeyCode::Char('y') => self.copy_payload(false),
             KeyCode::Char('Y') => self.copy_payload(true),
             KeyCode::Char('o') => self.other_side(),
@@ -823,8 +1043,9 @@ impl App {
         };
         match action {
             Edit::None => {}
-            Edit::Send => self.send_to_agent(),
-            Edit::Draft => self.save_draft(),
+            Edit::Save => self.save_comment(),
+            Edit::Cancel => self.cancel_composer(),
+            Edit::Agent => self.send_to_agent(),
             Edit::Github => self.ask_github(),
         }
     }
@@ -832,6 +1053,7 @@ impl App {
     fn dialog_key(&mut self, key: KeyEvent) {
         match self.dialog_kind() {
             Some(DialogKind::Comments) => self.comments_key(key),
+            Some(DialogKind::Files) => self.files_key(key),
             Some(DialogKind::Confirm) => self.confirm_key(key),
             Some(DialogKind::Loading) => {}
             Some(DialogKind::Help | DialogKind::Error) | None => {
@@ -857,7 +1079,7 @@ impl App {
 
     fn comments_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => self.dialog = Dialog::None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => self.dialog = Dialog::None,
             KeyCode::Down | KeyCode::Char('j') => {
                 let last = self.comments.len().saturating_sub(1);
                 if let Dialog::Comments { selected } = &mut self.dialog {
@@ -934,18 +1156,22 @@ impl App {
         };
         match mouse.kind {
             MouseEventKind::ScrollDown => {
+                self.clear_selection_on_move();
                 self.scroll = (self.scroll + WHEEL_ROWS).min(self.max_scroll());
                 self.cursor = self.snap(self.cursor.max(self.scroll));
             }
             MouseEventKind::ScrollUp => {
+                self.clear_selection_on_move();
                 self.scroll = self.scroll.saturating_sub(WHEEL_ROWS);
                 self.cursor = self.snap(self.cursor.min(self.scroll + self.view.height as usize));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(row) = row_at(mouse.row)
-                    && row < self.loaded.diff.rows().len()
+                    && row < self.split.lines().len()
                 {
                     let row = self.snap(row);
+                    self.visual = false;
+                    self.focus = None;
                     self.cursor = row;
                     self.selection = None;
                     self.drag_origin = Some(row);
@@ -954,7 +1180,7 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(origin) = self.drag_origin
                     && let Some(row) = row_at(mouse.row)
-                    && row < self.loaded.diff.rows().len()
+                    && row < self.split.lines().len()
                 {
                     self.selection = Some(origin);
                     self.cursor = self.snap(row);
@@ -983,38 +1209,55 @@ impl App {
     }
 
     fn max_scroll(&self) -> usize {
-        self.loaded
-            .diff
-            .rows()
+        self.split
+            .lines()
             .len()
             .saturating_sub(self.view.height as usize)
     }
 
-    fn snap(&self, row: usize) -> usize {
-        let diff = &self.loaded.diff;
-        if diff.rows().get(row).is_some_and(|r| r.kind.is_content()) {
-            return row;
+    /// The diff row the cursor is anchored to.
+    fn current_row(&self) -> Option<usize> {
+        self.split
+            .lines()
+            .get(self.cursor)
+            .and_then(|line| line.focus_row())
+    }
+
+    fn current_file(&self) -> Option<usize> {
+        self.current_row()
+            .and_then(|row| self.loaded.diff.file_index(row))
+    }
+
+    fn snap(&self, line: usize) -> usize {
+        self.split.snap(line)
+    }
+
+    /// A retained selection ends when the reader moves on; in visual mode the
+    /// selection stays and the movement extends it.
+    fn clear_selection_on_move(&mut self) {
+        self.focus = None;
+        if !self.visual {
+            self.selection = None;
         }
-        diff.next_content(row, true)
-            .or_else(|| diff.next_content(row, false))
-            .unwrap_or(row.min(diff.rows().len().saturating_sub(1)))
     }
 
     fn move_cursor(&mut self, forward: bool) {
-        if let Some(next) = self.loaded.diff.next_content(self.cursor, forward) {
+        self.clear_selection_on_move();
+        if let Some(next) = self.split.next_content(self.cursor, forward) {
             self.cursor = next;
         }
         self.follow_cursor();
     }
 
     fn page(&mut self, forward: bool, half: bool) {
+        self.clear_selection_on_move();
         let step = (self.view.height as usize).max(1);
         let step = if half {
             (step / 2).max(1)
         } else {
             step.saturating_sub(1).max(1)
         };
-        let last = self.loaded.diff.rows().len().saturating_sub(1);
+        let last = self.split.lines().len().saturating_sub(1);
         let target = if forward {
             (self.cursor + step).min(last)
         } else {
@@ -1025,33 +1268,91 @@ impl App {
     }
 
     fn go_edge(&mut self, end: bool) {
-        let diff = &self.loaded.diff;
+        self.clear_selection_on_move();
         self.cursor = if end {
-            diff.last_row()
+            self.split.last_content()
         } else {
-            diff.first_row()
+            self.split.first_content()
         }
         .unwrap_or(0);
         self.follow_cursor();
     }
 
     fn next_file(&mut self, forward: bool) {
+        self.clear_selection_on_move();
         let diff = &self.loaded.diff;
         if diff.files().is_empty() {
             return;
         }
-        let current = diff.file_index(self.cursor).unwrap_or(0);
+        let current = self.current_file().unwrap_or(0);
         let index = if forward {
             (current + 1) % diff.files().len()
         } else {
             (current + diff.files().len() - 1) % diff.files().len()
         };
         let count = diff.files().len();
-        if let Some(row) = diff.first_content(index) {
-            self.cursor = row;
-            self.selection = Some(row);
+        self.jump_file(index);
+        self.toast(format!("{} of {count}", index + 1));
+    }
+
+    fn jump_file(&mut self, index: usize) {
+        let line = self
+            .loaded
+            .diff
+            .first_content(index)
+            .and_then(|row| self.split.line_for_row(row));
+        if let Some(line) = line {
+            self.visual = false;
+            self.selection = None;
+            self.focus = None;
+            self.cursor = line;
             self.follow_cursor();
-            self.toast(format!("{} of {count}", index + 1));
+        }
+    }
+
+    fn show_files(&mut self) {
+        if self.loaded.diff.files().is_empty() {
+            self.toast("This diff has no files");
+            return;
+        }
+        let selected = self.current_file().unwrap_or(0);
+        self.dialog = Dialog::Files { selected };
+    }
+
+    fn files_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('F') | KeyCode::Char('f') => {
+                self.dialog = Dialog::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let last = self.loaded.diff.files().len().saturating_sub(1);
+                if let Dialog::Files { selected } = &mut self.dialog {
+                    *selected = (*selected + 1).min(last);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Dialog::Files { selected } = &mut self.dialog {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                if let Dialog::Files { selected } = &mut self.dialog {
+                    *selected = 0;
+                }
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                let last = self.loaded.diff.files().len().saturating_sub(1);
+                if let Dialog::Files { selected } = &mut self.dialog {
+                    *selected = last;
+                }
+            }
+            KeyCode::Enter => {
+                if let Dialog::Files { selected } = self.dialog {
+                    self.dialog = Dialog::None;
+                    self.jump_file(selected);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1068,13 +1369,28 @@ impl App {
         self.scroll = self.scroll.min(self.max_scroll());
     }
 
+    /// Keeps a whole highlighted range on screen, not only its cursor.
+    fn follow_focus(&mut self, first: usize, last: usize) {
+        let height = self.view.height as usize;
+        if height == 0 {
+            return;
+        }
+        if last >= first + height || first < self.scroll {
+            self.scroll = first;
+        } else if last >= self.scroll + height {
+            self.scroll = last + 1 - height;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
     fn toggle_selection(&mut self) {
-        if self.selection.is_some() {
+        self.focus = None;
+        if self.visual {
+            self.visual = false;
             self.selection = None;
-            self.toast("Selection cleared");
         } else {
+            self.visual = true;
             self.selection = Some(self.cursor);
-            self.toast("Selecting: move to extend, c to comment, Esc to clear");
         }
     }
 
@@ -1085,15 +1401,22 @@ impl App {
 
     fn compose(&mut self) {
         let (start, end) = self.range();
-        match self.loaded.diff.comment_range(start, end) {
+        let rows = self.split.rows_between(start, end);
+        let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
+        match range {
             Some((first, last, anchor)) => {
-                self.cursor = last;
-                self.selection = Some(first);
+                let lines = self.split.lines_for_rows(first, last);
+                self.visual = false;
+                self.focus = None;
+                if let Some((first_line, last_line)) = lines {
+                    self.cursor = last_line;
+                    self.selection = Some(first_line);
+                    self.follow_focus(first_line, last_line);
+                }
                 self.composer = Some(Composer::new(anchor, first, last));
-                self.follow_cursor();
             }
             None => self.fail(
-                "That range has no code line to comment on. Move to a line that changed, then press c.",
+                "That range has no code line to comment on. Move to a line that changed, then press C.",
             ),
         }
     }
@@ -1123,7 +1446,7 @@ impl App {
         match (self.deliver)(&text) {
             Ok(agent) => {
                 self.add_comment(comment);
-                self.selection = Some(composer.first);
+                self.selection = self.split.line_for_row(composer.first);
                 self.toast(format!("Pasted into {}", agent.describe()));
             }
             Err(e) => {
@@ -1137,13 +1460,14 @@ impl App {
         }
     }
 
-    fn save_draft(&mut self) {
+    fn save_comment(&mut self) {
         let Some(composer) = self.composer.take() else {
             return;
         };
         let body = composer.body();
         if body.is_empty() {
-            self.toast("Empty comment discarded");
+            self.composer = Some(composer);
+            self.toast("Write something first, or press Esc to cancel");
             return;
         }
         self.add_comment(Comment {
@@ -1151,7 +1475,13 @@ impl App {
             body,
             state: State::Draft,
         });
-        self.toast("Draft saved: C lists comments");
+        self.toast("Comment saved: m lists comments");
+    }
+
+    fn cancel_composer(&mut self) {
+        if self.composer.take().is_some() {
+            self.toast("Comment discarded");
+        }
     }
 
     fn ask_github(&mut self) {
@@ -1271,28 +1601,39 @@ impl App {
 
     fn show_comments(&mut self) {
         if self.comments.is_empty() {
-            self.toast("No comments yet: select lines with v, then press c");
+            self.toast("No comments yet: select lines with v, then press C");
             return;
         }
         self.dialog = Dialog::Comments { selected: 0 };
     }
 
     fn jump_to(&mut self, anchor: &Anchor) {
-        if let Some(row) = self
-            .loaded
-            .diff
-            .row_for(&anchor.file, anchor.side, anchor.start_line)
-        {
-            self.cursor = row;
-            self.selection = Some(row);
-            self.follow_cursor();
-            self.toast(anchor.label());
-        } else {
+        let diff = &self.loaded.diff;
+        let Some(first) = diff.row_for(&anchor.file, anchor.side, anchor.start_line) else {
             self.fail(format!(
                 "{} is not in this diff. Reload with r, then try again.",
                 anchor.label()
             ));
-        }
+            return;
+        };
+        let last = diff
+            .row_for(&anchor.file, anchor.side, anchor.end_line)
+            .unwrap_or(first)
+            .max(first);
+        let lines = self.split.lines_for_rows(first, last);
+        let Some((first, last)) = lines else {
+            self.fail(format!(
+                "{} is not in this diff. Reload with r, then try again.",
+                anchor.label()
+            ));
+            return;
+        };
+        self.visual = false;
+        self.cursor = first;
+        self.selection = Some(first);
+        self.focus = Some((first, last));
+        self.follow_focus(first, last);
+        self.toast(anchor.label());
     }
 
     fn copy_payload(&mut self, all: bool) {
@@ -1334,7 +1675,9 @@ impl App {
             return;
         }
         let (start, end) = self.range();
-        if let Some((first, last, anchor)) = self.loaded.diff.comment_range(start, end) {
+        let rows = self.split.rows_between(start, end);
+        let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
+        if let Some((first, last, anchor)) = range {
             self.copy = Some(payload(&self.loaded.diff, &anchor, first, last, ""));
             self.toast(format!("Copied {} {}", anchor.file, anchor.range_label()));
         } else {
@@ -1344,7 +1687,7 @@ impl App {
 
     fn remember(&self) -> Option<(String, Side, u32)> {
         let diff = &self.loaded.diff;
-        let row = diff.rows().get(self.cursor)?;
+        let row = diff.rows().get(self.current_row()?)?;
         if !row.kind.is_content() {
             return None;
         }
@@ -1411,25 +1754,17 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let header = Rect::new(area.x, area.y, area.width, 1);
-        let footer = if area.height >= 5 { 2 } else { 1 };
-        let body = Rect::new(
-            area.x,
-            area.y + 1,
-            area.width,
-            area.height.saturating_sub(1 + footer),
-        );
+        let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         self.view = body;
         self.follow_cursor();
-        self.draw_header(f, header);
         self.draw_rows(f, body);
         self.draw_footer(
             f,
             Rect::new(
                 area.x,
-                area.y + area.height.saturating_sub(footer),
+                area.y + body.height,
                 area.width,
-                footer,
+                area.height.saturating_sub(body.height),
             ),
         );
         self.draw_composer(f, body);
@@ -1438,112 +1773,72 @@ impl App {
         }
     }
 
-    fn draw_header(&self, f: &mut Frame, area: Rect) {
-        if area.height == 0 {
-            return;
-        }
-        let diff = &self.loaded.diff;
-        let (added, removed) = totals(diff);
-        let mut spans = vec![
-            Span::styled(
-                " leaf diff ",
-                Style::default()
-                    .fg(Color::Indexed(0))
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {} ", self.loaded.label),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if let Some(branch) = &self.loaded.branch {
-            spans.push(Span::styled(format!("{branch} "), Style::default().fg(DIM)));
-        }
-        let stats = format!(
-            " +{} −{} · {} {} ",
-            added,
-            removed,
-            diff.files().len(),
-            if diff.files().len() == 1 {
-                "file"
-            } else {
-                "files"
-            }
-        );
-        let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
-        let free = (area.width as usize).saturating_sub(used + cells(&stats));
-        if free > 0 {
-            spans.push(Span::raw(" ".repeat(free)));
-        }
-        spans.push(Span::styled(stats, Style::default().fg(DIM)));
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
         }
-        let status = self.status_line();
-        let first = if let Some(toast) = &self.toast {
+        let line = if let Some(toast) = &self.toast {
             let style = if toast.error {
-                Style::default()
-                    .fg(Color::Indexed(1))
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(REMOVED_FG)
             } else {
-                Style::default().fg(ACCENT)
+                Style::default().fg(DIM)
             };
             let text = clip(&toast.text, area.width.saturating_sub(2) as usize);
             Line::from(Span::styled(format!(" {text}"), style))
+        } else if self.composer.is_some() {
+            Line::from(Span::styled(
+                clip(
+                    " enter comment · ctrl+enter agent · alt+enter line · ctrl+g github · esc cancel",
+                    area.width as usize,
+                ),
+                Style::default().fg(DIM),
+            ))
         } else {
-            Line::from(status)
+            self.status_line(area.width)
         };
-        let keys = clip(
-            " j/k move · v select · c comment · C comments · y copy · o other side · r reload · ? help · q quit",
-            area.width as usize,
-        );
-        let mut lines = vec![first];
-        if area.height > 1 {
-            lines.push(Line::from(Span::styled(keys, Style::default().fg(DIM))));
-        }
-        f.render_widget(Paragraph::new(lines), area);
+        f.render_widget(Paragraph::new(line), area);
     }
 
-    fn status_line(&self) -> Vec<Span<'static>> {
+    fn status_line(&self, width: u16) -> Line<'static> {
         let diff = &self.loaded.diff;
-        let Some(row) = diff.rows().get(self.cursor) else {
-            return vec![Span::raw(" ")];
+        let Some(row) = self.current_row().and_then(|row| diff.rows().get(row)) else {
+            return Line::from(Span::raw(" "));
         };
-        let mut spans = Vec::new();
+        let mut left = String::new();
         if let Some(file) = diff.file(row.file as usize) {
-            spans.push(Span::styled(
-                format!(" {} ", file.path()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
+            left.push_str(file.path());
         }
         if row.kind.is_content() {
-            let (line, side) = match row.kind {
-                RowKind::Removed => (row.old, "old"),
-                _ => (row.new, "new"),
+            let line = if row.kind == RowKind::Removed {
+                row.old
+            } else {
+                row.new
             };
-            spans.push(Span::styled(
-                format!("L{line} {side} "),
-                Style::default().fg(DIM),
-            ));
+            left.push(':');
+            left.push_str(&line.to_string());
         }
         if self.selection.is_some() {
             let (first, last) = self.range();
-            let rows = diff.rows();
-            let lines = rows[first..=last.min(rows.len().saturating_sub(1))]
-                .iter()
-                .filter(|row| row.kind.is_content())
-                .count();
-            spans.push(Span::styled(
-                format!("· {lines} selected · c comment "),
-                Style::default().fg(NOTE),
-            ));
+            let lines = self
+                .split
+                .lines()
+                .get(first..=last.min(self.split.lines().len().saturating_sub(1)))
+                .map(|lines| lines.iter().filter(|line| line.is_content()).count())
+                .unwrap_or(0);
+            let mode = if self.visual { "visual · " } else { "" };
+            let unit = if lines == 1 { "line" } else { "lines" };
+            left.push_str(&format!("  {mode}{lines} {unit} · C comment"));
         }
-        spans
+        let (added, removed) = totals(diff);
+        let stats = format!("+{added} −{removed} ");
+        let left_width = (width as usize).saturating_sub(cells(&stats) + 1);
+        let left = clip(&left, left_width);
+        let pad = (width as usize).saturating_sub(1 + cells(&left) + cells(&stats));
+        Line::from(vec![
+            Span::styled(format!(" {left}"), Style::default().fg(DIM)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(stats, Style::default().fg(DIM)),
+        ])
     }
 
     fn draw_rows(&mut self, f: &mut Frame, area: Rect) {
@@ -1551,7 +1846,7 @@ impl App {
             return;
         }
         let diff = &self.loaded.diff;
-        if diff.rows().is_empty() {
+        if diff.rows().is_empty() || self.split.lines().is_empty() {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     " This diff is empty: nothing changed on this side.",
@@ -1561,10 +1856,14 @@ impl App {
             );
             return;
         }
-        let end = (self.scroll + area.height as usize).min(diff.rows().len());
-        let mut lines = Vec::with_capacity(end - self.scroll);
+        let end = (self.scroll + area.height as usize).min(self.split.lines().len());
+        let mut lines = Vec::with_capacity(end.saturating_sub(self.scroll));
         for index in self.scroll..end {
-            lines.push(self.row_line(index, area.width));
+            let line = self.split.lines()[index];
+            lines.push(match line.band {
+                Some(row) => self.row_line(row, area.width),
+                None => self.split_content(index, area.width),
+            });
         }
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -1578,131 +1877,179 @@ impl App {
                 let (added, removed) = file.map_or((0, 0), |file| (file.added, file.removed));
                 let path = file.map(|file| file.display()).unwrap_or_default();
                 let note = file.and_then(|file| file.note.clone());
+                let bg = self.palette.file;
                 let mut spans = vec![
-                    Span::styled(
-                        "▾ ",
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        path,
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(" ▎ ", Style::default().fg(ACCENT).bg(bg)),
+                    Span::styled(path, Style::default().bg(bg).add_modifier(Modifier::BOLD)),
                 ];
                 if added > 0 {
                     spans.push(Span::styled(
                         format!(" +{added}"),
-                        Style::default().fg(ADDED_FG),
+                        Style::default().fg(ADDED_FG).bg(bg),
                     ));
                 }
                 if removed > 0 {
                     spans.push(Span::styled(
                         format!(" −{removed}"),
-                        Style::default().fg(REMOVED_FG),
+                        Style::default().fg(REMOVED_FG).bg(bg),
                     ));
                 }
                 if let Some(note) = note {
-                    spans.push(Span::styled(format!("  {note}"), Style::default().fg(NOTE)));
+                    spans.push(Span::styled(
+                        format!("  {note}"),
+                        Style::default().fg(DIM).bg(bg),
+                    ));
                 }
+                fill_background(&mut spans, width, bg);
                 Line::from(spans)
             }
-            RowKind::Hunk => Line::from(Span::styled(
-                format!("  {}", diff.row_text(index)),
-                Style::default().fg(DIM),
-            )),
+            RowKind::Hunk => {
+                let bg = self.palette.file;
+                let gap = diff
+                    .file(row.file as usize)
+                    .and_then(|file| file.hunks.get(row.hunk as usize))
+                    .map_or(0, |hunk| hunk.gap_before);
+                let note = hunk_note(diff.row_text(index));
+                let label = if gap == 0 {
+                    "⋯".to_owned()
+                } else {
+                    format!("⋯ {gap} unmodified line{}", if gap == 1 { "" } else { "s" })
+                };
+                let mut spans = vec![
+                    Span::styled(" ▏ ", Style::default().fg(DIM).bg(bg)),
+                    Span::styled(label, Style::default().fg(DIM).bg(bg)),
+                ];
+                if let Some(note) = note {
+                    spans.push(Span::styled(
+                        format!("  ·  {note}"),
+                        Style::default().fg(DIM).bg(bg),
+                    ));
+                }
+                fill_background(&mut spans, width, bg);
+                Line::from(spans)
+            }
             RowKind::Meta | RowKind::NoNewline => Line::from(Span::styled(
-                format!("  {}", diff.row_text(index)),
-                Style::default().fg(NOTE).add_modifier(Modifier::ITALIC),
+                diff.row_text(index).to_owned(),
+                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
             )),
-            RowKind::Context | RowKind::Added | RowKind::Removed => self.content_line(index, width),
+            RowKind::Context | RowKind::Added | RowKind::Removed => Line::default(),
         }
     }
 
-    fn content_line(&mut self, index: usize, width: u16) -> Line<'static> {
-        let diff = &self.loaded.diff;
-        let row = diff.rows()[index];
-        let number = self.number_width();
-        let two = width >= FULL_GUTTER_MIN;
-        let mark = self.marks.get(&index).copied();
-        let gutter = if two { number * 2 + 4 } else { number + 3 };
+    fn split_content(&mut self, line_index: usize, width: u16) -> Line<'static> {
+        let Some(line) = self.split.lines().get(line_index).copied() else {
+            return Line::default();
+        };
+        if width < 3 {
+            return Line::default();
+        }
+        let current = line_index == self.cursor;
         let selected = self.selection.is_some_and(|anchor| {
-            index >= anchor.min(self.cursor) && index <= anchor.max(self.cursor)
+            line_index >= anchor.min(self.cursor) && line_index <= anchor.max(self.cursor)
         });
-        let tint = match row.kind {
-            RowKind::Added => Some(self.palette.added),
-            RowKind::Removed => Some(self.palette.removed),
+        let focused = self
+            .focus
+            .is_some_and(|(first, last)| line_index >= first && line_index <= last);
+        let left_width = width.saturating_sub(1) / 2;
+        let right_width = width.saturating_sub(1 + left_width);
+        let mut spans = Vec::new();
+        let side = SideState {
+            current,
+            selected,
+            focused,
+        };
+        self.side_line(&mut spans, line.left, Side::Old, left_width, side);
+        let rule_bg = if focused {
+            Some(self.palette.focus)
+        } else if selected {
+            Some(self.palette.file)
+        } else if current {
+            Some(self.palette.cursor)
+        } else {
+            None
+        };
+        spans.push(Span::styled(
+            "│",
+            Style::default().fg(DIM).bg(rule_bg.unwrap_or(Color::Reset)),
+        ));
+        self.side_line(&mut spans, line.right, Side::New, right_width, side);
+        Line::from(spans)
+    }
+
+    /// Draws one half of a split line: a change or comment marker, the line
+    /// number, then the code.
+    fn side_line(
+        &mut self,
+        spans: &mut Vec<Span<'static>>,
+        row: Option<usize>,
+        side: Side,
+        width: u16,
+        state: SideState,
+    ) {
+        if width == 0 {
+            return;
+        }
+        let number = self.number_width();
+        let Some(index) = row else {
+            let bg = self.empty_bg(state).unwrap_or(Color::Reset);
+            spans.push(Span::styled(
+                " ".repeat(width as usize),
+                Style::default().bg(bg),
+            ));
+            return;
+        };
+        let diff_row = self.loaded.diff.rows()[index];
+        let tint = match (diff_row.kind, side) {
+            (RowKind::Added, Side::New) => Some(self.palette.added),
+            (RowKind::Removed, Side::Old) => Some(self.palette.removed),
             _ => None,
         };
-        let word = match row.kind {
-            RowKind::Added => Some(self.palette.added_word),
-            RowKind::Removed => Some(self.palette.removed_word),
-            _ => None,
+        let bg = if state.focused {
+            Some(self.palette.focus)
+        } else if state.selected {
+            Some(self.palette.file)
+        } else if state.current && tint.is_none() {
+            Some(self.palette.cursor)
+        } else {
+            tint
         };
-        let base = match tint {
-            Some(tint) => Style::default().bg(tint),
-            None => Style::default(),
+        let base = Style::default().bg(bg.unwrap_or(Color::Reset));
+        let mark = self.marks.get(&index).copied();
+        let (lead, lead_style) = match (mark, diff_row.kind) {
+            (Some(mark), _) => {
+                let color = match mark {
+                    State::Draft => DIM,
+                    State::Agent => ACCENT,
+                    State::Github => ADDED_FG,
+                };
+                ("●", base.fg(color))
+            }
+            (None, RowKind::Added) if side == Side::New => ("▌", base.fg(ADDED_FG)),
+            (None, RowKind::Removed) if side == Side::Old => ("▌", base.fg(REMOVED_FG)),
+            _ => (" ", base),
         };
-        let gutter_style = if index == self.cursor {
+        spans.push(Span::styled(lead, lead_style));
+
+        let label = match side {
+            Side::Old => diff_row.old,
+            Side::New => diff_row.new,
+        };
+        let label = if label > 0 {
+            format!("{label:>number$} ")
+        } else {
+            " ".repeat(number + 1)
+        };
+        let gutter_style = if state.current {
             Style::default()
                 .fg(ACCENT)
-                .bg(tint.unwrap_or(Color::Reset))
+                .bg(bg.unwrap_or(Color::Reset))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(DIM).bg(tint.unwrap_or(Color::Reset))
-        };
-        let mut spans = Vec::new();
-        if let Some(state) = mark {
-            let color = match state {
-                State::Draft => DIM,
-                State::Agent => ACCENT,
-                State::Github => ADDED_FG,
-            };
-            spans.push(Span::styled(
-                "●",
-                Style::default().fg(color).bg(tint.unwrap_or(Color::Reset)),
-            ));
-        } else {
-            spans.push(Span::styled(
-                " ",
-                Style::default().bg(tint.unwrap_or(Color::Reset)),
-            ));
-        }
-        let label = if two {
-            format!(
-                "{:>number$} {:>number$} ",
-                if row.old > 0 {
-                    row.old.to_string()
-                } else {
-                    String::new()
-                },
-                if row.new > 0 {
-                    row.new.to_string()
-                } else {
-                    String::new()
-                },
-            )
-        } else {
-            format!(
-                "{:>number$} ",
-                if row.new > 0 {
-                    row.new.to_string()
-                } else if row.old > 0 {
-                    row.old.to_string()
-                } else {
-                    String::new()
-                }
-            )
+            Style::default().fg(DIM).bg(bg.unwrap_or(Color::Reset))
         };
         spans.push(Span::styled(label, gutter_style));
 
-        let text = diff.content(index).to_owned();
-        let marker = diff.row_text(index).chars().next().unwrap_or(' ');
-        let marker_style = match row.kind {
-            RowKind::Added => base.fg(ADDED_FG).add_modifier(Modifier::BOLD),
-            RowKind::Removed => base.fg(REMOVED_FG).add_modifier(Modifier::BOLD),
-            _ => base.fg(DIM),
-        };
-        spans.push(Span::styled(marker.to_string(), marker_style));
-
+        let text = self.loaded.diff.content(index).to_owned();
         let kinds = self.kinds_for(index);
         let line_index = self.hunk_line(index);
         let kinds_line = kinds
@@ -1710,27 +2057,50 @@ impl App {
             .and_then(|lines| lines.get(line_index))
             .map(Vec::as_slice);
         let emphasis = self.emphasis(index);
+        let word = match (diff_row.kind, side) {
+            (RowKind::Added, Side::New) => self.palette.added_word,
+            (RowKind::Removed, Side::Old) => self.palette.removed_word,
+            _ => Color::Reset,
+        };
+        let gutter = number + 2;
         let available = (width as usize).saturating_sub(gutter);
-        let selection_bg = Some(self.palette.file);
+        let overlay = if state.focused {
+            Some(self.palette.focus)
+        } else if state.selected {
+            Some(self.palette.file)
+        } else {
+            None
+        };
         let used = text_spans(
-            &mut spans,
+            spans,
             &text,
             self.left as usize,
             available,
             base,
             kinds_line,
             emphasis,
-            word.unwrap_or(Color::Reset),
-            if selected { selection_bg } else { None },
+            word,
+            overlay,
         );
-        let filled = (gutter + 1 + used).min(width as usize);
-        if let Some(tint) = tint {
+        let filled = (gutter + used).min(width as usize);
+        if filled < width as usize {
             spans.push(Span::styled(
-                " ".repeat((width as usize).saturating_sub(filled)),
-                Style::default().bg(tint),
+                " ".repeat(width as usize - filled),
+                Style::default().bg(bg.unwrap_or(Color::Reset)),
             ));
         }
-        Line::from(spans)
+    }
+
+    fn empty_bg(&self, state: SideState) -> Option<Color> {
+        if state.focused {
+            Some(self.palette.focus)
+        } else if state.selected {
+            Some(self.palette.file)
+        } else if state.current {
+            Some(self.palette.cursor)
+        } else {
+            None
+        }
     }
 
     fn number_width(&self) -> usize {
@@ -1864,33 +2234,30 @@ impl App {
         let Some(composer) = self.composer.as_ref() else {
             return;
         };
-        let width = area.width.clamp(20, 88);
-        let height = area.height.min(9);
-        if height < 4 {
+        if area.height < 2 || area.width < 4 {
             return;
         }
-        let rect = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height - height,
-            width,
-            height,
-        );
+        let width = area.width.saturating_sub(2);
+        let text_width = width.saturating_sub(2);
+        let (lines, cursor_line) = composer.wrap(text_width as usize);
+        let visible = lines.len().clamp(1, 5).min(area.height as usize - 1);
+        let height = visible as u16 + 1;
+        let rect = Rect::new(area.x + 1, area.y + area.height - height, width, height);
         f.render_widget(Clear, rect);
         let title = format!(
-            " comment · {} {} ",
+            " {} {} ",
             composer.anchor.file,
             composer.anchor.range_label()
         );
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
-            .title(Line::from(Span::styled(title, Style::default().fg(ACCENT))));
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(DIM))
+            .title(Line::from(Span::styled(title, Style::default().fg(DIM))));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
-        if inner.height == 0 || inner.width == 0 {
+        if inner.height == 0 || text_width == 0 {
             return;
         }
-        let (lines, cursor_line) = composer.wrap(inner.width as usize);
         let rows = inner.height as usize;
         let mut view = self.composer_view as usize;
         if cursor_line < view {
@@ -1901,6 +2268,12 @@ impl App {
         view = view.min(lines.len().saturating_sub(rows));
         self.composer_view = view as u16;
 
+        let text_area = Rect {
+            x: inner.x + 1,
+            y: inner.y,
+            width: text_width,
+            height: inner.height,
+        };
         let mut rendered = Vec::new();
         for &(start, end) in lines.iter().skip(view).take(rows) {
             let mut spans = Vec::new();
@@ -1921,7 +2294,7 @@ impl App {
             }
             rendered.push(Line::from(spans));
         }
-        f.render_widget(Paragraph::new(rendered), inner);
+        f.render_widget(Paragraph::new(rendered), text_area);
     }
 
     fn draw_dialog(&mut self, f: &mut Frame, area: Rect, kind: DialogKind) {
@@ -1936,14 +2309,8 @@ impl App {
                     f,
                     area,
                     "loading",
-                    vec![
-                        Line::from(Span::styled(text, Style::default().fg(ACCENT))),
-                        Line::from(Span::styled(
-                            "This takes a moment.",
-                            Style::default().fg(DIM),
-                        )),
-                    ],
-                    48,
+                    vec![Line::from(Span::styled(text, Style::default().fg(DIM)))],
+                    40,
                 );
             }
             DialogKind::Error => {
@@ -1964,8 +2331,55 @@ impl App {
                 panel(f, area, "could not finish", lines, width);
             }
             DialogKind::Comments => self.draw_comments(f, area),
+            DialogKind::Files => self.draw_files(f, area),
             DialogKind::Confirm => self.draw_confirm(f, area),
         }
+    }
+
+    /// A minimal list of the changed files. The cursor picks one, enter opens it.
+    fn draw_files(&self, f: &mut Frame, area: Rect) {
+        let Dialog::Files { selected } = &self.dialog else {
+            return;
+        };
+        let selected = *selected;
+        let files = self.loaded.diff.files();
+        let width = 62.min(area.width.saturating_sub(8)).max(24);
+        let text_width = width.saturating_sub(6) as usize;
+        let rows = (area.height as usize).saturating_sub(5).clamp(1, 12);
+        let start = selected.saturating_sub(rows.saturating_sub(1));
+        let mut lines = Vec::new();
+        for (index, file) in files.iter().enumerate().skip(start).take(rows) {
+            let chosen = index == selected;
+            let (status, status_color) = file_status(file);
+            let stats = format!("+{} −{}", file.added, file.removed);
+            let path_width = text_width.saturating_sub(cells(&stats) + 4);
+            let path = clip(&file.display(), path_width);
+            let pad = path_width.saturating_sub(cells(&path));
+            let style = if chosen {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if chosen { "▸ " } else { "  " }, style),
+                Span::styled(status.to_string(), Style::default().fg(status_color)),
+                Span::styled(format!(" {path}{}", " ".repeat(pad)), style),
+                Span::styled(
+                    format!("  {stats}"),
+                    Style::default().fg(if chosen { ACCENT } else { DIM }),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+        let shown = format!("{} of {}", selected + 1, files.len());
+        lines.push(Line::from(vec![
+            Span::styled(
+                "j k move · enter open · esc close",
+                Style::default().fg(DIM),
+            ),
+            Span::styled(format!("  {shown}"), Style::default().fg(DIM)),
+        ]));
+        panel(f, area, "files", lines, width);
     }
 
     fn draw_comments(&self, f: &mut Frame, area: Rect) {
@@ -1978,35 +2392,33 @@ impl App {
         for (index, saved) in self.comments.iter().enumerate() {
             let mark = if index == selected { "▸" } else { " " };
             let style = if index == selected {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), style),
-                Span::styled(saved.comment.label(), style),
-                Span::styled(
-                    format!("  {}", saved.comment.state.label()),
-                    Style::default().fg(DIM),
-                ),
-            ]));
+            let label = saved.comment.label();
+            let state = saved.comment.state.label();
+            let fixed = 6 + cells(&label) + cells(state);
             let body = clip(
                 &saved.comment.body.replace('\n', " "),
-                width.saturating_sub(8) as usize,
+                (width as usize).saturating_sub(fixed),
             );
-            lines.push(Line::from(Span::styled(
-                format!("   {body}"),
-                Style::default().fg(DIM),
-            )));
-            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().fg(ACCENT)),
+                Span::styled(format!(" {label}"), style),
+                Span::styled(format!("  {body}"), Style::default().fg(DIM)),
+                Span::styled(format!("  {state}"), Style::default().fg(DIM)),
+            ]));
         }
+        let max_rows = area.height.saturating_sub(5) as usize;
+        if lines.len() > max_rows {
+            lines.truncate(max_rows);
+        }
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Enter jump · a agent · g GitHub · d delete · y copy · Esc close",
+            "enter jump · a agent · g github · d delete · y copy · esc close",
             Style::default().fg(DIM),
         )));
-        if lines.len() + 4 > area.height as usize {
-            lines.truncate(area.height.saturating_sub(5) as usize);
-        }
         panel(f, area, "comments", lines, width);
     }
 
@@ -2014,27 +2426,28 @@ impl App {
         let Dialog::Confirm(confirm) = &self.dialog else {
             return;
         };
-        let width = 74.min(area.width.saturating_sub(8)).max(24);
+        let width = 60.min(area.width.saturating_sub(8)).max(24);
         let target = self
             .loaded
             .github
             .as_ref()
             .map(|resource| resource.label())
             .unwrap_or_else(|| "the pull request for this branch".to_owned());
-        let mut lines = vec![
-            Line::from(Span::styled(
-                format!("Post this comment to {target}?"),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                confirm.anchor.label(),
-                Style::default().fg(ACCENT),
-            )),
-        ];
-        for line in wrap_text(&confirm.body, width.saturating_sub(8) as usize)
+        let mut lines: Vec<Line> = wrap_text(
+            &format!("Post this comment to {target}?"),
+            width.saturating_sub(4) as usize,
+        )
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::default())))
+        .collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            confirm.anchor.label(),
+            Style::default().fg(DIM),
+        )));
+        for line in wrap_text(&confirm.body, width.saturating_sub(6) as usize)
             .into_iter()
-            .take(8)
+            .take(6)
         {
             lines.push(Line::from(Span::styled(
                 format!("  {line}"),
@@ -2043,15 +2456,9 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(
-                "y",
-                Style::default().fg(ADDED_FG).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("y", Style::default().fg(ADDED_FG)),
             Span::styled(" post    ", Style::default().fg(DIM)),
-            Span::styled(
-                "n",
-                Style::default().fg(REMOVED_FG).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("n", Style::default().fg(REMOVED_FG)),
             Span::styled(" back to editing", Style::default().fg(DIM)),
         ]));
         panel(f, area, "post to github", lines, width);
@@ -2059,12 +2466,14 @@ impl App {
 
     fn has_pending_highlight(&self) -> bool {
         let diff = &self.loaded.diff;
-        let end = (self.scroll + self.view.height as usize).min(diff.rows().len());
+        let end = (self.scroll + self.view.height as usize).min(self.split.lines().len());
         (self.scroll..end).any(|index| {
-            let row = diff.rows()[index];
-            row.kind.is_content()
-                && row.hunk != u32::MAX
-                && !self.highlight.contains_key(&(row.file, row.hunk))
+            self.split.lines()[index].rows().any(|row| {
+                let row = diff.rows()[row];
+                row.kind.is_content()
+                    && row.hunk != u32::MAX
+                    && !self.highlight.contains_key(&(row.file, row.hunk))
+            })
         })
     }
 }
@@ -2073,6 +2482,24 @@ fn totals(diff: &Diff) -> (u32, u32) {
     diff.files().iter().fold((0, 0), |(added, removed), file| {
         (added + file.added, removed + file.removed)
     })
+}
+
+/// The one-letter change marker the file picker shows.
+fn file_status(file: &File) -> (char, Color) {
+    match (&file.old_path, &file.new_path) {
+        (None, Some(_)) => ('A', ADDED_FG),
+        (Some(_), None) => ('D', REMOVED_FG),
+        (Some(old), Some(new)) if old != new => ('R', ACCENT),
+        _ => ('M', DIM),
+    }
+}
+
+/// The function or context Git prints after a hunk header.
+fn hunk_note(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("@@")?;
+    let at = rest.find("@@")?;
+    let note = rest[at + 2..].trim();
+    (!note.is_empty()).then_some(note)
 }
 
 fn cells(text: &str) -> usize {
@@ -2161,6 +2588,17 @@ fn push_text(spans: &mut Vec<Span<'static>>, style: Style, text: &str) {
     spans.push(Span::styled(text.to_owned(), style));
 }
 
+/// Pads a band row to the full width with its background still drawn.
+fn fill_background(spans: &mut Vec<Span<'static>>, width: u16, bg: Color) {
+    let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
+    if used < width as usize {
+        spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().bg(bg),
+        ));
+    }
+}
+
 fn clip(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -2202,9 +2640,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("space b", "page down or up"),
         ("g G  Home End", "first or last line"),
         ("[ ]  N n", "previous or next file"),
-        ("v", "select lines (move to extend)"),
-        ("c", "comment on the selection"),
-        ("C", "comments: jump, resend, delete, post"),
+        ("f", "files: pick one to open"),
+        ("v", "visual mode; move to select, esc to leave"),
+        ("C", "comment on the line or selection"),
+        ("m", "comments: jump, resend, delete, post"),
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
         ("h l  ← →", "scroll sideways; 0 resets"),
@@ -2221,23 +2660,23 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " c, write, Enter → pastes into the agent pane.",
+        " C, write, Enter saves the comment on that line.",
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(Span::styled(
-        " Alt+Enter adds a line · Ctrl+G posts to GitHub · Esc saves a draft.",
+        " Ctrl+Enter pastes it into the agent pane · Alt+Enter adds a line.",
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(Span::styled(
-        " y copies a prompt for any agent. LEAF_AGENT_PANE=%3 names the pane.",
+        " Ctrl+G posts to GitHub · Esc cancels. `leaf comments` lists them.",
         Style::default().fg(DIM),
     )));
     panel(f, area, "keys", lines, 78);
 }
 
 fn panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, width: u16) -> Rect {
-    let width = width.saturating_add(8).min(area.width);
-    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let width = width.saturating_add(6).min(area.width);
+    let height = (lines.len() as u16).saturating_add(2).min(area.height);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -2246,13 +2685,8 @@ fn panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, widt
     };
     f.render_widget(Clear, rect);
     let block = Block::bordered()
-        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(DIM))
-        .title(
-            Line::from(format!(" {title} "))
-                .style(Style::default().fg(DIM))
-                .centered(),
-        );
+        .title(Line::from(format!(" {title} ")).style(Style::default().fg(DIM)));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.height > 0 {
@@ -2303,6 +2737,21 @@ diff --git a/src/main.rs b/src/main.rs
 +let b = 3;
 +let c = 4;
  }
+";
+
+    const TWO_FILES: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,1 +1,1 @@
+-old
++new
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1,1 +1,1 @@
+-one
++two
 ";
 
     fn loaded(patch: &str) -> Loaded {
@@ -2381,7 +2830,131 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn a_selection_comments_the_lines_it_covers() {
+    fn the_view_is_a_split_diff_with_one_footer() {
+        let mut app = app();
+        let screen = draw(&mut app, 100, 16);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(!screen.contains("leaf diff"));
+        assert!(!screen.contains("j/k move"));
+        assert!(screen.contains("src/main.rs +2 −1"));
+        let paired = lines[3];
+        let old = paired.find("let b = 2;").expect("the old line");
+        let new = paired.find("let b = 3;").expect("the new line");
+        assert!(old < new, "old code stays on the left: {paired}");
+        assert!(lines[4].contains("let c = 4;"));
+        assert!(lines[15].contains("src/main.rs:10"));
+        assert!(lines[15].ends_with("+2 −1"));
+    }
+
+    #[test]
+    fn the_file_picker_lists_files_and_opens_one() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        let screen = draw(&mut app, 100, 16);
+        assert!(!screen.contains("▸ a.rs"));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(matches!(app.dialog, Dialog::Files { selected: 0 }));
+        let screen = draw(&mut app, 100, 16);
+        assert!(screen.contains("files"));
+        assert!(screen.contains("▸ M a.rs"));
+        assert!(screen.contains("  M b.rs"));
+        assert!(screen.contains("1 of 2"));
+
+        press(&mut app, KeyCode::Char('j'));
+        assert!(matches!(app.dialog, Dialog::Files { selected: 1 }));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.dialog, Dialog::None));
+        assert_eq!(app.cursor, 5);
+        assert_eq!(app.loaded.diff.file_index(app.cursor), Some(1));
+
+        press(&mut app, KeyCode::Char('F'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.dialog, Dialog::None));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn the_composer_is_a_rule_above_the_footer() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "why?");
+        let screen = draw(&mut app, 100, 16);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(lines[15].contains("enter comment"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("src/main.rs L10") && line.contains('─'))
+        );
+        assert!(screen.contains("why?"));
+    }
+
+    #[test]
+    fn jumping_to_a_range_scrolls_the_whole_block_into_view() {
+        let mut app = App::new(loaded(&big_patch(400)), Options::default());
+        app.view = Rect::new(0, 1, 120, 10);
+        app.scroll = 380;
+        app.jump_to(&Anchor {
+            file: "src/big.rs".to_owned(),
+            side: Side::New,
+            start_line: 250,
+            end_line: 252,
+        });
+        assert_eq!(app.focus, Some((251, 253)));
+        assert!(app.scroll <= 251);
+        assert!(253 < app.scroll + 10);
+        let screen = draw(&mut app, 100, 12);
+        assert!(screen.contains("line 250"));
+        assert!(screen.contains("line 252"));
+    }
+
+    #[test]
+    fn visual_mode_stops_extending_on_escape() {
+        let mut app = app();
+        assert_eq!(app.cursor, 2);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.visual);
+        assert_eq!(app.range(), (3, 4));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.quit);
+        assert!(!app.visual);
+        assert_eq!(app.range(), (3, 4));
+
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.selection.is_none());
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn a_visual_range_comments_on_enter() {
+        let mut app = app();
+        assert_eq!(app.cursor, 2);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('C'));
+
+        let composer = app.composer.as_ref().expect("a comment box");
+        assert_eq!(composer.anchor.file, "src/main.rs");
+        assert_eq!(composer.anchor.side, Side::New);
+        assert_eq!(
+            (composer.anchor.start_line, composer.anchor.end_line),
+            (11, 12)
+        );
+        assert_eq!((composer.first, composer.last), (3, 5));
+
+        type_text(&mut app, "why?");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.composer.is_none());
+        assert_eq!(app.comments.len(), 1);
+        assert_eq!(app.comments[0].comment.body, "why?");
+        assert_eq!(app.comments[0].comment.state, State::Draft);
+    }
+
+    #[test]
+    fn ctrl_enter_pastes_into_the_agent() {
         let sent = Rc::new(RefCell::new(None));
         let mut app = app();
         let captured = sent.clone();
@@ -2392,26 +2965,12 @@ diff --git a/src/main.rs b/src/main.rs
                 command: "claude".to_owned(),
             })
         });
-        assert_eq!(app.cursor, 2);
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('v'));
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('c'));
-
-        let composer = app.composer.as_ref().expect("a comment box");
-        assert_eq!(composer.anchor.file, "src/main.rs");
-        assert_eq!(composer.anchor.side, Side::New);
-        assert_eq!(
-            (composer.anchor.start_line, composer.anchor.end_line),
-            (11, 11)
-        );
-        assert_eq!((composer.first, composer.last), (3, 4));
-
+        press(&mut app, KeyCode::Char('C'));
         type_text(&mut app, "why?");
-        press(&mut app, KeyCode::Enter);
+        press_ctrl(&mut app, KeyCode::Enter);
         assert!(app.composer.is_none());
         assert_eq!(app.comments.len(), 1);
-        assert_eq!(app.comments[0].comment.body, "why?");
         assert_eq!(app.comments[0].comment.state, State::Agent);
 
         let text = sent.borrow().clone().expect("the payload");
@@ -2424,9 +2983,9 @@ diff --git a/src/main.rs b/src/main.rs
     fn failed_agent_delivery_keeps_a_draft_and_copies_the_prompt() {
         let mut app = app();
         app.deliver = Box::new(|_| Err(agent::AgentFailed::NoTmux));
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('C'));
         type_text(&mut app, "check this");
-        press(&mut app, KeyCode::Enter);
+        press_ctrl(&mut app, KeyCode::Enter);
 
         assert_eq!(app.comments.len(), 1);
         assert_eq!(app.comments[0].comment.state, State::Draft);
@@ -2438,21 +2997,20 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn escape_saves_the_comment_as_a_draft() {
+    fn escape_cancels_the_comment() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('C'));
         type_text(&mut app, "later");
         press(&mut app, KeyCode::Esc);
         assert!(app.composer.is_none());
-        assert_eq!(app.comments.len(), 1);
-        assert_eq!(app.comments[0].comment.state, State::Draft);
-        assert_eq!(app.comments[0].comment.anchor.start_line, 10);
+        assert!(app.comments.is_empty());
+        assert!(!app.quit);
     }
 
     #[test]
     fn github_posting_asks_first_and_returns_to_editing() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('C'));
         type_text(&mut app, "post me");
         press_ctrl(&mut app, KeyCode::Char('g'));
         assert!(matches!(app.dialog, Dialog::Confirm(_)));
@@ -2472,9 +3030,40 @@ diff --git a/src/main.rs b/src/main.rs
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('y'));
         let copied = app.copy.clone().expect("copied");
-        assert!(copied.starts_with("> src/main.rs L11:\n\n```diff\n"));
-        assert!(copied.contains("-let b = 2;\n+let b = 3;"));
+        assert!(copied.starts_with("> src/main.rs L11-L12:\n\n```diff\n"));
+        assert!(copied.contains("-let b = 2;\n+let b = 3;\n+let c = 4;"));
         assert!(!copied.contains("why?"));
+    }
+
+    #[test]
+    fn jumping_to_a_comment_focuses_its_whole_range() {
+        let mut app = app();
+        app.add_comment(Comment {
+            anchor: Anchor {
+                file: "src/main.rs".to_owned(),
+                side: Side::New,
+                start_line: 11,
+                end_line: 12,
+            },
+            body: "both".to_owned(),
+            state: State::Draft,
+        });
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.dialog, Dialog::None));
+        assert_eq!(app.selection, Some(3));
+        assert_eq!(app.cursor, 3);
+        assert_eq!(app.focus, Some((3, 4)));
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.text == "src/main.rs L11-L12")
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, 4);
+        assert!(app.focus.is_none());
+        assert!(app.selection.is_none());
     }
 
     #[test]
@@ -2495,7 +3084,7 @@ diff --git a/src/main.rs b/src/main.rs
             body: "second".to_owned(),
             ..comment
         });
-        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('d'));
         assert_eq!(app.comments.len(), 1);
@@ -2525,19 +3114,31 @@ diff --git a/src/main.rs b/src/main.rs
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.cursor, 2);
         press(&mut app, KeyCode::Char('G'));
-        assert_eq!(app.cursor, 6);
+        assert_eq!(app.cursor, 5);
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(app.cursor, 2);
     }
 
     #[test]
     fn a_range_of_only_removed_lines_anchors_to_the_old_side() {
-        let mut app = app();
+        let patch = "\
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1,3 +1,2 @@
+ one
+-two
+-three
++four
+";
+        let mut app = App::new(loaded(patch), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('C'));
         let composer = app.composer.as_ref().expect("a comment box");
         assert_eq!(composer.anchor.side, Side::Old);
-        assert_eq!(composer.anchor.start_line, 11);
+        assert_eq!(composer.anchor.start_line, 3);
     }
 
     #[test]

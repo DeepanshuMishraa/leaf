@@ -144,6 +144,16 @@ pub struct SavedComment {
     pub comment: Comment,
 }
 
+/// A saved comment plus the diff key it belongs to, for `leaf comments`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedComment {
+    pub key: String,
+    pub saved: SavedComment,
+}
+
+/// `id, file, side, start_line, end_line, body, state` as stored in SQLite.
+type CommentRow = (i64, String, String, i64, i64, String, String);
+
 /// Saved reading places and highlights, per document key (a PDF's real path
 /// or a URL), plus the image mode for every document.
 pub struct Store {
@@ -423,33 +433,45 @@ impl Store {
             .map_err(self.failed(Operation::Read))?;
         let mut comments = Vec::new();
         for row in rows {
-            let (id, file, side, start, end, body, state) =
-                row.map_err(self.failed(Operation::Read))?;
-            // Rows written by another version are skipped, not guessed at.
-            let (Some(side), Some(state), Some(start), Some(end)) = (
-                Side::parse(&side),
-                State::parse(&state),
-                count(start),
-                count(end),
-            ) else {
-                continue;
-            };
-            if start == 0 || end < start {
-                continue;
+            let row = row.map_err(self.failed(Operation::Read))?;
+            if let Some(saved) = saved_comment(row) {
+                comments.push(saved);
             }
-            comments.push(SavedComment {
-                id,
-                comment: Comment {
-                    anchor: Anchor {
-                        file,
-                        side,
-                        start_line: start as u32,
-                        end_line: end as u32,
-                    },
-                    body,
-                    state,
-                },
-            });
+        }
+        Ok(comments)
+    }
+
+    /// Every saved comment with its diff key, oldest first per diff.
+    pub fn load_all_diff_comments(&self) -> Result<Vec<KeyedComment>, StoreFailed> {
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT key, id, file, side, start_line, end_line, body, state
+                 FROM diff_comments ORDER BY key, id",
+            )
+            .map_err(self.failed(Operation::Read))?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                    ),
+                ))
+            })
+            .map_err(self.failed(Operation::Read))?;
+        let mut comments = Vec::new();
+        for row in rows {
+            let (key, row) = row.map_err(self.failed(Operation::Read))?;
+            if let Some(saved) = saved_comment(row) {
+                comments.push(KeyedComment { key, saved });
+            }
         }
         Ok(comments)
     }
@@ -491,6 +513,36 @@ impl Store {
             .map(drop)
             .map_err(self.failed(Operation::Save))
     }
+}
+
+/// Parses a diff_comments row. Rows written by another version are skipped,
+/// not guessed at.
+fn saved_comment(row: CommentRow) -> Option<SavedComment> {
+    let (id, file, side, start, end, body, state) = row;
+    let (Some(side), Some(state), Some(start), Some(end)) = (
+        Side::parse(&side),
+        State::parse(&state),
+        count(start),
+        count(end),
+    ) else {
+        return None;
+    };
+    if start == 0 || end < start {
+        return None;
+    }
+    Some(SavedComment {
+        id,
+        comment: Comment {
+            anchor: Anchor {
+                file,
+                side,
+                start_line: start as u32,
+                end_line: end as u32,
+            },
+            body,
+            state,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -668,7 +720,12 @@ mod tests {
         assert_eq!(saved[0].comment.state, State::Github);
         assert_eq!(saved[0].comment.label(), "src/main.rs L12-L14");
         assert!(store.load_diff_comments("diff:b").unwrap().is_empty());
+        let all = store.load_all_diff_comments().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].key, "diff:a");
+        assert_eq!(all[0].saved, saved[0]);
         store.delete_diff_comment(id).unwrap();
         assert!(store.load_diff_comments("diff:a").unwrap().is_empty());
+        assert!(store.load_all_diff_comments().unwrap().is_empty());
     }
 }

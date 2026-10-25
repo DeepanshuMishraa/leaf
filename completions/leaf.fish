@@ -9,3 +9,5 @@ complete -c leaf -n '__fish_seen_subcommand_from diff' -l base -x -a '(__fish_gi
 complete -c leaf -n '__fish_seen_subcommand_from diff' -s r -l range -x -d 'Revision or revision range'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -l patch -r -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
+complete -c leaf -n __fish_use_subcommand -a comments -d 'List saved diff comments'
+complete -c leaf -n '__fish_seen_subcommand_from comments' -l json -d 'Machine-readable JSON'

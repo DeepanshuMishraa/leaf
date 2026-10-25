@@ -31,6 +31,7 @@ use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf open <file.pdf | file.epub | file.md | url>
        leaf diff [options] [path | revision | GitHub url]
+       leaf comments [--json]
 
 Diff options:
   --staged           staged changes
@@ -39,8 +40,11 @@ Diff options:
   --range <spec>     any revision or range, such as main...HEAD
   --patch <file>     a .diff or .patch file
 
-Diff keys: j/k move, v select, c comment, C comments, y copy, o other side,
-r reload, ? keys, q quit
+Diff keys: j/k move, v visual, C comment, m comments, f files, y copy, o other
+side, r reload, ? keys, q quit
+
+Comments: leaf comments lists every saved review comment with its diff key.
+  --json prints them for tools and agents.
 
 Reader keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
 
@@ -185,6 +189,13 @@ fn main() -> ExitCode {
             }
             diff_command(rest)
         }
+        "comments" => {
+            if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            comments_command(rest)
+        }
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -253,6 +264,88 @@ fn diff_command(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Lists saved review comments so an editor, script or agent can pick them up.
+fn comments_command(args: &[String]) -> ExitCode {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => {
+                eprintln!("leaf: unknown option {other}. Run `leaf comments --help` for usage.");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let store = match Store::open(&progress::default_path()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let comments = match store.load_all_diff_comments() {
+        Ok(comments) => comments,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if json {
+        print!("{}", comments_json(&comments));
+    } else if comments.is_empty() {
+        println!("No comments.");
+    } else {
+        for keyed in &comments {
+            let comment = &keyed.saved.comment;
+            println!(
+                "{}  {}  {}",
+                comment.label(),
+                comment.anchor.side.as_str(),
+                comment.state.label()
+            );
+            println!("  {}", keyed.key);
+            for line in comment.body.lines() {
+                println!("  {line}");
+            }
+            println!();
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn comments_json(comments: &[progress::KeyedComment]) -> String {
+    use std::fmt::Write as _;
+
+    if comments.is_empty() {
+        return "[]\n".to_owned();
+    }
+    let mut out = String::from("[\n");
+    for (index, keyed) in comments.iter().enumerate() {
+        let comment = &keyed.saved.comment;
+        let _ = writeln!(out, "  {{");
+        let _ = writeln!(out, "    \"key\": \"{}\",", github::json_escape(&keyed.key));
+        let _ = writeln!(out, "    \"id\": {},", keyed.saved.id);
+        let _ = writeln!(
+            out,
+            "    \"file\": \"{}\",",
+            github::json_escape(&comment.anchor.file)
+        );
+        let _ = writeln!(out, "    \"side\": \"{}\",", comment.anchor.side.as_str());
+        let _ = writeln!(out, "    \"start_line\": {},", comment.anchor.start_line);
+        let _ = writeln!(out, "    \"end_line\": {},", comment.anchor.end_line);
+        let _ = writeln!(out, "    \"state\": \"{}\",", comment.state.as_str());
+        let _ = writeln!(
+            out,
+            "    \"body\": \"{}\"",
+            github::json_escape(&comment.body)
+        );
+        let comma = if index + 1 == comments.len() { "" } else { "," };
+        let _ = writeln!(out, "  }}{comma}");
+    }
+    out.push_str("]\n");
+    out
 }
 
 /// Opens the comment store and the comments saved for this diff. A store that
@@ -470,4 +563,50 @@ fn diff_request(args: &[String]) -> Result<diff::Request, String> {
         repo,
         paths: files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comment::{Anchor, Comment, Side, State};
+    use crate::progress::{KeyedComment, SavedComment};
+
+    fn keyed(body: &str) -> KeyedComment {
+        KeyedComment {
+            key: "diff:git:/repo:working".to_owned(),
+            saved: SavedComment {
+                id: 7,
+                comment: Comment {
+                    anchor: Anchor {
+                        file: "src/main.rs".to_owned(),
+                        side: Side::New,
+                        start_line: 11,
+                        end_line: 12,
+                    },
+                    body: body.to_owned(),
+                    state: State::Draft,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn comments_json_carries_the_key_and_anchor() {
+        let json = comments_json(&[keyed("why?\nreally")]);
+        assert!(json.starts_with("[\n  {\n"));
+        assert!(json.contains("\"key\": \"diff:git:/repo:working\""));
+        assert!(json.contains("\"id\": 7"));
+        assert!(json.contains("\"file\": \"src/main.rs\""));
+        assert!(json.contains("\"side\": \"new\""));
+        assert!(json.contains("\"start_line\": 11"));
+        assert!(json.contains("\"end_line\": 12"));
+        assert!(json.contains("\"state\": \"draft\""));
+        assert!(json.contains("\"body\": \"why?\\nreally\""));
+        assert!(json.ends_with("\n  }\n]\n"));
+    }
+
+    #[test]
+    fn no_comments_is_an_empty_json_list() {
+        assert_eq!(comments_json(&[]), "[]\n");
+    }
 }

@@ -627,7 +627,7 @@ fn parse_json_string(text: &str) -> Option<String> {
     None
 }
 
-fn json_escape(text: &str) -> String {
+pub(crate) fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     for c in text.chars() {
         match c {

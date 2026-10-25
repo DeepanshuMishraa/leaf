@@ -67,6 +67,8 @@ pub struct Row {
 pub struct Hunk {
     pub first: usize,
     pub end: usize,
+    /// Unchanged lines between the previous hunk (or the file start) and this one.
+    pub gap_before: u32,
 }
 
 /// A file in a patch. `old_path` is `None` for a new file and `new_path` is
@@ -182,31 +184,6 @@ impl Diff {
             .or(Some(file.header_row))
     }
 
-    /// The next row that holds a code line, skipping headings and notes.
-    pub fn next_content(&self, row: usize, forward: bool) -> Option<usize> {
-        if forward {
-            (row + 1..self.rows.len()).find(|&i| self.rows[i].kind.is_content())
-        } else {
-            (0..row.min(self.rows.len()))
-                .rev()
-                .find(|&i| self.rows[i].kind.is_content())
-        }
-    }
-
-    pub fn first_row(&self) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|row| row.kind.is_content())
-            .or((!self.rows.is_empty()).then_some(0))
-    }
-
-    pub fn last_row(&self) -> Option<usize> {
-        self.rows
-            .iter()
-            .rposition(|row| row.kind.is_content())
-            .or_else(|| self.rows.len().checked_sub(1))
-    }
-
     /// The row for a line on one side of a file, when the diff still has it.
     pub fn row_for(&self, file: &str, side: Side, line: u32) -> Option<usize> {
         let wanted = self.files.iter().position(|f| match side {
@@ -316,6 +293,8 @@ struct Builder<'a> {
     file: Option<usize>,
     hunk: Option<usize>,
     last_hunk: Option<usize>,
+    /// End of the previous hunk on the new side, for counting skipped lines.
+    last_new_end: Option<u32>,
     old_left: u32,
     new_left: u32,
     old_line: u32,
@@ -332,6 +311,7 @@ impl<'a> Builder<'a> {
             file: None,
             hunk: None,
             last_hunk: None,
+            last_new_end: None,
             old_left: 0,
             new_left: 0,
             old_line: 0,
@@ -440,6 +420,7 @@ impl<'a> Builder<'a> {
         self.file = Some(index);
         self.hunk = None;
         self.last_hunk = None;
+        self.last_new_end = None;
         self.old_left = 0;
         self.new_left = 0;
         self.old_line = 0;
@@ -465,6 +446,10 @@ impl<'a> Builder<'a> {
 
         let hunk = self.files[file].hunks.len();
         let header_row = self.rows.len();
+        let gap_before = self.last_new_end.map_or_else(
+            || new_start.saturating_sub(1),
+            |end| new_start.saturating_sub(end),
+        );
         self.rows.push(Row {
             start: start as u32,
             len: len as u32,
@@ -477,9 +462,11 @@ impl<'a> Builder<'a> {
         self.files[file].hunks.push(Hunk {
             first: header_row + 1,
             end: header_row + 1,
+            gap_before,
         });
         self.hunk = Some(hunk);
         self.last_hunk = Some(hunk);
+        self.last_new_end = Some(new_start + new_count);
         self.old_left = old_count;
         self.new_left = new_count;
         self.old_line = old_start;
@@ -1293,6 +1280,9 @@ diff --git a/a b/a
         assert_eq!(diff.row_text(first), "-three");
         assert_eq!(diff.row_text(last), " four");
         assert_eq!((anchor.start_line, anchor.end_line), (10, 11));
+        let hunks = &diff.files()[0].hunks;
+        assert_eq!(hunks[0].gap_before, 0);
+        assert_eq!(hunks[1].gap_before, 7);
     }
 
     #[test]
