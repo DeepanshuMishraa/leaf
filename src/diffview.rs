@@ -45,15 +45,13 @@ const HIGHLIGHT_BYTES: usize = 128 * 1024;
 /// How many rows one wheel notch moves.
 const WHEEL_ROWS: usize = 3;
 
-/// Warm backgrounds chosen for the terminal's paper, so text keeps its contrast.
+/// Colors chosen to sit on the terminal's own paper instead of painting over it.
 struct Palette {
     added: Color,
     removed: Color,
     added_word: Color,
     removed_word: Color,
-    file: Color,
     focus: Color,
-    cursor: Color,
 }
 
 impl Palette {
@@ -75,9 +73,7 @@ impl Palette {
                 removed: Color::Indexed(224),
                 added_word: Color::Indexed(157),
                 removed_word: Color::Indexed(217),
-                file: Color::Indexed(254),
                 focus: Color::Indexed(153),
-                cursor: Color::Indexed(253),
             }
         } else {
             Palette {
@@ -85,9 +81,7 @@ impl Palette {
                 removed: Color::Indexed(52),
                 added_word: Color::Indexed(28),
                 removed_word: Color::Indexed(88),
-                file: Color::Indexed(236),
                 focus: Color::Indexed(24),
-                cursor: Color::Indexed(237),
             }
         }
     }
@@ -103,9 +97,7 @@ impl Palette {
             removed: Color::Indexed(52),
             added_word: Color::Indexed(28),
             removed_word: Color::Indexed(88),
-            file: Color::Indexed(236),
             focus: Color::Indexed(24),
-            cursor: Color::Indexed(237),
         }
     }
 }
@@ -149,8 +141,15 @@ struct Confirm {
 enum Dialog {
     None,
     Help,
-    Comments { selected: usize },
-    Files { selected: usize },
+    Comments {
+        selected: usize,
+    },
+    Files {
+        /// The highlighted row, counted in filtered files.
+        selected: usize,
+        /// What has been typed into the search bar.
+        query: String,
+    },
     Error(String),
     Confirm(Confirm),
     Loading(String),
@@ -246,8 +245,7 @@ struct SplitRow {
 #[derive(Clone, Copy)]
 struct SideState {
     current: bool,
-    selected: bool,
-    focused: bool,
+    highlighted: bool,
 }
 
 impl SplitRow {
@@ -428,8 +426,8 @@ struct App {
     left: u16,
     /// The split line where a visual selection started.
     selection: Option<usize>,
-    /// Vim-style visual mode: movement extends the selection. Leaving visual
-    /// mode keeps the range so `C` can still comment on it.
+    /// Vim-style visual mode: movement extends the selection, and Escape leaves
+    /// visual mode and drops the range.
     visual: bool,
     /// The split lines of the comment just jumped to, highlighted until the
     /// reader moves.
@@ -995,8 +993,13 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc => {
+                // Escape drops whatever is highlighted before it quits.
                 if self.visual {
                     self.visual = false;
+                    self.selection = None;
+                } else if self.selection.is_some() || self.focus.is_some() {
+                    self.selection = None;
+                    self.focus = None;
                 } else {
                     self.quit = true;
                 }
@@ -1316,43 +1319,104 @@ impl App {
             return;
         }
         let selected = self.current_file().unwrap_or(0);
-        self.dialog = Dialog::Files { selected };
+        self.dialog = Dialog::Files {
+            selected,
+            query: String::new(),
+        };
+    }
+
+    /// The files the picker lists, in diff order, filtered by the search bar.
+    fn picker_files(&self) -> Vec<usize> {
+        match &self.dialog {
+            Dialog::Files { query, .. } => filtered_files(&self.loaded.diff, query),
+            _ => Vec::new(),
+        }
     }
 
     fn files_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('F') | KeyCode::Char('f') => {
-                self.dialog = Dialog::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let last = self.loaded.diff.files().len().saturating_sub(1);
-                if let Dialog::Files { selected } = &mut self.dialog {
-                    *selected = (*selected + 1).min(last);
+            // A search is the closest thing to dismiss, so Escape empties it first.
+            KeyCode::Esc => {
+                if self.files_searching() {
+                    let keep = self
+                        .picker_files()
+                        .get(self.pick_selected())
+                        .copied()
+                        .unwrap_or(0);
+                    if let Dialog::Files { selected, query } = &mut self.dialog {
+                        query.clear();
+                        *selected = keep;
+                    }
+                } else {
+                    self.dialog = Dialog::None;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if let Dialog::Files { selected } = &mut self.dialog {
-                    *selected = selected.saturating_sub(1);
-                }
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                if let Dialog::Files { selected } = &mut self.dialog {
+            KeyCode::Down => self.pick_move(1),
+            KeyCode::Up => self.pick_move(-1),
+            KeyCode::Char('n') if control => self.pick_move(1),
+            KeyCode::Char('p') if control => self.pick_move(-1),
+            KeyCode::Home => self.pick_to(0),
+            KeyCode::End => self.pick_to(usize::MAX),
+            KeyCode::Backspace => {
+                if let Dialog::Files { selected, query } = &mut self.dialog {
+                    query.pop();
                     *selected = 0;
                 }
             }
-            KeyCode::End | KeyCode::Char('G') => {
-                let last = self.loaded.diff.files().len().saturating_sub(1);
-                if let Dialog::Files { selected } = &mut self.dialog {
-                    *selected = last;
+            KeyCode::Char('u') if control => {
+                if let Dialog::Files { selected, query } = &mut self.dialog {
+                    query.clear();
+                    *selected = 0;
                 }
             }
             KeyCode::Enter => {
-                if let Dialog::Files { selected } = self.dialog {
+                let files = self.picker_files();
+                if let Some(&index) = files.get(self.pick_selected()) {
                     self.dialog = Dialog::None;
-                    self.jump_file(selected);
+                    self.jump_file(index);
+                }
+            }
+            KeyCode::Char(c) if !control => {
+                if let Dialog::Files { selected, query } = &mut self.dialog {
+                    query.push(c);
+                    *selected = 0;
                 }
             }
             _ => {}
+        }
+    }
+
+    fn pick_selected(&self) -> usize {
+        match &self.dialog {
+            Dialog::Files { selected, .. } => *selected,
+            _ => 0,
+        }
+    }
+
+    /// Whether the file picker has a search worth clearing.
+    fn files_searching(&self) -> bool {
+        match &self.dialog {
+            Dialog::Files { query, .. } => !query.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn pick_move(&mut self, delta: isize) {
+        let last = self.picker_files().len().saturating_sub(1);
+        let selected = self.pick_selected();
+        let next = if delta < 0 {
+            selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            (selected + delta as usize).min(last)
+        };
+        self.pick_to(next);
+    }
+
+    fn pick_to(&mut self, index: usize) {
+        let last = self.picker_files().len().saturating_sub(1);
+        if let Dialog::Files { selected, .. } = &mut self.dialog {
+            *selected = index.min(last);
         }
     }
 
@@ -1825,7 +1889,11 @@ impl App {
                 .get(first..=last.min(self.split.lines().len().saturating_sub(1)))
                 .map(|lines| lines.iter().filter(|line| line.is_content()).count())
                 .unwrap_or(0);
-            let mode = if self.visual { "visual · " } else { "" };
+            let mode = if self.visual {
+                "visual · "
+            } else {
+                "selected · "
+            };
             let unit = if lines == 1 { "line" } else { "lines" };
             left.push_str(&format!("  {mode}{lines} {unit} · C comment"));
         }
@@ -1861,14 +1929,14 @@ impl App {
         for index in self.scroll..end {
             let line = self.split.lines()[index];
             lines.push(match line.band {
-                Some(row) => self.row_line(row, area.width),
+                Some(row) => self.row_line(row),
                 None => self.split_content(index, area.width),
             });
         }
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    fn row_line(&mut self, index: usize, width: u16) -> Line<'static> {
+    fn row_line(&mut self, index: usize) -> Line<'static> {
         let diff = &self.loaded.diff;
         let row = diff.rows()[index];
         match row.kind {
@@ -1877,34 +1945,28 @@ impl App {
                 let (added, removed) = file.map_or((0, 0), |file| (file.added, file.removed));
                 let path = file.map(|file| file.display()).unwrap_or_default();
                 let note = file.and_then(|file| file.note.clone());
-                let bg = self.palette.file;
                 let mut spans = vec![
-                    Span::styled(" ▎ ", Style::default().fg(ACCENT).bg(bg)),
-                    Span::styled(path, Style::default().bg(bg).add_modifier(Modifier::BOLD)),
+                    Span::styled(" ▎ ", Style::default().fg(ACCENT)),
+                    Span::styled(path, Style::default().add_modifier(Modifier::BOLD)),
                 ];
                 if added > 0 {
                     spans.push(Span::styled(
                         format!(" +{added}"),
-                        Style::default().fg(ADDED_FG).bg(bg),
+                        Style::default().fg(ADDED_FG),
                     ));
                 }
                 if removed > 0 {
                     spans.push(Span::styled(
                         format!(" −{removed}"),
-                        Style::default().fg(REMOVED_FG).bg(bg),
+                        Style::default().fg(REMOVED_FG),
                     ));
                 }
                 if let Some(note) = note {
-                    spans.push(Span::styled(
-                        format!("  {note}"),
-                        Style::default().fg(DIM).bg(bg),
-                    ));
+                    spans.push(Span::styled(format!("  {note}"), Style::default().fg(DIM)));
                 }
-                fill_background(&mut spans, width, bg);
                 Line::from(spans)
             }
             RowKind::Hunk => {
-                let bg = self.palette.file;
                 let gap = diff
                     .file(row.file as usize)
                     .and_then(|file| file.hunks.get(row.hunk as usize))
@@ -1916,16 +1978,15 @@ impl App {
                     format!("⋯ {gap} unmodified line{}", if gap == 1 { "" } else { "s" })
                 };
                 let mut spans = vec![
-                    Span::styled(" ▏ ", Style::default().fg(DIM).bg(bg)),
-                    Span::styled(label, Style::default().fg(DIM).bg(bg)),
+                    Span::styled(" ▏ ", Style::default().fg(DIM)),
+                    Span::styled(label, Style::default().fg(DIM)),
                 ];
                 if let Some(note) = note {
                     spans.push(Span::styled(
                         format!("  ·  {note}"),
-                        Style::default().fg(DIM).bg(bg),
+                        Style::default().fg(DIM),
                     ));
                 }
-                fill_background(&mut spans, width, bg);
                 Line::from(spans)
             }
             RowKind::Meta | RowKind::NoNewline => Line::from(Span::styled(
@@ -1955,23 +2016,17 @@ impl App {
         let mut spans = Vec::new();
         let side = SideState {
             current,
-            selected,
-            focused,
+            highlighted: focused || selected,
         };
         self.side_line(&mut spans, line.left, Side::Old, left_width, side);
-        let rule_bg = if focused {
-            Some(self.palette.focus)
-        } else if selected {
-            Some(self.palette.file)
+        let rule_style = if side.highlighted {
+            Style::default().fg(ACCENT).bg(self.palette.focus)
         } else if current {
-            Some(self.palette.cursor)
+            Style::default().fg(ACCENT)
         } else {
-            None
+            Style::default().fg(DIM)
         };
-        spans.push(Span::styled(
-            "│",
-            Style::default().fg(DIM).bg(rule_bg.unwrap_or(Color::Reset)),
-        ));
+        spans.push(Span::styled("│", rule_style));
         self.side_line(&mut spans, line.right, Side::New, right_width, side);
         Line::from(spans)
     }
@@ -1991,11 +2046,11 @@ impl App {
         }
         let number = self.number_width();
         let Some(index) = row else {
-            let bg = self.empty_bg(state).unwrap_or(Color::Reset);
-            spans.push(Span::styled(
-                " ".repeat(width as usize),
-                Style::default().bg(bg),
-            ));
+            let style = match self.empty_bg(state) {
+                Some(bg) => Style::default().bg(bg),
+                None => Style::default(),
+            };
+            spans.push(Span::styled(" ".repeat(width as usize), style));
             return;
         };
         let diff_row = self.loaded.diff.rows()[index];
@@ -2004,12 +2059,8 @@ impl App {
             (RowKind::Removed, Side::Old) => Some(self.palette.removed),
             _ => None,
         };
-        let bg = if state.focused {
+        let bg = if state.highlighted {
             Some(self.palette.focus)
-        } else if state.selected {
-            Some(self.palette.file)
-        } else if state.current && tint.is_none() {
-            Some(self.palette.cursor)
         } else {
             tint
         };
@@ -2064,13 +2115,7 @@ impl App {
         };
         let gutter = number + 2;
         let available = (width as usize).saturating_sub(gutter);
-        let overlay = if state.focused {
-            Some(self.palette.focus)
-        } else if state.selected {
-            Some(self.palette.file)
-        } else {
-            None
-        };
+        let overlay = state.highlighted.then_some(self.palette.focus);
         let used = text_spans(
             spans,
             &text,
@@ -2092,15 +2137,7 @@ impl App {
     }
 
     fn empty_bg(&self, state: SideState) -> Option<Color> {
-        if state.focused {
-            Some(self.palette.focus)
-        } else if state.selected {
-            Some(self.palette.file)
-        } else if state.current {
-            Some(self.palette.cursor)
-        } else {
-            None
-        }
+        state.highlighted.then_some(self.palette.focus)
     }
 
     fn number_width(&self) -> usize {
@@ -2336,20 +2373,38 @@ impl App {
         }
     }
 
-    /// A minimal list of the changed files. The cursor picks one, enter opens it.
+    /// A minimal list of the changed files. Typing filters it, the cursor picks
+    /// one, and enter opens it.
     fn draw_files(&self, f: &mut Frame, area: Rect) {
-        let Dialog::Files { selected } = &self.dialog else {
+        let Dialog::Files { selected, query } = &self.dialog else {
             return;
         };
         let selected = *selected;
         let files = self.loaded.diff.files();
-        let width = 62.min(area.width.saturating_sub(8)).max(24);
+        let showing = filtered_files(&self.loaded.diff, query);
+        let width = 66.min(area.width.saturating_sub(8)).max(24);
         let text_width = width.saturating_sub(6) as usize;
-        let rows = (area.height as usize).saturating_sub(5).clamp(1, 12);
+        let rows = (area.height as usize).saturating_sub(6).clamp(1, 14);
         let start = selected.saturating_sub(rows.saturating_sub(1));
         let mut lines = Vec::new();
-        for (index, file) in files.iter().enumerate().skip(start).take(rows) {
-            let chosen = index == selected;
+        lines.push(Line::from(vec![
+            Span::styled(" / ", Style::default().fg(ACCENT)),
+            if query.is_empty() {
+                Span::styled("filter changed files", Style::default().fg(DIM))
+            } else {
+                Span::styled(query.clone(), Style::default())
+            },
+            Span::styled("▏", Style::default().fg(ACCENT)),
+        ]));
+        if showing.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "   no file matches",
+                Style::default().fg(DIM),
+            )));
+        }
+        for (offset, &index) in showing.iter().skip(start).take(rows).enumerate() {
+            let file = &files[index];
+            let chosen = start + offset == selected;
             let (status, status_color) = file_status(file);
             let stats = format!("+{} −{}", file.added, file.removed);
             let path_width = text_width.saturating_sub(cells(&stats) + 4);
@@ -2371,12 +2426,20 @@ impl App {
             ]));
         }
         lines.push(Line::from(""));
-        let shown = format!("{} of {}", selected + 1, files.len());
+        let shown = if showing.is_empty() {
+            format!("no match · {}", files.len())
+        } else if query.is_empty() {
+            format!("{} of {}", selected + 1, files.len())
+        } else {
+            format!(
+                "{} of {} · {} total",
+                selected + 1,
+                showing.len(),
+                files.len()
+            )
+        };
         lines.push(Line::from(vec![
-            Span::styled(
-                "j k move · enter open · esc close",
-                Style::default().fg(DIM),
-            ),
+            Span::styled("↑↓ move · enter open · esc close", Style::default().fg(DIM)),
             Span::styled(format!("  {shown}"), Style::default().fg(DIM)),
         ]));
         panel(f, area, "files", lines, width);
@@ -2494,6 +2557,17 @@ fn file_status(file: &File) -> (char, Color) {
     }
 }
 
+/// The files the picker lists for a search. An empty search keeps every file.
+fn filtered_files(diff: &Diff, query: &str) -> Vec<usize> {
+    let needle = query.to_lowercase();
+    diff.files()
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| needle.is_empty() || file.display().to_lowercase().contains(&needle))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// The function or context Git prints after a hunk header.
 fn hunk_note(text: &str) -> Option<&str> {
     let rest = text.strip_prefix("@@")?;
@@ -2589,16 +2663,6 @@ fn push_text(spans: &mut Vec<Span<'static>>, style: Style, text: &str) {
 }
 
 /// Pads a band row to the full width with its background still drawn.
-fn fill_background(spans: &mut Vec<Span<'static>>, width: u16, bg: Color) {
-    let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
-    if used < width as usize {
-        spans.push(Span::styled(
-            " ".repeat(width as usize - used),
-            Style::default().bg(bg),
-        ));
-    }
-}
-
 fn clip(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -2640,8 +2704,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("space b", "page down or up"),
         ("g G  Home End", "first or last line"),
         ("[ ]  N n", "previous or next file"),
-        ("f", "files: pick one to open"),
-        ("v", "visual mode; move to select, esc to leave"),
+        ("f", "files: filter by path, open one"),
+        ("v", "visual mode; move to select, esc clears"),
         ("C", "comment on the line or selection"),
         ("m", "comments: jump, resend, delete, post"),
         ("y Y", "copy this range or every comment"),
@@ -2852,21 +2916,53 @@ diff --git a/b.rs b/b.rs
         let screen = draw(&mut app, 100, 16);
         assert!(!screen.contains("▸ a.rs"));
         press(&mut app, KeyCode::Char('f'));
-        assert!(matches!(app.dialog, Dialog::Files { selected: 0 }));
+        assert!(matches!(app.dialog, Dialog::Files { selected: 0, .. }));
         let screen = draw(&mut app, 100, 16);
         assert!(screen.contains("files"));
+        assert!(screen.contains("filter changed files"));
         assert!(screen.contains("▸ M a.rs"));
         assert!(screen.contains("  M b.rs"));
         assert!(screen.contains("1 of 2"));
 
-        press(&mut app, KeyCode::Char('j'));
-        assert!(matches!(app.dialog, Dialog::Files { selected: 1 }));
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(app.dialog, Dialog::Files { selected: 1, .. }));
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.dialog, Dialog::None));
         assert_eq!(app.cursor, 5);
         assert_eq!(app.loaded.diff.file_index(app.cursor), Some(1));
 
         press(&mut app, KeyCode::Char('F'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.dialog, Dialog::None));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn the_file_picker_searches_the_changed_files() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut app, KeyCode::Char('f'));
+        type_text(&mut app, "b.");
+        let screen = draw(&mut app, 100, 16);
+        assert!(screen.contains("▸ M b.rs"), "{screen}");
+        assert!(!screen.contains("M a.rs"), "{screen}");
+        assert!(screen.contains("1 of 1 · 2 total"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.loaded.diff.file_index(app.cursor), Some(1));
+
+        // A search with no matches keeps the picker open and enter does nothing.
+        press(&mut app, KeyCode::Char('f'));
+        type_text(&mut app, "zzz");
+        let screen = draw(&mut app, 100, 16);
+        assert!(screen.contains("no file matches"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.dialog, Dialog::Files { .. }));
+
+        // Escape empties the search first, then closes the picker.
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.dialog, Dialog::Files { .. }));
+        let screen = draw(&mut app, 100, 16);
+        assert!(screen.contains("filter changed files"), "{screen}");
+        assert!(screen.contains("a.rs"), "{screen}");
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.dialog, Dialog::None));
         assert!(!app.quit);
@@ -2919,11 +3015,12 @@ diff --git a/b.rs b/b.rs
         press(&mut app, KeyCode::Esc);
         assert!(!app.quit);
         assert!(!app.visual);
-        assert_eq!(app.range(), (3, 4));
+        assert!(app.selection.is_none(), "escape drops the highlight");
+        assert!(app.focus.is_none());
 
-        press(&mut app, KeyCode::Char('j'));
-        assert!(app.selection.is_none());
-        assert_eq!(app.cursor, 5);
+        // Escape only quits once nothing is highlighted any more.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.quit);
     }
 
     #[test]
@@ -2933,7 +3030,6 @@ diff --git a/b.rs b/b.rs
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('v'));
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('C'));
 
         let composer = app.composer.as_ref().expect("a comment box");
