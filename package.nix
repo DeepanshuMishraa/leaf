@@ -9,7 +9,12 @@ rustPlatform.buildRustPackage {
   version = "0.3.0";
   src = lib.cleanSource ./.;
 
-  cargoLock.lockFile = ./Cargo.lock;
+  cargoLock = {
+    lockFile = ./Cargo.lock;
+    outputHashes = {
+      "compiler-0.0.0" = "sha256-WYf4q7RjssC9HYxebZOBmKDrIfMTyb2U9yDedp5fQEM=";
+    };
+  };
 
   nativeBuildInputs = [
     pkg-config

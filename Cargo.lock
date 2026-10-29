@@ -290,6 +290,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "compiler"
+version = "0.0.0"
+source = "git+https://github.com/wevm/ondine#0b589ec34481856b4153526f10a0a35558a201a8"
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1333,6 +1338,7 @@ name = "leaf-reader"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "compiler",
  "crossterm",
  "dom_smoothie",
  "htmd",
