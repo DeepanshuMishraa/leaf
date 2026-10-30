@@ -22,7 +22,8 @@ pub const DIM: Color = Color::Indexed(8);
 pub const CODE: Color = Color::Indexed(3);
 
 /// A block of centered lines, as PDF pages mark title pages and captions.
-static CENTERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)^<div align="center">\n(.*?)\n</div>\s*$"#).expect("pattern is valid"));
+static CENTERED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?s)^<div align="center">\n(.*?)\n</div>\s*$"#).expect("pattern is valid"));
 static HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6}) (.+)$").expect("pattern is valid"));
 static HTML_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</?[A-Za-z][^>]*>").expect("pattern is valid"));
 static LINE_BREAK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^<br\s*/?>$").expect("pattern is valid"));
@@ -103,8 +104,15 @@ enum Node {
     /// A block quote, or a GitHub alert (`> [!NOTE]`) when it has a kind.
     Quote(Option<BlockQuoteKind>, Vec<Node>),
     Code(String),
-    List { start: Option<u64>, items: Vec<Vec<Node>>, tight: bool },
-    Table { head: Vec<Inlines>, rows: Vec<Vec<Inlines>> },
+    List {
+        start: Option<u64>,
+        items: Vec<Vec<Node>>,
+        tight: bool,
+    },
+    Table {
+        head: Vec<Inlines>,
+        rows: Vec<Vec<Inlines>>,
+    },
     Figures(Vec<String>),
     Centered(String),
     Footnote(String, Vec<Node>),
@@ -143,7 +151,11 @@ struct TableParts {
 enum Frame {
     Root(Vec<Node>),
     Quote(Option<BlockQuoteKind>, Vec<Node>),
-    List { start: Option<u64>, items: Vec<Vec<Node>>, tight: bool },
+    List {
+        start: Option<u64>,
+        items: Vec<Vec<Node>>,
+        tight: bool,
+    },
     Item(Vec<Node>),
     Footnote(String, Vec<Node>),
     Definitions(Vec<Node>),
@@ -153,12 +165,9 @@ enum Frame {
 impl Frame {
     fn blocks(&mut self) -> &mut Vec<Node> {
         match self {
-            Frame::Root(b)
-            | Frame::Quote(_, b)
-            | Frame::Item(b)
-            | Frame::Footnote(_, b)
-            | Frame::Definitions(b)
-            | Frame::Definition(b) => b,
+            Frame::Root(b) | Frame::Quote(_, b) | Frame::Item(b) | Frame::Footnote(_, b) | Frame::Definitions(b) | Frame::Definition(b) => {
+                b
+            }
             Frame::List { items, .. } => {
                 if items.is_empty() {
                     items.push(Vec::new());
@@ -182,7 +191,10 @@ impl Builder {
         let style = self.style();
         match self.inlines.last_mut() {
             Some(run) if run.style == style => run.text.push_str(text),
-            _ => self.inlines.push(Run { text: text.to_owned(), style }),
+            _ => self.inlines.push(Run {
+                text: text.to_owned(),
+                style,
+            }),
         }
     }
 
@@ -200,7 +212,13 @@ impl Builder {
         if only_images {
             self.emit(Node::Figures(images));
         } else if inlines.iter().any(|r| !r.text.trim().is_empty()) {
-            let inlines = inlines.into_iter().map(|r| Run { text: r.text.replace(IMAGE_MARK, ""), style: r.style }).collect();
+            let inlines = inlines
+                .into_iter()
+                .map(|r| Run {
+                    text: r.text.replace(IMAGE_MARK, ""),
+                    style: r.style,
+                })
+                .collect();
             self.emit(Node::Paragraph(inlines));
         }
     }
@@ -251,7 +269,11 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 }
                 Tag::List(start) => {
                     b.flush_paragraph();
-                    b.stack.push(Frame::List { start, items: Vec::new(), tight: true });
+                    b.stack.push(Frame::List {
+                        start,
+                        items: Vec::new(),
+                        tight: true,
+                    });
                 }
                 Tag::Item => {
                     b.flush_paragraph();
@@ -526,10 +548,18 @@ impl Ctx<'_> {
         // The terminal has one font size, so rank comes from size where it fits
         // (large letters for a short title), then weight and space.
         if depth == 1 && font::width(&text) <= width as usize {
+            self.record(&text);
             let w = font::width(&text) as u16;
             let x = if align == Align::Center { x + (width - w) / 2 } else { x };
             for row in font::render(&text) {
-                self.laid.rows.push(Row { segs: vec![Seg { x, text: row, style: Style::default(), offset: None }] });
+                self.laid.rows.push(Row {
+                    segs: vec![Seg {
+                        x,
+                        text: row,
+                        style: Style::default(),
+                        offset: None,
+                    }],
+                });
             }
             return;
         }
@@ -538,7 +568,13 @@ impl Ctx<'_> {
         } else {
             Style::default().fg(DIM).add_modifier(Modifier::BOLD | Modifier::ITALIC)
         };
-        let runs: Vec<Run> = runs.iter().map(|r| Run { text: r.text.clone(), style: r.style.patch(style) }).collect();
+        let runs: Vec<Run> = runs
+            .iter()
+            .map(|r| Run {
+                text: r.text.clone(),
+                style: r.style.patch(style),
+            })
+            .collect();
         let cells = self.cells(&runs);
         self.flow(&cells, x, width, align, Wrap::Word);
     }
@@ -551,7 +587,13 @@ impl Ctx<'_> {
                 None => continue,
             };
             let top = self.laid.rows.len();
-            self.laid.figures.push(Figure { href: href.clone(), top, x: x + (width - cols.min(width)) / 2, cols, rows });
+            self.laid.figures.push(Figure {
+                href: href.clone(),
+                top,
+                x: x + (width - cols.min(width)) / 2,
+                cols,
+                rows,
+            });
             for _ in 0..rows {
                 self.blank();
             }
@@ -564,7 +606,16 @@ impl Ctx<'_> {
             if let Some(m) = HEADING.captures(line) {
                 let depth = m[1].len() as u8;
                 self.blank();
-                self.heading(depth, &[Run { text: m[2].to_owned(), style: Style::default() }], x, width, Align::Center);
+                self.heading(
+                    depth,
+                    &[Run {
+                        text: m[2].to_owned(),
+                        style: Style::default(),
+                    }],
+                    x,
+                    width,
+                    Align::Center,
+                );
                 self.blank();
                 continue;
             }
@@ -586,11 +637,24 @@ impl Ctx<'_> {
         let start = self.record(code);
         let mut offset = start;
         for line in code.split('\n') {
-            let cells: Vec<Cell> = line.chars().enumerate().map(|(i, c)| (c, Style::default(), Some(offset + i))).collect();
+            let cells: Vec<Cell> = line
+                .chars()
+                .enumerate()
+                .map(|(i, c)| (c, Style::default(), Some(offset + i)))
+                .collect();
             offset += line.chars().count() + 1;
-            let wrapped = if cells.is_empty() { vec![Vec::new()] } else { wrap_cells(&cells, width.saturating_sub(2).max(1), Wrap::Char) };
+            let wrapped = if cells.is_empty() {
+                vec![Vec::new()]
+            } else {
+                wrap_cells(&cells, width.saturating_sub(2).max(1), Wrap::Char)
+            };
             for part in wrapped {
-                let mut row_segs = vec![Seg { x, text: "┃".into(), style: Style::default().fg(DIM), offset: None }];
+                let mut row_segs = vec![Seg {
+                    x,
+                    text: "┃".into(),
+                    style: Style::default().fg(DIM),
+                    offset: None,
+                }];
                 row_segs.extend(segs(&part, x + 2));
                 self.laid.rows.push(Row { segs: row_segs });
             }
@@ -620,7 +684,12 @@ impl Ctx<'_> {
         if self.laid.rows.len() == first {
             self.blank();
         }
-        let marker = Seg { x, text: marker.to_owned(), style: Style::default().fg(DIM), offset: None };
+        let marker = Seg {
+            x,
+            text: marker.to_owned(),
+            style: Style::default().fg(DIM),
+            offset: None,
+        };
         self.laid.rows[first].segs.insert(0, marker);
     }
 
@@ -637,7 +706,14 @@ impl Ctx<'_> {
                 BlockQuoteKind::Caution => "Caution",
             };
             let style = Style::default().add_modifier(Modifier::BOLD);
-            self.laid.rows.push(Row { segs: vec![Seg { x: x + 2, text: label.into(), style, offset: None }] });
+            self.laid.rows.push(Row {
+                segs: vec![Seg {
+                    x: x + 2,
+                    text: label.into(),
+                    style,
+                    offset: None,
+                }],
+            });
         }
         let body = self.laid.rows.len();
         self.children(blocks, x + 2, width.saturating_sub(2).max(1), true);
@@ -648,9 +724,21 @@ impl Ctx<'_> {
                 }
             }
         }
-        let bar = if kind.is_some() { Style::default() } else { Style::default().fg(DIM) };
+        let bar = if kind.is_some() {
+            Style::default()
+        } else {
+            Style::default().fg(DIM)
+        };
         for row in &mut self.laid.rows[first..] {
-            row.segs.insert(0, Seg { x, text: "│".into(), style: bar, offset: None });
+            row.segs.insert(
+                0,
+                Seg {
+                    x,
+                    text: "│".into(),
+                    style: bar,
+                    offset: None,
+                },
+            );
         }
     }
 
@@ -660,7 +748,9 @@ impl Ctx<'_> {
             return;
         }
         let bold = Style::default().add_modifier(Modifier::BOLD);
-        let rows: Vec<(Vec<Inlines>, bool)> = std::iter::once((head.to_vec(), true)).chain(body.iter().map(|r| (r.clone(), false))).collect();
+        let rows: Vec<(Vec<Inlines>, bool)> = std::iter::once((head.to_vec(), true))
+            .chain(body.iter().map(|r| (r.clone(), false)))
+            .collect();
         // Cell characters, recorded in the page text row by row.
         let mut cells: Vec<Vec<Vec<Cell>>> = Vec::new();
         for (row, is_head) in &rows {
@@ -668,7 +758,14 @@ impl Ctx<'_> {
             for c in 0..columns {
                 let runs: Vec<Run> = row
                     .get(c)
-                    .map(|r| r.iter().map(|run| Run { text: run.text.clone(), style: if *is_head { run.style.patch(bold) } else { run.style } }).collect())
+                    .map(|r| {
+                        r.iter()
+                            .map(|run| Run {
+                                text: run.text.clone(),
+                                style: if *is_head { run.style.patch(bold) } else { run.style },
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 out.push(self.cells(&runs));
             }
@@ -678,7 +775,9 @@ impl Ctx<'_> {
         let mut widths: Vec<u16> = (0..columns).map(natural).collect();
         let available = width.saturating_sub(columns as u16 + 1).max(columns as u16);
         while widths.iter().sum::<u16>() > available {
-            let Some((widest, _)) = widths.iter().enumerate().max_by_key(|(_, w)| **w) else { break };
+            let Some((widest, _)) = widths.iter().enumerate().max_by_key(|(_, w)| **w) else {
+                break;
+            };
             if widths[widest] <= 1 {
                 break;
             }
@@ -687,7 +786,14 @@ impl Ctx<'_> {
         let border = Style::default().fg(DIM);
         let rule = |left: &str, mid: &str, right: &str| {
             let parts: Vec<String> = widths.iter().map(|w| "─".repeat(*w as usize)).collect();
-            Row { segs: vec![Seg { x, text: format!("{left}{}{right}", parts.join(mid)), style: border, offset: None }] }
+            Row {
+                segs: vec![Seg {
+                    x,
+                    text: format!("{left}{}{right}", parts.join(mid)),
+                    style: border,
+                    offset: None,
+                }],
+            }
         };
         self.laid.rows.push(rule("┌", "┬", "┐"));
         for (r, row) in cells.iter().enumerate() {
@@ -700,13 +806,23 @@ impl Ctx<'_> {
                 let mut row_segs = Vec::new();
                 let mut cx = x;
                 for (c, w) in widths.iter().enumerate() {
-                    row_segs.push(Seg { x: cx, text: "│".into(), style: border, offset: None });
+                    row_segs.push(Seg {
+                        x: cx,
+                        text: "│".into(),
+                        style: border,
+                        offset: None,
+                    });
                     if let Some(part) = wrapped[c].get(line) {
                         row_segs.extend(segs(part, cx + 1));
                     }
                     cx += w + 1;
                 }
-                row_segs.push(Seg { x: cx, text: "│".into(), style: border, offset: None });
+                row_segs.push(Seg {
+                    x: cx,
+                    text: "│".into(),
+                    style: border,
+                    offset: None,
+                });
                 self.laid.rows.push(Row { segs: row_segs });
             }
         }
@@ -731,7 +847,16 @@ impl Ctx<'_> {
                     // A lone heading keeps a heading's spacing.
                     [only] if HEADING.is_match(only) => {
                         let m = HEADING.captures(only).expect("matched");
-                        self.heading(m[1].len() as u8, &[Run { text: m[2].to_owned(), style: Style::default() }], x, width, Align::Center);
+                        self.heading(
+                            m[1].len() as u8,
+                            &[Run {
+                                text: m[2].to_owned(),
+                                style: Style::default(),
+                            }],
+                            x,
+                            width,
+                            Align::Center,
+                        );
                     }
                     _ => self.centered(content, x, width),
                 }
@@ -744,7 +869,14 @@ impl Ctx<'_> {
             Node::Definitions(blocks) => self.children(blocks, x, width, false),
             Node::Definition(blocks) => self.children(blocks, x + 4, width.saturating_sub(4).max(1), true),
             Node::Rule => {
-                self.laid.rows.push(Row { segs: vec![Seg { x, text: "─".repeat(width as usize), style: Style::default().fg(DIM), offset: None }] });
+                self.laid.rows.push(Row {
+                    segs: vec![Seg {
+                        x,
+                        text: "─".repeat(width as usize),
+                        style: Style::default().fg(DIM),
+                        offset: None,
+                    }],
+                });
             }
         }
     }
@@ -777,7 +909,11 @@ fn char_width(c: char) -> u16 {
 }
 
 fn line_width(cells: &[Cell]) -> u16 {
-    cells.split(|c| c.0 == '\n').map(|l| l.iter().map(|c| char_width(c.0)).sum::<u16>()).max().unwrap_or(0)
+    cells
+        .split(|c| c.0 == '\n')
+        .map(|l| l.iter().map(|c| char_width(c.0)).sum::<u16>())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Breaks cells into lines at most `width` wide: at spaces for `Word`
@@ -862,7 +998,12 @@ fn segs(line: &[Cell], x: u16) -> Vec<Seg> {
         if continues {
             out.last_mut().expect("a segment exists").text.push(c);
         } else {
-            out.push(Seg { x: col, text: c.to_string(), style, offset });
+            out.push(Seg {
+                x: col,
+                text: c.to_string(),
+                style,
+                offset,
+            });
         }
         prev = Some((style, offset));
         col += char_width(c);
@@ -873,7 +1014,11 @@ fn segs(line: &[Cell], x: u16) -> Vec<Seg> {
 /// Lays a page of markdown out `width` columns wide. Each block has a blank
 /// row below it; headings and figures have one above too.
 pub fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
-    let mut ctx = Ctx { laid: Laid::default(), image_sizes, cell };
+    let mut ctx = Ctx {
+        laid: Laid::default(),
+        image_sizes,
+        cell,
+    };
     for node in parse(markdown, true) {
         if spaced_above(&node) {
             ctx.blank();
@@ -970,7 +1115,18 @@ mod tests {
 
     #[test]
     fn footnotes_keep_their_label_in_text_and_hang_beside_it() {
-        assert_eq!(draw("Fact[^1].\n\n[^1]: Source here.", 40), vec!["Fact[1].", "", "[1] Source here.", ""]);
+        assert_eq!(
+            draw("Fact[^1].\n\n[^1]: Source here.", 40),
+            vec!["Fact[1].", "", "[1] Source here.", ""]
+        );
+    }
+
+    #[test]
+    fn fitting_level_one_headings_are_recorded_in_page_text() {
+        let laid = layout("# Hello", 40, (8, 16), &no_images);
+        let text: String = laid.text.iter().collect();
+
+        assert_eq!(text, "Hello\n");
     }
 
     #[test]
@@ -991,7 +1147,10 @@ mod tests {
 
     #[test]
     fn html_blocks_are_read_as_markdown() {
-        assert_eq!(draw("<details>\n<summary>More</summary>\n<p>Hidden <b>text</b></p>\n</details>", 40)[..2], ["More", ""]);
+        assert_eq!(
+            draw("<details>\n<summary>More</summary>\n<p>Hidden <b>text</b></p>\n</details>", 40)[..2],
+            ["More", ""]
+        );
         let sizes = |_: &str| Some((160, 80));
         let laid = layout("<p align=\"center\"><img src=\"leaf-image:0\"></p>", 40, (8, 16), &sizes);
         assert_eq!(laid.figures.len(), 1);
@@ -1001,7 +1160,16 @@ mod tests {
     fn images_alone_in_a_paragraph_hold_space_as_figures() {
         let sizes = |_: &str| Some((160, 80));
         let laid = layout("![](leaf-image:a)", 76, (8, 16), &sizes);
-        assert_eq!(laid.figures, vec![Figure { href: "leaf-image:a".into(), top: 1, x: 28, cols: 20, rows: 5 }]);
+        assert_eq!(
+            laid.figures,
+            vec![Figure {
+                href: "leaf-image:a".into(),
+                top: 1,
+                x: 28,
+                cols: 20,
+                rows: 5
+            }]
+        );
         assert_eq!(laid.rows.len(), 1 + 5 + 1);
     }
 }

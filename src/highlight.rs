@@ -51,7 +51,12 @@ mod tests {
     use super::*;
 
     fn h(page: usize, start: usize, end: usize) -> Highlight {
-        Highlight { page, start, end, text: format!("{start}-{end}") }
+        Highlight {
+            page,
+            start,
+            end,
+            text: format!("{start}-{end}"),
+        }
     }
 
     #[test]

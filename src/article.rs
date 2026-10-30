@@ -70,8 +70,15 @@ fn link_title(url: &str) -> String {
     let last = parsed.path_segments().and_then(|mut s| s.rfind(|p| !p.is_empty())).unwrap_or("");
     let decoded = percent_decode(last);
     let lower = decoded.to_ascii_lowercase();
-    let name = [".pdf", ".md", ".markdown"].iter().find(|ext| lower.ends_with(*ext)).map_or(decoded.as_str(), |ext| &decoded[..decoded.len() - ext.len()]);
-    if name.is_empty() { parsed.host_str().unwrap_or(url).to_owned() } else { name.to_owned() }
+    let name = [".pdf", ".md", ".markdown"]
+        .iter()
+        .find(|ext| lower.ends_with(*ext))
+        .map_or(decoded.as_str(), |ext| &decoded[..decoded.len() - ext.len()]);
+    if name.is_empty() {
+        parsed.host_str().unwrap_or(url).to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 fn percent_decode(text: &str) -> String {
@@ -93,7 +100,9 @@ fn percent_decode(text: &str) -> String {
 }
 
 fn media_type(content_type: Option<&str>) -> Option<String> {
-    content_type.and_then(|t| t.split(';').next()).map(|t| t.trim().to_ascii_lowercase())
+    content_type
+        .and_then(|t| t.split(';').next())
+        .map(|t| t.trim().to_ascii_lowercase())
 }
 
 fn is_pdf(content_type: Option<&str>, url: &str) -> bool {
@@ -124,7 +133,12 @@ pub fn from_html(html: &str, url: &str) -> Result<(String, String), ArticleFaile
         return Err(not_readable());
     }
     let converter = HtmlToMarkdown::builder()
-        .options(Options { bullet_list_marker: BulletListMarker::Dash, ul_bullet_spacing: 1, ol_number_spacing: 1, ..Options::default() })
+        .options(Options {
+            bullet_list_marker: BulletListMarker::Dash,
+            ul_bullet_spacing: 1,
+            ol_number_spacing: 1,
+            ..Options::default()
+        })
         .skip_tags(vec!["script", "style"])
         .build();
     let markdown = converter.convert(&article.content).map_err(|_| not_readable())?;
@@ -133,9 +147,12 @@ pub fn from_html(html: &str, url: &str) -> Result<(String, String), ArticleFaile
     if markdown.is_empty() {
         return Err(not_readable());
     }
-    let title = Some(article.title.trim().to_owned())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_else(|| url.to_owned()));
+    let title = Some(article.title.trim().to_owned()).filter(|t| !t.is_empty()).unwrap_or_else(|| {
+        Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| url.to_owned())
+    });
     Ok((title, markdown))
 }
 
@@ -146,11 +163,21 @@ pub fn open(link: &str) -> Result<Doc, ArticleFailed> {
         .call()
         .map_err(|e| match e {
             ureq::Error::StatusCode(status) => ArticleFailed::Http { url: url.clone(), status },
-            other => ArticleFailed::Fetch { url: url.clone(), cause: other.to_string() },
+            other => ArticleFailed::Fetch {
+                url: url.clone(),
+                cause: other.to_string(),
+            },
         })?;
     let final_url = response.get_uri().to_string();
-    let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let download = |e: ureq::Error| ArticleFailed::Download { url: url.clone(), cause: e.to_string() };
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let download = |e: ureq::Error| ArticleFailed::Download {
+        url: url.clone(),
+        cause: e.to_string(),
+    };
     let mut body = response.into_body();
     // Paper links often serve a PDF from a URL without ".pdf"; trust the content type.
     if is_pdf(content_type.as_deref(), &final_url) {
@@ -159,7 +186,10 @@ pub fn open(link: &str) -> Result<Doc, ArticleFailed> {
     }
     if is_markdown(content_type.as_deref(), &final_url) {
         let bytes = body.with_config().limit(MAX_DOWNLOAD_BYTES).read_to_vec().map_err(download)?;
-        let base = Url::parse(&final_url).map_err(|e| ArticleFailed::Fetch { url: final_url.clone(), cause: e.to_string() })?;
+        let base = Url::parse(&final_url).map_err(|e| ArticleFailed::Fetch {
+            url: final_url.clone(),
+            cause: e.to_string(),
+        })?;
         return Ok(markdown::from_url(link_title(&final_url), &String::from_utf8_lossy(&bytes), &base));
     }
     let html = body.with_config().limit(MAX_DOWNLOAD_BYTES).read_to_string().map_err(download)?;
@@ -186,7 +216,8 @@ mod tests {
 
     #[test]
     fn relative_links_and_images_become_absolute_and_permalinks_go() {
-        let html = page(r##"<h2>Setup <a href="#setup">#</a></h2><p>See <a href="/docs">the docs</a>.</p><img src="img/a.png" alt="diagram">"##);
+        let html =
+            page(r##"<h2>Setup <a href="#setup">#</a></h2><p>See <a href="/docs">the docs</a>.</p><img src="img/a.png" alt="diagram">"##);
         let (_, md) = from_html(&html, "https://example.com/blog/post").expect("readable");
         assert!(md.contains("## Setup\n"), "{md}");
         assert!(md.contains("[the docs](https://example.com/docs)"), "{md}");
@@ -195,12 +226,18 @@ mod tests {
 
     #[test]
     fn a_page_with_no_readable_content_is_an_error() {
-        assert!(matches!(from_html("<html><body></body></html>", "https://example.com/"), Err(ArticleFailed::NotReadable { .. })));
+        assert!(matches!(
+            from_html("<html><body></body></html>", "https://example.com/"),
+            Err(ArticleFailed::NotReadable { .. })
+        ));
     }
 
     #[test]
     fn an_arxiv_abstract_link_reads_the_paper() {
-        assert_eq!(paper_url("https://arxiv.org/abs/1706.03762v7"), "https://arxiv.org/pdf/1706.03762v7");
+        assert_eq!(
+            paper_url("https://arxiv.org/abs/1706.03762v7"),
+            "https://arxiv.org/pdf/1706.03762v7"
+        );
         assert_eq!(paper_url("https://example.com/abs/1"), "https://example.com/abs/1");
     }
 
@@ -217,14 +254,20 @@ mod tests {
             raw_markdown_url("https://github.com/o/r/blob/main/docs/README.md"),
             "https://raw.githubusercontent.com/o/r/main/docs/README.md"
         );
-        assert_eq!(raw_markdown_url("https://github.com/o/r/blob/main/src/lib.rs"), "https://github.com/o/r/blob/main/src/lib.rs");
+        assert_eq!(
+            raw_markdown_url("https://github.com/o/r/blob/main/src/lib.rs"),
+            "https://github.com/o/r/blob/main/src/lib.rs"
+        );
         assert_eq!(raw_markdown_url("https://github.com/o/r"), "https://github.com/o/r");
     }
 
     #[test]
     fn markdown_is_known_by_type_or_by_extension_on_plain_text() {
         assert!(is_markdown(Some("text/markdown; charset=utf-8"), "https://x.org/notes"));
-        assert!(is_markdown(Some("text/plain; charset=utf-8"), "https://raw.githubusercontent.com/o/r/main/README.md"));
+        assert!(is_markdown(
+            Some("text/plain; charset=utf-8"),
+            "https://raw.githubusercontent.com/o/r/main/README.md"
+        ));
         assert!(!is_markdown(Some("text/html"), "https://x.org/post.md"));
         assert!(!is_markdown(Some("text/plain"), "https://x.org/notes.txt"));
     }

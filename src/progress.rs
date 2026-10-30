@@ -140,7 +140,10 @@ pub fn default_path() -> PathBuf {
 }
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// A stored count, or `None` if it isn't one we wrote.
@@ -151,19 +154,31 @@ fn count(value: i64) -> Option<usize> {
 impl Store {
     /// Opens (creating if needed) the store at `path`; `:memory:` keeps it in memory.
     pub fn open(path: &Path) -> Result<Self, StoreFailed> {
-        let failed = |cause: String| StoreFailed { operation: Operation::Open, path: path.to_owned(), cause };
+        let failed = |cause: String| StoreFailed {
+            operation: Operation::Open,
+            path: path.to_owned(),
+            cause,
+        };
         let in_memory = path == Path::new(":memory:");
         if !in_memory && let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| failed(e.to_string()))?;
         }
-        let db = if in_memory { Connection::open_in_memory() } else { Connection::open(path) }
-            .map_err(|e| failed(e.to_string()))?;
+        let db = if in_memory {
+            Connection::open_in_memory()
+        } else {
+            Connection::open(path)
+        }
+        .map_err(|e| failed(e.to_string()))?;
         db.execute_batch(SCHEMA).map_err(|e| failed(e.to_string()))?;
         Ok(Store { db, path: path.to_owned() })
     }
 
     fn failed(&self, operation: Operation) -> impl Fn(rusqlite::Error) -> StoreFailed + '_ {
-        move |e| StoreFailed { operation, path: self.path.clone(), cause: e.to_string() }
+        move |e| StoreFailed {
+            operation,
+            path: self.path.clone(),
+            cause: e.to_string(),
+        }
     }
 
     pub fn load(&self, key: &str) -> Result<Option<Progress>, StoreFailed> {
@@ -175,7 +190,11 @@ impl Store {
             .optional()
             .map_err(self.failed(Operation::Read))?;
         Ok(row.and_then(|(page, page_count, percent)| {
-            let progress = Progress { page: count(page)?, page_count: count(page_count)?, percent: count(percent)? };
+            let progress = Progress {
+                page: count(page)?,
+                page_count: count(page_count)?,
+                percent: count(percent)?,
+            };
             (progress.page >= 1).then_some(progress)
         }))
     }
@@ -186,7 +205,13 @@ impl Store {
                 "INSERT INTO progress (key, page, page_count, percent, updated_at) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(key) DO UPDATE SET page = excluded.page, page_count = excluded.page_count,
                    percent = excluded.percent, updated_at = excluded.updated_at",
-                params![key, progress.page as i64, progress.page_count as i64, progress.percent as i64, now()],
+                params![
+                    key,
+                    progress.page as i64,
+                    progress.page_count as i64,
+                    progress.percent as i64,
+                    now()
+                ],
             )
             .map(drop)
             .map_err(self.failed(Operation::Save))
@@ -195,10 +220,17 @@ impl Store {
     pub fn load_scroll(&self, key: &str) -> Result<Option<Scroll>, StoreFailed> {
         let row = self
             .db
-            .query_row("SELECT anchor, percent FROM scroll WHERE key = ?", [key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .query_row("SELECT anchor, percent FROM scroll WHERE key = ?", [key], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
             .optional()
             .map_err(self.failed(Operation::Read))?;
-        Ok(row.and_then(|(anchor, percent)| Some(Scroll { anchor: count(anchor)?, percent: count(percent)? })))
+        Ok(row.and_then(|(anchor, percent)| {
+            Some(Scroll {
+                anchor: count(anchor)?,
+                percent: count(percent)?,
+            })
+        }))
     }
 
     pub fn save_scroll(&self, key: &str, scroll: Scroll) -> Result<(), StoreFailed> {
@@ -237,7 +269,14 @@ impl Store {
             .prepare("SELECT page, start, end, text FROM highlights WHERE key = ? ORDER BY page, start")
             .map_err(self.failed(Operation::Read))?;
         let rows = query
-            .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))
+            .query_map([key], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
             .map_err(self.failed(Operation::Read))?;
         let mut highlights = Vec::new();
         for row in rows {
@@ -255,7 +294,11 @@ impl Store {
     /// Replaces every highlight saved for `key`.
     pub fn save_highlights(&mut self, key: &str, highlights: &[Highlight]) -> Result<(), StoreFailed> {
         let path = self.path.clone();
-        let failed = |e: rusqlite::Error| StoreFailed { operation: Operation::Save, path: path.clone(), cause: e.to_string() };
+        let failed = |e: rusqlite::Error| StoreFailed {
+            operation: Operation::Save,
+            path: path.clone(),
+            cause: e.to_string(),
+        };
         let tx = self.db.transaction().map_err(failed)?;
         tx.execute("DELETE FROM highlights WHERE key = ?", [key]).map_err(failed)?;
         for h in highlights {
@@ -269,8 +312,13 @@ impl Store {
     }
 
     pub fn load_bookmarks(&self, key: &str) -> Result<Vec<Bookmark>, StoreFailed> {
-        let mut query = self.db.prepare("SELECT page, label FROM bookmarks WHERE key = ? ORDER BY page").map_err(self.failed(Operation::Read))?;
-        let rows = query.query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(self.failed(Operation::Read))?;
+        let mut query = self
+            .db
+            .prepare("SELECT page, label FROM bookmarks WHERE key = ? ORDER BY page")
+            .map_err(self.failed(Operation::Read))?;
+        let rows = query
+            .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(self.failed(Operation::Read))?;
         let mut bookmarks = Vec::new();
         for row in rows {
             let (page, label) = row.map_err(self.failed(Operation::Read))?;
@@ -284,11 +332,19 @@ impl Store {
     /// Replaces every bookmark of `key` with `bookmarks`.
     pub fn save_bookmarks(&mut self, key: &str, bookmarks: &[Bookmark]) -> Result<(), StoreFailed> {
         let path = self.path.clone();
-        let failed = |e: rusqlite::Error| StoreFailed { operation: Operation::Save, path: path.clone(), cause: e.to_string() };
+        let failed = |e: rusqlite::Error| StoreFailed {
+            operation: Operation::Save,
+            path: path.clone(),
+            cause: e.to_string(),
+        };
         let tx = self.db.transaction().map_err(failed)?;
         tx.execute("DELETE FROM bookmarks WHERE key = ?", [key]).map_err(failed)?;
         for b in bookmarks {
-            tx.execute("INSERT OR REPLACE INTO bookmarks (key, page, label) VALUES (?, ?, ?)", params![key, b.page as i64, b.label]).map_err(failed)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO bookmarks (key, page, label) VALUES (?, ?, ?)",
+                params![key, b.page as i64, b.label],
+            )
+            .map_err(failed)?;
         }
         tx.commit().map_err(failed)
     }
@@ -315,7 +371,14 @@ mod tests {
         assert_eq!(store.load("/a.pdf").unwrap(), None);
         store.save("/a.pdf", Progress::of(15, 613)).unwrap();
         store.save("/b.pdf", Progress::of(3, 10)).unwrap();
-        assert_eq!(store.load("/a.pdf").unwrap(), Some(Progress { page: 15, page_count: 613, percent: 2 }));
+        assert_eq!(
+            store.load("/a.pdf").unwrap(),
+            Some(Progress {
+                page: 15,
+                page_count: 613,
+                percent: 2
+            })
+        );
         store.save("/a.pdf", Progress::of(40, 613)).unwrap();
         assert_eq!(store.load("/a.pdf").unwrap().map(|p| p.page), Some(40));
     }
@@ -341,8 +404,18 @@ mod tests {
     #[test]
     fn highlights_come_back_per_document_and_saving_replaces_them() {
         let mut store = memory();
-        let first = Highlight { page: 2, start: 10, end: 15, text: "hello".into() };
-        let second = Highlight { page: 0, start: 0, end: 3, text: "abc".into() };
+        let first = Highlight {
+            page: 2,
+            start: 10,
+            end: 15,
+            text: "hello".into(),
+        };
+        let second = Highlight {
+            page: 0,
+            start: 0,
+            end: 3,
+            text: "abc".into(),
+        };
         store.save_highlights("/a.pdf", &[first.clone(), second.clone()]).unwrap();
         store.save_highlights("/b.pdf", std::slice::from_ref(&first)).unwrap();
         assert_eq!(store.load_highlights("/a.pdf").unwrap(), vec![second.clone(), first.clone()]);
@@ -354,7 +427,16 @@ mod tests {
     #[test]
     fn bookmarks_come_back_per_document_in_page_order() {
         let mut store = memory();
-        let (late, early) = (Bookmark { page: 9, label: "Chapter 2".into() }, Bookmark { page: 1, label: "Preface".into() });
+        let (late, early) = (
+            Bookmark {
+                page: 9,
+                label: "Chapter 2".into(),
+            },
+            Bookmark {
+                page: 1,
+                label: "Preface".into(),
+            },
+        );
         store.save_bookmarks("/a.epub", &[late.clone(), early.clone()]).unwrap();
         store.save_bookmarks("/b.epub", std::slice::from_ref(&late)).unwrap();
         assert_eq!(store.load_bookmarks("/a.epub").unwrap(), vec![early.clone(), late.clone()]);

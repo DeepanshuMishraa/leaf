@@ -12,7 +12,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ./Cargo.lock;
     outputHashes = {
-      "compiler-0.0.0" = "sha256-WYf4q7RjssC9HYxebZOBmKDrIfMTyb2U9yDedp5fQEM=";
+      "compiler-0.0.0" = "sha256-HzLngWsZZVVNgkmPYvDgEJHSK7hUq7UX5517nhR4IKc=";
     };
   };
 

@@ -110,7 +110,11 @@ enum Seek {
     /// Reading pages for the next match. Matches on `from`'s page count from
     /// its offset on (or, going back, before it); `step` pages have been read.
     /// The search wraps round, ending on the part of `from`'s page it skipped.
-    Seeking { direction: Direction, from: TextPos, step: usize },
+    Seeking {
+        direction: Direction,
+        from: TextPos,
+        step: usize,
+    },
     Found(Match),
     Missing,
 }
@@ -135,7 +139,11 @@ struct Selection {
 
 impl Selection {
     fn range(self) -> (TextPos, TextPos) {
-        if self.anchor <= self.head { (self.anchor, self.head) } else { (self.head, self.anchor) }
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
     }
 }
 
@@ -282,7 +290,7 @@ impl App {
         };
         let (doc_paged, options_anchor) = (doc.page_count.is_some(), options.start_anchor);
         let (fetched_tx, fetched_rx) = mpsc::channel();
-        let kitty =(picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected()).then(Kitty::default);
+        let kitty = (picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected()).then(Kitty::default);
         App {
             image_mode: options.image_mode,
             highlights: options.highlights.clone(),
@@ -351,7 +359,11 @@ impl App {
 
     /// Rows above a page's text: top padding, or the page number between pages when scrolling.
     fn prefix(&self, page: usize) -> usize {
-        if self.mode == Mode::Scroll && page > 0 && self.doc.page_count.is_some() { 3 } else { 1 }
+        if self.mode == Mode::Scroll && page > 0 && self.doc.page_count.is_some() {
+            3
+        } else {
+            1
+        }
     }
 
     fn height(&mut self, page: usize) -> usize {
@@ -387,7 +399,10 @@ impl App {
 
     fn at_bottom(&mut self) -> bool {
         match self.mode {
-            Mode::Paged => self.offset >= self.max_offset(),
+            Mode::Paged => {
+                let max = self.max_offset();
+                self.offset >= max
+            }
             Mode::Scroll => self.rows_to_end() <= self.view(),
         }
     }
@@ -445,7 +460,11 @@ impl App {
 
     /// The page the reader is on: at the very end, the last page, even if it starts below the top.
     fn reading(&mut self) -> usize {
-        if self.mode == Mode::Scroll && self.at_bottom() { self.last() } else { self.current }
+        if self.mode == Mode::Scroll && self.at_bottom() {
+            self.last()
+        } else {
+            self.current
+        }
     }
 
     fn footer(&mut self) -> String {
@@ -485,14 +504,22 @@ impl App {
     fn top_anchor(&mut self) -> usize {
         let laid = self.laid(0);
         let top = self.offset.saturating_sub(self.prefix(0)).min(laid.rows.len());
-        laid.rows[top..].iter().flat_map(|row| &row.segs).find_map(|seg| seg.offset).unwrap_or(laid.text.len())
+        laid.rows[top..]
+            .iter()
+            .flat_map(|row| &row.segs)
+            .find_map(|seg| seg.offset)
+            .unwrap_or(laid.text.len())
     }
 
     /// Scrolls a page-less document so the line holding `anchor` is at the top.
     fn scroll_to_anchor(&mut self, anchor: usize) {
         let laid = self.laid(0);
         let holds = |seg: &render::Seg| seg.offset.is_some_and(|o| o + seg.text.chars().count() > anchor);
-        let row = laid.rows.iter().position(|row| row.segs.iter().any(holds)).unwrap_or(laid.rows.len());
+        let row = laid
+            .rows
+            .iter()
+            .position(|row| row.segs.iter().any(holds))
+            .unwrap_or(laid.rows.len());
         self.offset = if row == 0 { 0 } else { row + self.prefix(0) };
     }
 
@@ -506,7 +533,10 @@ impl App {
     /// Reports the place in a page-less document when its percent changes, or
     /// on `settling` (quitting) whenever it moved at all.
     fn report_scroll(&mut self, settling: bool) {
-        let scroll = Scroll { anchor: self.top_anchor(), percent: self.scrolled() };
+        let scroll = Scroll {
+            anchor: self.top_anchor(),
+            percent: self.scrolled(),
+        };
         let due = match self.reported_scroll {
             None => true,
             Some(last) => last.percent != scroll.percent || (settling && last != scroll),
@@ -640,7 +670,12 @@ impl App {
             self.clamp_end();
         }
         self.prune();
-        self.column = Rect { x: area.x + (area.width - width) / 2, y: area.y, width, height: self.view_height };
+        self.column = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y,
+            width,
+            height: self.view_height,
+        };
 
         // What each row of the screen shows.
         let mut screen = Vec::with_capacity(self.view());
@@ -664,14 +699,26 @@ impl App {
         let found = self.matches_on(&screen);
         for (y, slot) in screen.iter().enumerate() {
             let Some(ScreenRow { page, row }) = *slot else { continue };
-            let marks = Marks { selection, found: found.get(&page).map_or(&[], Vec::as_slice), here: self.found_here() };
+            let marks = Marks {
+                selection,
+                found: found.get(&page).map_or(&[], Vec::as_slice),
+                here: self.found_here(),
+            };
             self.draw_row(f, page, row, self.column.y + y as u16, marks);
         }
         self.draw_figures(f, &screen);
 
         let footer = self.footer();
-        let footer_area = Rect { x: area.x, y: area.y + area.height.saturating_sub(2), width: area.width, height: 1.min(area.height) };
-        f.render_widget(Paragraph::new(footer).style(Style::default().fg(DIM)).alignment(Alignment::Center), footer_area);
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width,
+            height: 1.min(area.height),
+        };
+        f.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(DIM)).alignment(Alignment::Center),
+            footer_area,
+        );
 
         let panel = match self.dialog.clone() {
             Dialog::None => None,
@@ -688,7 +735,9 @@ impl App {
 
     /// Every match of the search on the pages on screen.
     fn matches_on(&mut self, screen: &[Option<ScreenRow>]) -> HashMap<usize, Vec<(usize, usize)>> {
-        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else { return HashMap::new() };
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return HashMap::new();
+        };
         let mut found = HashMap::new();
         for page in screen.iter().flatten().map(|s| s.page) {
             found.entry(page).or_insert_with(|| query.matches(&self.laid(page).text));
@@ -769,26 +818,43 @@ impl App {
                 let visible: Vec<usize> = screen
                     .iter()
                     .enumerate()
-                    .filter_map(|(y, s)| s.filter(|s| s.page == page && s.row >= top && s.row < top + figure.rows as usize).map(|_| y))
+                    .filter_map(|(y, s)| {
+                        s.filter(|s| s.page == page && s.row >= top && s.row < top + figure.rows as usize)
+                            .map(|_| y)
+                    })
                     .collect();
-                let (Some(&first_y), Some(&last_y)) = (visible.first(), visible.last()) else { continue };
+                let (Some(&first_y), Some(&last_y)) = (visible.first(), visible.last()) else {
+                    continue;
+                };
                 let from = (screen[first_y].map_or(top, |s| s.row) - top) as u16;
                 let to = from + (last_y - first_y + 1) as u16;
                 let pixels = self.figure_pixels(&figure.href, figure.cols);
                 pixels_used.insert((figure.href.clone(), self.image_mode));
                 let Some(pixels) = pixels else { continue };
-                let key = ProtocolKey { href: figure.href.clone(), mode: self.image_mode, cols: figure.cols, from, to };
+                let key = ProtocolKey {
+                    href: figure.href.clone(),
+                    mode: self.image_mode,
+                    cols: figure.cols,
+                    from,
+                    to,
+                };
                 if !self.protocols.contains_key(&key) {
                     // Only the rows on screen are drawn: protocols can't clip an image's top.
                     let (w, h) = pixels.dimensions();
                     let rows = figure.rows as u32;
-                    let (y0, y1) = (h * from as u32 / rows, (h * to as u32 / rows).max(h * from as u32 / rows + 1).min(h));
+                    let (y0, y1) = (
+                        h * from as u32 / rows,
+                        (h * to as u32 / rows).max(h * from as u32 / rows + 1).min(h),
+                    );
                     let slice = image::imageops::crop_imm(pixels.as_ref(), 0, y0, w, y1 - y0).to_image();
                     // Protocols never scale an image up, so it's sized to fill its cells first.
                     let font = self.picker.font_size();
                     let (box_w, box_h) = (figure.cols as f32 * font.width as f32, (to - from) as f32 * font.height as f32);
                     let scale = (box_w / slice.width() as f32).min(box_h / slice.height() as f32);
-                    let fitted = (((slice.width() as f32 * scale) as u32).max(1), ((slice.height() as f32 * scale) as u32).max(1));
+                    let fitted = (
+                        ((slice.width() as f32 * scale) as u32).max(1),
+                        ((slice.height() as f32 * scale) as u32).max(1),
+                    );
                     let slice = if fitted == slice.dimensions() {
                         slice
                     } else {
@@ -797,12 +863,19 @@ impl App {
                     let drawn = match &mut self.kitty {
                         Some(kitty) => {
                             let cells = |px: u32, cell: u16, max: u16| (px.div_ceil(cell.max(1) as u32) as u16).clamp(1, max);
-                            let (cols, rows) = (cells(slice.width(), font.width, figure.cols), cells(slice.height(), font.height, to - from));
+                            let (cols, rows) = (
+                                cells(slice.width(), font.width, figure.cols),
+                                cells(slice.height(), font.height, to - from),
+                            );
                             kitty.upload(&slice, cols, rows).map(Drawn::Kitty)
                         }
                         None => self
                             .picker
-                            .new_protocol(DynamicImage::ImageRgba8(slice), Size::new(figure.cols, to - from), Resize::Fit(None))
+                            .new_protocol(
+                                DynamicImage::ImageRgba8(slice),
+                                Size::new(figure.cols, to - from),
+                                Resize::Fit(None),
+                            )
                             .ok()
                             .map(Drawn::Protocol),
                     };
@@ -816,8 +889,17 @@ impl App {
                 };
                 let x = self.column.x + figure.x + figure.cols.saturating_sub(size.width) / 2;
                 // A figure cut off at the top sits against the bottom of its visible rows.
-                let y = if from > 0 { self.column.y + last_y as u16 + 1 - size.height.min(to - from) } else { self.column.y + first_y as u16 };
-                let rect = Rect { x, y, width: size.width, height: size.height.min(to - from) };
+                let y = if from > 0 {
+                    self.column.y + last_y as u16 + 1 - size.height.min(to - from)
+                } else {
+                    self.column.y + first_y as u16
+                };
+                let rect = Rect {
+                    x,
+                    y,
+                    width: size.width,
+                    height: size.height.min(to - from),
+                };
                 match drawn {
                     Drawn::Kitty(image) => self.placements.push((*image, rect)),
                     Drawn::Protocol(protocol) => f.render_widget(Image::new(protocol).allow_clipping(true), rect),
@@ -857,7 +939,12 @@ impl App {
             .title(Line::from(format!(" {title} ")).style(Style::default().fg(DIM)).centered());
         let inner = block.inner(rect);
         f.render_widget(block, rect);
-        let body = Rect { x: inner.x + 3, y: inner.y + 1, width: inner.width.saturating_sub(6), height: inner.height.saturating_sub(2) };
+        let body = Rect {
+            x: inner.x + 3,
+            y: inner.y + 1,
+            width: inner.width.saturating_sub(6),
+            height: inner.height.saturating_sub(2),
+        };
         f.render_widget(Paragraph::new(lines), body);
         rect
     }
@@ -868,15 +955,31 @@ impl App {
         if paged {
             rows.push(("←/→  h/l", "previous / next page"));
         }
-        rows.extend([("j/k  ↓/↑", "scroll"), ("d/u", "half screen down / up"), ("space/b", "next / previous screen")]);
+        rows.extend([
+            ("j/k  ↓/↑", "scroll"),
+            ("d/u", "half screen down / up"),
+            ("space/b", "next / previous screen"),
+        ]);
         rows.push(("g/G", if paged { "first / last page" } else { "top / bottom" }));
         if paged {
             rows.push(("t  :", "go to page"));
             rows.extend([("m", "bookmark this page, or remove it"), ("'", "bookmarks")]);
         }
         rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
-        rows.push(("i", if self.image_mode == ImageMode::Color { "paint images" } else { "show original images" }));
-        rows.extend([("drag", "select and copy text"), ("y", "highlight selection, or clear one"), ("?", "this help"), ("q", "quit")]);
+        rows.push((
+            "i",
+            if self.image_mode == ImageMode::Color {
+                "paint images"
+            } else {
+                "show original images"
+            },
+        ));
+        rows.extend([
+            ("drag", "select and copy text"),
+            ("y", "highlight selection, or clear one"),
+            ("?", "this help"),
+            ("q", "quit"),
+        ]);
         rows
     }
 
@@ -913,7 +1016,10 @@ impl App {
     fn draw_find(&self, f: &mut Frame, area: Rect, typed: &str) -> Rect {
         let hint = "enter find · esc cancel";
         let lines = vec![
-            Line::from(vec![Span::styled(typed.to_owned(), Style::default().add_modifier(Modifier::BOLD)), Span::raw("▏")]),
+            Line::from(vec![
+                Span::styled(typed.to_owned(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("▏"),
+            ]),
             Line::default(),
             Line::from(Span::styled(hint, Style::default().fg(DIM))).centered(),
         ];
@@ -937,7 +1043,11 @@ impl App {
             .enumerate()
             .map(|(i, b)| {
                 let picked = first + i == selected;
-                let style = if picked { Style::default().add_modifier(Modifier::BOLD) } else { Style::default().fg(DIM) };
+                let style = if picked {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                };
                 Line::from(vec![
                     Span::styled(if picked { "› " } else { "  " }, style),
                     Span::styled(format!("{:>number_width$}  ", b.page + 1), Style::default().fg(DIM)),
@@ -945,7 +1055,12 @@ impl App {
                 ])
             })
             .collect();
-        let width = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(hint.chars().count() as u16);
+        let width = lines
+            .iter()
+            .map(|l| l.width() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(hint.chars().count() as u16);
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
         Self::panel(f, area, "Bookmarks", lines, width)
@@ -990,8 +1105,16 @@ impl App {
         let last = self.bookmarks.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('\'') => self.dialog = Dialog::None,
-            KeyCode::Down | KeyCode::Char('j') => self.dialog = Dialog::Bookmarks { selected: (selected + 1).min(last) },
-            KeyCode::Up | KeyCode::Char('k') => self.dialog = Dialog::Bookmarks { selected: selected.saturating_sub(1) },
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.dialog = Dialog::Bookmarks {
+                    selected: (selected + 1).min(last),
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.dialog = Dialog::Bookmarks {
+                    selected: selected.saturating_sub(1),
+                }
+            }
             KeyCode::Enter => {
                 self.dialog = Dialog::None;
                 if let Some(page) = self.bookmarks.get(selected).map(|b| b.page) {
@@ -1004,7 +1127,9 @@ impl App {
             {
                 self.bookmarks.remove(selected);
                 (self.options.on_bookmarks)(&self.bookmarks);
-                self.dialog = Dialog::Bookmarks { selected: selected.min(self.bookmarks.len().saturating_sub(1)) };
+                self.dialog = Dialog::Bookmarks {
+                    selected: selected.min(self.bookmarks.len().saturating_sub(1)),
+                };
             }
             _ => {}
         }
@@ -1019,7 +1144,10 @@ impl App {
 
     /// Searches from `from`, reading pages for a while.
     fn seek(&mut self, query: Query, direction: Direction, from: TextPos) {
-        self.search = Some(Search { query, seek: Seek::Seeking { direction, from, step: 0 } });
+        self.search = Some(Search {
+            query,
+            seek: Seek::Seeking { direction, from, step: 0 },
+        });
         self.advance_search(SEARCH_SLICE);
     }
 
@@ -1045,7 +1173,11 @@ impl App {
                 Direction::Backward if step == pages => start >= from.offset,
                 _ => true,
             };
-            let mut ranges = search.query.matches(&self.laid(page).text).into_iter().filter(|&(start, _)| keep(start));
+            let mut ranges = search
+                .query
+                .matches(&self.laid(page).text)
+                .into_iter()
+                .filter(|&(start, _)| keep(start));
             let hit = match direction {
                 Direction::Forward => ranges.next(),
                 Direction::Backward => ranges.next_back(),
@@ -1066,7 +1198,13 @@ impl App {
 
     /// The match after (or before) the one the reader is on.
     fn next_match(&mut self, direction: Direction) {
-        let Some(Search { query, seek: Seek::Found(here) }) = &self.search else { return };
+        let Some(Search {
+            query,
+            seek: Seek::Found(here),
+        }) = &self.search
+        else {
+            return;
+        };
         let offset = match direction {
             Direction::Forward => here.start + 1,
             Direction::Backward => here.start,
@@ -1079,7 +1217,10 @@ impl App {
     fn reveal(&mut self, found: Match) {
         self.go_to_page(found.page, false);
         let laid = self.laid(found.page);
-        let holds = |seg: &render::Seg| seg.offset.is_some_and(|o| o <= found.start && found.start < o + seg.text.chars().count());
+        let holds = |seg: &render::Seg| {
+            seg.offset
+                .is_some_and(|o| o <= found.start && found.start < o + seg.text.chars().count())
+        };
         let row = laid.rows.iter().position(|row| row.segs.iter().any(holds)).unwrap_or(0) + self.prefix(found.page);
         if row >= self.view() {
             let offset = row.saturating_sub(self.view() / 3);
@@ -1132,7 +1273,14 @@ impl App {
             KeyCode::Enter => {
                 self.dialog = Dialog::None;
                 if let Some(query) = Query::new(&typed) {
-                    self.seek(query, Direction::Forward, TextPos { page: self.current, offset: 0 });
+                    self.seek(
+                        query,
+                        Direction::Forward,
+                        TextPos {
+                            page: self.current,
+                            offset: 0,
+                        },
+                    );
                 }
             }
             KeyCode::Backspace => {
@@ -1140,7 +1288,11 @@ impl App {
                 typed.pop();
                 self.dialog = Dialog::Find { typed };
             }
-            KeyCode::Char(c) => self.dialog = Dialog::Find { typed: format!("{typed}{c}") },
+            KeyCode::Char(c) => {
+                self.dialog = Dialog::Find {
+                    typed: format!("{typed}{c}"),
+                }
+            }
             _ => {}
         }
     }
@@ -1166,7 +1318,10 @@ impl App {
             Some('?') | Some('/') => self.dialog = Dialog::Help,
             Some('t') | Some(':') => {
                 if let Some(page_count) = self.doc.page_count {
-                    self.dialog = Dialog::Goto { digits: String::new(), page_count };
+                    self.dialog = Dialog::Goto {
+                        digits: String::new(),
+                        page_count,
+                    };
                 }
             }
             Some('m') if key.kind == KeyEventKind::Press => self.toggle_bookmark(),
@@ -1250,7 +1405,9 @@ impl App {
         let text_rows = laid.rows.iter().enumerate().skip(slot.row.saturating_sub(prefix));
         for (i, row) in text_rows {
             let segs: Vec<&render::Seg> = row.segs.iter().filter(|s| s.offset.is_some()).collect();
-            let (Some(first), Some(last)) = (segs.first(), segs.last()) else { continue };
+            let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
+                continue;
+            };
             // A row below the one pointed at: its start.
             if i + prefix != slot.row || col < first.x {
                 return first.offset.map(|offset| TextPos { page: slot.page, offset });
@@ -1260,14 +1417,23 @@ impl App {
                 for (n, c) in seg.text.chars().enumerate() {
                     let w = char_width(c).max(1);
                     if col < sx + w {
-                        return seg.offset.map(|o| TextPos { page: slot.page, offset: o + n });
+                        return seg.offset.map(|o| TextPos {
+                            page: slot.page,
+                            offset: o + n,
+                        });
                     }
                     sx += w;
                 }
             }
-            return last.offset.map(|o| TextPos { page: slot.page, offset: o + last.text.chars().count() });
+            return last.offset.map(|o| TextPos {
+                page: slot.page,
+                offset: o + last.text.chars().count(),
+            });
         }
-        Some(TextPos { page: slot.page, offset: laid.text.len() })
+        Some(TextPos {
+            page: slot.page,
+            offset: laid.text.len(),
+        })
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
@@ -1302,7 +1468,9 @@ impl App {
 
     /// The selection as ranges of page text, one per page it spans.
     fn selected_ranges(&mut self) -> Vec<Highlight> {
-        let Some((start, end)) = self.selection.map(Selection::range) else { return Vec::new() };
+        let Some((start, end)) = self.selection.map(Selection::range) else {
+            return Vec::new();
+        };
         let mut ranges = Vec::new();
         for page in start.page..=end.page {
             let text = self.laid(page).text.clone();
@@ -1310,7 +1478,12 @@ impl App {
             let to = if page == end.page { end.offset } else { text.len() }.min(text.len());
             if from < to {
                 let slice: String = text[from..to].iter().collect();
-                ranges.push(Highlight { page, start: from, end: to, text: slice.trim_end_matches('\n').to_owned() });
+                ranges.push(Highlight {
+                    page,
+                    start: from,
+                    end: to,
+                    text: slice.trim_end_matches('\n').to_owned(),
+                });
             }
         }
         ranges
@@ -1357,7 +1530,11 @@ impl App {
             }
             // A search keeps reading pages between keys, and images
             // downloading are checked for often; otherwise sleep until something happens.
-            let wait = if self.seeking() { Some(Duration::ZERO) } else { self.loading().then_some(Duration::from_millis(100)) };
+            let wait = if self.seeking() {
+                Some(Duration::ZERO)
+            } else {
+                self.loading().then_some(Duration::from_millis(100))
+            };
             if let Some(wait) = wait
                 && !event::poll(wait)?
             {
@@ -1394,7 +1571,11 @@ fn query_color(code: u8) -> Option<Rgb> {
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
         let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
-        let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        let mut fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: one valid pollfd for stdin, polled with a timeout.
         if unsafe { libc::poll(&mut fd, 1, left.max(1)) } <= 0 {
             break;
@@ -1469,7 +1650,11 @@ mod tests {
     }
 
     fn book(pages: &[&str]) -> Doc {
-        Doc { title: "Book".into(), page_count: Some(pages.len()), source: Box::new(Book(pages.iter().map(|p| p.to_string()).collect())) }
+        Doc {
+            title: "Book".into(),
+            page_count: Some(pages.len()),
+            source: Box::new(Book(pages.iter().map(|p| p.to_string()).collect())),
+        }
     }
 
     struct Screen {
@@ -1480,7 +1665,10 @@ mod tests {
     impl Screen {
         fn new(doc: Doc, width: u16, height: u16, options: ViewerOptions) -> Self {
             let app = App::new(doc, options, Picker::halfblocks());
-            let mut screen = Screen { app, terminal: Terminal::new(TestBackend::new(width, height)).expect("test terminal") };
+            let mut screen = Screen {
+                app,
+                terminal: Terminal::new(TestBackend::new(width, height)).expect("test terminal"),
+            };
             screen.draw();
             screen
         }
@@ -1491,18 +1679,34 @@ mod tests {
             app.report_page();
             let buffer = self.terminal.backend().buffer();
             (0..buffer.area.height)
-                .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_owned())
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         }
 
         fn press(&mut self, code: KeyCode) -> String {
-            self.app.key(KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+            self.app.key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            });
             self.draw()
         }
 
         fn mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) -> String {
-            self.app.mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+            self.app.mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
             self.draw()
         }
 
@@ -1536,7 +1740,11 @@ mod tests {
     #[test]
     fn a_figure_that_cant_be_decoded_is_tried_once_while_on_screen() {
         let tries = Rc::new(std::cell::Cell::new(0));
-        let doc = Doc { title: "Book".into(), page_count: Some(1), source: Box::new(Broken(tries.clone())) };
+        let doc = Doc {
+            title: "Book".into(),
+            page_count: Some(1),
+            source: Box::new(Broken(tries.clone())),
+        };
         let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
         s.draw();
         s.draw();
@@ -1546,7 +1754,12 @@ mod tests {
 
     #[test]
     fn a_wide_window_shows_one_page_at_a_time_and_right_turns_it() {
-        let mut s = Screen::new(book(&["Alpha text", "Bravo text", "Charlie text"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["Alpha text", "Bravo text", "Charlie text"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         let frame = s.draw();
         assert!(frame.contains("Alpha text") && !frame.contains("Bravo text"), "{frame}");
         assert!(frame.contains("1 / 3 · 33%"));
@@ -1560,14 +1773,21 @@ mod tests {
     fn a_narrow_window_scrolls_through_pages_with_numbers_between() {
         let mut s = Screen::new(book(&["Alpha text", "Bravo text"]), 60, 20, ViewerOptions::default());
         let frame = s.draw();
-        assert!(frame.contains("Alpha text") && frame.contains("·  2  ·") && frame.contains("Bravo text"), "{frame}");
+        assert!(
+            frame.contains("Alpha text") && frame.contains("·  2  ·") && frame.contains("Bravo text"),
+            "{frame}"
+        );
     }
 
     #[test]
     fn reading_resumes_on_the_saved_page_and_page_changes_are_reported() {
         let pages = Rc::new(RefCell::new(Vec::new()));
         let heard = pages.clone();
-        let options = ViewerOptions { start_page: Some(2), on_page: Box::new(move |p| heard.borrow_mut().push(p)), ..ViewerOptions::default() };
+        let options = ViewerOptions {
+            start_page: Some(2),
+            on_page: Box::new(move |p| heard.borrow_mut().push(p)),
+            ..ViewerOptions::default()
+        };
         let mut s = Screen::new(book(&["Alpha", "Bravo", "Charlie"]), 120, 30, options);
         assert!(s.draw().contains("Bravo"));
         s.press(KeyCode::Char('l'));
@@ -1579,19 +1799,34 @@ mod tests {
         let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
         let places = Rc::new(RefCell::new(Vec::new()));
         let heard = places.clone();
-        let options = ViewerOptions { on_scroll: Box::new(move |p| heard.borrow_mut().push(p)), ..ViewerOptions::default() };
+        let options = ViewerOptions {
+            on_scroll: Box::new(move |p| heard.borrow_mut().push(p)),
+            ..ViewerOptions::default()
+        };
         let mut s = Screen::new(Doc::whole("Notes", text.clone()), 120, 30, options);
         s.press(KeyCode::Char(' '));
         let frame = s.draw();
-        let top = frame.lines().find(|l| !l.trim().is_empty()).expect("a line shows").trim().to_owned();
+        let top = frame
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .expect("a line shows")
+            .trim()
+            .to_owned();
         s.app.report_scroll(true);
         let place = *places.borrow().last().expect("a place was heard");
         assert!(place.percent > 0, "{place:?}");
 
-        let options = ViewerOptions { start_anchor: Some(place.anchor), ..ViewerOptions::default() };
+        let options = ViewerOptions {
+            start_anchor: Some(place.anchor),
+            ..ViewerOptions::default()
+        };
         let mut again = Screen::new(Doc::whole("Notes", text), 80, 30, options);
         let frame = again.draw();
-        assert_eq!(frame.lines().find(|l| !l.trim().is_empty()).map(str::trim), Some(top.as_str()), "{frame}");
+        assert_eq!(
+            frame.lines().find(|l| !l.trim().is_empty()).map(str::trim),
+            Some(top.as_str()),
+            "{frame}"
+        );
     }
 
     #[test]
@@ -1616,12 +1851,21 @@ mod tests {
     fn m_bookmarks_the_page_and_the_list_turns_back_to_it() {
         let saved = Rc::new(RefCell::new(Vec::new()));
         let heard = saved.clone();
-        let options = ViewerOptions { on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()), ..ViewerOptions::default() };
+        let options = ViewerOptions {
+            on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()),
+            ..ViewerOptions::default()
+        };
         let mut s = Screen::new(book(&["Alpha", "Bravo text", "Charlie"]), 120, 30, options);
         s.draw();
         s.press(KeyCode::Char('l'));
         assert!(s.press(KeyCode::Char('m')).contains("bookmarked"));
-        assert_eq!(*saved.borrow(), vec![Bookmark { page: 1, label: "Bravo text".into() }]);
+        assert_eq!(
+            *saved.borrow(),
+            vec![Bookmark {
+                page: 1,
+                label: "Bravo text".into()
+            }]
+        );
         s.press(KeyCode::Char('G'));
         let list = s.press(KeyCode::Char('\''));
         assert!(list.contains("Bookmarks") && list.contains("Bravo text"), "{list}");
@@ -1636,7 +1880,16 @@ mod tests {
         let saved = Rc::new(RefCell::new(Vec::new()));
         let heard = saved.clone();
         let options = ViewerOptions {
-            bookmarks: vec![Bookmark { page: 0, label: "Alpha".into() }, Bookmark { page: 2, label: "Charlie".into() }],
+            bookmarks: vec![
+                Bookmark {
+                    page: 0,
+                    label: "Alpha".into(),
+                },
+                Bookmark {
+                    page: 2,
+                    label: "Charlie".into(),
+                },
+            ],
             on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()),
             ..ViewerOptions::default()
         };
@@ -1645,7 +1898,13 @@ mod tests {
         s.press(KeyCode::Char('\''));
         s.press(KeyCode::Char('j'));
         let list = s.press(KeyCode::Char('x'));
-        assert_eq!(*saved.borrow(), vec![Bookmark { page: 0, label: "Alpha".into() }]);
+        assert_eq!(
+            *saved.borrow(),
+            vec![Bookmark {
+                page: 0,
+                label: "Alpha".into()
+            }]
+        );
         assert!(!list.contains("Charlie"), "{list}");
     }
 
@@ -1654,7 +1913,16 @@ mod tests {
         let saved = Rc::new(RefCell::new(Vec::new()));
         let heard = saved.clone();
         let options = ViewerOptions {
-            bookmarks: vec![Bookmark { page: 0, label: "Alpha".into() }, Bookmark { page: 2, label: "Charlie".into() }],
+            bookmarks: vec![
+                Bookmark {
+                    page: 0,
+                    label: "Alpha".into(),
+                },
+                Bookmark {
+                    page: 2,
+                    label: "Charlie".into(),
+                },
+            ],
             on_bookmarks: Box::new(move |b| *heard.borrow_mut() = b.to_vec()),
             ..ViewerOptions::default()
         };
@@ -1662,8 +1930,19 @@ mod tests {
         s.draw();
         s.press(KeyCode::Char('\''));
         s.press(KeyCode::Char('x'));
-        s.app.key(KeyEvent { code: KeyCode::Char('x'), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Repeat, state: KeyEventState::NONE });
-        assert_eq!(*saved.borrow(), vec![Bookmark { page: 2, label: "Charlie".into() }]);
+        s.app.key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(
+            *saved.borrow(),
+            vec![Bookmark {
+                page: 2,
+                label: "Charlie".into()
+            }]
+        );
     }
 
     #[test]
@@ -1672,7 +1951,10 @@ mod tests {
         assert!(!s.draw().contains("quit"));
         for close in [KeyCode::Esc, KeyCode::Char('?'), KeyCode::Char('q')] {
             let frame = s.press(KeyCode::Char('?'));
-            assert!(frame.contains("Keys") && frame.contains("go to page") && frame.contains("quit"), "{frame}");
+            assert!(
+                frame.contains("Keys") && frame.contains("go to page") && frame.contains("quit"),
+                "{frame}"
+            );
             assert!(!s.press(close).contains("go to page"));
             assert!(!s.app.quit);
         }
@@ -1680,7 +1962,12 @@ mod tests {
 
     #[test]
     fn go_to_page_takes_only_digits_within_the_book() {
-        let mut s = Screen::new(book(&["A1", "B2", "C3", "D4", "E5", "F6", "G7", "H8", "I9", "J10", "K11", "L12"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["A1", "B2", "C3", "D4", "E5", "F6", "G7", "H8", "I9", "J10", "K11", "L12"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         s.press(KeyCode::Char('t'));
         s.press(KeyCode::Char('1'));
         s.press(KeyCode::Char('3'));
@@ -1694,7 +1981,10 @@ mod tests {
     fn dragging_selects_text_copies_it_and_y_highlights_it() {
         let saved = Rc::new(RefCell::new(Vec::new()));
         let heard = saved.clone();
-        let options = ViewerOptions { on_highlights: Box::new(move |h| *heard.borrow_mut() = h.to_vec()), ..ViewerOptions::default() };
+        let options = ViewerOptions {
+            on_highlights: Box::new(move |h| *heard.borrow_mut() = h.to_vec()),
+            ..ViewerOptions::default()
+        };
         let mut s = Screen::new(book(&["Some words to select here."]), 120, 30, options);
         let (x, y) = s.find("words");
         s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
@@ -1736,7 +2026,12 @@ mod tests {
 
     #[test]
     fn find_turns_to_the_page_with_the_term_and_marks_it() {
-        let mut s = Screen::new(book(&["Alpha text", "Bravo text", "Charlie text", "Delta text"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["Alpha text", "Bravo text", "Charlie text", "Delta text"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         let frame = search(&mut s, "charLIE");
         assert!(frame.contains("Charlie text") && frame.contains("3 / 4"), "{frame}");
         assert!(frame.contains("\"charLIE\" n/N"), "{frame}");
@@ -1756,7 +2051,12 @@ mod tests {
 
     #[test]
     fn n_and_shift_n_step_through_matches_wrapping_round() {
-        let mut s = Screen::new(book(&["Alpha raft", "Bravo", "Raft one, raft two", "Delta"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["Alpha raft", "Bravo", "Raft one, raft two", "Delta"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         search(&mut s, "raft");
         let at = |s: &Screen| s.app.found_here().map(|m| (m.page, m.start));
         assert_eq!(at(&s), Some((0, 6)));
@@ -1796,12 +2096,20 @@ mod tests {
         s.press(KeyCode::Char('b'));
         assert!(s.draw().contains("Find"));
         let frame = s.press(KeyCode::Esc);
-        assert!(!frame.contains("Find") && frame.contains("Alpha text") && s.app.search.is_none(), "{frame}");
+        assert!(
+            !frame.contains("Find") && frame.contains("Alpha text") && s.app.search.is_none(),
+            "{frame}"
+        );
     }
 
     #[test]
     fn centered_blocks_sit_in_the_middle_of_the_column() {
-        let mut s = Screen::new(book(&["<div align=\"center\">\nSubmitted By\n</div>\n\nLeft text."]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["<div align=\"center\">\nSubmitted By\n</div>\n\nLeft text."]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         let (centered, _) = s.find("Submitted By");
         let (left, _) = s.find("Left text.");
         assert_eq!(left, 22);

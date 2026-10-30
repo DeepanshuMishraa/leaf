@@ -292,7 +292,7 @@ dependencies = [
 [[package]]
 name = "compiler"
 version = "0.0.0"
-source = "git+https://github.com/wevm/ondine#0b589ec34481856b4153526f10a0a35558a201a8"
+source = "git+https://github.com/wevm/ondine?rev=c8e8034c009bb6f987258e1c36045e080f46fde3#c8e8034c009bb6f987258e1c36045e080f46fde3"
 
 [[package]]
 name = "convert_case"

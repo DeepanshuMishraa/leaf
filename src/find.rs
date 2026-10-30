@@ -19,7 +19,10 @@ impl Query {
         if words.is_empty() {
             return None;
         }
-        Some(Query { typed: typed.trim().to_owned(), folded: words.join(" ").chars().collect() })
+        Some(Query {
+            typed: typed.trim().to_owned(),
+            folded: words.join(" ").chars().collect(),
+        })
     }
 
     /// The query as typed, trimmed.
@@ -84,7 +87,10 @@ mod tests {
 
     #[test]
     fn matching_ignores_case_and_finds_every_occurrence() {
-        assert_eq!(found("raft", "Raft and RAFT, not rafters? raft"), vec![(0, 4), (9, 13), (19, 23), (28, 32)]);
+        assert_eq!(
+            found("raft", "Raft and RAFT, not rafters? raft"),
+            vec![(0, 4), (9, 13), (19, 23), (28, 32)]
+        );
     }
 
     #[test]
@@ -104,6 +110,9 @@ mod tests {
 
     #[test]
     fn the_typed_query_is_kept_trimmed() {
-        assert_eq!(Query::new("  Leader Election ").map(|q| q.typed().to_owned()), Some("Leader Election".to_owned()));
+        assert_eq!(
+            Query::new("  Leader Election ").map(|q| q.typed().to_owned()),
+            Some("Leader Election".to_owned())
+        );
     }
 }

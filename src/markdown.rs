@@ -14,7 +14,7 @@ use regex::Regex;
 use url::Url;
 
 use crate::doc::{Doc, Source};
-use crate::mermaid::{self, DIAGRAM_PREFIX, Diagram, splice};
+use crate::mermaid::{self, DIAGRAM_PREFIX, Diagram, diagrams, splice};
 use crate::mono::Rgb;
 use crate::render;
 
@@ -32,9 +32,8 @@ pub enum MarkdownFailed {
 static FRONT_MATTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\A(?:---\r?\n(?s:.*?)\r?\n(?:---|\.\.\.)|\+\+\+\r?\n(?s:.*?)\r?\n\+\+\+)[ \t]*(?:\r?\n|\z)").expect("pattern is valid")
 });
-static IMG_SRC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(<img\b[^>]*?\bsrc\s*=\s*)(["'])([^"']*)(["'])"#).expect("pattern is valid")
-});
+static IMG_SRC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)(<img\b[^>]*?\bsrc\s*=\s*)(["'])([^"']*)(["'])"#).expect("pattern is valid"));
 
 /// Where a document's relative image paths start from.
 #[derive(Clone, Copy)]
@@ -45,11 +44,7 @@ enum Base<'a> {
 
 /// Whether `href` is relative to the document rather than a full address.
 fn is_relative(href: &str) -> bool {
-    !href.is_empty()
-        && !href.contains("://")
-        && !href.starts_with("data:")
-        && !href.starts_with("mailto:")
-        && !href.starts_with('#')
+    !href.is_empty() && !href.contains("://") && !href.starts_with("data:") && !href.starts_with("mailto:") && !href.starts_with('#')
 }
 
 /// Points relative images where the viewer finds them: files beside a local
@@ -59,32 +54,19 @@ fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut id = |href: &str| match base {
         Base::Dir(dir) => {
-            let path = href
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(href)
-                .replace("%20", " ");
+            let path = href.split(['?', '#']).next().unwrap_or(href).replace("%20", " ");
             files.push(dir.join(path));
             Doc::image_href(&(files.len() - 1).to_string())
         }
-        Base::Url(url) => url
-            .join(href)
-            .map(String::from)
-            .unwrap_or_else(|_| href.to_owned()),
+        Base::Url(url) => url.join(href).map(String::from).unwrap_or_else(|_| href.to_owned()),
     };
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     for (event, range) in Parser::new_ext(markdown, render::MARKDOWN).into_offset_iter() {
         match event {
-            Event::Start(Tag::Image { dest_url, .. }) if is_relative(&dest_url) => {
-                edits.push((range, format!("![]({})", id(&dest_url))))
-            }
+            Event::Start(Tag::Image { dest_url, .. }) if is_relative(&dest_url) => edits.push((range, format!("![]({})", id(&dest_url)))),
             Event::Html(html) | Event::InlineHtml(html) if IMG_SRC.is_match(&html) => {
                 let replaced = IMG_SRC.replace_all(&html, |c: &regex::Captures| {
-                    let src = if is_relative(&c[3]) {
-                        id(&c[3])
-                    } else {
-                        c[3].to_owned()
-                    };
+                    let src = if is_relative(&c[3]) { id(&c[3]) } else { c[3].to_owned() };
                     format!("{}{}{src}{}", &c[1], &c[2], &c[4])
                 });
                 edits.push((range, replaced.into_owned()));
@@ -110,8 +92,7 @@ impl MarkdownSource {
     }
 
     fn diagram(&self, id: &str) -> Option<&Diagram> {
-        self.diagrams
-            .get(id.strip_prefix(DIAGRAM_PREFIX)?.parse::<usize>().ok()?)
+        self.diagrams.get(id.strip_prefix(DIAGRAM_PREFIX)?.parse::<usize>().ok()?)
     }
 }
 
@@ -137,11 +118,7 @@ impl Source for MarkdownSource {
     fn decode(&self, id: &str, width: u32) -> Option<RgbaImage> {
         let image = image::open(self.path(id)?.1).ok()?;
         let image = if image.width() > width.max(1) {
-            image.resize(
-                width.max(1),
-                u32::MAX,
-                image::imageops::FilterType::Triangle,
-            )
+            image.resize(width.max(1), u32::MAX, image::imageops::FilterType::Triangle)
         } else {
             image
         };
@@ -166,10 +143,7 @@ pub fn open(path: &Path) -> Result<Doc, MarkdownFailed> {
             MarkdownFailed::Read { path, cause }
         }
     })?;
-    let title = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(document(
         title,
         &String::from_utf8_lossy(&bytes),
@@ -184,11 +158,7 @@ pub fn from_url(title: String, text: &str, url: &Url) -> Doc {
 
 fn document(title: String, text: &str, base: Base) -> Doc {
     let (markdown, images) = localize(&FRONT_MATTER.replace(text, ""), base);
-    let (markdown, diagrams) = crate::mermaid::diagrams(
-        &markdown,
-        |i| format!("{}{i}", mermaid::DIAGRAM_PREFIX),
-        mermaid::render,
-    );
+    let (markdown, diagrams) = diagrams(&markdown, |i| format!("{}{i}", DIAGRAM_PREFIX), mermaid::render);
     Doc {
         title,
         page_count: None,
@@ -213,13 +183,7 @@ mod tests {
             out,
             "![](leaf-image:0) ![](https://x.org/b.png)\n\n<p align=\"center\"><img width=\"9\" src=\"leaf-image:1\"></p>\n"
         );
-        assert_eq!(
-            files,
-            vec![
-                PathBuf::from("/docs/img/a b.png"),
-                PathBuf::from("/docs/c.png")
-            ]
-        );
+        assert_eq!(files, vec![PathBuf::from("/docs/img/a b.png"), PathBuf::from("/docs/c.png")]);
     }
 
     #[test]
@@ -230,8 +194,7 @@ mod tests {
 
     #[test]
     fn images_in_a_linked_document_resolve_against_its_url() {
-        let url = Url::parse("https://raw.githubusercontent.com/o/r/main/docs/README.md")
-            .expect("valid url");
+        let url = Url::parse("https://raw.githubusercontent.com/o/r/main/docs/README.md").expect("valid url");
         let (out, files) = localize("![](img/a.png) <img src=\"../b.png\">", Base::Url(&url));
         assert_eq!(
             out,
@@ -240,35 +203,12 @@ mod tests {
         assert!(files.is_empty());
     }
 
-    /*
-    #[test]
-    fn mermaid_blocks_that_draw_become_figures() {
-        let md = "Text\n```mermaid\ngraph LR\n  A-->B\n```\nMore text\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n";
-        let mut asked = Vec::new();
-        let (out, found) = diagrams(md, |sources| {
-            asked = sources.to_vec();
-            vec![Diagram::new(r#"<svg width="10" height="5"></svg>"#), None]
-        });
-        assert_eq!(asked, vec!["graph LR\n  A-->B\n", "not a diagram\n"]);
-        assert_eq!(
-            out,
-            "Text\n\n![](leaf-image:mermaid-0)\n\nMore text\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n"
-        );
-        assert_eq!(found.len(), 1);
-    }
-    */
     /// Runs `examples/mermaid.md` through the real runtime and rasterizer.
     /// Skipped when neither bun nor node is installed.
-    /*
     #[test]
     fn sample_diagrams_draw_and_rasterize() {
-        //let runtime = ["bun", "node"].iter().any(|r| std::process::Command::new(r).arg("--version").output().is_ok_and(|o| o.status.success()));
-        //if !runtime {
-        //    eprintln!("skipped: no bun or node on PATH");
-        //    return;
-        //}
         let md = include_str!("../examples/mermaid.md");
-        let (out, found) = diagrams(md, mermaid::render);
+        let (out, found) = mermaid::diagrams(md, |i| format!("{i}"), mermaid::render);
         // 10 mermaid blocks; only the invalid one stays as code.
         assert_eq!(found.len(), 9, "markdown after drawing:\n{out}");
         assert!(out.contains("```mermaid\nthis is not a diagram at all\n```"));
@@ -279,32 +219,24 @@ mod tests {
         );
         let (ink, paper) = ([230, 230, 230], [20, 20, 20]);
         for (i, diagram) in found.iter().enumerate() {
-            assert!(
-                diagram.size.0 > 0 && diagram.size.1 > 0,
-                "diagram {i} has no size"
-            );
+            eprintln!("Diagram {i}: {:?}", diagram.size);
+            assert!(diagram.size.0 > 0 && diagram.size.1 > 0, "diagram {i} has no size");
             let image = diagram
                 .rasterize(800, ink, paper)
                 .unwrap_or_else(|| panic!("diagram {i} did not rasterize"));
             assert!(image.width() <= 800);
-            let inked = image.pixels().filter(|p| p[3] > 128 && p[0] > 180).count();
-            assert!(
-                inked > 50,
-                "diagram {i} has almost no ink-colored pixels ({inked})"
-            );
+            let inked = image
+                .pixels()
+                .filter(|p| p[3] > 128 && p[0].abs_diff(ink[0]) < 20 && p[1].abs_diff(ink[1]) < 20 && p[2].abs_diff(ink[2]) < 20)
+                .count();
+            assert!(inked > 50, "diagram {i} has almost no ink-colored pixels ({inked})");
         }
     }
-    */
+
     #[test]
     fn front_matter_is_not_shown() {
         assert_eq!(FRONT_MATTER.replace("---\ntitle: x\n---\n# Hi", ""), "# Hi");
-        assert_eq!(
-            FRONT_MATTER.replace("+++\ntitle = 1\n+++\nBody", ""),
-            "Body"
-        );
-        assert_eq!(
-            FRONT_MATTER.replace("Text\n\n---\nmore\n---\n", ""),
-            "Text\n\n---\nmore\n---\n"
-        );
+        assert_eq!(FRONT_MATTER.replace("+++\ntitle = 1\n+++\nBody", ""), "Body");
+        assert_eq!(FRONT_MATTER.replace("Text\n\n---\nmore\n---\n", ""), "Text\n\n---\nmore\n---\n");
     }
 }

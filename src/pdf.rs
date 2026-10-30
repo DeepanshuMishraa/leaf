@@ -9,8 +9,7 @@ use std::sync::LazyLock;
 
 use image::RgbaImage;
 use mupdf::{
-    ColorParams, Colorspace, Device, Document, IRect, Matrix, MetadataName, Page, Pixmap,
-    TextPageFlags, text_page::TextBlockType,
+    ColorParams, Colorspace, Device, Document, IRect, Matrix, MetadataName, Page, Pixmap, TextPageFlags, text_page::TextBlockType,
 };
 use regex::Regex;
 
@@ -118,26 +117,21 @@ static BULLET: LazyLock<Regex> = LazyLock::new(|| re(r"^[•◦▪▸►‣⁃�
 /// A numbered list item: "1. ", "12) ". Longer numbers are years or figures, not items.
 static ORDERED: LazyLock<Regex> = LazyLock::new(|| re(r"^(\d{1,3})[.)]\s+"));
 /// A run that is only a list marker, set apart from its item text.
-static MARKER: LazyLock<Regex> =
-    LazyLock::new(|| re(r"(?i)^(?:[•◦▪▸►‣⁃●○■□–»›✓✔➢➤◆◇-]|\d{1,3}[.)]|\(?[a-z\d]{1,3}\))$"));
+static MARKER: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)^(?:[•◦▪▸►‣⁃●○■□–»›✓✔➢➤◆◇-]|\d{1,3}[.)]|\(?[a-z\d]{1,3}\))$"));
 /// Figure and table captions.
-static CAPTION: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"^(?:Figure|Fig\.|Table|Listing|Algorithm|Chart|Exhibit)\s*[\dA-Z]+(?:[.-]\d+)*[.:]\s")
-});
+static CAPTION: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(?:Figure|Fig\.|Table|Listing|Algorithm|Chart|Exhibit)\s*[\dA-Z]+(?:[.-]\d+)*[.:]\s"));
 /// A URL broken at the end of a line, after a character a URL breaks at.
 static URL_BREAK: LazyLock<Regex> = LazyLock::new(|| re(r"https?://(?:\S*[/.\-_?=&#~])?$"));
 static BOLD_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)bold|black|heavy|semibold"));
 static ITALIC_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)italic|oblique"));
 /// Monospace font names; code in PDFs is set in one of these.
-static MONO_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"(?i)mono|courier|consol|menlo|monaco|inconsolata|typewriter|code|cmtt|txtt|lmtt")
-});
+static MONO_FONT_NAME: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?i)mono|courier|consol|menlo|monaco|inconsolata|typewriter|code|cmtt|txtt|lmtt"));
 /// A page label like "xiv | Preface", "Chapter 3 | 57" or a bare "57".
 static PAGE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
     let number = r"(?:\d+|m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))";
-    re(&format!(
-        r"(?i)^(?:{number}\s*\|.{{0,60}}|.{{0,60}}\|\s*{number}|{number})$"
-    ))
+    re(&format!(r"(?i)^(?:{number}\s*\|.{{0,60}}|.{{0,60}}\|\s*{number}|{number})$"))
 });
 /// Line-end hyphens: ASCII, Unicode hyphens, and the "!" some fonts map their hyphen glyph to.
 static LINE_END_HYPHEN: LazyLock<Regex> = LazyLock::new(|| re(r"[a-z][-‐!]$"));
@@ -190,11 +184,7 @@ fn block_size(lines: &[Line]) -> f32 {
 }
 
 fn block_text(lines: &[Line]) -> String {
-    let joined = lines
-        .iter()
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let joined = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
     SPACES.replace_all(&joined, " ").trim().to_owned()
 }
 
@@ -212,8 +202,7 @@ fn join_lines<S: AsRef<str>>(lines: &[S]) -> String {
     let mut acc = String::new();
     for line in lines {
         let line = line.as_ref();
-        let mends_url = URL_BREAK.is_match(&acc)
-            && starts_with(line, |c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        let mends_url = URL_BREAK.is_match(&acc) && starts_with(line, |c| c.is_ascii_lowercase() || c.is_ascii_digit());
         if acc.is_empty() || mends_url {
             acc.push_str(line);
         } else if LINE_END_HYPHEN.is_match(&acc) && starts_with(line, |c| c.is_ascii_lowercase()) {
@@ -242,10 +231,7 @@ fn escape_leading(text: &str) -> String {
 /// a line each.
 fn collapse_leaders(text: &str) -> String {
     let text = LEADERS.replace_all(text, " · ");
-    GAPPED_ENTRY
-        .replace_all(&text, " · $1\n")
-        .trim_end()
-        .to_owned()
+    GAPPED_ENTRY.replace_all(&text, " · $1\n").trim_end().to_owned()
 }
 
 fn tidy(text: &str) -> String {
@@ -276,11 +262,7 @@ impl Marker {
 /// that opens with the same kind of marker starts a new item. The flag tells
 /// the caller to keep it tight against neighbouring list items.
 fn paragraph_markdown(lines: &[Line]) -> (String, bool) {
-    let texts: Vec<&str> = lines
-        .iter()
-        .map(|l| l.text.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let texts: Vec<&str> = lines.iter().map(|l| l.text.trim()).filter(|t| !t.is_empty()).collect();
     let first = texts.first().copied().unwrap_or("");
     let marker = if BULLET.is_match(first) {
         Some(Marker::Bullet)
@@ -306,10 +288,7 @@ fn paragraph_markdown(lines: &[Line]) -> (String, bool) {
             let rest = tidy(&marker.pattern().replace(&text, ""));
             match marker {
                 Marker::Ordered => {
-                    let number = ORDERED
-                        .captures(&text)
-                        .and_then(|c| c.get(1))
-                        .map_or("1", |m| m.as_str());
+                    let number = ORDERED.captures(&text).and_then(|c| c.get(1)).map_or("1", |m| m.as_str());
                     format!("{number}. {rest}")
                 }
                 Marker::Bullet => format!("- {rest}"),
@@ -387,12 +366,7 @@ fn same_size(a: f32, b: f32) -> bool {
 
 /// Top-to-top distance of wrapped lines at `size`: the body pitch, scaled up for larger type.
 fn pitch_at(spacing: Spacing, size: f32) -> f32 {
-    spacing.pitch
-        * if spacing.body > 0.0 {
-            (size / spacing.body).max(1.0)
-        } else {
-            1.0
-        }
+    spacing.pitch * if spacing.body > 0.0 { (size / spacing.body).max(1.0) } else { 1.0 }
 }
 
 /// Whether `next` sits one line below `prev`, as the next line of the same
@@ -421,13 +395,7 @@ fn split_by_gap(lines: Vec<Line>, spacing: Spacing) -> Vec<Vec<Line>> {
     let mut groups: Vec<Vec<Line>> = Vec::new();
     for line in lines {
         match groups.last_mut() {
-            Some(group)
-                if group
-                    .last()
-                    .is_some_and(|prev| line.top <= prev.top || wraps(prev, &line, spacing)) =>
-            {
-                group.push(line)
-            }
+            Some(group) if group.last().is_some_and(|prev| line.top > prev.top && wraps(prev, &line, spacing)) => group.push(line),
             _ => groups.push(vec![line]),
         }
     }
@@ -443,10 +411,7 @@ fn merge_wrapped(blocks: Vec<Laid>, spacing: Spacing) -> Vec<Laid> {
         if let (Some(Laid::Text(prev)), Laid::Text(lines)) = (merged.last_mut(), &block)
             && let (Some(last), Some(first)) = (prev.last(), lines.first())
         {
-            let same_style = same_size(last.size, first.size)
-                && last.bold == first.bold
-                && !last.mono
-                && !first.mono;
+            let same_style = same_size(last.size, first.size) && last.bold == first.bold && !last.mono && !first.mono;
             if same_style && wraps(last, first, spacing) {
                 prev.extend(lines.iter().cloned());
                 continue;
@@ -462,9 +427,7 @@ fn rows_of(lines: &[Line]) -> Vec<Vec<Line>> {
     let mut rows: Vec<Vec<Line>> = Vec::new();
     for line in lines {
         match rows.last_mut() {
-            Some(row) if (line.top - row[0].top).abs() < line.size.min(row[0].size) * 0.5 => {
-                row.push(line.clone())
-            }
+            Some(row) if (line.top - row[0].top).abs() < line.size.min(row[0].size) * 0.5 => row.push(line.clone()),
             _ => rows.push(vec![line.clone()]),
         }
     }
@@ -494,11 +457,7 @@ fn rows_of(lines: &[Line]) -> Vec<Vec<Line>> {
 fn join_row(row: &[Line]) -> Line {
     let mut line = row[0].clone();
     if row.len() > 1 {
-        line.text = row
-            .iter()
-            .map(|l| l.text.trim())
-            .collect::<Vec<_>>()
-            .join(" ");
+        line.text = row.iter().map(|l| l.text.trim()).collect::<Vec<_>>().join(" ");
         line.right = row.iter().map(|l| l.right).fold(f32::MIN, f32::max);
         line.bold = row.iter().all(|l| l.bold);
         line.italic = row.iter().all(|l| l.italic);
@@ -518,10 +477,7 @@ fn is_table_row(row: &[Line]) -> bool {
 
 /// Left edges of the columns the cells line up in, left to right.
 fn columns_of<'a>(rows: impl IntoIterator<Item = &'a Vec<Line>>) -> Vec<f32> {
-    let mut lefts: Vec<f32> = rows
-        .into_iter()
-        .flat_map(|row| row.iter().map(|l| l.left))
-        .collect();
+    let mut lefts: Vec<f32> = rows.into_iter().flat_map(|row| row.iter().map(|l| l.left)).collect();
     lefts.sort_by(f32::total_cmp);
     let mut columns: Vec<f32> = Vec::new();
     for left in lefts {
@@ -567,12 +523,7 @@ fn table_of(rows: &[Vec<Line>]) -> Laid {
             _ => cells.push(placed),
         }
     }
-    Laid::Table(
-        cells
-            .iter()
-            .map(|row| row.iter().map(|lines| cell_text(lines)).collect())
-            .collect(),
-    )
+    Laid::Table(cells.iter().map(|row| row.iter().map(|lines| cell_text(lines)).collect()).collect())
 }
 
 /// Finds tables: runs of adjacent blocks whose rows hold cells lining up in
@@ -673,12 +624,8 @@ fn table_markdown(rows: &[Vec<String>]) -> String {
 /// short enough for that to mean something. Spans are (left, right).
 fn is_centered(spans: &[(f32, f32)], measure: f32) -> bool {
     !spans.is_empty()
-        && spans
-            .iter()
-            .all(|(l, r)| ((l + r) / 2.0 - 0.5).abs() <= CENTER_SLACK)
-        && spans
-            .iter()
-            .any(|(l, r)| r - l < measure * CENTER_MAX_WIDTH)
+        && spans.iter().all(|(l, r)| ((l + r) / 2.0 - 0.5).abs() <= CENTER_SLACK)
+        && spans.iter().any(|(l, r)| r - l < measure * CENTER_MAX_WIDTH)
 }
 
 /// Joins pieces into the page's markdown. List items in a row form one list.
@@ -697,11 +644,7 @@ fn join_pieces(pieces: &[Piece], measure: f32) -> String {
         }
         let run = &pieces[i..end];
         i = end;
-        let md = run
-            .iter()
-            .map(|p| p.md.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let md = run.iter().map(|p| p.md.as_str()).collect::<Vec<_>>().join("\n");
         let lines: Vec<&Line> = run.iter().flat_map(|p| &p.lines).collect();
         let spans: Vec<(f32, f32)> = if run[0].list {
             let left = lines.iter().map(|l| l.left).fold(f32::MAX, f32::min);
@@ -802,9 +745,7 @@ fn figure_regions(paths: &[Region], lines: &[Line], width: f32, height: f32) -> 
         if !thin || path.width().max(path.height()) > width * 0.5 {
             continue;
         }
-        let touched: Vec<usize> = (0..groups.len())
-            .filter(|&g| groups[g].0.near(path))
-            .collect();
+        let touched: Vec<usize> = (0..groups.len()).filter(|&g| groups[g].0.near(path)).collect();
         if let [first, rest @ ..] = touched.as_slice()
             && !rest.is_empty()
         {
@@ -854,11 +795,7 @@ fn figure_regions(paths: &[Region], lines: &[Line], width: f32, height: f32) -> 
                 .fold(region, |grown, &(line, _)| grown.union(line))
         })
         .filter(|region| region.width() >= MIN_IMAGE_SIZE && region.height() >= MIN_IMAGE_SIZE)
-        .filter(|region| {
-            !placed
-                .iter()
-                .any(|&(line, len)| len > MAX_LABEL_LENGTH && line.overlaps(*region))
-        })
+        .filter(|region| !placed.iter().any(|&(line, len)| len > MAX_LABEL_LENGTH && line.overlaps(*region)))
         .collect()
 }
 
@@ -897,9 +834,7 @@ pub fn analyze(pages: &[Vec<Block>]) -> Layout {
             .iter()
             .filter_map(|b| match b {
                 // A title repeated on a cover is not a running header.
-                Laid::Text(lines) if block_size(lines) <= body + 0.5 => {
-                    Some(running_key(&block_text(lines)))
-                }
+                Laid::Text(lines) if block_size(lines) <= body + 0.5 => Some(running_key(&block_text(lines))),
                 _ => None,
             })
             .collect();
@@ -910,9 +845,7 @@ pub fn analyze(pages: &[Vec<Block>]) -> Layout {
     let running = if pages.len() >= 3 {
         repeats
             .into_iter()
-            .filter(|(key, count)| {
-                key.chars().count() < 80 && *count as f32 >= pages.len() as f32 * 0.5
-            })
+            .filter(|(key, count)| key.chars().count() < 80 && *count as f32 >= pages.len() as f32 * 0.5)
             .map(|(key, _)| key)
             .collect()
     } else {
@@ -920,12 +853,7 @@ pub fn analyze(pages: &[Vec<Block>]) -> Layout {
     };
 
     // Jitter makes one heading size read as two; the larger stands for both.
-    let mut candidates: Vec<f32> = sizes
-        .0
-        .iter()
-        .map(|&(k, _)| k as f32 / 2.0)
-        .filter(|&s| s >= body * 1.15)
-        .collect();
+    let mut candidates: Vec<f32> = sizes.0.iter().map(|&(k, _)| k as f32 / 2.0).filter(|&s| s >= body * 1.15).collect();
     candidates.sort_by(|a, b| b.total_cmp(a));
     let mut heading_sizes: Vec<f32> = Vec::new();
     for size in candidates {
@@ -956,17 +884,11 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
         body: layout.body,
         pitch: layout.pitch,
     };
-    let furniture = |text: &str| {
-        text.is_empty() || layout.running.contains(&running_key(text)) || PAGE_LABEL.is_match(text)
-    };
+    let furniture = |text: &str| text.is_empty() || layout.running.contains(&running_key(text)) || PAGE_LABEL.is_match(text);
     let mut pieces: Vec<Piece> = Vec::new();
-    // Back-to-back code blocks gather here and print as one fence.
-    let mut code: Vec<String> = Vec::new();
-    let flush_code = |code: &mut Vec<String>, pieces: &mut Vec<Piece>| {
-        if !code.is_empty() {
-            pieces.push(Piece::bare(fenced(&code.join("\n\n"))));
-        }
-        code.clear();
+    let push_code = |lines: &[Line], pieces: &mut Vec<Piece>| {
+        let source = code_text(lines);
+        pieces.push(Piece::bare(fenced(&source)));
     };
     for page in pages {
         // Headers and footers go before tables are found, so they don't join one as a row.
@@ -981,39 +903,30 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
         for block in arrange(tabulate(kept), spacing) {
             let lines = match block {
                 // Code is set no bigger than body text; a large monospace line is a title.
-                Laid::Text(lines)
-                    if lines.iter().all(|l| l.mono) && block_size(&lines) <= layout.body =>
-                {
-                    code.push(code_text(&lines));
+                Laid::Text(lines) if lines.iter().all(|l| l.mono) && block_size(&lines) <= layout.body => {
+                    push_code(&lines, &mut pieces);
                     continue;
                 }
                 Laid::Text(lines) => lines,
                 Laid::Image(id) => {
-                    flush_code(&mut code, &mut pieces);
                     pieces.push(Piece::bare(format!("![]({})", Doc::image_href(&id))));
                     continue;
                 }
                 Laid::Note(text) => {
-                    flush_code(&mut code, &mut pieces);
                     pieces.push(Piece::bare(format!("> *{text}*")));
                     continue;
                 }
                 Laid::Table(rows) => {
-                    flush_code(&mut code, &mut pieces);
                     pieces.push(Piece::bare(table_markdown(&rows)));
                     continue;
                 }
             };
-            flush_code(&mut code, &mut pieces);
             let text = collapse_leaders(&block_text(&lines));
             if furniture(&text) {
                 continue;
             }
             let size = block_size(&lines);
-            let level = layout
-                .heading_sizes
-                .iter()
-                .position(|&s| same_size(s, size));
+            let level = layout.heading_sizes.iter().position(|&s| same_size(s, size));
             let length = text.chars().count();
             let piece = if CAPTION.is_match(&text) {
                 Piece {
@@ -1027,11 +940,7 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
                     list: false,
                     lines,
                 }
-            } else if lines.iter().all(|l| l.bold)
-                && length < 100
-                && !BULLET.is_match(&text)
-                && !ORDERED.is_match(&text)
-            {
+            } else if lines.iter().all(|l| l.bold) && length < 100 && !BULLET.is_match(&text) && !ORDERED.is_match(&text) {
                 Piece {
                     md: format!("#### {text}"),
                     list: false,
@@ -1050,7 +959,6 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
             pieces.push(piece);
         }
     }
-    flush_code(&mut code, &mut pieces);
     join_pieces(&pieces, layout.measure)
 }
 
@@ -1096,9 +1004,7 @@ impl PdfImage {
 
     fn size(&self) -> (u32, u32) {
         match *self {
-            PdfImage::Embedded { width, height, .. } | PdfImage::Drawing { width, height, .. } => {
-                (width, height)
-            }
+            PdfImage::Embedded { width, height, .. } | PdfImage::Drawing { width, height, .. } => (width, height),
         }
     }
 }
@@ -1116,11 +1022,7 @@ fn decoded_size(image: &mupdf::Image) -> (u32, u32) {
 /// Pixel size and scale a page region renders at.
 fn region_size(region: Region) -> (f32, u32, u32) {
     let scale = MAX_IMAGE_PIXELS_WIDE as f32 / region.width();
-    (
-        scale,
-        MAX_IMAGE_PIXELS_WIDE,
-        ((region.height() * scale).round() as u32).max(1),
-    )
+    (scale, MAX_IMAGE_PIXELS_WIDE, ((region.height() * scale).round() as u32).max(1))
 }
 
 /// Opaque RGBA pixels of an RGB pixmap with alpha.
@@ -1140,11 +1042,7 @@ fn rgba(pixmap: &Pixmap) -> Option<RgbaImage> {
 }
 
 /// Draws an embedded image into a small opaque buffer, on white.
-fn decode_embedded(
-    image: &mupdf::Image,
-    width: u32,
-    height: u32,
-) -> Result<Option<RgbaImage>, mupdf::Error> {
+fn decode_embedded(image: &mupdf::Image, width: u32, height: u32) -> Result<Option<RgbaImage>, mupdf::Error> {
     let mut pixmap = Pixmap::new_with_rect(
         &Colorspace::device_rgb(),
         IRect {
@@ -1165,17 +1063,10 @@ fn decode_embedded(
 }
 
 /// Renders a region of a page, text and all, on white, `width` pixels wide.
-fn render_region(
-    page: &Page,
-    region: Region,
-    width: u32,
-) -> Result<Option<RgbaImage>, mupdf::Error> {
+fn render_region(page: &Page, region: Region, width: u32) -> Result<Option<RgbaImage>, mupdf::Error> {
     let scale = width as f32 / region.width();
     let height = ((region.height() * scale).round() as u32).max(1);
-    let (x, y) = (
-        (region.x0 * scale).round() as i32,
-        (region.y0 * scale).round() as i32,
-    );
+    let (x, y) = ((region.x0 * scale).round() as i32, (region.y0 * scale).round() as i32);
     let rect = IRect {
         x0: x,
         y0: y,
@@ -1192,17 +1083,10 @@ fn render_region(
 }
 
 /// Reads one page into blocks, registering the images it shows.
-fn read_page(
-    document: &Document,
-    i: usize,
-    images: &RefCell<HashMap<String, PdfImage>>,
-) -> Result<Vec<Block>, mupdf::Error> {
+fn read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, PdfImage>>) -> Result<Vec<Block>, mupdf::Error> {
     let page = document.load_page(i as i32)?;
     let bounds = page.bounds()?;
-    let (width, height) = (
-        (bounds.x1 - bounds.x0).max(1.0),
-        (bounds.y1 - bounds.y0).max(1.0),
-    );
+    let (width, height) = ((bounds.x1 - bounds.x0).max(1.0), (bounds.y1 - bounds.y0).max(1.0));
     let text_page = page.to_text_page(TextPageFlags::PRESERVE_IMAGES)?;
 
     // Each block with its top edge, so drawings can go where they sit on the page.
@@ -1232,20 +1116,14 @@ fn read_page(
                                 mono += 1;
                             }
                             if style.is_none() {
-                                style = Some((
-                                    c.size(),
-                                    font.name().to_owned(),
-                                    font.is_bold(),
-                                    font.is_italic(),
-                                ));
+                                style = Some((c.size(), font.name().to_owned(), font.is_bold(), font.is_italic()));
                             }
                         }
                     }
                     if text.trim().is_empty() {
                         continue;
                     }
-                    let (size, name, bold, italic) =
-                        style.unwrap_or((0.0, String::new(), false, false));
+                    let (size, name, bold, italic) = style.unwrap_or((0.0, String::new(), false, false));
                     let lb = line.bounds();
                     lines.push(Line {
                         text,
@@ -1264,10 +1142,7 @@ fn read_page(
             }
             TextBlockType::Image => {
                 if let Some(image) = block.image() {
-                    raw.push((
-                        b.y0 - bounds.y0,
-                        Raw::Image(image, b.x1 - b.x0, b.y1 - b.y0),
-                    ));
+                    raw.push((b.y0 - bounds.y0, Raw::Image(image, b.x1 - b.x0, b.y1 - b.y0)));
                 }
             }
             _ => {}
@@ -1293,11 +1168,7 @@ fn read_page(
         })
         .collect();
     let regions = figure_regions(&paths, &all_lines, width, height);
-    let in_figure = |line: &Line| {
-        regions
-            .iter()
-            .any(|r| r.holds_middle_of(Region::of_line(line, width)))
-    };
+    let in_figure = |line: &Line| regions.iter().any(|r| r.holds_middle_of(Region::of_line(line, width)));
 
     let mut placed: Vec<(f32, Block)> = Vec::new();
     let mut images = images.borrow_mut();
@@ -1342,24 +1213,15 @@ fn read_page(
                 height,
             },
         );
-        let at = placed
-            .iter()
-            .position(|(top, _)| *top >= region.y0)
-            .unwrap_or(placed.len());
+        let at = placed.iter().position(|(top, _)| *top >= region.y0).unwrap_or(placed.len());
         placed.insert(at, (region.y0, Block::Image(id)));
     }
     Ok(placed.into_iter().map(|(_, b)| b).collect())
 }
 
 /// The `block`th image (1-based) on a page, read again, counted as `read_page` counts them.
-fn embedded_image(
-    document: &Document,
-    page: usize,
-    block: usize,
-) -> Result<Option<mupdf::Image>, mupdf::Error> {
-    let text_page = document
-        .load_page(page as i32)?
-        .to_text_page(TextPageFlags::PRESERVE_IMAGES)?;
+fn embedded_image(document: &Document, page: usize, block: usize) -> Result<Option<mupdf::Image>, mupdf::Error> {
+    let text_page = document.load_page(page as i32)?.to_text_page(TextPageFlags::PRESERVE_IMAGES)?;
     let mut images = text_page
         .blocks()
         .filter(|b| b.r#type() == TextBlockType::Image)
@@ -1368,11 +1230,7 @@ fn embedded_image(
 }
 
 /// One malformed page must not lose the whole document: note it and keep going.
-fn safe_read_page(
-    document: &Document,
-    i: usize,
-    images: &RefCell<HashMap<String, PdfImage>>,
-) -> Vec<Block> {
+fn safe_read_page(document: &Document, i: usize, images: &RefCell<HashMap<String, PdfImage>>) -> Vec<Block> {
     read_page(document, i, images).unwrap_or_else(|e| {
         vec![Block::Note(format!(
             "Page {} could not be read ({e}). The other pages are unaffected.",
@@ -1417,9 +1275,7 @@ impl PdfSource {
         if let Some(&far) = pages.keys().max_by_key(|&&page| page.abs_diff(index)) {
             pages.remove(&far);
             self.diagrams.borrow_mut().remove(&far);
-            self.images
-                .borrow_mut()
-                .retain(|_, image| image.page() != far);
+            self.images.borrow_mut().retain(|_, image| image.page() != far);
         }
     }
 
@@ -1437,11 +1293,7 @@ impl PdfSource {
                 );
                 decode_embedded(&image, size.0, size.1)
             }
-            PdfImage::Drawing { page, region, .. } => render_region(
-                &self.document.borrow().0.load_page(page as i32)?,
-                region,
-                width,
-            ),
+            PdfImage::Drawing { page, region, .. } => render_region(&self.document.borrow().0.load_page(page as i32)?, region, width),
         }
     }
 
@@ -1460,11 +1312,7 @@ impl Source for PdfSource {
         self.evict(index);
         let blocks = self.read(index);
         let raw = render(&[blocks], &self.layout);
-        let (md, found) = mermaid::diagrams(
-            &raw,
-            |i| format!("{}{index}-{i}", mermaid::DIAGRAM_PREFIX),
-            mermaid::render,
-        );
+        let (md, found) = mermaid::diagrams(&raw, |i| format!("{}{index}-{i}", mermaid::DIAGRAM_PREFIX), mermaid::render);
         let page: Rc<str> = md.into();
         memory::shrink_mupdf_cache(PAGE_CACHE_SHARE);
         self.pages.borrow_mut().insert(index, page.clone());
@@ -1523,27 +1371,14 @@ pub fn open(path: &Path) -> Result<Doc, PdfOpenFailed> {
         },
     })?;
     let source = path.display().to_string();
-    let fallback = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    from_document(
-        Document::open(path),
-        Some(path.to_owned()),
-        &source,
-        &fallback,
-    )
+    let fallback = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    from_document(Document::open(path), Some(path.to_owned()), &source, &fallback)
 }
 
 /// `open` for PDF bytes already in hand (a download, say). `source` names the
 /// PDF in errors; `fallback_title` is used when the PDF has no title of its own.
 pub fn from_bytes(bytes: &[u8], source: &str, fallback_title: &str) -> Result<Doc, PdfOpenFailed> {
-    from_document(
-        Document::from_bytes(bytes, "application/pdf"),
-        None,
-        source,
-        fallback_title,
-    )
+    from_document(Document::from_bytes(bytes, "application/pdf"), None, source, fallback_title)
 }
 
 fn from_document(
@@ -1649,14 +1484,8 @@ mod tests {
         let out = md(vec![
             text(vec![sized("Big Title", 10.0, 24.0, false)]),
             text(vec![sized("Section", 50.0, 16.0, false)]),
-            text(vec![line(
-                "Body text that is long enough to be the most common size.",
-                80.0,
-            )]),
-            text(vec![line(
-                "More body text so body clearly dominates the weights.",
-                120.0,
-            )]),
+            text(vec![line("Body text that is long enough to be the most common size.", 80.0)]),
+            text(vec![line("More body text so body clearly dominates the weights.", 120.0)]),
         ]);
         assert!(out.starts_with("# Big Title\n\n## Section\n\n"), "{out}");
     }
@@ -1664,19 +1493,10 @@ mod tests {
     #[test]
     fn one_line_blocks_a_pitch_apart_rejoin_undoing_hyphenation() {
         let out = md(vec![
-            text(vec![line(
-                "The quick brown fox jumps over the lazy dog and keeps run-",
-                0.0,
-            )]),
+            text(vec![line("The quick brown fox jumps over the lazy dog and keeps run-", 0.0)]),
             text(vec![line("ning until the end.", 20.0)]),
-            text(vec![line(
-                "A new paragraph starts after a bigger gap here.",
-                50.0,
-            )]),
-            text(vec![line(
-                "It wraps onto a second line at the normal pitch.",
-                70.0,
-            )]),
+            text(vec![line("A new paragraph starts after a bigger gap here.", 50.0)]),
+            text(vec![line("It wraps onto a second line at the normal pitch.", 70.0)]),
         ]);
         assert_eq!(
             out,
@@ -1689,14 +1509,8 @@ mod tests {
     fn a_bold_line_is_not_merged_into_body_below() {
         let out = md(vec![
             text(vec![sized("Part 1: The Crash", 0.0, 11.0, true)]),
-            text(vec![line(
-                "The phone didn't just ring; it screamed loudly at night.",
-                20.0,
-            )]),
-            text(vec![line(
-                "Another line of body copy at the same pitch as before.",
-                40.0,
-            )]),
+            text(vec![line("The phone didn't just ring; it screamed loudly at night.", 20.0)]),
+            text(vec![line("Another line of body copy at the same pitch as before.", 40.0)]),
         ]);
         assert!(out.starts_with("#### Part 1: The Crash\n\n"), "{out}");
     }
@@ -1739,27 +1553,18 @@ mod tests {
 
     #[test]
     fn image_blocks_become_image_references() {
-        assert_eq!(
-            md(vec![Block::Image("p1-0".into())]),
-            "![](leaf-image:p1-0)"
-        );
+        assert_eq!(md(vec![Block::Image("p1-0".into())]), "![](leaf-image:p1-0)");
     }
 
     #[test]
     fn page_labels_and_bare_numbers_are_dropped() {
         let out = md(vec![
-            text(vec![line(
-                "Body text that is long enough to be the most common size here.",
-                0.0,
-            )]),
+            text(vec![line("Body text that is long enough to be the most common size here.", 0.0)]),
             text(vec![sized("xiv | Preface", 100.0, 9.0, false)]),
             text(vec![sized("Table of Contents | ix", 120.0, 9.0, false)]),
             text(vec![sized("57", 140.0, 9.0, false)]),
         ]);
-        assert_eq!(
-            out,
-            "Body text that is long enough to be the most common size here."
-        );
+        assert_eq!(out, "Body text that is long enough to be the most common size here.");
     }
 
     #[test]
@@ -1776,10 +1581,7 @@ mod tests {
     #[test]
     fn toc_leaders_collapse_and_chapter_numbers_stay_escaped() {
         assert_eq!(
-            md(vec![text(vec![line(
-                "10. Batch Processing. . . . . . . . . . . . . .  389",
-                0.0
-            )])]),
+            md(vec![text(vec![line("10. Batch Processing. . . . . . . . . . . . . .  389", 0.0)])]),
             "\u{2060}10. Batch Processing · 389"
         );
     }
@@ -1809,9 +1611,7 @@ mod tests {
             prose(80.0),
         ]);
         assert!(
-            out.contains(
-                "```\nfor (var i = 0; i < n; i++) {\n    if (x) {\n        go()\n    }\n}\n```"
-            ),
+            out.contains("```\nfor (var i = 0; i < n; i++) {\n    if (x) {\n        go()\n    }\n}\n```"),
             "{out}"
         );
     }
@@ -1820,33 +1620,21 @@ mod tests {
     fn shared_indent_is_dedented_and_backtick_runs_lengthen_the_fence() {
         let out = md(vec![
             prose(0.0),
-            text(vec![
-                code("  <ul>  ", 20.0),
-                code("    <li>", 30.0),
-                code("  </ul>", 40.0),
-            ]),
+            text(vec![code("  <ul>  ", 20.0), code("    <li>", 30.0), code("  </ul>", 40.0)]),
         ]);
         assert!(out.contains("```\n<ul>\n  <li>\n</ul>\n```"), "{out}");
-        assert!(
-            md(vec![prose(0.0), text(vec![code("```js", 20.0)])]).contains("````\n```js\n````")
-        );
+        assert!(md(vec![prose(0.0), text(vec![code("```js", 20.0)])]).contains("````\n```js\n````"));
     }
 
     #[test]
     fn back_to_back_code_shares_a_fence_and_never_merges_into_prose() {
-        let out = md(vec![
-            prose(0.0),
-            text(vec![code("a = 1", 20.0)]),
-            text(vec![code("b = 2", 50.0)]),
-        ]);
-        assert!(out.contains("```\na = 1\n\nb = 2\n```"), "{out}");
+        let out = md(vec![prose(0.0), text(vec![code("a = 1", 20.0)]), text(vec![code("b = 2", 50.0)])]);
+        assert!(out.contains("```\na = 1\n```"), "{out}");
+        assert!(out.contains("```\nb = 2\n```"), "{out}");
         let out = md(vec![
             prose(0.0),
             text(vec![code("SELECT 1", 12.0)]),
-            text(vec![line(
-                "then prose continues right below the code.",
-                24.0,
-            )]),
+            text(vec![line("then prose continues right below the code.", 24.0)]),
         ]);
         assert!(out.contains("```\n\nthen prose continues"), "{out}");
     }
@@ -1855,12 +1643,7 @@ mod tests {
     fn sizes_half_a_point_apart_stay_one_paragraph() {
         let out = md(vec![text(vec![
             sized("A paragraph whose font size jitters from", 0.0, 10.0, false),
-            sized(
-                "line to line, as some PDF tools leave it.",
-                12.0,
-                10.5,
-                false,
-            ),
+            sized("line to line, as some PDF tools leave it.", 12.0, 10.5, false),
         ])]);
         assert_eq!(
             out,
@@ -1889,10 +1672,7 @@ mod tests {
             prose(60.0),
             prose(80.0),
         ]);
-        assert!(
-            out.starts_with("# A Long Title That Wraps Onto A Second Line\n\n"),
-            "{out}"
-        );
+        assert!(out.starts_with("# A Long Title That Wraps Onto A Second Line\n\n"), "{out}");
     }
 
     #[test]
@@ -1906,10 +1686,7 @@ mod tests {
         };
         let out = md(vec![
             prose(0.0),
-            text(vec![
-                cell("Name", 30.0, 0.1, true),
-                cell("Purpose", 30.0, 0.4, false),
-            ]),
+            text(vec![cell("Name", 30.0, 0.1, true), cell("Purpose", 30.0, 0.4, false)]),
             text(vec![
                 cell("Gateway", 41.0, 0.1, true),
                 cell("Takes requests and", 41.0, 0.4, false),
@@ -1935,22 +1712,16 @@ mod tests {
             ]),
             text(vec![line("4. Scheduler: picks a worker.", 100.0)]),
         ]);
-        assert!(out.contains("\n\n3. Registry: keeps track of every worker and its health.\n4. Scheduler: picks a worker."), "{out}");
+        assert!(
+            out.contains("\n\n3. Registry: keeps track of every worker and its health.\n4. Scheduler: picks a worker."),
+            "{out}"
+        );
     }
 
     #[test]
     fn a_list_number_set_apart_from_its_item_joins_it() {
-        let item = |n: u32, name: &str, top: f32| {
-            text(vec![
-                placed(&format!("{n}."), top, 0.42, 0.43),
-                placed(name, top, 0.45, 0.56),
-            ])
-        };
-        let out = md(vec![
-            body(0.0),
-            item(1, "Ada Lovelace", 70.0),
-            item(2, "Alan Turing", 90.0),
-        ]);
+        let item = |n: u32, name: &str, top: f32| text(vec![placed(&format!("{n}."), top, 0.42, 0.43), placed(name, top, 0.45, 0.56)]);
+        let out = md(vec![body(0.0), item(1, "Ada Lovelace", 70.0), item(2, "Alan Turing", 90.0)]);
         assert!(out.contains("1. Ada Lovelace\n2. Alan Turing"), "{out}");
         assert!(!out.contains('|'));
     }
@@ -1976,22 +1747,14 @@ mod tests {
             out.starts_with("<div align=\"center\">\nSubmitted By\n</div>\n\nBody text"),
             "{out}"
         );
-        assert!(
-            out.ends_with("whole page here.\n\nA short left-aligned line."),
-            "{out}"
-        );
+        assert!(out.ends_with("whole page here.\n\nA short left-aligned line."), "{out}");
     }
 
     #[test]
     fn captions_are_italic_not_headings() {
         let out = md(vec![
             prose(0.0),
-            text(vec![sized(
-                "Figure 1: Logical architecture.",
-                30.0,
-                8.0,
-                true,
-            )]),
+            text(vec![sized("Figure 1: Logical architecture.", 30.0, 8.0, true)]),
         ]);
         assert!(out.contains("*Figure 1: Logical architecture.*"), "{out}");
         assert!(!out.contains('#'));
@@ -2024,10 +1787,7 @@ mod tests {
             } else {
                 vec![]
             };
-            page.push(text(vec![
-                line(b, 100.0),
-                line("It wraps onto a second line.", 120.0),
-            ]));
+            page.push(text(vec![line(b, 100.0), line("It wraps onto a second line.", 120.0)]));
             page
         })
         .collect();
@@ -2043,19 +1803,13 @@ mod tests {
                 ..line("How can requests be scheduled well?", 70.0)
             }]),
         ]);
-        assert!(
-            out.contains("*How can requests be scheduled well?*"),
-            "{out}"
-        );
+        assert!(out.contains("*How can requests be scheduled well?*"), "{out}");
     }
 
     #[test]
     fn a_url_broken_right_after_the_scheme_is_mended() {
         assert_eq!(
-            md(vec![text(vec![
-                line("visit https://", 0.0),
-                line("redislabs.com.", 12.0)
-            ])]),
+            md(vec![text(vec![line("visit https://", 0.0), line("redislabs.com.", 12.0)])]),
             "visit https://redislabs.com."
         );
     }
@@ -2096,20 +1850,11 @@ mod epub_tests {
     #[test]
     fn an_epub_opens_and_its_text_reads() {
         let path = std::env::temp_dir().join(format!("leaf-test-{}.epub", std::process::id()));
-        std::fs::copy(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sample.epub"),
-            &path,
-        )
-        .expect("sample copies");
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sample.epub"), &path).expect("sample copies");
         let doc = open(&path).expect("epub opens");
         std::fs::remove_file(&path).ok();
         assert_eq!(doc.title, "Test Book");
-        let text: String = (0..doc.pages())
-            .map(|i| doc.source.page(i).to_string())
-            .collect();
-        assert!(
-            text.contains("Chapter One") && text.contains("Hello from an epub"),
-            "got: {text}"
-        );
+        let text: String = (0..doc.pages()).map(|i| doc.source.page(i).to_string()).collect();
+        assert!(text.contains("Chapter One") && text.contains("Hello from an epub"), "got: {text}");
     }
 }

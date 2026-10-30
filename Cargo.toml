@@ -33,4 +33,4 @@ thiserror = "2"
 unicode-width = "0.2"
 ureq = "3"
 url = "2"
-ondine = { package = "compiler", git = "https://github.com/wevm/ondine" }
+ondine = { package = "compiler", git = "https://github.com/wevm/ondine", rev = "c8e8034c009bb6f987258e1c36045e080f46fde3" }

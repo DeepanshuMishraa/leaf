@@ -55,7 +55,9 @@ fn load(target: &str) -> Result<Doc, String> {
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(Path::new(target)).map_err(|e| e.to_string());
     }
-    Err(format!("Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."))
+    Err(format!(
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."
+    ))
 }
 
 /// Remembers the image mode, each document's highlights and bookmarks, and where each
@@ -80,7 +82,9 @@ fn resume(target: &str, page_count: Option<usize>, failure: &Rc<RefCell<Option<S
     let key = if is_url(target) {
         target.to_owned()
     } else {
-        std::fs::canonicalize(target).map(|p| p.display().to_string()).unwrap_or_else(|_| target.to_owned())
+        std::fs::canonicalize(target)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| target.to_owned())
     };
 
     let mut options = ViewerOptions::default();

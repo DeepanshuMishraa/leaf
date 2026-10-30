@@ -110,7 +110,10 @@ mod tests {
         let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1).unwrap();
         let rect = Rect::new(3, 5, 2, 1);
         let first = flushed(&mut kitty, &[(image, rect)]);
-        let (upload, place) = (first.find("a=t,f=100,i=1").unwrap(), first.find("\x1b[6;4H\x1b_Ga=p,i=1,c=2,r=1").unwrap());
+        let (upload, place) = (
+            first.find("a=t,f=100,i=1").unwrap(),
+            first.find("\x1b[6;4H\x1b_Ga=p,i=1,c=2,r=1").unwrap(),
+        );
         assert!(upload < place);
         assert_eq!(flushed(&mut kitty, &[(image, rect)]), "");
     }
