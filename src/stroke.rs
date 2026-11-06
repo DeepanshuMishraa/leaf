@@ -68,6 +68,30 @@ pub struct Stroke {
     pub hue: Hue,
     /// Never empty.
     pub points: Vec<Point>,
+    pub trace: Trace,
+}
+
+/// How a stroke's points are joined: curved through, as drawn by hand, or
+/// with straight lines, for a shape it was tidied into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Trace {
+    Freehand,
+    Shape,
+}
+
+impl Trace {
+    pub fn name(self) -> &'static str {
+        match self {
+            Trace::Freehand => "freehand",
+            Trace::Shape => "shape",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Trace> {
+        [Trace::Freehand, Trace::Shape]
+            .into_iter()
+            .find(|t| t.name() == name)
+    }
 }
 
 /// The pen's width as a share of a cell's height.
@@ -87,7 +111,289 @@ fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
     (x * x + y * y).sqrt()
 }
 
+/// The smallest box holding every point of a stroke, in cells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Extent {
+    pub min: Point,
+    pub max: Point,
+}
+
+/// A corner of a picked stroke's frame, the handle that resizes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+impl Corner {
+    pub const ALL: [Corner; 4] = [
+        Corner::TopLeft,
+        Corner::TopRight,
+        Corner::BottomRight,
+        Corner::BottomLeft,
+    ];
+
+    fn opposite(self) -> Corner {
+        match self {
+            Corner::TopLeft => Corner::BottomRight,
+            Corner::TopRight => Corner::BottomLeft,
+            Corner::BottomRight => Corner::TopLeft,
+            Corner::BottomLeft => Corner::TopRight,
+        }
+    }
+}
+
+/// How far a frame stands off the ink it holds, in cells.
+pub const FRAME_PAD: Point = Point { x: 0.6, y: 0.4 };
+/// The smallest a stroke is resized to, in cells.
+const MIN_SIZE: f32 = 1.0;
+
+impl Extent {
+    pub fn width(self) -> f32 {
+        self.max.x - self.min.x
+    }
+
+    pub fn height(self) -> f32 {
+        self.max.y - self.min.y
+    }
+
+    /// The extent grown by `pad` on every side.
+    pub fn padded(self, pad: Point) -> Extent {
+        Extent {
+            min: Point {
+                x: self.min.x - pad.x,
+                y: self.min.y - pad.y,
+            },
+            max: Point {
+                x: self.max.x + pad.x,
+                y: self.max.y + pad.y,
+            },
+        }
+    }
+
+    pub fn corner(self, corner: Corner) -> Point {
+        match corner {
+            Corner::TopLeft => self.min,
+            Corner::TopRight => Point {
+                x: self.max.x,
+                y: self.min.y,
+            },
+            Corner::BottomRight => self.max,
+            Corner::BottomLeft => Point {
+                x: self.min.x,
+                y: self.max.y,
+            },
+        }
+    }
+
+    pub fn contains(self, p: Point) -> bool {
+        (self.min.x..=self.max.x).contains(&p.x) && (self.min.y..=self.max.y).contains(&p.y)
+    }
+
+    /// The extent with `corner` dragged to `to` and its opposite corner held
+    /// still. It can't be turned inside out or squashed smaller than a cell.
+    pub fn dragged(self, corner: Corner, to: Point) -> Extent {
+        let fixed = self.corner(corner.opposite());
+        let grabbed = self.corner(corner);
+        // Each side keeps to its own side of the fixed corner.
+        let along = |to: f32, grabbed: f32, fixed: f32| {
+            if grabbed >= fixed {
+                to.max(fixed + MIN_SIZE)
+            } else {
+                to.min(fixed - MIN_SIZE)
+            }
+        };
+        let moved = Point {
+            x: if self.width() > 0.0 {
+                along(to.x, grabbed.x, fixed.x)
+            } else {
+                grabbed.x
+            },
+            y: if self.height() > 0.0 {
+                along(to.y, grabbed.y, fixed.y)
+            } else {
+                grabbed.y
+            },
+        };
+        Extent {
+            min: Point {
+                x: moved.x.min(fixed.x),
+                y: moved.y.min(fixed.y),
+            },
+            max: Point {
+                x: moved.x.max(fixed.x),
+                y: moved.y.max(fixed.y),
+            },
+        }
+    }
+
+    /// The extent grown (or, below 1, shrunk) by `factor` about its middle,
+    /// no smaller than a cell.
+    pub fn scaled(self, factor: f32) -> Extent {
+        let (cx, cy) = (
+            (self.min.x + self.max.x) / 2.0,
+            (self.min.y + self.max.y) / 2.0,
+        );
+        let half = |size: f32| {
+            if size > 0.0 {
+                (size * factor).max(MIN_SIZE) / 2.0
+            } else {
+                0.0
+            }
+        };
+        let (hw, hh) = (half(self.width()), half(self.height()));
+        Extent {
+            min: Point {
+                x: cx - hw,
+                y: cy - hh,
+            },
+            max: Point {
+                x: cx + hw,
+                y: cy + hh,
+            },
+        }
+    }
+}
+
+/// A picked stroke's frame: a thin box around `extent` with a handle at
+/// each corner, inside `clip`, with cells `cell` pixels in size.
+pub fn paint_frame(extent: Extent, clip: Cells, cell: (u16, u16)) -> Option<RgbaImage> {
+    let (cw, ch) = (cell.0.max(1) as f32, cell.1.max(1) as f32);
+    let (width, height) = (clip.cols as u32 * cw as u32, clip.rows as u32 * ch as u32);
+    let mut pixmap = tiny_skia::Pixmap::new(width.max(1), height.max(1))?;
+    let px = |p: Point| ((p.x - clip.left as f32) * cw, (p.y - clip.top as f32) * ch);
+    let frame = extent.padded(FRAME_PAD);
+    let ((x0, y0), (x1, y1)) = (px(frame.min), px(frame.max));
+    let mut ink = tiny_skia::Paint::default();
+    ink.set_color_rgba8(150, 150, 150, 255);
+    ink.anti_alias = true;
+    let rect = tiny_skia::Rect::from_ltrb(x0, y0, x1, y1)?;
+    let outline = tiny_skia::PathBuilder::from_rect(rect);
+    let line = tiny_skia::Stroke {
+        width: 1.5,
+        dash: tiny_skia::StrokeDash::new(vec![5.0, 4.0], 0.0),
+        ..Default::default()
+    };
+    pixmap.stroke_path(
+        &outline,
+        &ink,
+        &line,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+    let mut paper = tiny_skia::Paint::default();
+    paper.set_color_rgba8(250, 250, 250, 255);
+    let side = (cw * 0.9).max(6.0);
+    for corner in Corner::ALL {
+        let (x, y) = px(frame.corner(corner));
+        let Some(handle) = tiny_skia::Rect::from_xywh(x - side / 2.0, y - side / 2.0, side, side)
+        else {
+            continue;
+        };
+        let path = tiny_skia::PathBuilder::from_rect(handle);
+        pixmap.fill_path(
+            &path,
+            &paper,
+            tiny_skia::FillRule::Winding,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        pixmap.stroke_path(
+            &path,
+            &ink,
+            &tiny_skia::Stroke {
+                width: 1.5,
+                ..Default::default()
+            },
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    }
+    let pixels = pixmap.pixels().iter().flat_map(|p| {
+        let c = p.demultiply();
+        [c.red(), c.green(), c.blue(), c.alpha()]
+    });
+    RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixels.collect())
+}
+
 impl Stroke {
+    /// The smallest box holding every point.
+    pub fn extent(&self) -> Extent {
+        let first = self
+            .points
+            .first()
+            .copied()
+            .unwrap_or(Point { x: 0.0, y: 0.0 });
+        self.points.iter().fold(
+            Extent {
+                min: first,
+                max: first,
+            },
+            |e, p| Extent {
+                min: Point {
+                    x: e.min.x.min(p.x),
+                    y: e.min.y.min(p.y),
+                },
+                max: Point {
+                    x: e.max.x.max(p.x),
+                    y: e.max.y.max(p.y),
+                },
+            },
+        )
+    }
+
+    /// The cells the stroke's frame and its handles fall in.
+    pub fn frame_bounds(&self) -> Cells {
+        let frame = self.extent().padded(FRAME_PAD);
+        let (left, top) = (
+            (frame.min.x - 1.0).floor() as i32,
+            (frame.min.y - 1.0).floor() as i32,
+        );
+        let (right, bottom) = (
+            (frame.max.x + 1.0).ceil() as i32,
+            (frame.max.y + 1.0).ceil() as i32,
+        );
+        Cells {
+            left,
+            top,
+            cols: (right - left).clamp(1, u16::MAX as i32) as u16,
+            rows: (bottom - top).clamp(1, u16::MAX as i32) as u16,
+        }
+    }
+
+    /// Moves every point `dx` cells across and `dy` down.
+    pub fn shift(&mut self, dx: f32, dy: f32) {
+        for p in &mut self.points {
+            p.x += dx;
+            p.y += dy;
+        }
+    }
+
+    /// The stroke stretched so its extent becomes `to`.
+    pub fn fitted(&self, to: Extent) -> Stroke {
+        let from = self.extent();
+        let axis = |v: f32, from_min: f32, from_size: f32, to_min: f32, to_size: f32| {
+            if from_size > 0.0 {
+                to_min + (v - from_min) * to_size / from_size
+            } else {
+                v + to_min - from_min
+            }
+        };
+        Stroke {
+            points: self
+                .points
+                .iter()
+                .map(|p| Point {
+                    x: axis(p.x, from.min.x, from.width(), to.min.x, to.width()),
+                    y: axis(p.y, from.min.y, from.height(), to.min.y, to.height()),
+                })
+                .collect(),
+            ..self.clone()
+        }
+    }
+
     /// A stroke begun at `at`.
     pub fn begin(page: usize, anchor: usize, hue: Hue, at: Point) -> Stroke {
         Stroke {
@@ -95,6 +401,20 @@ impl Stroke {
             anchor,
             hue,
             points: vec![at],
+            trace: Trace::Freehand,
+        }
+    }
+
+    /// The stroke as the shape it was meant to be, when it's near one; see
+    /// [`crate::shape::tidy`]. `cell` is a cell's size in pixels.
+    pub fn tidied(self, cell: (u16, u16)) -> Stroke {
+        match crate::shape::tidy(&self.points, cell) {
+            Some(points) => Stroke {
+                points,
+                trace: Trace::Shape,
+                ..self
+            },
+            None => self,
         }
     }
 
@@ -158,6 +478,20 @@ impl Stroke {
                     None,
                 );
                 None
+            }
+            [first, rest @ ..] if self.trace == Trace::Shape => {
+                let mut pb = tiny_skia::PathBuilder::new();
+                let (x, y) = px(*first);
+                pb.move_to(x, y);
+                for p in rest {
+                    let (x, y) = px(*p);
+                    pb.line_to(x, y);
+                }
+                // A shape that ends where it began is closed, so its first corner is sharp too.
+                if rest.last() == Some(first) {
+                    pb.close();
+                }
+                pb.finish()
             }
             [first, rest @ ..] => {
                 // Mouse points come a cell apart; curving through the midpoints smooths the corners.
@@ -234,7 +568,117 @@ mod tests {
             anchor: 0,
             hue: Hue::Blue,
             points: points.iter().map(|&(x, y)| Point { x, y }).collect(),
+            trace: Trace::Freehand,
         }
+    }
+
+    #[test]
+    fn a_rough_box_is_tidied_into_a_shape_and_a_scribble_is_left_alone() {
+        let mut path = vec![];
+        for x in 0..=12 {
+            path.push((x as f32 + 0.5, 0.5));
+        }
+        for y in 1..=6 {
+            path.push((12.5, y as f32 + 0.5));
+        }
+        for x in (0..12).rev() {
+            path.push((x as f32 + 0.5, 6.5));
+        }
+        for y in (0..6).rev() {
+            path.push((0.5, y as f32 + 0.5));
+        }
+        let boxed = line(&path).tidied((8, 16));
+        assert_eq!(boxed.trace, Trace::Shape);
+        assert_eq!(boxed.points.len(), 5);
+        let scribble = line(&[(0.5, 0.5), (1.5, 2.5), (2.5, 0.5), (3.5, 2.5)]);
+        assert_eq!(scribble.clone().tidied((8, 16)), scribble);
+    }
+
+    fn extent(x0: f32, y0: f32, x1: f32, y1: f32) -> Extent {
+        Extent {
+            min: Point { x: x0, y: y0 },
+            max: Point { x: x1, y: y1 },
+        }
+    }
+
+    #[test]
+    fn dragging_a_corner_holds_the_opposite_one_still() {
+        let e = extent(2.0, 2.0, 10.0, 6.0);
+        assert_eq!(
+            e.dragged(Corner::BottomRight, Point { x: 14.0, y: 9.0 }),
+            extent(2.0, 2.0, 14.0, 9.0)
+        );
+        assert_eq!(
+            e.dragged(Corner::TopLeft, Point { x: 0.0, y: 1.0 }),
+            extent(0.0, 1.0, 10.0, 6.0)
+        );
+        // Dragged past the fixed corner, it stops a cell short instead of flipping.
+        assert_eq!(
+            e.dragged(Corner::TopRight, Point { x: -5.0, y: 20.0 }),
+            extent(2.0, 5.0, 3.0, 6.0)
+        );
+    }
+
+    #[test]
+    fn a_flat_line_resizes_along_its_length_only() {
+        let e = extent(2.0, 3.0, 10.0, 3.0);
+        assert_eq!(
+            e.dragged(Corner::BottomRight, Point { x: 20.0, y: 9.0 }),
+            extent(2.0, 3.0, 20.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn scaling_grows_about_the_middle_but_not_below_a_cell() {
+        assert_eq!(
+            extent(0.0, 0.0, 10.0, 4.0).scaled(1.5),
+            extent(-2.5, -1.0, 12.5, 5.0)
+        );
+        assert_eq!(
+            extent(0.0, 0.0, 2.0, 2.0).scaled(0.1),
+            extent(0.5, 0.5, 1.5, 1.5)
+        );
+    }
+
+    #[test]
+    fn fitting_stretches_every_point_into_the_new_extent() {
+        let stroke = line(&[(0.0, 0.0), (4.0, 2.0), (2.0, 1.0)]);
+        let fitted = stroke.fitted(extent(10.0, 10.0, 18.0, 16.0));
+        assert_eq!(fitted.extent(), extent(10.0, 10.0, 18.0, 16.0));
+        assert_eq!(fitted.points[2], Point { x: 14.0, y: 13.0 });
+        let mut moved = stroke.clone();
+        moved.shift(1.0, -1.0);
+        assert_eq!(moved.extent(), extent(1.0, -1.0, 5.0, 1.0));
+    }
+
+    #[test]
+    fn a_frame_has_its_handles_inside_its_bounds() {
+        let stroke = line(&[(0.5, 0.5), (6.5, 3.5)]);
+        let bounds = stroke.frame_bounds();
+        let image = paint_frame(stroke.extent(), bounds, (10, 20)).unwrap();
+        assert_eq!(
+            image.dimensions(),
+            (bounds.cols as u32 * 10, bounds.rows as u32 * 20)
+        );
+        // The top-left handle, at the padded corner, is drawn.
+        let corner = stroke.extent().padded(FRAME_PAD).min;
+        let (x, y) = (
+            ((corner.x - bounds.left as f32) * 10.0) as u32,
+            ((corner.y - bounds.top as f32) * 20.0) as u32,
+        );
+        assert_eq!(image.get_pixel(x, y).0[3], 255);
+    }
+
+    #[test]
+    fn a_shape_is_drawn_with_sharp_corners() {
+        let mut square = line(&[(0.5, 0.5), (4.5, 0.5), (4.5, 2.5), (0.5, 2.5), (0.5, 0.5)]);
+        let cell = (10, 20);
+        let curved = square.paint(square.bounds(), cell).unwrap();
+        square.trace = Trace::Shape;
+        let sharp = square.paint(square.bounds(), cell).unwrap();
+        // The top-right corner, at (45, 10): inked when joined straight, cut off when curved.
+        assert_eq!(sharp.get_pixel(45, 10).0[3], 255);
+        assert!(curved.get_pixel(45, 10).0[3] < 255);
     }
 
     #[test]

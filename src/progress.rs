@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::comment::{Anchor, Comment, Side, State};
 use crate::highlight::Highlight;
 use crate::hue::Hue;
-use crate::stroke::Stroke;
+use crate::stroke::{Stroke, Trace};
 
 /// Where a reader is in a paged document. `page` is 1-based.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,19 +217,25 @@ impl Store {
         .map_err(|e| failed(e.to_string()))?;
         db.execute_batch(SCHEMA)
             .map_err(|e| failed(e.to_string()))?;
-        // Highlights saved before they had colors are yellow, as they were drawn.
-        let has_hue: bool = db
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('highlights') WHERE name = 'hue'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| failed(e.to_string()))?;
-        if !has_hue {
-            db.execute_batch(
-                "ALTER TABLE highlights ADD COLUMN hue TEXT NOT NULL DEFAULT 'yellow'",
-            )
-            .map_err(|e| failed(e.to_string()))?;
+        // Highlights saved before they had colors are yellow, and strokes
+        // saved before shapes were tidied are freehand, as they were drawn.
+        for (table, column, declaration) in [
+            ("highlights", "hue", "TEXT NOT NULL DEFAULT 'yellow'"),
+            ("strokes", "trace", "TEXT NOT NULL DEFAULT 'freehand'"),
+        ] {
+            let present: bool = db
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+                    [table, column],
+                    |r| r.get(0),
+                )
+                .map_err(|e| failed(e.to_string()))?;
+            if !present {
+                db.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                ))
+                .map_err(|e| failed(e.to_string()))?;
+            }
         }
         Ok(Store {
             db,
@@ -402,7 +408,9 @@ impl Store {
     pub fn load_strokes(&self, key: &str) -> Result<Vec<Stroke>, StoreFailed> {
         let mut query = self
             .db
-            .prepare("SELECT page, anchor, hue, points FROM strokes WHERE key = ? ORDER BY rowid")
+            .prepare(
+                "SELECT page, anchor, hue, points, trace FROM strokes WHERE key = ? ORDER BY rowid",
+            )
             .map_err(self.failed(Operation::Read))?;
         let rows = query
             .query_map([key], |r| {
@@ -411,24 +419,27 @@ impl Store {
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .map_err(self.failed(Operation::Read))?;
         let mut strokes = Vec::new();
         for row in rows {
-            let (page, anchor, hue, points) = row.map_err(self.failed(Operation::Read))?;
+            let (page, anchor, hue, points, trace) = row.map_err(self.failed(Operation::Read))?;
             // Rows we didn't write are skipped rather than trusted.
-            if let (Some(page), Some(anchor), Some(hue), Some(points)) = (
+            if let (Some(page), Some(anchor), Some(hue), Some(points), Some(trace)) = (
                 count(page),
                 count(anchor),
                 Hue::parse(&hue),
                 Stroke::decode_points(&points),
+                Trace::parse(&trace),
             ) {
                 strokes.push(Stroke {
                     page,
                     anchor,
                     hue,
                     points,
+                    trace,
                 });
             }
         }
@@ -449,7 +460,7 @@ impl Store {
         {
             let mut insert = tx
                 .prepare(
-                    "INSERT INTO strokes (key, page, anchor, hue, points) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO strokes (key, page, anchor, hue, points, trace) VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .map_err(failed)?;
             for s in strokes {
@@ -459,7 +470,8 @@ impl Store {
                         s.page as i64,
                         s.anchor as i64,
                         s.hue.name(),
-                        s.encode_points()
+                        s.encode_points(),
+                        s.trace.name()
                     ])
                     .map_err(failed)?;
             }
@@ -729,10 +741,34 @@ mod tests {
     }
 
     #[test]
+    fn strokes_saved_before_shapes_come_back_freehand() {
+        let path = std::env::temp_dir().join(format!("leaf-trace-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE strokes (key TEXT NOT NULL, page INTEGER NOT NULL,
+               anchor INTEGER NOT NULL, hue TEXT NOT NULL, points BLOB NOT NULL);",
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO strokes VALUES ('/a.md', 0, 2, 'red', ?)",
+            [0.5f32.to_le_bytes().repeat(2)],
+        )
+        .unwrap();
+        drop(old);
+        let store = Store::open(&path).unwrap();
+        let loaded = store.load_strokes("/a.md").unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].trace, Trace::Freehand);
+    }
+
+    #[test]
     fn strokes_come_back_per_document_in_order_and_saving_replaces_them() {
         use crate::stroke::Point;
         let mut store = memory();
-        let stroke = |page, x| Stroke {
+        let stroke = |page, x, trace| Stroke {
             page,
             anchor: 7,
             hue: Hue::Green,
@@ -743,8 +779,12 @@ mod tests {
                     y: -1.5,
                 },
             ],
+            trace,
         };
-        let (first, second) = (stroke(3, 0.5), stroke(0, -2.5));
+        let (first, second) = (
+            stroke(3, 0.5, Trace::Freehand),
+            stroke(0, -2.5, Trace::Shape),
+        );
         store
             .save_strokes("/a.pdf", &[first.clone(), second.clone()])
             .unwrap();

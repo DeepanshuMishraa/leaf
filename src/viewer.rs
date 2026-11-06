@@ -33,7 +33,7 @@ use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::render::{self, DIM, Laid};
-use crate::stroke::{Cells, Point, Stroke};
+use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
 
 /// Widest the text column gets; a book-like measure is easiest to read.
 const MAX_TEXT_WIDTH: u16 = 76;
@@ -59,6 +59,12 @@ const SEARCH_SLICE: Duration = Duration::from_millis(30);
 const INK_LAYER: i32 = 1;
 /// How close, in cells, the eraser has to pass to a stroke to take it.
 const ERASER_REACH: f32 = 0.7;
+/// How close, in cells, a click has to be to a stroke to pick it up.
+const PICK_REACH: f32 = 1.0;
+/// A picked stroke's frame is drawn over all ink.
+const FRAME_LAYER: i32 = 2;
+/// How much `+` grows a picked stroke, and `-` shrinks it.
+const GROW: f32 = 1.15;
 
 const SELECTION: Color = Color::Indexed(8);
 // Dark ink on the light marker colors reads the same on light and dark themes.
@@ -163,12 +169,14 @@ impl Selection {
     }
 }
 
-/// What dragging the mouse does: select text, draw, or rub strokes out.
+/// What dragging the mouse does: select text, draw, rub strokes out, or
+/// pick a stroke up to move and resize it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Select,
     Pen,
     Eraser,
+    Move,
 }
 
 /// A stroke, and the serial its drawn images are kept under.
@@ -188,15 +196,28 @@ enum Drag {
     Erasing {
         erased: bool,
     },
+    /// Carrying the picked stroke: `from` is the cell the mouse took hold
+    /// at, `original` the stroke as it was then.
+    Moving {
+        from: (u16, u16),
+        original: Stroke,
+    },
+    /// Stretching the picked stroke by one corner of its frame.
+    Resizing {
+        corner: Corner,
+        original: Stroke,
+    },
 }
 
-/// A stroke's image as drawn: which stroke, how far it had got, and the
-/// cells of it on screen, measured from its anchor.
+/// A stroke's image as drawn: which stroke, how far it had got, the cells
+/// of it on screen, measured from its anchor, and whether it's the stroke
+/// or the frame round it when picked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct InkKey {
     serial: u64,
     points: usize,
     clip: Cells,
+    frame: bool,
 }
 
 enum Remote {
@@ -316,6 +337,8 @@ pub struct App {
     next_serial: u64,
     /// Strokes' images the terminal holds, for the parts of them on screen.
     ink_drawn: HashMap<InkKey, kitty::Image>,
+    /// The serial of the stroke picked up with the move tool.
+    picked: Option<u64>,
     dialog: Dialog,
     remote: HashMap<String, Remote>,
     fetched_tx: mpsc::Sender<(String, Option<RgbaImage>)>,
@@ -351,6 +374,21 @@ fn char_width(c: char) -> u16 {
     c.width().unwrap_or(0) as u16
 }
 
+/// Where the ink's corner goes when a frame's `corner` handle is dragged to
+/// `p`: the frame stands off the ink, so the handle sits that far outside it.
+fn handle_to_ink(corner: Corner, p: Point) -> Point {
+    let (sx, sy) = match corner {
+        Corner::TopLeft => (1.0, 1.0),
+        Corner::TopRight => (-1.0, 1.0),
+        Corner::BottomRight => (-1.0, -1.0),
+        Corner::BottomLeft => (1.0, -1.0),
+    };
+    Point {
+        x: p.x + sx * FRAME_PAD.x,
+        y: p.y + sy * FRAME_PAD.y,
+    }
+}
+
 impl App {
     pub fn new(doc: Doc, options: ViewerOptions, picker: Picker) -> Self {
         let current = match (doc.page_count, options.start_page) {
@@ -375,6 +413,7 @@ impl App {
             strokes,
             tool: Tool::Select,
             drag: Drag::Idle,
+            picked: None,
             ink_drawn: HashMap::new(),
             image_mode: options.image_mode,
             highlights: options.highlights.clone(),
@@ -562,6 +601,12 @@ impl App {
                 footer = format!("{footer} · pen {} · e eraser · esc stop", self.hue.name())
             }
             Tool::Eraser => footer = format!("{footer} · eraser · d pen · esc stop"),
+            Tool::Move if self.picked.is_some() => {
+                footer = format!(
+                    "{footer} · drag or arrows move · corners or +/- resize · x delete · esc done"
+                )
+            }
+            Tool::Move => footer = format!("{footer} · move: click ink to pick it · esc stop"),
         }
         let hidden = self.no_ink().is_some() && {
             let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
@@ -1184,6 +1229,7 @@ impl App {
             ("1-6", "pick a color; paints the selection"),
             ("d", "pen: drag to draw"),
             ("e", "eraser: drag over ink"),
+            ("v", "move tool: pick, move, resize ink"),
             ("!", "how to highlight and draw"),
             ("?", "this help"),
             ("q", "quit"),
@@ -1245,23 +1291,25 @@ impl App {
             Line::raw(""),
             heading("Colors"),
             Line::from([vec![Span::raw("  ")], swatches].concat()),
-            step("1-6", "pick the color for highlights and the pen"),
-            step("", "with text selected, paints it or recolors it"),
+            step("1-6", "pick a color; paints a selection too"),
             Line::raw(""),
             heading("Draw"),
             step("d", "pen: drag anywhere to draw"),
             step("e", "eraser: drag over a stroke to rub it out"),
             step("esc", "back to selecting text"),
+            step("", "lines, boxes, triangles and circles snap clean"),
             step("", "ink sticks to the word it starts on"),
+            Line::raw(""),
+            heading("Move and resize"),
+            step("v", "move tool: click a stroke to pick it"),
+            step("drag", "move it; drag a corner to resize"),
+            step("←↓↑→ +-", "nudge (or hjkl) · bigger / smaller"),
+            step("1-6  x", "recolor · delete · esc lets go"),
         ];
         if self.no_ink().is_some() {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "  Drawing needs Kitty graphics (Kitty, Ghostty, WezTerm),",
-                dim,
-            )));
-            lines.push(Line::from(Span::styled(
-                "  and doesn't work inside tmux.",
+                "  Drawing needs Kitty graphics, and not inside tmux.",
                 dim,
             )));
         }
@@ -1647,6 +1695,9 @@ impl App {
             Dialog::None => {}
         }
         self.notice = None;
+        if self.tool == Tool::Move && self.arrange_key(&key) {
+            return;
+        }
         if let Some(hue) = typed(&key).and_then(Hue::of_key) {
             return self.pick_hue(hue);
         }
@@ -1697,8 +1748,11 @@ impl App {
             Some('i') => self.toggle_images(),
             Some('d') | Some('D') => self.take_tool(Tool::Pen),
             Some('e') | Some('E') => self.take_tool(Tool::Eraser),
+            Some('v') | Some('V') => self.take_tool(Tool::Move),
             _ => match key.code {
-                // Esc puts the pen down, then lets go of a selection, then a search, then quits.
+                // Esc lets go of a picked stroke, puts the pen down, then lets
+                // go of a selection, then a search, then quits.
+                KeyCode::Esc if self.picked.take().is_some() => {}
                 KeyCode::Esc if self.tool != Tool::Select => self.tool = Tool::Select,
                 KeyCode::Esc => {
                     if self.selection.take().is_none() && self.search.take().is_none() {
@@ -1827,6 +1881,10 @@ impl App {
                 let erased = self.erase_at(x, y);
                 self.drag = Drag::Erasing { erased };
             }
+            (MouseEventKind::Down(MouseButton::Left), Tool::Move) => {
+                self.selection = None;
+                self.take_hold(x, y);
+            }
             (MouseEventKind::Drag(MouseButton::Left), _) => match &self.drag {
                 Drag::Idle => {}
                 Drag::Selecting => {
@@ -1849,6 +1907,18 @@ impl App {
                         erased: erased || now,
                     };
                 }
+                Drag::Moving { from, original } => {
+                    let (from, mut stroke) = (*from, original.clone());
+                    stroke.shift(x as f32 - from.0 as f32, y as f32 - from.1 as f32);
+                    self.replace_picked(stroke);
+                }
+                Drag::Resizing { corner, original } => {
+                    let (corner, original) = (*corner, original.clone());
+                    if let Some(p) = self.point_from(original.page, original.anchor, x, y) {
+                        let to = original.extent().dragged(corner, handle_to_ink(corner, p));
+                        self.replace_picked(original.fitted(to));
+                    }
+                }
             },
             (MouseEventKind::Up(MouseButton::Left), _) => {
                 match std::mem::replace(&mut self.drag, Drag::Idle) {
@@ -1863,10 +1933,25 @@ impl App {
                         }
                     }
                     Drag::Inking(inked) => {
-                        self.strokes.push(inked);
+                        let font = self.picker.font_size();
+                        let stroke = inked.stroke.tidied((font.width, font.height));
+                        // A tidied stroke is drawn afresh, not from the images of it being drawn.
+                        let serial = if stroke.trace == Trace::Shape {
+                            self.next_serial += 1;
+                            self.next_serial - 1
+                        } else {
+                            inked.serial
+                        };
+                        self.strokes.push(Inked { serial, stroke });
                         self.report_strokes();
                     }
                     Drag::Erasing { erased: true } => self.report_strokes(),
+                    Drag::Moving { original, .. } | Drag::Resizing { original, .. } => {
+                        if self.picked_stroke() != Some(&original) {
+                            self.reanchor_picked();
+                            self.report_strokes();
+                        }
+                    }
                 }
             }
             (MouseEventKind::ScrollDown, _) => self.scroll_by(WHEEL_STEP),
@@ -1921,6 +2006,142 @@ impl App {
         self.strokes.len() != before
     }
 
+    fn picked_index(&self) -> Option<usize> {
+        let serial = self.picked?;
+        self.strokes.iter().position(|i| i.serial == serial)
+    }
+
+    fn picked_stroke(&self) -> Option<&Stroke> {
+        self.picked_index().map(|i| &self.strokes[i].stroke)
+    }
+
+    /// Puts `stroke` in place of the picked one, under a new serial so it's drawn afresh.
+    fn replace_picked(&mut self, stroke: Stroke) {
+        let Some(i) = self.picked_index() else {
+            return;
+        };
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.strokes[i] = Inked { serial, stroke };
+        self.picked = Some(serial);
+    }
+
+    /// With the move tool: a corner handle or the inside of the picked
+    /// stroke's frame takes hold of it; otherwise the topmost stroke under
+    /// the mouse is picked, ready to carry, or nothing is.
+    fn take_hold(&mut self, x: u16, y: u16) {
+        if let Some(stroke) = self.picked_stroke().cloned()
+            && let Some(p) = self.point_from(stroke.page, stroke.anchor, x, y)
+        {
+            let frame = stroke.extent().padded(FRAME_PAD);
+            let handle = Corner::ALL.into_iter().find(|&c| {
+                let h = frame.corner(c);
+                (p.x - h.x).abs() <= 1.0 && (p.y - h.y).abs() <= 0.75
+            });
+            if let Some(corner) = handle {
+                self.drag = Drag::Resizing {
+                    corner,
+                    original: stroke,
+                };
+                return;
+            }
+            if frame.padded(Point { x: 0.5, y: 0.5 }).contains(p) {
+                self.drag = Drag::Moving {
+                    from: (x, y),
+                    original: stroke,
+                };
+                return;
+            }
+        }
+        self.picked = None;
+        for i in (0..self.strokes.len()).rev() {
+            let (page, anchor) = (self.strokes[i].stroke.page, self.strokes[i].stroke.anchor);
+            if let Some(p) = self.point_from(page, anchor, x, y)
+                && self.strokes[i].stroke.near(p, PICK_REACH)
+            {
+                self.picked = Some(self.strokes[i].serial);
+                self.drag = Drag::Moving {
+                    from: (x, y),
+                    original: self.strokes[i].stroke.clone(),
+                };
+                return;
+            }
+        }
+    }
+
+    /// Pins the picked stroke to the word now under its first point, so a
+    /// stroke carried to another paragraph moves with that one when text reflows.
+    fn reanchor_picked(&mut self) {
+        let Some(i) = self.picked_index() else {
+            return;
+        };
+        let stroke = self.strokes[i].stroke.clone();
+        let Some((ox, oy)) = self.anchor_cell(stroke.page, stroke.anchor) else {
+            return;
+        };
+        let (sx, sy) = (
+            ox as f32 + stroke.points[0].x,
+            oy as f32 + stroke.points[0].y,
+        );
+        if sx < 0.0 || sy < 0.0 || sx > u16::MAX as f32 || sy > u16::MAX as f32 {
+            return;
+        }
+        let Some(at) = self.hit(sx as u16, sy as u16) else {
+            return;
+        };
+        let Some((nx, ny)) = self.anchor_cell(at.page, at.offset) else {
+            return;
+        };
+        let mut moved = stroke;
+        moved.shift((ox - nx) as f32, (oy - ny) as f32);
+        moved.page = at.page;
+        moved.anchor = at.offset;
+        self.strokes[i].stroke = moved;
+    }
+
+    /// Keys for the picked stroke: arrows or `hjkl` nudge it a cell, `+`
+    /// and `-` resize it, a number recolors it, and `x` deletes it. Says
+    /// whether the key was one of them.
+    fn arrange_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(stroke) = self.picked_stroke().cloned() else {
+            return false;
+        };
+        let nudge = match (key.code, typed(key)) {
+            (KeyCode::Left, _) | (_, Some('h')) => Some((-1.0, 0.0)),
+            (KeyCode::Right, _) | (_, Some('l')) => Some((1.0, 0.0)),
+            (KeyCode::Up, _) | (_, Some('k')) => Some((0.0, -1.0)),
+            (KeyCode::Down, _) | (_, Some('j')) => Some((0.0, 1.0)),
+            _ => None,
+        };
+        let changed = if let Some((dx, dy)) = nudge {
+            let mut moved = stroke;
+            moved.shift(dx, dy);
+            moved
+        } else if matches!(typed(key), Some('+') | Some('=')) {
+            stroke.fitted(stroke.extent().scaled(GROW))
+        } else if typed(key) == Some('-') {
+            stroke.fitted(stroke.extent().scaled(1.0 / GROW))
+        } else if let Some(hue) = typed(key).and_then(Hue::of_key) {
+            self.hue = hue;
+            Stroke { hue, ..stroke }
+        } else if matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
+            || typed(key) == Some('x')
+        {
+            if let Some(i) = self.picked_index() {
+                self.strokes.remove(i);
+            }
+            self.picked = None;
+            self.report_strokes();
+            return true;
+        } else {
+            return false;
+        };
+        self.replace_picked(changed);
+        self.reanchor_picked();
+        self.report_strokes();
+        true
+    }
+
     fn report_strokes(&mut self) {
         let strokes: Vec<Stroke> = self.strokes.iter().map(|i| i.stroke.clone()).collect();
         (self.options.on_strokes)(&strokes);
@@ -1944,6 +2165,7 @@ impl App {
             return;
         }
         self.selection = None;
+        self.picked = None;
         self.tool = tool;
     }
 
@@ -1995,6 +2217,7 @@ impl App {
                 serial: inked.serial,
                 points: stroke.points.len(),
                 clip: visible.shift(-ox, -oy),
+                frame: false,
             };
             let image = match self.ink_drawn.get(&key) {
                 Some(image) => *image,
@@ -2020,6 +2243,43 @@ impl App {
             };
             self.placements.push((image, rect));
             used.insert(key);
+        }
+        // The picked stroke's frame, with a handle at each corner.
+        let picked = self
+            .picked
+            .and_then(|serial| self.strokes.iter().find(|i| i.serial == serial));
+        if let Some(inked) = picked
+            && let Some(&(ox, oy)) = origins.get(&(inked.stroke.page, inked.stroke.anchor))
+            && let Some(visible) = inked.stroke.frame_bounds().shift(ox, oy).intersect(view)
+        {
+            let key = InkKey {
+                serial: inked.serial,
+                points: inked.stroke.points.len(),
+                clip: visible.shift(-ox, -oy),
+                frame: true,
+            };
+            let image = match self.ink_drawn.get(&key) {
+                Some(image) => Some(*image),
+                None => {
+                    stroke::paint_frame(inked.stroke.extent(), key.clip, (font.width, font.height))
+                        .and_then(|pixels| {
+                            kitty.upload(&pixels, visible.cols, visible.rows, FRAME_LAYER)
+                        })
+                        .inspect(|image| {
+                            self.ink_drawn.insert(key, *image);
+                        })
+                }
+            };
+            if let Some(image) = image {
+                let rect = Rect {
+                    x: visible.left as u16,
+                    y: visible.top as u16,
+                    width: visible.cols,
+                    height: visible.rows,
+                };
+                self.placements.push((image, rect));
+                used.insert(key);
+            }
         }
         self.ink_drawn.retain(|key, image| {
             let kept = used.contains(key);
@@ -2785,6 +3045,125 @@ mod tests {
         s.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
         assert!(saved.borrow().is_empty());
         assert!(ink_on_screen(&s).is_empty());
+    }
+
+    #[test]
+    fn a_box_drawn_by_hand_is_saved_as_a_rectangle() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = inking(&"Some words to draw around. ".repeat(20), options);
+        s.press(KeyCode::Char('d'));
+        let (x, y) = s.find("Some");
+        let mut path: Vec<(u16, u16)> = (0..=14).map(|i| (x + i, y)).collect();
+        path.extend((1..=5).map(|i| (x + 14, y + i)));
+        path.extend((0..14).rev().map(|i| (x + i, y + 5)));
+        path.extend((1..5).rev().map(|i| (x, y + i)));
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        for &(px, py) in &path[1..] {
+            s.mouse(MouseEventKind::Drag(MouseButton::Left), px, py);
+        }
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x, y + 1);
+        let strokes = saved.borrow();
+        assert_eq!(strokes.len(), 1);
+        assert_eq!(strokes[0].trace, Trace::Shape);
+        assert_eq!(strokes[0].points.len(), 5);
+        assert_eq!(ink_on_screen(&s).len(), 1);
+    }
+
+    /// A screen with a level line of ink under the start of "Some words",
+    /// six cells long, and the saved strokes as they're reported.
+    fn with_a_line() -> (Screen, Rc<RefCell<Vec<Stroke>>>, (u16, u16)) {
+        let line = Stroke {
+            points: vec![Point { x: 0.5, y: 0.5 }, Point { x: 6.5, y: 0.5 }],
+            trace: Trace::Shape,
+            ..Stroke::begin(0, 0, Hue::Red, Point { x: 0.5, y: 0.5 })
+        };
+        let saved = Rc::new(RefCell::new(vec![line.clone()]));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            strokes: vec![line],
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let text = "Some words here.\n\nAnother paragraph below it.\n\nAnd a third one.";
+        let mut s = inking(text, options);
+        let at = s.find("Some");
+        (s, saved, at)
+    }
+
+    fn frames_on_screen(s: &Screen) -> usize {
+        s.app
+            .placements
+            .iter()
+            .filter(|(image, _)| image.layer == FRAME_LAYER)
+            .count()
+    }
+
+    #[test]
+    fn the_move_tool_picks_a_stroke_and_carries_it() {
+        let (mut s, saved, (x, y)) = with_a_line();
+        s.press(KeyCode::Char('v'));
+        assert_eq!(s.app.tool, Tool::Move);
+        // A click away from any ink picks nothing.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y + 4);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y + 4);
+        assert_eq!(frames_on_screen(&s), 0);
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        assert_eq!(frames_on_screen(&s), 1, "a picked stroke shows its frame");
+        let before = ink_on_screen(&s)[0];
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y + 2);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y + 2);
+        let after = ink_on_screen(&s)[0];
+        assert_eq!((after.x, after.y), (before.x + 2, before.y + 2));
+        assert_eq!(saved.borrow().len(), 1);
+        // Carried onto another paragraph, it's pinned to the text there now.
+        assert_ne!(saved.borrow()[0].anchor, 0);
+        let extent = saved.borrow()[0].extent();
+        assert_eq!(extent.width(), 6.0);
+    }
+
+    #[test]
+    fn dragging_a_corner_handle_resizes_the_picked_stroke() {
+        let (mut s, saved, (x, y)) = with_a_line();
+        s.press(KeyCode::Char('v'));
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        // The bottom-right handle sits just past the line's right end.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 6, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 12, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 12, y);
+        let extent = saved.borrow()[0].extent();
+        assert!(extent.width() > 10.0, "{extent:?}");
+        assert_eq!(extent.height(), 0.0, "a level line stays level");
+    }
+
+    #[test]
+    fn keys_nudge_resize_recolor_and_delete_the_picked_stroke() {
+        let (mut s, saved, (x, y)) = with_a_line();
+        s.press(KeyCode::Char('v'));
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        let before = ink_on_screen(&s)[0];
+        s.press(KeyCode::Right);
+        assert_eq!(ink_on_screen(&s)[0].x, before.x + 1);
+        s.press(KeyCode::Char('+'));
+        assert!((saved.borrow()[0].extent().width() - 6.0 * GROW).abs() < 0.01);
+        s.press(KeyCode::Char('3'));
+        assert_eq!(saved.borrow()[0].hue, Hue::Blue);
+        // Esc lets go of the stroke but keeps the move tool.
+        s.press(KeyCode::Esc);
+        assert_eq!(frames_on_screen(&s), 0);
+        assert_eq!(s.app.tool, Tool::Move);
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        s.press(KeyCode::Char('x'));
+        assert!(saved.borrow().is_empty());
+        assert!(ink_on_screen(&s).is_empty());
+        assert!(!s.app.quit);
     }
 
     #[test]
