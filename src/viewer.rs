@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
@@ -559,9 +559,9 @@ impl App {
         match self.tool {
             Tool::Select => {}
             Tool::Pen => {
-                footer = format!("{footer} · pen {} · E eraser · esc stop", self.hue.name())
+                footer = format!("{footer} · pen {} · e eraser · esc stop", self.hue.name())
             }
-            Tool::Eraser => footer = format!("{footer} · eraser · D pen · esc stop"),
+            Tool::Eraser => footer = format!("{footer} · eraser · d pen · esc stop"),
         }
         let hidden = self.no_ink().is_some() && {
             let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
@@ -1151,7 +1151,7 @@ impl App {
         }
         rows.extend([
             ("j/k  ↓/↑", "scroll"),
-            ("d/u", "half screen down / up"),
+            ("^d  u", "half screen down / up"),
             ("space/b", "next / previous screen"),
         ]);
         rows.push((
@@ -1182,8 +1182,8 @@ impl App {
             ("drag", "select and copy text"),
             ("y", "highlight selection, or clear one"),
             ("1-6", "pick a color; paints the selection"),
-            ("D", "pen: drag to draw"),
-            ("E  e", "eraser: drag over ink"),
+            ("d", "pen: drag to draw"),
+            ("e", "eraser: drag over ink"),
             ("!", "how to highlight and draw"),
             ("?", "this help"),
             ("q", "quit"),
@@ -1249,8 +1249,8 @@ impl App {
             step("", "with text selected, paints it or recolors it"),
             Line::raw(""),
             heading("Draw"),
-            step("D", "pen: drag anywhere to draw"),
-            step("E  e", "eraser: drag over a stroke to rub it out"),
+            step("d", "pen: drag anywhere to draw"),
+            step("e", "eraser: drag over a stroke to rub it out"),
             step("esc", "back to selecting text"),
             step("", "ink sticks to the word it starts on"),
         ];
@@ -1683,7 +1683,10 @@ impl App {
             Some('y') => self.toggle_highlight(),
             Some('j') => self.scroll_by(1),
             Some('k') => self.scroll_by(-1),
-            Some('d') => self.scroll_by(self.screen_step() / 2),
+            // Plain d is the pen, so half a screen down is ctrl+d, as in vim.
+            Some('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_by(self.screen_step() / 2)
+            }
             Some('u') => self.scroll_by(-(self.screen_step() / 2)),
             Some(' ') => self.next_screen(paged),
             Some('b') => self.previous_screen(paged),
@@ -1692,7 +1695,7 @@ impl App {
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
-            Some('D') => self.take_tool(Tool::Pen),
+            Some('d') | Some('D') => self.take_tool(Tool::Pen),
             Some('e') | Some('E') => self.take_tool(Tool::Eraser),
             _ => match key.code {
                 // Esc puts the pen down, then lets go of a selection, then a search, then quits.
@@ -2788,15 +2791,30 @@ mod tests {
     fn d_always_takes_the_pen_and_e_always_the_eraser() {
         let mut s = inking("Some words", ViewerOptions::default());
         for (key, tool) in [
-            ('D', Tool::Pen),
-            ('D', Tool::Pen),
-            ('E', Tool::Eraser),
+            ('d', Tool::Pen),
+            ('d', Tool::Pen),
             ('e', Tool::Eraser),
+            ('E', Tool::Eraser),
             ('D', Tool::Pen),
         ] {
             s.press(KeyCode::Char(key));
             assert_eq!(s.app.tool, tool, "after {key}");
         }
+    }
+
+    #[test]
+    fn ctrl_d_scrolls_half_a_screen_instead_of_taking_the_pen() {
+        let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
+        let mut s = Screen::new(Doc::whole("Notes", text), 120, 30, ViewerOptions::default());
+        s.app.kitty = Some(Kitty::default());
+        s.app.key(KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert!(s.app.offset > 0);
+        assert_eq!(s.app.tool, Tool::Select);
     }
 
     #[test]

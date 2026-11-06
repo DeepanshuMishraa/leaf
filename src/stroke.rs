@@ -71,9 +71,9 @@ pub struct Stroke {
 }
 
 /// The pen's width as a share of a cell's height.
-const PEN: f32 = 0.14;
+const PEN: f32 = 0.22;
 /// Thinnest the pen draws, in pixels.
-const MIN_PEN_PX: f32 = 2.0;
+const MIN_PEN_PX: f32 = 3.0;
 
 fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
     let (dx, dy) = (b.x - a.x, b.y - a.y);

@@ -48,7 +48,7 @@ side, r reload, ? keys, q quit
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
 
-Reader keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, 1-6 color, D pen, E eraser, ! guide, ? keys, q quit";
+Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, 1-6 color, d pen, e eraser, ! guide, ? keys, q quit";
 
 fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
