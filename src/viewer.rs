@@ -28,10 +28,12 @@ use crate::article;
 use crate::doc::{Doc, ImageRef};
 use crate::find::Query;
 use crate::highlight::{self, Highlight};
+use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::render::{self, DIM, Laid};
+use crate::stroke::{Cells, Point, Stroke};
 
 /// Widest the text column gets; a book-like measure is easiest to read.
 const MAX_TEXT_WIDTH: u16 = 76;
@@ -53,9 +55,13 @@ const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
 
+/// Ink is drawn over figures.
+const INK_LAYER: i32 = 1;
+/// How close, in cells, the eraser has to pass to a stroke to take it.
+const ERASER_REACH: f32 = 0.7;
+
 const SELECTION: Color = Color::Indexed(8);
-// Highlighter yellow under dark ink reads the same on light and dark themes.
-const MARK: Color = Color::Rgb(250, 214, 64);
+// Dark ink on the light marker colors reads the same on light and dark themes.
 const MARK_INK: Color = Color::Rgb(20, 20, 20);
 /// Search matches in light orange, the one the reader is on in a deeper orange.
 const FOUND: Color = Color::Rgb(255, 196, 140);
@@ -75,9 +81,18 @@ enum Mode {
 enum Dialog {
     None,
     Help,
-    Goto { digits: String, page_count: usize },
-    Find { typed: String },
-    Bookmarks { selected: usize },
+    /// How to highlight, pick colors and draw.
+    Guide,
+    Goto {
+        digits: String,
+        page_count: usize,
+    },
+    Find {
+        typed: String,
+    },
+    Bookmarks {
+        selected: usize,
+    },
 }
 
 /// Which way a search moves through the pages.
@@ -148,6 +163,42 @@ impl Selection {
     }
 }
 
+/// What dragging the mouse does: select text, draw, or rub strokes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Select,
+    Pen,
+    Eraser,
+}
+
+/// A stroke, and the serial its drawn images are kept under.
+#[derive(Debug, Clone, PartialEq)]
+struct Inked {
+    serial: u64,
+    stroke: Stroke,
+}
+
+/// What the mouse button held down is doing.
+#[derive(Debug, Clone, PartialEq)]
+enum Drag {
+    Idle,
+    Selecting,
+    Inking(Inked),
+    /// `erased` once a stroke has gone, so letting go saves.
+    Erasing {
+        erased: bool,
+    },
+}
+
+/// A stroke's image as drawn: which stroke, how far it had got, and the
+/// cells of it on screen, measured from its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InkKey {
+    serial: u64,
+    points: usize,
+    clip: Cells,
+}
+
 enum Remote {
     Loading,
     Ready(Rc<RgbaImage>),
@@ -189,6 +240,7 @@ struct ScreenRow {
 /// Hears the full set of highlights after each change.
 pub type HighlightsListener = Box<dyn FnMut(&[Highlight])>;
 pub type BookmarksListener = Box<dyn FnMut(&[Bookmark])>;
+pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 
 pub struct ViewerOptions {
     /// For paged documents, where reading resumes (1-based).
@@ -208,6 +260,10 @@ pub struct ViewerOptions {
     pub bookmarks: Vec<Bookmark>,
     /// Hears every bookmark there is, each time one is added or removed.
     pub on_bookmarks: BookmarksListener,
+    /// Ink drawn on the document, oldest first.
+    pub strokes: Vec<Stroke>,
+    /// Hears every stroke there is, each time one is drawn or erased.
+    pub on_strokes: StrokesListener,
 }
 
 impl Default for ViewerOptions {
@@ -223,6 +279,8 @@ impl Default for ViewerOptions {
             on_highlights: Box::new(|_| {}),
             bookmarks: Vec::new(),
             on_bookmarks: Box::new(|_| {}),
+            strokes: Vec::new(),
+            on_strokes: Box::new(|_| {}),
         }
     }
 }
@@ -245,9 +303,19 @@ pub struct App {
     ink: Option<Rgb>,
     paper: Option<Rgb>,
     highlights: Vec<Highlight>,
+    /// The color new highlights and ink come in.
+    hue: Hue,
+    /// A word in the footer about the last key, gone at the next one.
+    notice: Option<String>,
     bookmarks: Vec<Bookmark>,
     selection: Option<Selection>,
-    dragging: bool,
+    tool: Tool,
+    drag: Drag,
+    strokes: Vec<Inked>,
+    /// The serial the next stroke gets.
+    next_serial: u64,
+    /// Strokes' images the terminal holds, for the parts of them on screen.
+    ink_drawn: HashMap<InkKey, kitty::Image>,
     dialog: Dialog,
     remote: HashMap<String, Remote>,
     fetched_tx: mpsc::Sender<(String, Option<RgbaImage>)>,
@@ -293,9 +361,25 @@ impl App {
         let (fetched_tx, fetched_rx) = mpsc::channel();
         let kitty = (picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected())
             .then(Kitty::default);
+        let strokes: Vec<Inked> = options
+            .strokes
+            .iter()
+            .zip(0..)
+            .map(|(stroke, serial)| Inked {
+                serial,
+                stroke: stroke.clone(),
+            })
+            .collect();
         App {
+            next_serial: strokes.len() as u64,
+            strokes,
+            tool: Tool::Select,
+            drag: Drag::Idle,
+            ink_drawn: HashMap::new(),
             image_mode: options.image_mode,
             highlights: options.highlights.clone(),
+            hue: Hue::default(),
+            notice: None,
             bookmarks: options.bookmarks.clone(),
             doc,
             options,
@@ -309,7 +393,6 @@ impl App {
             ink: None,
             paper: None,
             selection: None,
-            dragging: false,
             dialog: Dialog::None,
             remote: HashMap::new(),
             fetched_tx,
@@ -472,6 +555,27 @@ impl App {
     }
 
     fn footer(&mut self) -> String {
+        let mut footer = self.searched();
+        match self.tool {
+            Tool::Select => {}
+            Tool::Pen => {
+                footer = format!("{footer} · pen {} · E eraser · esc stop", self.hue.name())
+            }
+            Tool::Eraser => footer = format!("{footer} · eraser · D pen · esc stop"),
+        }
+        let hidden = self.no_ink().is_some() && {
+            let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
+            self.strokes.iter().any(|i| pages.contains(&i.stroke.page))
+        };
+        match &self.notice {
+            Some(notice) => format!("{footer} · {notice}"),
+            None if hidden => format!("{footer} · drawings here need Kitty graphics to show"),
+            None => footer,
+        }
+    }
+
+    /// The place, and how the search is going.
+    fn searched(&mut self) -> String {
         let place = self.place();
         let Some(search) = &self.search else {
             return place;
@@ -746,6 +850,7 @@ impl App {
             self.draw_row(f, page, row, self.column.y + y as u16, marks);
         }
         self.draw_figures(f, &screen);
+        self.draw_strokes(area);
 
         let footer = self.footer();
         let footer_area = Rect {
@@ -764,6 +869,7 @@ impl App {
         let panel = match self.dialog.clone() {
             Dialog::None => None,
             Dialog::Help => Some(self.draw_help(f, area)),
+            Dialog::Guide => Some(self.draw_guide(f, area)),
             Dialog::Goto { digits, page_count } => {
                 Some(self.draw_goto(f, area, &digits, page_count))
             }
@@ -834,11 +940,11 @@ impl App {
                 let mut style = seg.style;
                 if let Some(offset) = seg.offset.map(|o| o + i) {
                     let at = TextPos { page, offset };
-                    if highlights
+                    if let Some(h) = highlights
                         .iter()
-                        .any(|h| h.start <= offset && offset < h.end)
+                        .find(|h| h.start <= offset && offset < h.end)
                     {
-                        style = style.bg(MARK).fg(MARK_INK);
+                        style = style.bg(h.hue.marker()).fg(MARK_INK);
                     }
                     if marks
                         .found
@@ -947,7 +1053,7 @@ impl App {
                                 cells(slice.width(), font.width, figure.cols),
                                 cells(slice.height(), font.height, to - from),
                             );
-                            kitty.upload(&slice, cols, rows).map(Drawn::Kitty)
+                            kitty.upload(&slice, cols, rows, 0).map(Drawn::Kitty)
                         }
                         None => self
                             .picker
@@ -1075,6 +1181,10 @@ impl App {
         rows.extend([
             ("drag", "select and copy text"),
             ("y", "highlight selection, or clear one"),
+            ("1-6", "pick a color; paints the selection"),
+            ("D", "pen: drag to draw"),
+            ("E  e", "eraser: drag over ink"),
+            ("!", "how to highlight and draw"),
             ("?", "this help"),
             ("q", "quit"),
         ]);
@@ -1102,6 +1212,65 @@ impl App {
             })
             .collect();
         Self::panel(f, area, "Keys", lines, width)
+    }
+
+    /// How to mark up a document: highlights, colors, the pen and the eraser.
+    fn draw_guide(&self, f: &mut Frame, area: Rect) -> Rect {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(DIM);
+        let heading = |text: &'static str| Line::from(Span::styled(text, bold));
+        let step = |keys: &'static str, action: &'static str| {
+            Line::from(vec![
+                Span::styled(format!("  {keys:<10}"), bold),
+                Span::styled(action, dim),
+            ])
+        };
+        let swatches: Vec<Span> = Hue::ALL
+            .iter()
+            .zip(1..)
+            .flat_map(|(hue, n)| {
+                [
+                    Span::styled(
+                        format!(" {n} {} ", hue.name()),
+                        Style::default().bg(hue.marker()).fg(MARK_INK),
+                    ),
+                    Span::raw(" "),
+                ]
+            })
+            .collect();
+        let mut lines = vec![
+            heading("Highlight"),
+            step("drag", "select text; it's copied as you let go"),
+            step("y", "highlight it, or clear a highlight it touches"),
+            Line::raw(""),
+            heading("Colors"),
+            Line::from([vec![Span::raw("  ")], swatches].concat()),
+            step("1-6", "pick the color for highlights and the pen"),
+            step("", "with text selected, paints it or recolors it"),
+            Line::raw(""),
+            heading("Draw"),
+            step("D", "pen: drag anywhere to draw"),
+            step("E  e", "eraser: drag over a stroke to rub it out"),
+            step("esc", "back to selecting text"),
+            step("", "ink sticks to the word it starts on"),
+        ];
+        if self.no_ink().is_some() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  Drawing needs Kitty graphics (Kitty, Ghostty, WezTerm),",
+                dim,
+            )));
+            lines.push(Line::from(Span::styled(
+                "  and doesn't work inside tmux.",
+                dim,
+            )));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  saved as you go · esc close",
+            dim,
+        )));
+        Self::panel(f, area, "Mark up", lines, 58)
     }
 
     fn draw_goto(&self, f: &mut Frame, area: Rect, digits: &str, page_count: usize) -> Rect {
@@ -1466,10 +1635,10 @@ impl App {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
             Dialog::Find { typed } => return self.find_key(&key, typed),
             Dialog::Bookmarks { selected } => return self.bookmarks_key(&key, selected),
-            Dialog::Help => {
+            Dialog::Help | Dialog::Guide => {
                 if matches!(
                     key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('!')
                 ) {
                     self.dialog = Dialog::None;
                 }
@@ -1477,9 +1646,14 @@ impl App {
             }
             Dialog::None => {}
         }
+        self.notice = None;
+        if let Some(hue) = typed(&key).and_then(Hue::of_key) {
+            return self.pick_hue(hue);
+        }
         let paged = self.mode == Mode::Paged;
         match typed(&key) {
             Some('?') | Some('/') => self.dialog = Dialog::Help,
+            Some('!') => self.dialog = Dialog::Guide,
             Some('t') | Some(':') => {
                 if let Some(page_count) = self.doc.page_count {
                     self.dialog = Dialog::Goto {
@@ -1518,8 +1692,11 @@ impl App {
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
+            Some('D') => self.take_tool(Tool::Pen),
+            Some('e') | Some('E') => self.take_tool(Tool::Eraser),
             _ => match key.code {
-                // Esc lets go of a selection, then a search, then quits.
+                // Esc puts the pen down, then lets go of a selection, then a search, then quits.
+                KeyCode::Esc if self.tool != Tool::Select => self.tool = Tool::Select,
                 KeyCode::Esc => {
                     if self.selection.take().is_none() && self.search.take().is_none() {
                         self.quit = true;
@@ -1618,35 +1795,236 @@ impl App {
         if self.dialog != Dialog::None {
             return;
         }
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.selection = self.hit(mouse.column, mouse.row).map(|at| Selection {
+        let (x, y) = (mouse.column, mouse.row);
+        match (mouse.kind, self.tool) {
+            (MouseEventKind::Down(MouseButton::Left), Tool::Select) => {
+                self.selection = self.hit(x, y).map(|at| Selection {
                     anchor: at,
                     head: at,
                 });
-                self.dragging = self.selection.is_some();
+                if self.selection.is_some() {
+                    self.drag = Drag::Selecting;
+                }
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
-                if let (Some(selection), Some(head)) =
-                    (self.selection, self.hit(mouse.column, mouse.row))
+            (MouseEventKind::Down(MouseButton::Left), Tool::Pen) => {
+                self.selection = None;
+                if let Some(at) = self.hit(x, y)
+                    && let Some(point) = self.point_from(at.page, at.offset, x, y)
                 {
-                    self.selection = Some(Selection { head, ..selection });
+                    let serial = self.next_serial;
+                    self.next_serial += 1;
+                    self.drag = Drag::Inking(Inked {
+                        serial,
+                        stroke: Stroke::begin(at.page, at.offset, self.hue, point),
+                    });
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
-                self.dragging = false;
-                let text = self.selected_text();
-                if text.is_empty() {
-                    self.selection = None;
-                } else {
-                    // Taking over the mouse turns off the terminal's own selection, so copy here.
-                    self.copy = Some(text);
+            (MouseEventKind::Down(MouseButton::Left), Tool::Eraser) => {
+                self.selection = None;
+                let erased = self.erase_at(x, y);
+                self.drag = Drag::Erasing { erased };
+            }
+            (MouseEventKind::Drag(MouseButton::Left), _) => match &self.drag {
+                Drag::Idle => {}
+                Drag::Selecting => {
+                    if let (Some(selection), Some(head)) = (self.selection, self.hit(x, y)) {
+                        self.selection = Some(Selection { head, ..selection });
+                    }
+                }
+                Drag::Inking(inked) => {
+                    let (page, anchor) = (inked.stroke.page, inked.stroke.anchor);
+                    if let Some(point) = self.point_from(page, anchor, x, y)
+                        && let Drag::Inking(inked) = &mut self.drag
+                    {
+                        inked.stroke.extend(point);
+                    }
+                }
+                Drag::Erasing { erased } => {
+                    let erased = *erased;
+                    let now = self.erase_at(x, y);
+                    self.drag = Drag::Erasing {
+                        erased: erased || now,
+                    };
+                }
+            },
+            (MouseEventKind::Up(MouseButton::Left), _) => {
+                match std::mem::replace(&mut self.drag, Drag::Idle) {
+                    Drag::Idle | Drag::Erasing { erased: false } => {}
+                    Drag::Selecting => {
+                        let text = self.selected_text();
+                        if text.is_empty() {
+                            self.selection = None;
+                        } else {
+                            // Taking over the mouse turns off the terminal's own selection, so copy here.
+                            self.copy = Some(text);
+                        }
+                    }
+                    Drag::Inking(inked) => {
+                        self.strokes.push(inked);
+                        self.report_strokes();
+                    }
+                    Drag::Erasing { erased: true } => self.report_strokes(),
                 }
             }
-            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_STEP),
-            MouseEventKind::ScrollUp => self.scroll_by(-WHEEL_STEP),
+            (MouseEventKind::ScrollDown, _) => self.scroll_by(WHEEL_STEP),
+            (MouseEventKind::ScrollUp, _) => self.scroll_by(-WHEEL_STEP),
             _ => {}
         }
+    }
+
+    /// The screen cell a page's character `anchor` is drawn in, if the page is on screen.
+    fn anchor_cell(&mut self, page: usize, anchor: usize) -> Option<(i32, i32)> {
+        let (y, slot) = self
+            .screen
+            .iter()
+            .enumerate()
+            .find_map(|(y, s)| s.filter(|s| s.page == page).map(|s| (y, s)))?;
+        let top = self.column.y as i32 + y as i32 - slot.row as i32;
+        let (row, col) = self.laid(page).locate(anchor);
+        Some((
+            self.column.x as i32 + col as i32,
+            top + (self.prefix(page) + row) as i32,
+        ))
+    }
+
+    /// The middle of screen cell `x`, `y`, measured from a page's character `anchor`.
+    fn point_from(&mut self, page: usize, anchor: usize, x: u16, y: u16) -> Option<Point> {
+        let (ox, oy) = self.anchor_cell(page, anchor)?;
+        Some(Point {
+            x: x as f32 + 0.5 - ox as f32,
+            y: y as f32 + 0.5 - oy as f32,
+        })
+    }
+
+    /// Rubs out every stroke on screen passing through cell `x`, `y`; says whether any went.
+    fn erase_at(&mut self, x: u16, y: u16) -> bool {
+        let pins: Vec<(usize, usize)> = self
+            .strokes
+            .iter()
+            .map(|i| (i.stroke.page, i.stroke.anchor))
+            .collect();
+        let points: Vec<Option<Point>> = pins
+            .into_iter()
+            .map(|(page, anchor)| self.point_from(page, anchor, x, y))
+            .collect();
+        let before = self.strokes.len();
+        let mut points = points.into_iter();
+        self.strokes.retain(|inked| {
+            !points
+                .next()
+                .flatten()
+                .is_some_and(|p| inked.stroke.near(p, ERASER_REACH))
+        });
+        self.strokes.len() != before
+    }
+
+    fn report_strokes(&mut self) {
+        let strokes: Vec<Stroke> = self.strokes.iter().map(|i| i.stroke.clone()).collect();
+        (self.options.on_strokes)(&strokes);
+    }
+
+    /// Why ink can't be drawn here, when it can't.
+    fn no_ink(&self) -> Option<&'static str> {
+        match (&self.kitty, self.picker.tmux_detected()) {
+            (Some(_), _) => None,
+            (None, true) => Some("drawing needs Kitty graphics, which leaf can't use inside tmux"),
+            (None, false) => Some(
+                "drawing needs Kitty graphics, which this terminal doesn't have; try Kitty, Ghostty or WezTerm",
+            ),
+        }
+    }
+
+    /// Takes up `tool`, or says why ink can't be drawn.
+    fn take_tool(&mut self, tool: Tool) {
+        if let Some(reason) = self.no_ink() {
+            self.notice = Some(reason.to_owned());
+            return;
+        }
+        self.selection = None;
+        self.tool = tool;
+    }
+
+    /// Draws the part of each stroke on screen, and the one being drawn.
+    fn draw_strokes(&mut self, area: Rect) {
+        if self.kitty.is_none() {
+            return;
+        }
+        let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
+        let live = match &self.drag {
+            Drag::Inking(inked) => Some(inked),
+            _ => None,
+        };
+        let pins: HashSet<(usize, usize)> = self
+            .strokes
+            .iter()
+            .chain(live)
+            .map(|i| (i.stroke.page, i.stroke.anchor))
+            .filter(|(page, _)| pages.contains(page))
+            .collect();
+        let origins: HashMap<(usize, usize), (i32, i32)> = pins
+            .into_iter()
+            .filter_map(|pin| Some((pin, self.anchor_cell(pin.0, pin.1)?)))
+            .collect();
+        let font = self.picker.font_size();
+        let view = Cells {
+            left: area.x as i32,
+            top: self.column.y as i32,
+            cols: area.width,
+            rows: self.view_height,
+        };
+        let Some(kitty) = &mut self.kitty else {
+            return;
+        };
+        let live = match &self.drag {
+            Drag::Inking(inked) => Some(inked),
+            _ => None,
+        };
+        let mut used = HashSet::new();
+        for inked in self.strokes.iter().chain(live) {
+            let stroke = &inked.stroke;
+            let Some(&(ox, oy)) = origins.get(&(stroke.page, stroke.anchor)) else {
+                continue;
+            };
+            let Some(visible) = stroke.bounds().shift(ox, oy).intersect(view) else {
+                continue;
+            };
+            let key = InkKey {
+                serial: inked.serial,
+                points: stroke.points.len(),
+                clip: visible.shift(-ox, -oy),
+            };
+            let image = match self.ink_drawn.get(&key) {
+                Some(image) => *image,
+                None => {
+                    let Some(image) =
+                        stroke
+                            .paint(key.clip, (font.width, font.height))
+                            .and_then(|pixels| {
+                                kitty.upload(&pixels, visible.cols, visible.rows, INK_LAYER)
+                            })
+                    else {
+                        continue;
+                    };
+                    self.ink_drawn.insert(key, image);
+                    image
+                }
+            };
+            let rect = Rect {
+                x: visible.left as u16,
+                y: visible.top as u16,
+                width: visible.cols,
+                height: visible.rows,
+            };
+            self.placements.push((image, rect));
+            used.insert(key);
+        }
+        self.ink_drawn.retain(|key, image| {
+            let kept = used.contains(key);
+            if !kept {
+                kitty.free(*image);
+            }
+            kept
+        });
     }
 
     /// The selection as ranges of page text, one per page it spans.
@@ -1671,6 +2049,7 @@ impl App {
                     start: from,
                     end: to,
                     text: slice.trim_end_matches('\n').to_owned(),
+                    hue: self.hue,
                 });
             }
         }
@@ -1692,6 +2071,21 @@ impl App {
         }
         let ranges = highlight::merge(self.selected_ranges());
         self.highlights = highlight::toggle(&self.highlights, &ranges);
+        self.selection = None;
+        (self.options.on_highlights)(&self.highlights);
+    }
+
+    /// Makes `hue` the color of new highlights and ink. A selection is
+    /// painted in it straight away: the highlights it touches change
+    /// color, or it becomes one.
+    fn pick_hue(&mut self, hue: Hue) {
+        self.hue = hue;
+        self.notice = Some(format!("{} picked", hue.name()));
+        if self.selection.is_none() {
+            return;
+        }
+        let ranges = highlight::merge(self.selected_ranges());
+        self.highlights = highlight::paint(&self.highlights, &ranges, hue);
         self.selection = None;
         (self.options.on_highlights)(&self.highlights);
     }
@@ -2227,13 +2621,206 @@ mod tests {
         assert_eq!(saved.borrow().len(), 1);
         assert_eq!(saved.borrow()[0].text, "words");
         let cell = &s.terminal.backend().buffer()[(x, y)];
-        assert_eq!(cell.bg, MARK);
+        assert_eq!(cell.bg, Hue::Yellow.marker());
         // Selecting inside it and pressing y again clears it.
         s.mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y);
         s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 3, y);
         s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
         s.press(KeyCode::Char('y'));
         assert!(saved.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_number_key_paints_the_selection_and_recolors_a_highlight() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_highlights: Box::new(move |h| *heard.borrow_mut() = h.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Some words to select here."]), 120, 30, options);
+        let (x, y) = s.find("words");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        let frame = s.press(KeyCode::Char('3'));
+        assert!(frame.contains("blue picked"));
+        assert_eq!(s.terminal.backend().buffer()[(x, y)].bg, Hue::Blue.marker());
+        // A selection inside it turns it pink, and new highlights stay pink.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 2, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 2, y);
+        s.press(KeyCode::Char('4'));
+        assert_eq!(saved.borrow().len(), 1);
+        assert_eq!(saved.borrow()[0].hue, Hue::Pink);
+        assert_eq!(
+            s.terminal.backend().buffer()[(x + 4, y)].bg,
+            Hue::Pink.marker()
+        );
+        assert_eq!(s.app.hue, Hue::Pink);
+    }
+
+    /// A screen whose terminal takes kitty images, so ink can be drawn.
+    fn inking(text: &str, options: ViewerOptions) -> Screen {
+        let mut s = Screen::new(book(&[text]), 120, 30, options);
+        s.app.kitty = Some(Kitty::default());
+        s.draw();
+        s
+    }
+
+    fn ink_on_screen(s: &Screen) -> Vec<Rect> {
+        s.app
+            .placements
+            .iter()
+            .filter(|(image, _)| image.layer == INK_LAYER)
+            .map(|(_, rect)| *rect)
+            .collect()
+    }
+
+    #[test]
+    fn drawing_without_kitty_graphics_says_why_and_stays_selecting() {
+        let mut s = Screen::new(book(&["Some words"]), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('D'));
+        assert!(frame.contains("drawing needs Kitty graphics"));
+        assert_eq!(s.app.tool, Tool::Select);
+    }
+
+    #[test]
+    fn saved_ink_without_kitty_graphics_says_it_is_hidden() {
+        let options = ViewerOptions {
+            strokes: vec![Stroke::begin(0, 0, Hue::Red, Point { x: 0.5, y: 0.5 })],
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Some words"]), 120, 30, options);
+        assert!(s.draw().contains("drawings here need Kitty graphics"));
+    }
+
+    #[test]
+    fn a_stroke_shows_while_drawn_is_saved_and_follows_its_word_when_text_reflows() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let text = format!("{}target here.", "word ".repeat(12));
+        let mut s = inking(&text, options);
+        s.press(KeyCode::Char('D'));
+        s.press(KeyCode::Char('3'));
+        let (x, y) = s.find("target");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        assert_eq!(ink_on_screen(&s).len(), 1, "ink shows before letting go");
+        assert!(saved.borrow().is_empty());
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(saved.borrow().len(), 1);
+        assert_eq!(saved.borrow()[0].hue, Hue::Blue);
+        assert_eq!(saved.borrow()[0].points.len(), 2);
+        let ink = ink_on_screen(&s)[0];
+        let from_word =
+            |rect: Rect, (x, y): (u16, u16)| (rect.x as i32 - x as i32, rect.y as i32 - y as i32);
+        let before = from_word(ink, (x, y));
+
+        // A narrower window wraps the word onto the next line; the ink goes with it.
+        s.terminal.backend_mut().resize(60, 30);
+        let moved = s.find("target");
+        assert_ne!(moved, (x, y));
+        assert_eq!(from_word(ink_on_screen(&s)[0], moved), before);
+        assert!(s.draw().contains("pen blue"));
+    }
+
+    #[test]
+    fn ink_on_a_document_without_pages_scrolls_with_its_line() {
+        let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(Doc::whole("Notes", text), 120, 30, options);
+        s.app.kitty = Some(Kitty::default());
+        s.press(KeyCode::Char('D'));
+        let (x, y) = s.find("Line 9");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        assert_eq!(saved.borrow()[0].page, 0);
+        let before = ink_on_screen(&s)[0];
+        s.press(KeyCode::Char('j'));
+        s.press(KeyCode::Char('j'));
+        let (mx, my) = s.find("Line 9");
+        assert_eq!(my, y - 2);
+        let after = ink_on_screen(&s)[0];
+        assert_eq!((after.x, after.y), (before.x + mx - x, before.y - 2));
+    }
+
+    #[test]
+    fn the_eraser_rubs_out_a_stroke_it_passes_over() {
+        let saved = Rc::new(RefCell::new(vec![Stroke::begin(
+            0,
+            0,
+            Hue::Red,
+            Point { x: 0.5, y: 0.5 },
+        )]));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            strokes: saved.borrow().clone(),
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = inking("Some words", options);
+        assert_eq!(ink_on_screen(&s).len(), 1, "saved ink comes back");
+        let (x, y) = s.find("Some");
+        s.press(KeyCode::Char('e'));
+        // Passing by a cell away leaves it.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        assert_eq!(saved.borrow().len(), 1);
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(saved.borrow().is_empty());
+        assert!(ink_on_screen(&s).is_empty());
+    }
+
+    #[test]
+    fn d_always_takes_the_pen_and_e_always_the_eraser() {
+        let mut s = inking("Some words", ViewerOptions::default());
+        for (key, tool) in [
+            ('D', Tool::Pen),
+            ('D', Tool::Pen),
+            ('E', Tool::Eraser),
+            ('e', Tool::Eraser),
+            ('D', Tool::Pen),
+        ] {
+            s.press(KeyCode::Char(key));
+            assert_eq!(s.app.tool, tool, "after {key}");
+        }
+    }
+
+    #[test]
+    fn bang_opens_the_mark_up_guide_and_closes_it() {
+        let mut s = Screen::new(book(&["Some words"]), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('!'));
+        assert!(frame.contains("Mark up"));
+        assert!(frame.contains("1 yellow"));
+        assert!(frame.contains("drag anywhere to draw"));
+        assert!(frame.contains("Drawing needs Kitty graphics"));
+        assert!(!s.press(KeyCode::Char('!')).contains("Mark up"));
+        assert!(!s.app.quit);
+    }
+
+    #[test]
+    fn escape_puts_the_pen_down_before_quitting() {
+        let mut s = inking("Some words", ViewerOptions::default());
+        s.press(KeyCode::Char('D'));
+        assert_eq!(s.app.tool, Tool::Pen);
+        s.press(KeyCode::Esc);
+        assert_eq!(s.app.tool, Tool::Select);
+        assert!(!s.app.quit);
+        s.press(KeyCode::Esc);
+        assert!(s.app.quit);
     }
 
     #[test]

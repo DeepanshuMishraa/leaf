@@ -7,6 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::comment::{Anchor, Comment, Side, State};
 use crate::highlight::Highlight;
+use crate::hue::Hue;
+use crate::stroke::Stroke;
 
 /// Where a reader is in a paged document. `page` is 1-based.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,14 @@ CREATE TABLE IF NOT EXISTS highlights (
   text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS highlights_key ON highlights (key);
+CREATE TABLE IF NOT EXISTS strokes (
+  key TEXT NOT NULL,
+  page INTEGER NOT NULL,
+  anchor INTEGER NOT NULL,
+  hue TEXT NOT NULL,
+  points BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS strokes_key ON strokes (key);
 CREATE TABLE IF NOT EXISTS bookmarks (
   key TEXT NOT NULL,
   page INTEGER NOT NULL,
@@ -207,6 +217,20 @@ impl Store {
         .map_err(|e| failed(e.to_string()))?;
         db.execute_batch(SCHEMA)
             .map_err(|e| failed(e.to_string()))?;
+        // Highlights saved before they had colors are yellow, as they were drawn.
+        let has_hue: bool = db
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('highlights') WHERE name = 'hue'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| failed(e.to_string()))?;
+        if !has_hue {
+            db.execute_batch(
+                "ALTER TABLE highlights ADD COLUMN hue TEXT NOT NULL DEFAULT 'yellow'",
+            )
+            .map_err(|e| failed(e.to_string()))?;
+        }
         Ok(Store {
             db,
             path: path.to_owned(),
@@ -315,7 +339,7 @@ impl Store {
         let mut query = self
             .db
             .prepare(
-                "SELECT page, start, end, text FROM highlights WHERE key = ? ORDER BY page, start",
+                "SELECT page, start, end, text, hue FROM highlights WHERE key = ? ORDER BY page, start",
             )
             .map_err(self.failed(Operation::Read))?;
         let rows = query
@@ -325,14 +349,16 @@ impl Store {
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .map_err(self.failed(Operation::Read))?;
         let mut highlights = Vec::new();
         for row in rows {
-            let (page, start, end, text) = row.map_err(self.failed(Operation::Read))?;
+            let (page, start, end, text, hue) = row.map_err(self.failed(Operation::Read))?;
             // Rows we didn't write are skipped rather than trusted.
-            if let (Some(page), Some(start), Some(end)) = (count(page), count(start), count(end))
+            if let (Some(page), Some(start), Some(end), Some(hue)) =
+                (count(page), count(start), count(end), Hue::parse(&hue))
                 && end > start
             {
                 highlights.push(Highlight {
@@ -340,6 +366,7 @@ impl Store {
                     start,
                     end,
                     text,
+                    hue,
                 });
             }
         }
@@ -363,10 +390,79 @@ impl Store {
             .map_err(failed)?;
         for h in highlights {
             tx.execute(
-                "INSERT INTO highlights (key, page, start, end, text) VALUES (?, ?, ?, ?, ?)",
-                params![key, h.page as i64, h.start as i64, h.end as i64, h.text],
+                "INSERT INTO highlights (key, page, start, end, text, hue) VALUES (?, ?, ?, ?, ?, ?)",
+                params![key, h.page as i64, h.start as i64, h.end as i64, h.text, h.hue.name()],
             )
             .map_err(failed)?;
+        }
+        tx.commit().map_err(failed)
+    }
+
+    /// The strokes drawn on `key`, oldest first.
+    pub fn load_strokes(&self, key: &str) -> Result<Vec<Stroke>, StoreFailed> {
+        let mut query = self
+            .db
+            .prepare("SELECT page, anchor, hue, points FROM strokes WHERE key = ? ORDER BY rowid")
+            .map_err(self.failed(Operation::Read))?;
+        let rows = query
+            .query_map([key], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(self.failed(Operation::Read))?;
+        let mut strokes = Vec::new();
+        for row in rows {
+            let (page, anchor, hue, points) = row.map_err(self.failed(Operation::Read))?;
+            // Rows we didn't write are skipped rather than trusted.
+            if let (Some(page), Some(anchor), Some(hue), Some(points)) = (
+                count(page),
+                count(anchor),
+                Hue::parse(&hue),
+                Stroke::decode_points(&points),
+            ) {
+                strokes.push(Stroke {
+                    page,
+                    anchor,
+                    hue,
+                    points,
+                });
+            }
+        }
+        Ok(strokes)
+    }
+
+    /// Replaces every stroke saved for `key`.
+    pub fn save_strokes(&mut self, key: &str, strokes: &[Stroke]) -> Result<(), StoreFailed> {
+        let path = self.path.clone();
+        let failed = |e: rusqlite::Error| StoreFailed {
+            operation: Operation::Save,
+            path: path.clone(),
+            cause: e.to_string(),
+        };
+        let tx = self.db.transaction().map_err(failed)?;
+        tx.execute("DELETE FROM strokes WHERE key = ?", [key])
+            .map_err(failed)?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO strokes (key, page, anchor, hue, points) VALUES (?, ?, ?, ?, ?)",
+                )
+                .map_err(failed)?;
+            for s in strokes {
+                insert
+                    .execute(params![
+                        key,
+                        s.page as i64,
+                        s.anchor as i64,
+                        s.hue.name(),
+                        s.encode_points()
+                    ])
+                    .map_err(failed)?;
+            }
         }
         tx.commit().map_err(failed)
     }
@@ -633,6 +729,60 @@ mod tests {
     }
 
     #[test]
+    fn strokes_come_back_per_document_in_order_and_saving_replaces_them() {
+        use crate::stroke::Point;
+        let mut store = memory();
+        let stroke = |page, x| Stroke {
+            page,
+            anchor: 7,
+            hue: Hue::Green,
+            points: vec![
+                Point { x, y: 0.5 },
+                Point {
+                    x: x + 1.0,
+                    y: -1.5,
+                },
+            ],
+        };
+        let (first, second) = (stroke(3, 0.5), stroke(0, -2.5));
+        store
+            .save_strokes("/a.pdf", &[first.clone(), second.clone()])
+            .unwrap();
+        store
+            .save_strokes("/b.pdf", std::slice::from_ref(&first))
+            .unwrap();
+        assert_eq!(
+            store.load_strokes("/a.pdf").unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        store
+            .save_strokes("/a.pdf", std::slice::from_ref(&second))
+            .unwrap();
+        assert_eq!(store.load_strokes("/a.pdf").unwrap(), vec![second]);
+        assert_eq!(store.load_strokes("/b.pdf").unwrap(), vec![first]);
+    }
+
+    #[test]
+    fn highlights_saved_before_colors_come_back_yellow() {
+        let path = std::env::temp_dir().join(format!("leaf-hue-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE highlights (key TEXT NOT NULL, page INTEGER NOT NULL,
+               start INTEGER NOT NULL, end INTEGER NOT NULL, text TEXT NOT NULL);
+             INSERT INTO highlights VALUES ('/a.pdf', 0, 1, 4, 'old');",
+        )
+        .unwrap();
+        drop(old);
+        let store = Store::open(&path).unwrap();
+        let loaded = store.load_highlights("/a.pdf").unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].hue, Hue::Yellow);
+    }
+
+    #[test]
     fn highlights_come_back_per_document_and_saving_replaces_them() {
         let mut store = memory();
         let first = Highlight {
@@ -640,12 +790,14 @@ mod tests {
             start: 10,
             end: 15,
             text: "hello".into(),
+            hue: Hue::Yellow,
         };
         let second = Highlight {
             page: 0,
             start: 0,
             end: 3,
             text: "abc".into(),
+            hue: Hue::Purple,
         };
         store
             .save_highlights("/a.pdf", &[first.clone(), second.clone()])

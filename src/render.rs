@@ -80,6 +80,29 @@ pub struct Laid {
     pub text: Vec<char>,
 }
 
+impl Laid {
+    /// The row and column character `offset` of the page text is drawn at.
+    /// An offset that isn't drawn (a block's closing newline) takes the next
+    /// character drawn, or the end of the last; a page with no text puts it at the top left.
+    pub fn locate(&self, offset: usize) -> (usize, u16) {
+        let mut end = (0, 0);
+        for (r, row) in self.rows.iter().enumerate() {
+            for seg in &row.segs {
+                let Some(start) = seg.offset else { continue };
+                let mut x = seg.x;
+                for (n, c) in seg.text.chars().enumerate() {
+                    if start + n >= offset {
+                        return (r, x);
+                    }
+                    x += char_width(c);
+                }
+                end = (r, x);
+            }
+        }
+        end
+    }
+}
+
 /// Rough pixels per terminal column, so small images aren't blown up to full width.
 const PIXELS_PER_COLUMN: u32 = 8;
 
@@ -1182,6 +1205,17 @@ mod tests {
                 line.iter().collect::<String>().trim_end().to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn locate_finds_a_character_at_any_width() {
+        let text = "one two three four";
+        let three = text.find("three").unwrap();
+        assert_eq!(layout(text, 9, (8, 16), &no_images).locate(three), (1, 0));
+        assert_eq!(layout(text, 40, (8, 16), &no_images).locate(three), (0, 8));
+        // Past the last character: just after it.
+        assert_eq!(layout(text, 40, (8, 16), &no_images).locate(999), (0, 18));
+        assert_eq!(layout("", 40, (8, 16), &no_images).locate(5), (0, 0));
     }
 
     #[test]

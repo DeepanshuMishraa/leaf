@@ -19,6 +19,8 @@ pub struct Image {
     pub id: u32,
     pub cols: u16,
     pub rows: u16,
+    /// Images with a higher layer are drawn over those below.
+    pub layer: i32,
 }
 
 #[derive(Default)]
@@ -30,11 +32,25 @@ pub struct Kitty {
 }
 
 impl Kitty {
-    /// Queues `pixels` for upload, to be drawn over `cols` × `rows` cells.
-    pub fn upload(&mut self, pixels: &RgbaImage, cols: u16, rows: u16) -> Option<Image> {
+    /// Queues `pixels` for upload, to be drawn over `cols` × `rows` cells in `layer`.
+    pub fn upload(
+        &mut self,
+        pixels: &RgbaImage,
+        cols: u16,
+        rows: u16,
+        layer: i32,
+    ) -> Option<Image> {
+        use image::ImageEncoder;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
         let mut png = Vec::new();
-        image::DynamicImage::ImageRgba8(pixels.clone())
-            .write_to(&mut io::Cursor::new(&mut png), image::ImageFormat::Png)
+        // Fast compression: ink is redrawn while the mouse moves.
+        PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
+            .write_image(
+                pixels.as_raw(),
+                pixels.width(),
+                pixels.height(),
+                image::ExtendedColorType::Rgba8,
+            )
             .ok()?;
         self.next_id += 1;
         let id = self.next_id;
@@ -50,7 +66,12 @@ impl Kitty {
             self.pending.extend_from_slice(chunk);
             self.pending.extend_from_slice(b"\x1b\\");
         }
-        Some(Image { id, cols, rows })
+        Some(Image {
+            id,
+            cols,
+            rows,
+            layer,
+        })
     }
 
     /// Frees an uploaded image and its placements.
@@ -67,26 +88,28 @@ impl Kitty {
 
     /// Sends queued uploads, then makes `wanted` the images on screen.
     pub fn flush(&mut self, out: &mut impl Write, wanted: &[(Image, Rect)]) -> io::Result<()> {
-        let wanted: Vec<(u32, Rect)> = wanted
+        let ids: Vec<(u32, Rect)> = wanted
             .iter()
             .map(|(image, rect)| (image.id, *rect))
             .collect();
-        if wanted != self.placed {
+        if ids != self.placed {
             // Placements outlive the text drawn over them, so the old ones go first.
             self.pending.extend_from_slice(b"\x1b_Ga=d,d=a,q=2\x1b\\");
             self.pending.extend_from_slice(b"\x1b7");
-            for (id, rect) in &wanted {
+            for (image, rect) in wanted {
                 let _ = write!(
                     self.pending,
-                    "\x1b[{};{}H\x1b_Ga=p,i={id},c={},r={},C=1,q=2\x1b\\",
+                    "\x1b[{};{}H\x1b_Ga=p,i={},c={},r={},z={},C=1,q=2\x1b\\",
                     rect.y + 1,
                     rect.x + 1,
+                    image.id,
                     rect.width,
-                    rect.height
+                    rect.height,
+                    image.layer
                 );
             }
             self.pending.extend_from_slice(b"\x1b8");
-            self.placed = wanted;
+            self.placed = ids;
         }
         if self.pending.is_empty() {
             return Ok(());
@@ -110,7 +133,7 @@ mod tests {
     #[test]
     fn uploads_go_out_before_the_placement_and_nothing_goes_twice() {
         let mut kitty = Kitty::default();
-        let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1).unwrap();
+        let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1, 0).unwrap();
         let rect = Rect::new(3, 5, 2, 1);
         let first = flushed(&mut kitty, &[(image, rect)]);
         let (upload, place) = (
@@ -124,7 +147,7 @@ mod tests {
     #[test]
     fn placements_are_redrawn_once_the_screen_is_reset() {
         let mut kitty = Kitty::default();
-        let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1).unwrap();
+        let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1, 0).unwrap();
         let wanted = [(image, Rect::new(0, 0, 2, 1))];
         flushed(&mut kitty, &wanted);
         kitty.reset();
@@ -134,7 +157,7 @@ mod tests {
     #[test]
     fn no_placeholder_glyphs_are_written() {
         let mut kitty = Kitty::default();
-        let image = kitty.upload(&RgbaImage::new(64, 64), 4, 4).unwrap();
+        let image = kitty.upload(&RgbaImage::new(64, 64), 4, 4, 0).unwrap();
         assert!(!flushed(&mut kitty, &[(image, Rect::new(0, 0, 4, 4))]).contains('\u{10EEEE}'));
     }
 }

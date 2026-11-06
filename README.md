@@ -19,7 +19,9 @@ Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `d/u` half screen, `space/
 
 Press `f` to find text: type a word or phrase and press enter. leaf turns to the next page that has it and marks every match in orange. `n` and `N` go to the next and previous match, wrapping round the book, and `esc` clears the search. Case doesn't matter, and a phrase is found across line breaks.
 
-Drag with the mouse to select text; it's copied to the clipboard when you let go. Press `y` to highlight the selection in yellow, or `y` on a selection that touches a highlight to clear it. Highlights are saved with your reading place.
+Drag with the mouse to select text; it's copied to the clipboard when you let go. Press `y` to highlight the selection, or `y` on a selection that touches a highlight to clear it. `1`–`6` pick the color (yellow, green, blue, pink, purple, red) for new highlights and ink; pressed with a selection, they paint it, or recolor the highlights it touches. Highlights are saved with your reading place.
+
+Press `D` for the pen: dragging the mouse inks a line over the page in the picked color, anywhere on screen. `E` (or `e`) takes the eraser, which rubs out any stroke it passes over. `esc` goes back to selecting text. `!` shows a short guide to highlighting, colors and drawing. Each stroke is pinned to the word it starts on, so it moves with that word when the window is resized and the text wraps differently. Strokes are saved with your highlights. Drawing needs the Kitty graphics protocol (Kitty, Ghostty, WezTerm) and doesn't work inside tmux; elsewhere leaf says so in the footer, and saved drawings stay hidden until you open the document in such a terminal.
 
 The reader uses your terminal's own colors. Painted mode draws each image in your text color with a transparent background, so diagrams sit on the terminal like text.
 

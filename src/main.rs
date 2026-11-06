@@ -8,6 +8,7 @@ mod find;
 mod font;
 mod github;
 mod highlight;
+mod hue;
 mod kitty;
 mod markdown;
 mod memory;
@@ -16,6 +17,7 @@ mod mono;
 mod pdf;
 mod progress;
 mod render;
+mod stroke;
 mod syntax;
 mod viewer;
 
@@ -46,7 +48,7 @@ side, r reload, ? keys, q quit
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
 
-Reader keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, ? keys, q quit";
+Reader keys: ←/→ page, j/k scroll, d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, 1-6 color, D pen, E eraser, ! guide, ? keys, q quit";
 
 fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
@@ -121,6 +123,16 @@ fn resume(
         Ok(highlights) => options.highlights = highlights,
         Err(e) => record(Err(e)),
     }
+    match store.borrow().load_strokes(&key) {
+        // Like bookmarks, ink past the end was drawn on a longer copy of the file.
+        Ok(strokes) => {
+            options.strokes = strokes
+                .into_iter()
+                .filter(|s| page_count.is_none_or(|count| s.page < count))
+                .collect()
+        }
+        Err(e) => record(Err(e)),
+    }
     if let Some(count) = page_count {
         // A bookmark past the end was made in a longer copy of the file; it points nowhere now.
         match store.borrow().load_bookmarks(&key) {
@@ -149,6 +161,10 @@ fn resume(
     options.on_highlights = {
         let (store, record, key) = (store.clone(), record.clone(), key.clone());
         Box::new(move |highlights| record(store.borrow_mut().save_highlights(&key, highlights)))
+    };
+    options.on_strokes = {
+        let (store, record, key) = (store.clone(), record.clone(), key.clone());
+        Box::new(move |strokes| record(store.borrow_mut().save_strokes(&key, strokes)))
     };
     options.on_bookmarks = {
         let (store, record, key) = (store.clone(), record.clone(), key.clone());
