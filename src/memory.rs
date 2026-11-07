@@ -7,7 +7,12 @@ use mupdf_sys::fz_context;
 /// output ever changes shape; the cache then just isn't trimmed.
 fn mupdf_context() -> Option<*mut fz_context> {
     let shown = format!("{:?}", mupdf::Context::get());
-    let hex: String = shown.split("0x").nth(1)?.chars().take_while(char::is_ascii_hexdigit).collect();
+    let hex: String = shown
+        .split("0x")
+        .nth(1)?
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
     let address = usize::from_str_radix(&hex, 16).ok().filter(|&a| a != 0)?;
     Some(std::ptr::with_exposed_provenance_mut(address))
 }
@@ -41,7 +46,9 @@ pub fn without_large_cache() {
         if std::env::var_os(VAR).is_some() {
             return;
         }
-        let Ok(exe) = std::env::current_exe() else { return };
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
         let mut args = std::env::args_os();
         let mut command = std::process::Command::new(exe);
         if let Some(name) = args.next() {

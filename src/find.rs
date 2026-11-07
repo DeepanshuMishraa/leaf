@@ -15,7 +15,10 @@ fn fold(c: char) -> char {
 impl Query {
     /// `None` for a query of nothing but whitespace.
     pub fn new(typed: &str) -> Option<Query> {
-        let words: Vec<String> = typed.split_whitespace().map(|w| w.chars().map(fold).collect()).collect();
+        let words: Vec<String> = typed
+            .split_whitespace()
+            .map(|w| w.chars().map(fold).collect())
+            .collect();
         if words.is_empty() {
             return None;
         }
@@ -77,7 +80,9 @@ mod tests {
     }
 
     fn found(query: &str, text: &str) -> Vec<(usize, usize)> {
-        Query::new(query).expect("query has text").matches(&chars(text))
+        Query::new(query)
+            .expect("query has text")
+            .matches(&chars(text))
     }
 
     #[test]
@@ -95,7 +100,10 @@ mod tests {
 
     #[test]
     fn a_space_matches_a_line_break_or_several_spaces() {
-        assert_eq!(found("total  order", "Total\norder and total   order"), vec![(0, 11), (16, 29)]);
+        assert_eq!(
+            found("total  order", "Total\norder and total   order"),
+            vec![(0, 11), (16, 29)]
+        );
     }
 
     #[test]

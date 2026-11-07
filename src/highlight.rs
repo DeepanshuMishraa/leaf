@@ -1,5 +1,7 @@
 //! Highlighted stretches of page text.
 
+use crate::hue::Hue;
+
 /// A highlighted stretch of a page. `page` is 0-based (0 for documents
 /// without pages); `start` and `end` are character offsets into the page's
 /// text as the viewer lays it out. `text` is what was highlighted.
@@ -9,6 +11,7 @@ pub struct Highlight {
     pub start: usize,
     pub end: usize,
     pub text: String,
+    pub hue: Hue,
 }
 
 fn overlaps(a: &Highlight, b: &Highlight) -> bool {
@@ -46,6 +49,29 @@ pub fn toggle(existing: &[Highlight], selection: &[Highlight]) -> Vec<Highlight>
         .collect()
 }
 
+/// Turns the highlights the selection touches `hue`, or, when it touches
+/// none, highlights the selection in `hue`.
+pub fn paint(existing: &[Highlight], selection: &[Highlight], hue: Hue) -> Vec<Highlight> {
+    let touched = |h: &Highlight| selection.iter().any(|r| overlaps(h, r));
+    if !existing.iter().any(touched) {
+        let fresh: Vec<Highlight> = selection
+            .iter()
+            .map(|r| Highlight { hue, ..r.clone() })
+            .collect();
+        return toggle(existing, &fresh);
+    }
+    existing
+        .iter()
+        .map(|h| {
+            if touched(h) {
+                Highlight { hue, ..h.clone() }
+            } else {
+                h.clone()
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,7 +82,20 @@ mod tests {
             start,
             end,
             text: format!("{start}-{end}"),
+            hue: Hue::Yellow,
         }
+    }
+
+    #[test]
+    fn painting_recolors_what_the_selection_touches_or_adds_it() {
+        let existing = vec![h(0, 0, 4), h(0, 10, 14)];
+        let painted = paint(&existing, &[h(0, 2, 3)], Hue::Blue);
+        assert_eq!(painted[0].hue, Hue::Blue);
+        assert_eq!((painted[0].start, painted[0].end), (0, 4));
+        assert_eq!(painted[1].hue, Hue::Yellow);
+        let added = paint(&existing, &[h(0, 5, 8)], Hue::Green);
+        assert_eq!(added.len(), 3);
+        assert_eq!(added[2].hue, Hue::Green);
     }
 
     #[test]

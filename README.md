@@ -1,6 +1,6 @@
 # leaf
 
-Read PDFs, markdown files and web articles in the terminal.
+Read PDFs, markdown files and web articles in the terminal, and review diffs.
 
 ```sh
 cargo install leaf-reader   # installs the `leaf` command to ~/.cargo/bin
@@ -15,11 +15,19 @@ leaf open README.md
 leaf open https://example.com/post
 ```
 
-Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `d/u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `?` all keys, `q` quit.
+Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `ctrl+d`/`u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `?` all keys, `q` quit.
 
 Press `f` to find text: type a word or phrase and press enter. leaf turns to the next page that has it and marks every match in orange. `n` and `N` go to the next and previous match, wrapping round the book, and `esc` clears the search. Case doesn't matter, and a phrase is found across line breaks.
 
-Drag with the mouse to select text; it's copied to the clipboard when you let go. Press `y` to highlight the selection in yellow, or `y` on a selection that touches a highlight to clear it. Highlights are saved with your reading place.
+Drag with the mouse to select text; it's copied to the clipboard when you let go. Press `y` to highlight the selection, or `y` on a selection that touches a highlight to clear it. `1`–`6` pick the color (yellow, green, blue, pink, purple, red) for new highlights and ink; pressed with a selection, they paint it, or recolor the highlights it touches. Highlights are saved with your reading place.
+
+Press `d` for the pen: dragging the mouse inks a line over the page in the picked color, anywhere on screen. `e` takes the eraser, which rubs out any stroke it passes over. `esc` goes back to selecting text. `!` shows a short guide to highlighting, colors and drawing. When you let go, a stroke that was meant as a shape is tidied into it: a wobbly line comes out straight (and level or upright when it's close), a loop with three or four corners becomes a triangle or rectangle, and a round loop becomes an ellipse, or a circle when it's nearly round. Handwriting, ticks and scribbles stay as drawn.
+
+Press `v` for the move tool and click a stroke to pick it: a frame with a handle at each corner appears around it. Drag inside the frame to move it, or drag a corner to resize it while the opposite corner stays put. The arrow keys (or `hjkl`) nudge it a cell, `+` and `-` make it bigger or smaller, `1`–`6` recolor it, `x` deletes it, and `esc` lets go. A stroke moved onto other text is pinned to that text from then on.
+
+Each stroke is pinned to the word it starts on, so it moves with that word when the window is resized and the text wraps differently. Strokes are saved with your highlights. Drawing needs the Kitty graphics protocol (Kitty, Ghostty, WezTerm) and doesn't work inside tmux; elsewhere leaf says so in the footer, and saved drawings stay hidden until you open the document in such a terminal.
+
+Press `a` to have the document read aloud. Reading starts at the selection if there is one, otherwise where it last stopped if that's on screen, otherwise at the top of the screen. The word being spoken is marked as it's said, and the screen turns to keep it in view. Scroll away and it stops following until the word is back on screen. `a` pauses and carries on, and `A` or `esc` stops. `]` and `[` step the speed between 0.5× and 4× without changing the voice's pitch. `.` and `,` skip to the next sentence or back to the start of this one (or the one before, if it has only just started). `s` opens the voice picker. Its search box takes a name, language, region or gender (`hindi female`, `british`, `sonia`) and narrows Microsoft's few hundred voices as you type. Move with `↑/↓` and press `enter`. The list shows once it has fully loaded; until then the picker says it's loading, and you can type the search already. A voice picked while reading takes over from the word being read. Connections to the service are kept open between sentences, so the new voice starts in about half a second. The voice and speed are remembered. Speech comes from Microsoft Edge's online read-aloud voices, so reading aloud needs a network connection; the next few sentences are fetched ahead so the voice doesn't stop to wait.
 
 The reader uses your terminal's own colors. Painted mode draws each image in your text color with a transparent background, so diagrams sit on the terminal like text.
 
@@ -35,9 +43,33 @@ PDFs are converted to markdown (headings from font size, paragraphs rejoined, ru
 
 Markdown files (`.md`, `.markdown`) show as written, with GitHub's extensions: tables, task lists, strikethrough, footnotes and alerts (`> [!NOTE]`), plus definition lists and math (kept as source). Front matter is hidden, HTML blocks such as a README's centered logo are read as markdown, and images next to the file show inline (PNG, JPEG, GIF, WebP).
 
-`mermaid` code blocks are drawn as diagrams in the terminal's colors, with [Pele](https://github.com/obsidianmd/pele) run under `bun` or `node`; without either, or for a diagram Pele can't read, the block shows as code.
+`mermaid` code blocks are drawn as diagrams in the terminal's colors, with [Ondine](https://github.com/wevm/ondine), in pure Rust; a diagram Ondine can't read shows as code.
+
+Code is colored with [Highlights](https://diffs.com/highlights), whose lexers are WebAssembly. A fence's language is used. PDF and EPUB blocks have no language, so they are colored only when the source is clearly one language; anything uncertain stays plain. Colors are the terminal's own palette.
 
 Images use the Kitty, iTerm2 or Sixel graphics protocol, whichever the terminal answers to, and fall back to colored half blocks.
+
+## Diffs
+
+`leaf diff` shows the working tree's changes. Pass a path, revision, range, patch file or GitHub link to review something else:
+
+```sh
+leaf diff                          # unstaged changes
+leaf diff --staged                 # staged changes
+leaf diff --branch                 # this branch against its base
+leaf diff main...HEAD              # any revision or range
+leaf diff src/viewer.rs            # one file
+leaf diff changes.patch            # a .diff or .patch file, anywhere
+leaf diff https://github.com/owner/repo/pull/12
+```
+
+Local diffs need a Git repository. A patch file and a GitHub pull request, commit or comparison link open without one. `o` flips between the working tree and the base branch, and `r` reloads.
+
+Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. Added and removed lines are tinted, with the changed words picked out.
+
+Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `v` enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `C` comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` pastes it into an agent running in another tmux pane, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
+
+An agent pane is found from `LEAF_AGENT_PANE=%3`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini` or another known agent. Pasting is bracketed, so it fills the prompt without submitting it. With no agent or no tmux, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
 Built in Rust with ratatui and mupdf.
 

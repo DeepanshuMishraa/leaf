@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
@@ -23,14 +24,18 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 use unicode_width::UnicodeWidthChar;
 
+use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
 use crate::article;
 use crate::doc::{Doc, ImageRef};
+use crate::edge;
 use crate::find::Query;
 use crate::highlight::{self, Highlight};
+use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::render::{self, DIM, Laid};
+use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
 
 /// Widest the text column gets; a book-like measure is easiest to read.
 const MAX_TEXT_WIDTH: u16 = 76;
@@ -51,10 +56,23 @@ const KEPT_PAGES: usize = 4;
 const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
+/// How often the word read aloud is checked: fast enough that the mark
+/// keeps up with the voice at 4×.
+const NARRATION_TICK: Duration = Duration::from_millis(15);
+
+/// Ink is drawn over figures.
+const INK_LAYER: i32 = 1;
+/// How close, in cells, the eraser has to pass to a stroke to take it.
+const ERASER_REACH: f32 = 0.7;
+/// How close, in cells, a click has to be to a stroke to pick it up.
+const PICK_REACH: f32 = 1.0;
+/// A picked stroke's frame is drawn over all ink.
+const FRAME_LAYER: i32 = 2;
+/// How much `+` grows a picked stroke, and `-` shrinks it.
+const GROW: f32 = 1.15;
 
 const SELECTION: Color = Color::Indexed(8);
-// Highlighter yellow under dark ink reads the same on light and dark themes.
-const MARK: Color = Color::Rgb(250, 214, 64);
+// Dark ink on the light marker colors reads the same on light and dark themes.
 const MARK_INK: Color = Color::Rgb(20, 20, 20);
 /// Search matches in light orange, the one the reader is on in a deeper orange.
 const FOUND: Color = Color::Rgb(255, 196, 140);
@@ -74,9 +92,24 @@ enum Mode {
 enum Dialog {
     None,
     Help,
-    Goto { digits: String, page_count: usize },
-    Find { typed: String },
-    Bookmarks { selected: usize },
+    /// How to highlight, pick colors and draw.
+    Guide,
+    Goto {
+        digits: String,
+        page_count: usize,
+    },
+    Find {
+        typed: String,
+    },
+    Bookmarks {
+        selected: usize,
+    },
+    /// The voices to read aloud with, filtered by what's typed.
+    /// `selected` is the row moved to; until then, the voice reading now.
+    Voices {
+        typed: String,
+        selected: Option<usize>,
+    },
 }
 
 /// Which way a search moves through the pages.
@@ -147,6 +180,57 @@ impl Selection {
     }
 }
 
+/// What dragging the mouse does: select text, draw, rub strokes out, or
+/// pick a stroke up to move and resize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Select,
+    Pen,
+    Eraser,
+    Move,
+}
+
+/// A stroke, and the serial its drawn images are kept under.
+#[derive(Debug, Clone, PartialEq)]
+struct Inked {
+    serial: u64,
+    stroke: Stroke,
+}
+
+/// What the mouse button held down is doing.
+#[derive(Debug, Clone, PartialEq)]
+enum Drag {
+    Idle,
+    Selecting,
+    Inking(Inked),
+    /// `erased` once a stroke has gone, so letting go saves.
+    Erasing {
+        erased: bool,
+    },
+    /// Carrying the picked stroke: `from` is the cell the mouse took hold
+    /// at, `original` the stroke as it was then.
+    Moving {
+        from: (u16, u16),
+        original: Stroke,
+    },
+    /// Stretching the picked stroke by one corner of its frame.
+    Resizing {
+        corner: Corner,
+        original: Stroke,
+    },
+}
+
+/// A stroke's image as drawn: which stroke, how far it had got, the cells
+/// of it on screen, measured from its anchor, and whether it's the stroke
+/// or the frame round it when picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InkKey {
+    serial: u64,
+    points: usize,
+    clip: Cells,
+    frame: bool,
+}
+
 enum Remote {
     Loading,
     Ready(Rc<RgbaImage>),
@@ -176,6 +260,8 @@ struct Marks<'a> {
     selection: Option<(TextPos, TextPos)>,
     found: &'a [(usize, usize)],
     here: Option<Match>,
+    /// The word being read aloud.
+    said: Option<Said>,
 }
 
 /// What a row on screen shows.
@@ -188,6 +274,7 @@ struct ScreenRow {
 /// Hears the full set of highlights after each change.
 pub type HighlightsListener = Box<dyn FnMut(&[Highlight])>;
 pub type BookmarksListener = Box<dyn FnMut(&[Bookmark])>;
+pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 
 pub struct ViewerOptions {
     /// For paged documents, where reading resumes (1-based).
@@ -207,6 +294,18 @@ pub struct ViewerOptions {
     pub bookmarks: Vec<Bookmark>,
     /// Hears every bookmark there is, each time one is added or removed.
     pub on_bookmarks: BookmarksListener,
+    /// Ink drawn on the document, oldest first.
+    pub strokes: Vec<Stroke>,
+    /// Hears every stroke there is, each time one is drawn or erased.
+    pub on_strokes: StrokesListener,
+    /// The voice that reads aloud, by its service name.
+    pub voice: String,
+    /// How fast it reads, 1.0 being normal.
+    pub speed: f32,
+    pub on_voice: Box<dyn FnMut(&str)>,
+    pub on_speed: Box<dyn FnMut(f32)>,
+    /// Where speech comes from and goes.
+    pub speech: Backend,
 }
 
 impl Default for ViewerOptions {
@@ -222,6 +321,13 @@ impl Default for ViewerOptions {
             on_highlights: Box::new(|_| {}),
             bookmarks: Vec::new(),
             on_bookmarks: Box::new(|_| {}),
+            strokes: Vec::new(),
+            on_strokes: Box::new(|_| {}),
+            voice: edge::DEFAULT_VOICE.to_owned(),
+            speed: 1.0,
+            on_voice: Box::new(|_| {}),
+            on_speed: Box::new(|_| {}),
+            speech: Backend::Edge,
         }
     }
 }
@@ -244,9 +350,21 @@ pub struct App {
     ink: Option<Rgb>,
     paper: Option<Rgb>,
     highlights: Vec<Highlight>,
+    /// The color new highlights and ink come in.
+    hue: Hue,
+    /// A word in the footer about the last key, gone at the next one.
+    notice: Option<String>,
     bookmarks: Vec<Bookmark>,
     selection: Option<Selection>,
-    dragging: bool,
+    tool: Tool,
+    drag: Drag,
+    strokes: Vec<Inked>,
+    /// The serial the next stroke gets.
+    next_serial: u64,
+    /// Strokes' images the terminal holds, for the parts of them on screen.
+    ink_drawn: HashMap<InkKey, kitty::Image>,
+    /// The serial of the stroke picked up with the move tool.
+    picked: Option<u64>,
     dialog: Dialog,
     remote: HashMap<String, Remote>,
     fetched_tx: mpsc::Sender<(String, Option<RgbaImage>)>,
@@ -267,7 +385,27 @@ pub struct App {
     reported_scroll: Option<Scroll>,
     copy: Option<String>,
     search: Option<Search>,
+    narrator: Narrator,
+    /// Whether the screen keeps the word being read aloud in view. Scrolling
+    /// away lets it go; it picks up again once the word is back on screen.
+    follow: bool,
     quit: bool,
+}
+
+/// The row picked in the voice list: the one moved to, or else the voice
+/// reading now when nothing's typed, or the best match when something is.
+fn picked_voice(
+    ranked: &[&edge::Voice],
+    current: &str,
+    typed: &str,
+    selected: Option<usize>,
+) -> usize {
+    selected
+        .unwrap_or_else(|| match typed {
+            "" => ranked.iter().position(|v| v.name == current).unwrap_or(0),
+            _ => 0,
+        })
+        .min(ranked.len().saturating_sub(1))
 }
 
 /// The character a key types.
@@ -282,18 +420,58 @@ fn char_width(c: char) -> u16 {
     c.width().unwrap_or(0) as u16
 }
 
+/// Where the ink's corner goes when a frame's `corner` handle is dragged to
+/// `p`: the frame stands off the ink, so the handle sits that far outside it.
+fn handle_to_ink(corner: Corner, p: Point) -> Point {
+    let (sx, sy) = match corner {
+        Corner::TopLeft => (1.0, 1.0),
+        Corner::TopRight => (-1.0, 1.0),
+        Corner::BottomRight => (-1.0, -1.0),
+        Corner::BottomLeft => (1.0, -1.0),
+    };
+    Point {
+        x: p.x + sx * FRAME_PAD.x,
+        y: p.y + sy * FRAME_PAD.y,
+    }
+}
+
 impl App {
-    pub fn new(doc: Doc, options: ViewerOptions, picker: Picker) -> Self {
+    pub fn new(doc: Doc, mut options: ViewerOptions, picker: Picker) -> Self {
         let current = match (doc.page_count, options.start_page) {
             (Some(count), Some(start)) => start.clamp(1, count.max(1)) - 1,
             _ => 0,
         };
         let (doc_paged, options_anchor) = (doc.page_count.is_some(), options.start_anchor);
         let (fetched_tx, fetched_rx) = mpsc::channel();
-        let kitty = (picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected()).then(Kitty::default);
+        let kitty = (picker.protocol_type() == ProtocolType::Kitty && !picker.tmux_detected())
+            .then(Kitty::default);
+        let strokes: Vec<Inked> = options
+            .strokes
+            .iter()
+            .zip(0..)
+            .map(|(stroke, serial)| Inked {
+                serial,
+                stroke: stroke.clone(),
+            })
+            .collect();
+        let narrator = Narrator::new(
+            options.voice.clone(),
+            options.speed,
+            std::mem::replace(&mut options.speech, Backend::Edge),
+        );
         App {
+            narrator,
+            follow: true,
+            next_serial: strokes.len() as u64,
+            strokes,
+            tool: Tool::Select,
+            drag: Drag::Idle,
+            picked: None,
+            ink_drawn: HashMap::new(),
             image_mode: options.image_mode,
             highlights: options.highlights.clone(),
+            hue: Hue::default(),
+            notice: None,
             bookmarks: options.bookmarks.clone(),
             doc,
             options,
@@ -307,7 +485,6 @@ impl App {
             ink: None,
             paper: None,
             selection: None,
-            dragging: false,
             dialog: Dialog::None,
             remote: HashMap::new(),
             fetched_tx,
@@ -352,7 +529,12 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
-        let laid = Rc::new(render::layout(&markdown, self.width, (font.width, font.height), &sizes));
+        let laid = Rc::new(render::layout(
+            &markdown,
+            self.width,
+            (font.width, font.height),
+            &sizes,
+        ));
         self.laid.insert(page, laid.clone());
         laid
     }
@@ -468,12 +650,59 @@ impl App {
     }
 
     fn footer(&mut self) -> String {
+        let mut footer = self.searched();
+        match self.tool {
+            Tool::Select => {}
+            Tool::Pen => {
+                footer = format!("{footer} · pen {} · e eraser · esc stop", self.hue.name())
+            }
+            Tool::Eraser => footer = format!("{footer} · eraser · d pen · esc stop"),
+            Tool::Move if self.picked.is_some() => {
+                footer = format!(
+                    "{footer} · drag or arrows move · corners or +/- resize · x delete · esc done"
+                )
+            }
+            Tool::Move => footer = format!("{footer} · move: click ink to pick it · esc stop"),
+        }
+        let mark = match self.narrator.status() {
+            Status::Idle => None,
+            Status::Loading => Some("…"),
+            Status::Speaking => Some("▶"),
+            Status::Paused => Some("❚❚"),
+        };
+        if let Some(mark) = mark {
+            footer = format!(
+                "{footer} · {mark} {} {}",
+                self.narrator.voice_label(),
+                aloud::speed_label(self.narrator.speed())
+            );
+        }
+        let hidden = self.no_ink().is_some() && {
+            let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
+            self.strokes.iter().any(|i| pages.contains(&i.stroke.page))
+        };
+        match &self.notice {
+            Some(notice) => format!("{footer} · {notice}"),
+            None if hidden => format!("{footer} · drawings here need Kitty graphics to show"),
+            None => footer,
+        }
+    }
+
+    /// The place, and how the search is going.
+    fn searched(&mut self) -> String {
         let place = self.place();
-        let Some(search) = &self.search else { return place };
+        let Some(search) = &self.search else {
+            return place;
+        };
         let query = search.query.typed();
         match search.seek {
-            Seek::Seeking { direction, from, step } => {
-                let page = direction.page(from.page, step.min(self.pages()), self.pages().max(1)) + 1;
+            Seek::Seeking {
+                direction,
+                from,
+                step,
+            } => {
+                let page =
+                    direction.page(from.page, step.min(self.pages()), self.pages().max(1)) + 1;
                 format!("searching \"{query}\" · page {page} / {}", self.pages())
             }
             Seek::Found(_) => format!("{place} · \"{query}\" n/N"),
@@ -488,8 +717,15 @@ impl App {
             Some(count) => {
                 let reading = self.reading();
                 let progress = Progress::of(reading + 1, count);
-                let marked = if self.bookmarked(reading) { " · bookmarked" } else { "" };
-                format!("{} / {} · {}%{marked}", progress.page, progress.page_count, progress.percent)
+                let marked = if self.bookmarked(reading) {
+                    " · bookmarked"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} / {} · {}%{marked}",
+                    progress.page, progress.page_count, progress.percent
+                )
             }
         }
     }
@@ -503,7 +739,10 @@ impl App {
     /// Where in a page-less document's text the top line of the screen sits.
     fn top_anchor(&mut self) -> usize {
         let laid = self.laid(0);
-        let top = self.offset.saturating_sub(self.prefix(0)).min(laid.rows.len());
+        let top = self
+            .offset
+            .saturating_sub(self.prefix(0))
+            .min(laid.rows.len());
         laid.rows[top..]
             .iter()
             .flat_map(|row| &row.segs)
@@ -514,7 +753,10 @@ impl App {
     /// Scrolls a page-less document so the line holding `anchor` is at the top.
     fn scroll_to_anchor(&mut self, anchor: usize) {
         let laid = self.laid(0);
-        let holds = |seg: &render::Seg| seg.offset.is_some_and(|o| o + seg.text.chars().count() > anchor);
+        let holds = |seg: &render::Seg| {
+            seg.offset
+                .is_some_and(|o| o + seg.text.chars().count() > anchor)
+        };
         let row = laid
             .rows
             .iter()
@@ -560,14 +802,20 @@ impl App {
 
     /// Lets go of laid-out pages and pixels far from the reader.
     fn prune(&mut self) {
-        let (from, to) = (self.current.saturating_sub(KEPT_PAGES), self.current + KEPT_PAGES);
+        let (from, to) = (
+            self.current.saturating_sub(KEPT_PAGES),
+            self.current + KEPT_PAGES,
+        );
         self.laid.retain(|page, _| (from..=to).contains(page));
     }
 
     fn receive_images(&mut self) {
         let mut arrived = false;
         while let Ok((url, image)) = self.fetched_rx.try_recv() {
-            self.remote.insert(url, image.map_or(Remote::Failed, |i| Remote::Ready(Rc::new(i))));
+            self.remote.insert(
+                url,
+                image.map_or(Remote::Failed, |i| Remote::Ready(Rc::new(i))),
+            );
             arrived = true;
         }
         // A remote image's size is known once it arrives, so pages lay out again.
@@ -582,11 +830,15 @@ impl App {
     }
 
     fn ink(&mut self) -> Rgb {
-        *self.ink.get_or_insert_with(|| query_color(10).unwrap_or(FALLBACK_INK))
+        *self
+            .ink
+            .get_or_insert_with(|| query_color(10).unwrap_or(FALLBACK_INK))
     }
 
     fn paper(&mut self) -> Rgb {
-        *self.paper.get_or_insert_with(|| query_color(11).unwrap_or(FALLBACK_PAPER))
+        *self
+            .paper
+            .get_or_insert_with(|| query_color(11).unwrap_or(FALLBACK_PAPER))
     }
 
     /// The pixels of a figure in the current image mode, decoding or fetching as needed.
@@ -642,7 +894,10 @@ impl App {
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
         let width = MAX_TEXT_WIDTH.min(area.width.saturating_sub(4)).max(1);
-        let mode = if self.doc.page_count.is_some() && area.width >= PAGED_MIN_WIDTH && area.height >= PAGED_MIN_HEIGHT {
+        let mode = if self.doc.page_count.is_some()
+            && area.width >= PAGED_MIN_WIDTH
+            && area.height >= PAGED_MIN_HEIGHT
+        {
             Mode::Paged
         } else {
             Mode::Scroll
@@ -698,15 +953,19 @@ impl App {
         let screen = self.screen.clone();
         let found = self.matches_on(&screen);
         for (y, slot) in screen.iter().enumerate() {
-            let Some(ScreenRow { page, row }) = *slot else { continue };
+            let Some(ScreenRow { page, row }) = *slot else {
+                continue;
+            };
             let marks = Marks {
                 selection,
                 found: found.get(&page).map_or(&[], Vec::as_slice),
                 here: self.found_here(),
+                said: self.narrator.said(),
             };
             self.draw_row(f, page, row, self.column.y + y as u16, marks);
         }
         self.draw_figures(f, &screen);
+        self.draw_strokes(area);
 
         let footer = self.footer();
         let footer_area = Rect {
@@ -716,16 +975,22 @@ impl App {
             height: 1.min(area.height),
         };
         f.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(DIM)).alignment(Alignment::Center),
+            Paragraph::new(footer)
+                .style(Style::default().fg(DIM))
+                .alignment(Alignment::Center),
             footer_area,
         );
 
         let panel = match self.dialog.clone() {
             Dialog::None => None,
             Dialog::Help => Some(self.draw_help(f, area)),
-            Dialog::Goto { digits, page_count } => Some(self.draw_goto(f, area, &digits, page_count)),
+            Dialog::Guide => Some(self.draw_guide(f, area)),
+            Dialog::Goto { digits, page_count } => {
+                Some(self.draw_goto(f, area, &digits, page_count))
+            }
             Dialog::Find { typed } => Some(self.draw_find(f, area, &typed)),
             Dialog::Bookmarks { selected } => Some(self.draw_bookmarks(f, area, selected)),
+            Dialog::Voices { typed, selected } => Some(self.draw_voices(f, area, &typed, selected)),
         };
         // Kitty images sit above the text, so any under a panel would hide it.
         if let Some(panel) = panel {
@@ -740,7 +1005,9 @@ impl App {
         };
         let mut found = HashMap::new();
         for page in screen.iter().flatten().map(|s| s.page) {
-            found.entry(page).or_insert_with(|| query.matches(&self.laid(page).text));
+            found
+                .entry(page)
+                .or_insert_with(|| query.matches(&self.laid(page).text));
         }
         found
     }
@@ -768,12 +1035,20 @@ impl App {
         if laid.rows.is_empty() && self.blank(page) {
             if row == prefix + 1 {
                 let label = "blank page";
-                buf.set_string(column.x + (column.width.saturating_sub(10)) / 2, y, label, Style::default().fg(DIM));
+                buf.set_string(
+                    column.x + (column.width.saturating_sub(10)) / 2,
+                    y,
+                    label,
+                    Style::default().fg(DIM),
+                );
             }
             return;
         }
-        let Some(line) = laid.rows.get(row - prefix) else { return };
-        let highlights: Vec<&Highlight> = self.highlights.iter().filter(|h| h.page == page).collect();
+        let Some(line) = laid.rows.get(row - prefix) else {
+            return;
+        };
+        let highlights: Vec<&Highlight> =
+            self.highlights.iter().filter(|h| h.page == page).collect();
         let buf = f.buffer_mut();
         for seg in &line.segs {
             let mut x = column.x + seg.x;
@@ -781,14 +1056,36 @@ impl App {
                 let mut style = seg.style;
                 if let Some(offset) = seg.offset.map(|o| o + i) {
                     let at = TextPos { page, offset };
-                    if highlights.iter().any(|h| h.start <= offset && offset < h.end) {
-                        style = style.bg(MARK).fg(MARK_INK);
+                    if let Some(h) = highlights
+                        .iter()
+                        .find(|h| h.start <= offset && offset < h.end)
+                    {
+                        style = style.bg(h.hue.marker()).fg(MARK_INK);
                     }
-                    if marks.found.iter().any(|&(start, end)| start <= offset && offset < end) {
-                        let here = marks.here.is_some_and(|m| m.page == page && m.start <= offset && offset < m.end);
+                    if marks
+                        .found
+                        .iter()
+                        .any(|&(start, end)| start <= offset && offset < end)
+                    {
+                        let here = marks
+                            .here
+                            .is_some_and(|m| m.page == page && m.start <= offset && offset < m.end);
                         style = style.bg(if here { FOUND_HERE } else { FOUND }).fg(MARK_INK);
                     }
-                    if marks.selection.is_some_and(|(start, end)| start <= at && at < end) {
+                    // The word being read aloud, in the terminal's own colors turned over.
+                    if marks
+                        .said
+                        .is_some_and(|s| s.page == page && s.start <= offset && offset < s.end)
+                    {
+                        style = style
+                            .fg(Color::Reset)
+                            .bg(Color::Reset)
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                    }
+                    if marks
+                        .selection
+                        .is_some_and(|(start, end)| start <= at && at < end)
+                    {
                         style = style.bg(SELECTION).fg(Color::Reset);
                     }
                 }
@@ -819,8 +1116,10 @@ impl App {
                     .iter()
                     .enumerate()
                     .filter_map(|(y, s)| {
-                        s.filter(|s| s.page == page && s.row >= top && s.row < top + figure.rows as usize)
-                            .map(|_| y)
+                        s.filter(|s| {
+                            s.page == page && s.row >= top && s.row < top + figure.rows as usize
+                        })
+                        .map(|_| y)
                     })
                     .collect();
                 let (Some(&first_y), Some(&last_y)) = (visible.first(), visible.last()) else {
@@ -844,12 +1143,18 @@ impl App {
                     let rows = figure.rows as u32;
                     let (y0, y1) = (
                         h * from as u32 / rows,
-                        (h * to as u32 / rows).max(h * from as u32 / rows + 1).min(h),
+                        (h * to as u32 / rows)
+                            .max(h * from as u32 / rows + 1)
+                            .min(h),
                     );
-                    let slice = image::imageops::crop_imm(pixels.as_ref(), 0, y0, w, y1 - y0).to_image();
+                    let slice =
+                        image::imageops::crop_imm(pixels.as_ref(), 0, y0, w, y1 - y0).to_image();
                     // Protocols never scale an image up, so it's sized to fill its cells first.
                     let font = self.picker.font_size();
-                    let (box_w, box_h) = (figure.cols as f32 * font.width as f32, (to - from) as f32 * font.height as f32);
+                    let (box_w, box_h) = (
+                        figure.cols as f32 * font.width as f32,
+                        (to - from) as f32 * font.height as f32,
+                    );
                     let scale = (box_w / slice.width() as f32).min(box_h / slice.height() as f32);
                     let fitted = (
                         ((slice.width() as f32 * scale) as u32).max(1),
@@ -858,16 +1163,23 @@ impl App {
                     let slice = if fitted == slice.dimensions() {
                         slice
                     } else {
-                        image::imageops::resize(&slice, fitted.0, fitted.1, image::imageops::FilterType::Triangle)
+                        image::imageops::resize(
+                            &slice,
+                            fitted.0,
+                            fitted.1,
+                            image::imageops::FilterType::Triangle,
+                        )
                     };
                     let drawn = match &mut self.kitty {
                         Some(kitty) => {
-                            let cells = |px: u32, cell: u16, max: u16| (px.div_ceil(cell.max(1) as u32) as u16).clamp(1, max);
+                            let cells = |px: u32, cell: u16, max: u16| {
+                                (px.div_ceil(cell.max(1) as u32) as u16).clamp(1, max)
+                            };
                             let (cols, rows) = (
                                 cells(slice.width(), font.width, figure.cols),
                                 cells(slice.height(), font.height, to - from),
                             );
-                            kitty.upload(&slice, cols, rows).map(Drawn::Kitty)
+                            kitty.upload(&slice, cols, rows, 0).map(Drawn::Kitty)
                         }
                         None => self
                             .picker
@@ -882,7 +1194,9 @@ impl App {
                     let Some(drawn) = drawn else { continue };
                     self.protocols.insert(key.clone(), drawn);
                 }
-                let Some(drawn) = self.protocols.get(&key) else { continue };
+                let Some(drawn) = self.protocols.get(&key) else {
+                    continue;
+                };
                 let size = match drawn {
                     Drawn::Kitty(image) => Size::new(image.cols, image.rows),
                     Drawn::Protocol(protocol) => protocol.size(),
@@ -902,7 +1216,9 @@ impl App {
                 };
                 match drawn {
                     Drawn::Kitty(image) => self.placements.push((*image, rect)),
-                    Drawn::Protocol(protocol) => f.render_widget(Image::new(protocol).allow_clipping(true), rect),
+                    Drawn::Protocol(protocol) => {
+                        f.render_widget(Image::new(protocol).allow_clipping(true), rect)
+                    }
                 }
                 used.insert(key);
             }
@@ -936,7 +1252,11 @@ impl App {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(DIM))
-            .title(Line::from(format!(" {title} ")).style(Style::default().fg(DIM)).centered());
+            .title(
+                Line::from(format!(" {title} "))
+                    .style(Style::default().fg(DIM))
+                    .centered(),
+            );
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let body = Rect {
@@ -957,15 +1277,32 @@ impl App {
         }
         rows.extend([
             ("j/k  ↓/↑", "scroll"),
-            ("d/u", "half screen down / up"),
+            ("^d  u", "half screen down / up"),
             ("space/b", "next / previous screen"),
         ]);
-        rows.push(("g/G", if paged { "first / last page" } else { "top / bottom" }));
+        rows.push((
+            "g/G",
+            if paged {
+                "first / last page"
+            } else {
+                "top / bottom"
+            },
+        ));
         if paged {
             rows.push(("t  :", "go to page"));
-            rows.extend([("m", "bookmark this page, or remove it"), ("'", "bookmarks")]);
+            rows.extend([
+                ("m", "bookmark this page, or remove it"),
+                ("'", "bookmarks"),
+            ]);
         }
         rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
+        rows.extend([
+            ("a", "read aloud from here; pause / go on"),
+            ("A", "stop reading aloud"),
+            ("[  ]", "read slower / faster"),
+            (",  .", "previous / next sentence aloud"),
+            ("s", "pick a voice"),
+        ]);
         rows.push((
             "i",
             if self.image_mode == ImageMode::Color {
@@ -977,6 +1314,11 @@ impl App {
         rows.extend([
             ("drag", "select and copy text"),
             ("y", "highlight selection, or clear one"),
+            ("1-6", "pick a color; paints the selection"),
+            ("d", "pen: drag to draw"),
+            ("e", "eraser: drag over ink"),
+            ("v", "move tool: pick, move, resize ink"),
+            ("!", "how to highlight and draw"),
             ("?", "this help"),
             ("q", "quit"),
         ]);
@@ -985,12 +1327,20 @@ impl App {
 
     fn draw_help(&self, f: &mut Frame, area: Rect) -> Rect {
         let rows = self.help_rows();
-        let width = 12 + rows.iter().map(|(_, a)| a.chars().count() as u16).max().unwrap_or(0);
+        let width = 12
+            + rows
+                .iter()
+                .map(|(_, a)| a.chars().count() as u16)
+                .max()
+                .unwrap_or(0);
         let lines = rows
             .into_iter()
             .map(|(keys, action)| {
                 Line::from(vec![
-                    Span::styled(format!("{keys:<12}"), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{keys:<12}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(action, Style::default().fg(DIM)),
                 ])
             })
@@ -998,11 +1348,75 @@ impl App {
         Self::panel(f, area, "Keys", lines, width)
     }
 
+    /// How to mark up a document: highlights, colors, the pen and the eraser.
+    fn draw_guide(&self, f: &mut Frame, area: Rect) -> Rect {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(DIM);
+        let heading = |text: &'static str| Line::from(Span::styled(text, bold));
+        let step = |keys: &'static str, action: &'static str| {
+            Line::from(vec![
+                Span::styled(format!("  {keys:<10}"), bold),
+                Span::styled(action, dim),
+            ])
+        };
+        let swatches: Vec<Span> = Hue::ALL
+            .iter()
+            .zip(1..)
+            .flat_map(|(hue, n)| {
+                [
+                    Span::styled(
+                        format!(" {n} {} ", hue.name()),
+                        Style::default().bg(hue.marker()).fg(MARK_INK),
+                    ),
+                    Span::raw(" "),
+                ]
+            })
+            .collect();
+        let mut lines = vec![
+            heading("Highlight"),
+            step("drag", "select text; it's copied as you let go"),
+            step("y", "highlight it, or clear a highlight it touches"),
+            Line::raw(""),
+            heading("Colors"),
+            Line::from([vec![Span::raw("  ")], swatches].concat()),
+            step("1-6", "pick a color; paints a selection too"),
+            Line::raw(""),
+            heading("Draw"),
+            step("d", "pen: drag anywhere to draw"),
+            step("e", "eraser: drag over a stroke to rub it out"),
+            step("esc", "back to selecting text"),
+            step("", "lines, boxes, triangles and circles snap clean"),
+            step("", "ink sticks to the word it starts on"),
+            Line::raw(""),
+            heading("Move and resize"),
+            step("v", "move tool: click a stroke to pick it"),
+            step("drag", "move it; drag a corner to resize"),
+            step("←↓↑→ +-", "nudge (or hjkl) · bigger / smaller"),
+            step("1-6  x", "recolor · delete · esc lets go"),
+        ];
+        if self.no_ink().is_some() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  Drawing needs Kitty graphics, and not inside tmux.",
+                dim,
+            )));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  saved as you go · esc close",
+            dim,
+        )));
+        Self::panel(f, area, "Mark up", lines, 58)
+    }
+
     fn draw_goto(&self, f: &mut Frame, area: Rect, digits: &str, page_count: usize) -> Rect {
         let hint = "enter go · esc cancel";
         let lines = vec![
             Line::from(vec![
-                Span::styled(digits.to_owned(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    digits.to_owned(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("▏"),
                 Span::styled(format!(" / {page_count}"), Style::default().fg(DIM)),
             ])
@@ -1017,7 +1431,10 @@ impl App {
         let hint = "enter find · esc cancel";
         let lines = vec![
             Line::from(vec![
-                Span::styled(typed.to_owned(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    typed.to_owned(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("▏"),
             ]),
             Line::default(),
@@ -1030,12 +1447,20 @@ impl App {
     fn draw_bookmarks(&self, f: &mut Frame, area: Rect, selected: usize) -> Rect {
         let hint = "enter go · x remove · esc close";
         if self.bookmarks.is_empty() {
-            let lines = vec![Line::from(Span::styled("No bookmarks yet. Press m to mark a page.", Style::default().fg(DIM))).centered()];
+            let lines = vec![
+                Line::from(Span::styled(
+                    "No bookmarks yet. Press m to mark a page.",
+                    Style::default().fg(DIM),
+                ))
+                .centered(),
+            ];
             return Self::panel(f, area, "Bookmarks", lines, 42);
         }
         // As many as fit, keeping the picked one in view.
         let room = (area.height as usize).saturating_sub(8).max(1);
-        let first = selected.saturating_sub(room - 1).min(self.bookmarks.len().saturating_sub(room));
+        let first = selected
+            .saturating_sub(room - 1)
+            .min(self.bookmarks.len().saturating_sub(room));
         let number_width = self.pages().to_string().len();
         let mut lines: Vec<Line> = self.bookmarks[first..]
             .iter()
@@ -1050,7 +1475,10 @@ impl App {
                 };
                 Line::from(vec![
                     Span::styled(if picked { "› " } else { "  " }, style),
-                    Span::styled(format!("{:>number_width$}  ", b.page + 1), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("{:>number_width$}  ", b.page + 1),
+                        Style::default().fg(DIM),
+                    ),
                     Span::styled(b.label.clone(), style),
                 ])
             })
@@ -1066,6 +1494,387 @@ impl App {
         Self::panel(f, area, "Bookmarks", lines, width)
     }
 
+    /// The voice picker: a search box over every voice, or a word that
+    /// they're on their way. The list keeps its size as the search narrows it.
+    fn draw_voices(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        typed: &str,
+        selected: Option<usize>,
+    ) -> Rect {
+        let hint = "↑/↓ pick · enter use · esc close";
+        let current = self.narrator.voice().to_owned();
+        let search = Line::from(vec![
+            Span::styled("search  ", Style::default().fg(DIM)),
+            Span::styled(
+                typed.to_owned(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("▏"),
+            Span::styled(
+                if typed.is_empty() {
+                    "name, language or gender"
+                } else {
+                    ""
+                },
+                Style::default().fg(DIM),
+            ),
+        ]);
+        let Some(voices) = self.narrator.voices() else {
+            let lines = vec![
+                search,
+                Line::default(),
+                Line::from(Span::styled("Loading voices…", Style::default().fg(DIM))),
+            ];
+            return Self::panel(f, area, "Voice", lines, 52);
+        };
+        let ranked = aloud::rank(voices, typed);
+        let picked = picked_voice(&ranked, &current, typed, selected);
+        let room = (area.height as usize)
+            .saturating_sub(12)
+            .clamp(1, voices.len().max(1));
+        let first = picked
+            .saturating_sub(room - 1)
+            .min(ranked.len().saturating_sub(room));
+        // Sized for every voice, so the panel holds still while typing.
+        let name_width = voices
+            .iter()
+            .map(|v| v.short().chars().count())
+            .max()
+            .unwrap_or(0);
+        let about_width = voices
+            .iter()
+            .map(|v| v.language.chars().count() + v.gender.chars().count() + 3)
+            .max()
+            .unwrap_or(0);
+        let mut lines = vec![
+            search,
+            Line::from(Span::styled(
+                format!("{} of {}", ranked.len(), voices.len()),
+                Style::default().fg(DIM),
+            )),
+            Line::default(),
+        ];
+        if ranked.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No voice matches. Try a name, language or gender.",
+                Style::default().fg(DIM),
+            )));
+        }
+        lines.extend(
+            ranked
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(room)
+                .map(|(i, v)| {
+                    let style = if i == picked {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    let mark = match (i == picked, v.name == current) {
+                        (true, _) => "› ",
+                        (false, true) => "• ",
+                        (false, false) => "  ",
+                    };
+                    Line::from(vec![
+                        Span::styled(mark, style),
+                        Span::styled(format!("{:<name_width$}  ", v.short()), style),
+                        Span::styled(
+                            format!("{} · {}", v.language, v.gender.to_lowercase()),
+                            Style::default().fg(DIM),
+                        ),
+                    ])
+                }),
+        );
+        let shown = ranked.len().saturating_sub(first).min(room).max(1);
+        lines.extend((shown..room).map(|_| Line::default()));
+        let width = (name_width + about_width + 4).max(hint.chars().count()) as u16;
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
+        Self::panel(f, area, "Voice", lines, width)
+    }
+
+    /// Typing in the voice picker searches; enter reads in the picked voice
+    /// from the word being read. While the list loads, only the search works.
+    fn voices_key(&mut self, key: &KeyEvent, typed: String, selected: Option<usize>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let current = self.narrator.voice().to_owned();
+        let pick = self.narrator.voices().map(|voices| {
+            let ranked = aloud::rank(voices, &typed);
+            let at = picked_voice(&ranked, &current, &typed, selected);
+            (
+                at,
+                ranked.len(),
+                ranked
+                    .get(at)
+                    .map(|v| (v.name.clone(), v.short().to_owned())),
+            )
+        });
+        let up = matches!(key.code, KeyCode::Up | KeyCode::BackTab)
+            || (ctrl && matches!(key.code, KeyCode::Char('p' | 'k')));
+        let down = matches!(key.code, KeyCode::Down | KeyCode::Tab)
+            || (ctrl && matches!(key.code, KeyCode::Char('n' | 'j')));
+        match (key.code, pick) {
+            (KeyCode::Esc, _) => self.dialog = Dialog::None,
+            (KeyCode::Enter, Some((_, _, Some((name, short))))) => {
+                self.dialog = Dialog::None;
+                (self.options.on_voice)(&name);
+                let reading = self.narrator.active();
+                self.narrator.set_voice(name);
+                self.follow = true;
+                self.notice = Some(if reading {
+                    format!("reading in {short}")
+                } else {
+                    format!("{short} reads next · a to start")
+                });
+            }
+            (_, Some((at, _, _))) if up => {
+                self.dialog = Dialog::Voices {
+                    typed,
+                    selected: Some(at.saturating_sub(1)),
+                }
+            }
+            (_, Some((at, count, _))) if down => {
+                self.dialog = Dialog::Voices {
+                    typed,
+                    selected: Some((at + 1).min(count.saturating_sub(1))),
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                let mut typed = typed;
+                typed.pop();
+                self.dialog = Dialog::Voices {
+                    typed,
+                    selected: None,
+                };
+            }
+            (KeyCode::Char(c), _) if !ctrl => {
+                self.dialog = Dialog::Voices {
+                    typed: format!("{typed}{c}"),
+                    selected: None,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the voice picker on the voice reading now.
+    fn open_voices(&mut self) {
+        self.narrator.prepare_voices();
+        self.dialog = Dialog::Voices {
+            typed: String::new(),
+            selected: None,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading aloud.
+
+    /// Where the text on screen starts: the sentence the top line is in, if it
+    /// began just above.
+    fn screen_top(&mut self) -> Spot {
+        for slot in self.screen.clone().into_iter().flatten() {
+            let prefix = self.prefix(slot.page);
+            if slot.row < prefix {
+                continue;
+            }
+            let laid = self.laid(slot.page);
+            let first = laid
+                .rows
+                .get(slot.row - prefix)
+                .and_then(|row| row.segs.iter().find_map(|seg| seg.offset));
+            if let Some(offset) = first {
+                let start = aloud::sentence_start(&laid.text, offset);
+                return Spot {
+                    page: slot.page,
+                    offset: if offset - start <= MAX_TEXT_WIDTH as usize {
+                        start
+                    } else {
+                        offset
+                    },
+                };
+            }
+        }
+        Spot {
+            page: self.current,
+            offset: 0,
+        }
+    }
+
+    /// The screen row character `offset` of `page` is on, as last drawn.
+    fn screen_row(&mut self, page: usize, offset: usize) -> Option<usize> {
+        let row = self.laid(page).locate(offset).0 + self.prefix(page);
+        self.screen
+            .iter()
+            .position(|s| s.is_some_and(|s| s.page == page && s.row == row))
+    }
+
+    /// Scrolls so character `offset` of `page` sits a third of the way down.
+    fn show(&mut self, page: usize, offset: usize) {
+        let row = self.laid(page).locate(offset).0 + self.prefix(page);
+        self.current = page.min(self.last());
+        let offset = row.saturating_sub(self.view() / 3);
+        match self.mode {
+            Mode::Paged => self.offset = offset.min(self.max_offset()),
+            Mode::Scroll => {
+                self.offset = offset;
+                self.clamp_end();
+            }
+        }
+    }
+
+    /// `a`: reads aloud from the selection, from where reading stopped if
+    /// that's on screen, or from the top of the screen; while reading, pauses
+    /// and carries on.
+    fn read_aloud(&mut self) {
+        self.follow = true;
+        if self.narrator.active() {
+            return self.narrator.toggle();
+        }
+        let from = match self.selection.map(Selection::range) {
+            Some((start, end)) if start != end => {
+                self.selection = None;
+                Spot {
+                    page: start.page,
+                    offset: start.offset,
+                }
+            }
+            _ => match self.narrator.resume() {
+                Some(spot) if self.screen_row(spot.page, spot.offset).is_some() => spot,
+                _ => self.screen_top(),
+            },
+        };
+        self.narrator.start(from);
+    }
+
+    /// `,` and `.`: back to the start of this sentence (or the one before,
+    /// just after one starts), or on to the next.
+    fn skip_sentence(&mut self, direction: Direction) {
+        let Some(here) = self.narrator.here() else {
+            return;
+        };
+        let laid = self.laid(here.page);
+        let text = &laid.text;
+        let target = match direction {
+            Direction::Forward => {
+                let end = aloud::sentence_end(text, here.offset);
+                if text[end.min(text.len())..]
+                    .iter()
+                    .any(|c| c.is_alphanumeric())
+                {
+                    Spot {
+                        page: here.page,
+                        offset: end,
+                    }
+                } else if here.page < self.last() {
+                    Spot {
+                        page: here.page + 1,
+                        offset: 0,
+                    }
+                } else {
+                    return;
+                }
+            }
+            Direction::Backward => {
+                let start = aloud::sentence_start(text, here.offset);
+                // Just into a sentence, back goes to the one before.
+                let words_in = text[start..here.offset.min(text.len())]
+                    .iter()
+                    .filter(|c| c.is_whitespace())
+                    .count();
+                if words_in >= 2 {
+                    Spot {
+                        page: here.page,
+                        offset: start,
+                    }
+                } else if start > 0 {
+                    let mut before = start;
+                    while before > 0 && text[before - 1].is_whitespace() {
+                        before -= 1;
+                    }
+                    Spot {
+                        page: here.page,
+                        offset: aloud::sentence_start(text, before.saturating_sub(1)),
+                    }
+                } else if here.page > 0 {
+                    let previous = self.laid(here.page - 1);
+                    let last = previous.text.len().saturating_sub(2);
+                    Spot {
+                        page: here.page - 1,
+                        offset: aloud::sentence_start(&previous.text, last),
+                    }
+                } else {
+                    Spot {
+                        page: here.page,
+                        offset: 0,
+                    }
+                }
+            }
+        };
+        self.follow = true;
+        if !self.narrator.seek(target) {
+            self.narrator.start(target);
+        }
+    }
+
+    fn change_speed(&mut self, faster: bool) {
+        let speed = aloud::step_speed(self.narrator.speed(), faster);
+        if speed != self.narrator.speed() {
+            self.narrator.set_speed(speed);
+            (self.options.on_speed)(speed);
+        }
+        self.notice = Some(format!("speed {}", aloud::speed_label(speed)));
+    }
+
+    /// Feeds the narrator text, takes in its speech, and keeps the word being
+    /// read in view. True when the screen should be drawn again.
+    fn narrate(&mut self) -> bool {
+        let pages = self.pages();
+        // A run of empty pages is crossed a few at a time, between keys.
+        for _ in 0..8 {
+            let Some((from, budget)) = self.narrator.wants() else {
+                break;
+            };
+            let cut = if from.page >= pages {
+                Cut::End
+            } else {
+                let laid = self.laid(from.page);
+                match aloud::cut(&laid.text, from.offset, budget) {
+                    Some((start, end)) => Cut::Passage {
+                        page: from.page,
+                        start,
+                        text: laid.text[start..end].to_vec(),
+                    },
+                    None => Cut::PageDone,
+                }
+            };
+            self.narrator.give(cut);
+        }
+        let before = self.narrator.said();
+        let mut changed = self.narrator.tick();
+        if let Some(notice) = self.narrator.take_notice() {
+            self.notice = Some(notice);
+            changed = true;
+        }
+        if let Some(said) = self.narrator.said()
+            && Some(said) != before
+        {
+            let y = self.screen_row(said.page, said.start);
+            if y.is_some() {
+                self.follow = true;
+            }
+            // Turn before the word reaches the very bottom, so the next line shows too.
+            let near_bottom = |y: usize| self.view() > 6 && y + 2 >= self.view();
+            if self.follow && y.is_none_or(near_bottom) {
+                self.show(said.page, said.start);
+            }
+        }
+        changed
+    }
+
     // -----------------------------------------------------------------------
     // Bookmarks.
 
@@ -1076,7 +1885,11 @@ impl App {
     /// The start of a page's text, for the bookmark list.
     fn page_label(&mut self, page: usize) -> String {
         let text: String = self.laid(page).text.iter().collect();
-        let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
         let mut label: String = line.chars().take(BOOKMARK_LABEL_CHARS).collect();
         if line.chars().count() > BOOKMARK_LABEL_CHARS {
             label.push('…');
@@ -1123,7 +1936,9 @@ impl App {
             }
             // A held key would remove one bookmark after another.
             KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace
-                if key.kind == KeyEventKind::Press && selected <= last && !self.bookmarks.is_empty() =>
+                if key.kind == KeyEventKind::Press
+                    && selected <= last
+                    && !self.bookmarks.is_empty() =>
             {
                 self.bookmarks.remove(selected);
                 (self.options.on_bookmarks)(&self.bookmarks);
@@ -1139,14 +1954,20 @@ impl App {
     // Search.
 
     fn seeking(&self) -> bool {
-        self.search.as_ref().is_some_and(|s| matches!(s.seek, Seek::Seeking { .. }))
+        self.search
+            .as_ref()
+            .is_some_and(|s| matches!(s.seek, Seek::Seeking { .. }))
     }
 
     /// Searches from `from`, reading pages for a while.
     fn seek(&mut self, query: Query, direction: Direction, from: TextPos) {
         self.search = Some(Search {
             query,
-            seek: Seek::Seeking { direction, from, step: 0 },
+            seek: Seek::Seeking {
+                direction,
+                from,
+                step: 0,
+            },
         });
         self.advance_search(SEARCH_SLICE);
     }
@@ -1154,8 +1975,15 @@ impl App {
     /// Reads pages for the next match until one is found, every page has
     /// been read, or `budget` runs out; the event loop carries on from there.
     fn advance_search(&mut self, budget: Duration) {
-        let Some(search) = self.search.take() else { return };
-        let Seek::Seeking { direction, from, mut step } = search.seek else {
+        let Some(search) = self.search.take() else {
+            return;
+        };
+        let Seek::Seeking {
+            direction,
+            from,
+            mut step,
+        } = search.seek
+        else {
             self.search = Some(search);
             return;
         };
@@ -1187,7 +2015,11 @@ impl App {
             }
             step += 1;
             if started.elapsed() >= budget {
-                break Seek::Seeking { direction, from, step };
+                break Seek::Seeking {
+                    direction,
+                    from,
+                    step,
+                };
             }
         };
         if let Seek::Found(found) = seek {
@@ -1209,7 +2041,14 @@ impl App {
             Direction::Forward => here.start + 1,
             Direction::Backward => here.start,
         };
-        self.seek(query.clone(), direction, TextPos { page: here.page, offset });
+        self.seek(
+            query.clone(),
+            direction,
+            TextPos {
+                page: here.page,
+                offset,
+            },
+        );
     }
 
     /// Turns to a match's page and, if it is below the first screen, scrolls
@@ -1221,7 +2060,12 @@ impl App {
             seg.offset
                 .is_some_and(|o| o <= found.start && found.start < o + seg.text.chars().count())
         };
-        let row = laid.rows.iter().position(|row| row.segs.iter().any(holds)).unwrap_or(0) + self.prefix(found.page);
+        let row = laid
+            .rows
+            .iter()
+            .position(|row| row.segs.iter().any(holds))
+            .unwrap_or(0)
+            + self.prefix(found.page);
         if row >= self.view() {
             let offset = row.saturating_sub(self.view() / 3);
             self.offset = match self.mode {
@@ -1259,7 +2103,10 @@ impl App {
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let next = format!("{digits}{c}");
                 if !next.starts_with('0') && next.parse::<usize>().is_ok_and(|n| n <= page_count) {
-                    self.dialog = Dialog::Goto { digits: next, page_count };
+                    self.dialog = Dialog::Goto {
+                        digits: next,
+                        page_count,
+                    };
                 }
             }
             _ => {}
@@ -1298,6 +2145,15 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        let place = (self.current, self.offset);
+        self.act(key);
+        // Scrolling away from the word being read stops the screen following it.
+        if place != (self.current, self.offset) {
+            self.follow = false;
+        }
+    }
+
+    fn act(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -1305,17 +2161,29 @@ impl App {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
             Dialog::Find { typed } => return self.find_key(&key, typed),
             Dialog::Bookmarks { selected } => return self.bookmarks_key(&key, selected),
-            Dialog::Help => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+            Dialog::Voices { typed, selected } => return self.voices_key(&key, typed, selected),
+            Dialog::Help | Dialog::Guide => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('!')
+                ) {
                     self.dialog = Dialog::None;
                 }
                 return;
             }
             Dialog::None => {}
         }
+        self.notice = None;
+        if self.tool == Tool::Move && self.arrange_key(&key) {
+            return;
+        }
+        if let Some(hue) = typed(&key).and_then(Hue::of_key) {
+            return self.pick_hue(hue);
+        }
         let paged = self.mode == Mode::Paged;
         match typed(&key) {
             Some('?') | Some('/') => self.dialog = Dialog::Help,
+            Some('!') => self.dialog = Dialog::Guide,
             Some('t') | Some(':') => {
                 if let Some(page_count) = self.doc.page_count {
                     self.dialog = Dialog::Goto {
@@ -1328,17 +2196,27 @@ impl App {
             Some('\'') if self.doc.page_count.is_some() => {
                 // Opens on the bookmark at or before the page being read.
                 let reading = self.reading();
-                let selected = self.bookmarks.partition_point(|b| b.page <= reading).saturating_sub(1);
+                let selected = self
+                    .bookmarks
+                    .partition_point(|b| b.page <= reading)
+                    .saturating_sub(1);
                 self.dialog = Dialog::Bookmarks { selected };
             }
-            Some('f') | Some('F') => self.dialog = Dialog::Find { typed: String::new() },
+            Some('f') | Some('F') => {
+                self.dialog = Dialog::Find {
+                    typed: String::new(),
+                }
+            }
             Some('n') if self.found_here().is_some() => self.next_match(Direction::Forward),
             Some('N') => self.next_match(Direction::Backward),
             Some('q') => self.quit = true,
             Some('y') => self.toggle_highlight(),
             Some('j') => self.scroll_by(1),
             Some('k') => self.scroll_by(-1),
-            Some('d') => self.scroll_by(self.screen_step() / 2),
+            // Plain d is the pen, so half a screen down is ctrl+d, as in vim.
+            Some('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_by(self.screen_step() / 2)
+            }
             Some('u') => self.scroll_by(-(self.screen_step() / 2)),
             Some(' ') => self.next_screen(paged),
             Some('b') => self.previous_screen(paged),
@@ -1347,11 +2225,28 @@ impl App {
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
+            Some('d') | Some('D') => self.take_tool(Tool::Pen),
+            Some('e') | Some('E') => self.take_tool(Tool::Eraser),
+            Some('v') | Some('V') => self.take_tool(Tool::Move),
+            Some('a') if key.kind == KeyEventKind::Press => self.read_aloud(),
+            Some('A') if self.narrator.active() => self.narrator.stop(),
+            Some('s') | Some('S') => self.open_voices(),
+            Some('[') => self.change_speed(false),
+            Some(']') => self.change_speed(true),
+            Some(',') => self.skip_sentence(Direction::Backward),
+            Some('.') => self.skip_sentence(Direction::Forward),
             _ => match key.code {
-                // Esc lets go of a selection, then a search, then quits.
+                // Esc lets go of a picked stroke, puts the pen down, then lets
+                // go of a selection, then a search, then quits.
+                KeyCode::Esc if self.picked.take().is_some() => {}
+                KeyCode::Esc if self.tool != Tool::Select => self.tool = Tool::Select,
                 KeyCode::Esc => {
                     if self.selection.take().is_none() && self.search.take().is_none() {
-                        self.quit = true;
+                        if self.narrator.active() {
+                            self.narrator.stop();
+                        } else {
+                            self.quit = true;
+                        }
                     }
                 }
                 KeyCode::Down => self.scroll_by(1),
@@ -1402,7 +2297,11 @@ impl App {
         let laid = self.laid(slot.page);
         let prefix = self.prefix(slot.page);
         let col = x.saturating_sub(self.column.x);
-        let text_rows = laid.rows.iter().enumerate().skip(slot.row.saturating_sub(prefix));
+        let text_rows = laid
+            .rows
+            .iter()
+            .enumerate()
+            .skip(slot.row.saturating_sub(prefix));
         for (i, row) in text_rows {
             let segs: Vec<&render::Seg> = row.segs.iter().filter(|s| s.offset.is_some()).collect();
             let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
@@ -1410,7 +2309,10 @@ impl App {
             };
             // A row below the one pointed at: its start.
             if i + prefix != slot.row || col < first.x {
-                return first.offset.map(|offset| TextPos { page: slot.page, offset });
+                return first.offset.map(|offset| TextPos {
+                    page: slot.page,
+                    offset,
+                });
             }
             for seg in &segs {
                 let mut sx = seg.x;
@@ -1440,30 +2342,448 @@ impl App {
         if self.dialog != Dialog::None {
             return;
         }
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.selection = self.hit(mouse.column, mouse.row).map(|at| Selection { anchor: at, head: at });
-                self.dragging = self.selection.is_some();
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
-                if let (Some(selection), Some(head)) = (self.selection, self.hit(mouse.column, mouse.row)) {
-                    self.selection = Some(Selection { head, ..selection });
+        let (x, y) = (mouse.column, mouse.row);
+        match (mouse.kind, self.tool) {
+            (MouseEventKind::Down(MouseButton::Left), Tool::Select) => {
+                self.selection = self.hit(x, y).map(|at| Selection {
+                    anchor: at,
+                    head: at,
+                });
+                if self.selection.is_some() {
+                    self.drag = Drag::Selecting;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
-                self.dragging = false;
-                let text = self.selected_text();
-                if text.is_empty() {
-                    self.selection = None;
-                } else {
-                    // Taking over the mouse turns off the terminal's own selection, so copy here.
-                    self.copy = Some(text);
+            (MouseEventKind::Down(MouseButton::Left), Tool::Pen) => {
+                self.selection = None;
+                if let Some(at) = self.hit(x, y)
+                    && let Some(point) = self.point_from(at.page, at.offset, x, y)
+                {
+                    let serial = self.next_serial;
+                    self.next_serial += 1;
+                    self.drag = Drag::Inking(Inked {
+                        serial,
+                        stroke: Stroke::begin(at.page, at.offset, self.hue, point),
+                    });
                 }
             }
-            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_STEP),
-            MouseEventKind::ScrollUp => self.scroll_by(-WHEEL_STEP),
+            (MouseEventKind::Down(MouseButton::Left), Tool::Eraser) => {
+                self.selection = None;
+                let erased = self.erase_at(x, y);
+                self.drag = Drag::Erasing { erased };
+            }
+            (MouseEventKind::Down(MouseButton::Left), Tool::Move) => {
+                self.selection = None;
+                self.take_hold(x, y);
+            }
+            (MouseEventKind::Drag(MouseButton::Left), _) => match &self.drag {
+                Drag::Idle => {}
+                Drag::Selecting => {
+                    if let (Some(selection), Some(head)) = (self.selection, self.hit(x, y)) {
+                        self.selection = Some(Selection { head, ..selection });
+                    }
+                }
+                Drag::Inking(inked) => {
+                    let (page, anchor) = (inked.stroke.page, inked.stroke.anchor);
+                    if let Some(point) = self.point_from(page, anchor, x, y)
+                        && let Drag::Inking(inked) = &mut self.drag
+                    {
+                        inked.stroke.extend(point);
+                    }
+                }
+                Drag::Erasing { erased } => {
+                    let erased = *erased;
+                    let now = self.erase_at(x, y);
+                    self.drag = Drag::Erasing {
+                        erased: erased || now,
+                    };
+                }
+                Drag::Moving { from, original } => {
+                    let (from, mut stroke) = (*from, original.clone());
+                    stroke.shift(x as f32 - from.0 as f32, y as f32 - from.1 as f32);
+                    self.replace_picked(stroke);
+                }
+                Drag::Resizing { corner, original } => {
+                    let (corner, original) = (*corner, original.clone());
+                    if let Some(p) = self.point_from(original.page, original.anchor, x, y) {
+                        let to = original.extent().dragged(corner, handle_to_ink(corner, p));
+                        self.replace_picked(original.fitted(to));
+                    }
+                }
+            },
+            (MouseEventKind::Up(MouseButton::Left), _) => {
+                match std::mem::replace(&mut self.drag, Drag::Idle) {
+                    Drag::Idle | Drag::Erasing { erased: false } => {}
+                    Drag::Selecting => {
+                        let text = self.selected_text();
+                        if text.is_empty() {
+                            self.selection = None;
+                        } else {
+                            // Taking over the mouse turns off the terminal's own selection, so copy here.
+                            self.copy = Some(text);
+                        }
+                    }
+                    Drag::Inking(inked) => {
+                        let font = self.picker.font_size();
+                        let stroke = inked.stroke.tidied((font.width, font.height));
+                        // A tidied stroke is drawn afresh, not from the images of it being drawn.
+                        let serial = if stroke.trace == Trace::Shape {
+                            self.next_serial += 1;
+                            self.next_serial - 1
+                        } else {
+                            inked.serial
+                        };
+                        self.strokes.push(Inked { serial, stroke });
+                        self.report_strokes();
+                    }
+                    Drag::Erasing { erased: true } => self.report_strokes(),
+                    Drag::Moving { original, .. } | Drag::Resizing { original, .. } => {
+                        if self.picked_stroke() != Some(&original) {
+                            self.reanchor_picked();
+                            self.report_strokes();
+                        }
+                    }
+                }
+            }
+            (MouseEventKind::ScrollDown, _) => {
+                self.follow = false;
+                self.scroll_by(WHEEL_STEP)
+            }
+            (MouseEventKind::ScrollUp, _) => {
+                self.follow = false;
+                self.scroll_by(-WHEEL_STEP)
+            }
             _ => {}
         }
+    }
+
+    /// The screen cell a page's character `anchor` is drawn in, if the page is on screen.
+    fn anchor_cell(&mut self, page: usize, anchor: usize) -> Option<(i32, i32)> {
+        let (y, slot) = self
+            .screen
+            .iter()
+            .enumerate()
+            .find_map(|(y, s)| s.filter(|s| s.page == page).map(|s| (y, s)))?;
+        let top = self.column.y as i32 + y as i32 - slot.row as i32;
+        let (row, col) = self.laid(page).locate(anchor);
+        Some((
+            self.column.x as i32 + col as i32,
+            top + (self.prefix(page) + row) as i32,
+        ))
+    }
+
+    /// The middle of screen cell `x`, `y`, measured from a page's character `anchor`.
+    fn point_from(&mut self, page: usize, anchor: usize, x: u16, y: u16) -> Option<Point> {
+        let (ox, oy) = self.anchor_cell(page, anchor)?;
+        Some(Point {
+            x: x as f32 + 0.5 - ox as f32,
+            y: y as f32 + 0.5 - oy as f32,
+        })
+    }
+
+    /// Rubs out every stroke on screen passing through cell `x`, `y`; says whether any went.
+    fn erase_at(&mut self, x: u16, y: u16) -> bool {
+        let pins: Vec<(usize, usize)> = self
+            .strokes
+            .iter()
+            .map(|i| (i.stroke.page, i.stroke.anchor))
+            .collect();
+        let points: Vec<Option<Point>> = pins
+            .into_iter()
+            .map(|(page, anchor)| self.point_from(page, anchor, x, y))
+            .collect();
+        let before = self.strokes.len();
+        let mut points = points.into_iter();
+        self.strokes.retain(|inked| {
+            !points
+                .next()
+                .flatten()
+                .is_some_and(|p| inked.stroke.near(p, ERASER_REACH))
+        });
+        self.strokes.len() != before
+    }
+
+    fn picked_index(&self) -> Option<usize> {
+        let serial = self.picked?;
+        self.strokes.iter().position(|i| i.serial == serial)
+    }
+
+    fn picked_stroke(&self) -> Option<&Stroke> {
+        self.picked_index().map(|i| &self.strokes[i].stroke)
+    }
+
+    /// Puts `stroke` in place of the picked one, under a new serial so it's drawn afresh.
+    fn replace_picked(&mut self, stroke: Stroke) {
+        let Some(i) = self.picked_index() else {
+            return;
+        };
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.strokes[i] = Inked { serial, stroke };
+        self.picked = Some(serial);
+    }
+
+    /// With the move tool: a corner handle or the inside of the picked
+    /// stroke's frame takes hold of it; otherwise the topmost stroke under
+    /// the mouse is picked, ready to carry, or nothing is.
+    fn take_hold(&mut self, x: u16, y: u16) {
+        if let Some(stroke) = self.picked_stroke().cloned()
+            && let Some(p) = self.point_from(stroke.page, stroke.anchor, x, y)
+        {
+            let frame = stroke.extent().padded(FRAME_PAD);
+            let handle = Corner::ALL.into_iter().find(|&c| {
+                let h = frame.corner(c);
+                (p.x - h.x).abs() <= 1.0 && (p.y - h.y).abs() <= 0.75
+            });
+            if let Some(corner) = handle {
+                self.drag = Drag::Resizing {
+                    corner,
+                    original: stroke,
+                };
+                return;
+            }
+            if frame.padded(Point { x: 0.5, y: 0.5 }).contains(p) {
+                self.drag = Drag::Moving {
+                    from: (x, y),
+                    original: stroke,
+                };
+                return;
+            }
+        }
+        self.picked = None;
+        for i in (0..self.strokes.len()).rev() {
+            let (page, anchor) = (self.strokes[i].stroke.page, self.strokes[i].stroke.anchor);
+            if let Some(p) = self.point_from(page, anchor, x, y)
+                && self.strokes[i].stroke.near(p, PICK_REACH)
+            {
+                self.picked = Some(self.strokes[i].serial);
+                self.drag = Drag::Moving {
+                    from: (x, y),
+                    original: self.strokes[i].stroke.clone(),
+                };
+                return;
+            }
+        }
+    }
+
+    /// Pins the picked stroke to the word now under its first point, so a
+    /// stroke carried to another paragraph moves with that one when text reflows.
+    fn reanchor_picked(&mut self) {
+        let Some(i) = self.picked_index() else {
+            return;
+        };
+        let stroke = self.strokes[i].stroke.clone();
+        let Some((ox, oy)) = self.anchor_cell(stroke.page, stroke.anchor) else {
+            return;
+        };
+        let (sx, sy) = (
+            ox as f32 + stroke.points[0].x,
+            oy as f32 + stroke.points[0].y,
+        );
+        if sx < 0.0 || sy < 0.0 || sx > u16::MAX as f32 || sy > u16::MAX as f32 {
+            return;
+        }
+        let Some(at) = self.hit(sx as u16, sy as u16) else {
+            return;
+        };
+        let Some((nx, ny)) = self.anchor_cell(at.page, at.offset) else {
+            return;
+        };
+        let mut moved = stroke;
+        moved.shift((ox - nx) as f32, (oy - ny) as f32);
+        moved.page = at.page;
+        moved.anchor = at.offset;
+        self.strokes[i].stroke = moved;
+    }
+
+    /// Keys for the picked stroke: arrows or `hjkl` nudge it a cell, `+`
+    /// and `-` resize it, a number recolors it, and `x` deletes it. Says
+    /// whether the key was one of them.
+    fn arrange_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(stroke) = self.picked_stroke().cloned() else {
+            return false;
+        };
+        let nudge = match (key.code, typed(key)) {
+            (KeyCode::Left, _) | (_, Some('h')) => Some((-1.0, 0.0)),
+            (KeyCode::Right, _) | (_, Some('l')) => Some((1.0, 0.0)),
+            (KeyCode::Up, _) | (_, Some('k')) => Some((0.0, -1.0)),
+            (KeyCode::Down, _) | (_, Some('j')) => Some((0.0, 1.0)),
+            _ => None,
+        };
+        let changed = if let Some((dx, dy)) = nudge {
+            let mut moved = stroke;
+            moved.shift(dx, dy);
+            moved
+        } else if matches!(typed(key), Some('+') | Some('=')) {
+            stroke.fitted(stroke.extent().scaled(GROW))
+        } else if typed(key) == Some('-') {
+            stroke.fitted(stroke.extent().scaled(1.0 / GROW))
+        } else if let Some(hue) = typed(key).and_then(Hue::of_key) {
+            self.hue = hue;
+            Stroke { hue, ..stroke }
+        } else if matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
+            || typed(key) == Some('x')
+        {
+            if let Some(i) = self.picked_index() {
+                self.strokes.remove(i);
+            }
+            self.picked = None;
+            self.report_strokes();
+            return true;
+        } else {
+            return false;
+        };
+        self.replace_picked(changed);
+        self.reanchor_picked();
+        self.report_strokes();
+        true
+    }
+
+    fn report_strokes(&mut self) {
+        let strokes: Vec<Stroke> = self.strokes.iter().map(|i| i.stroke.clone()).collect();
+        (self.options.on_strokes)(&strokes);
+    }
+
+    /// Why ink can't be drawn here, when it can't.
+    fn no_ink(&self) -> Option<&'static str> {
+        match (&self.kitty, self.picker.tmux_detected()) {
+            (Some(_), _) => None,
+            (None, true) => Some("drawing needs Kitty graphics, which leaf can't use inside tmux"),
+            (None, false) => Some(
+                "drawing needs Kitty graphics, which this terminal doesn't have; try Kitty, Ghostty or WezTerm",
+            ),
+        }
+    }
+
+    /// Takes up `tool`, or says why ink can't be drawn.
+    fn take_tool(&mut self, tool: Tool) {
+        if let Some(reason) = self.no_ink() {
+            self.notice = Some(reason.to_owned());
+            return;
+        }
+        self.selection = None;
+        self.picked = None;
+        self.tool = tool;
+    }
+
+    /// Draws the part of each stroke on screen, and the one being drawn.
+    fn draw_strokes(&mut self, area: Rect) {
+        if self.kitty.is_none() {
+            return;
+        }
+        let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
+        let live = match &self.drag {
+            Drag::Inking(inked) => Some(inked),
+            _ => None,
+        };
+        let pins: HashSet<(usize, usize)> = self
+            .strokes
+            .iter()
+            .chain(live)
+            .map(|i| (i.stroke.page, i.stroke.anchor))
+            .filter(|(page, _)| pages.contains(page))
+            .collect();
+        let origins: HashMap<(usize, usize), (i32, i32)> = pins
+            .into_iter()
+            .filter_map(|pin| Some((pin, self.anchor_cell(pin.0, pin.1)?)))
+            .collect();
+        let font = self.picker.font_size();
+        let view = Cells {
+            left: area.x as i32,
+            top: self.column.y as i32,
+            cols: area.width,
+            rows: self.view_height,
+        };
+        let Some(kitty) = &mut self.kitty else {
+            return;
+        };
+        let live = match &self.drag {
+            Drag::Inking(inked) => Some(inked),
+            _ => None,
+        };
+        let mut used = HashSet::new();
+        for inked in self.strokes.iter().chain(live) {
+            let stroke = &inked.stroke;
+            let Some(&(ox, oy)) = origins.get(&(stroke.page, stroke.anchor)) else {
+                continue;
+            };
+            let Some(visible) = stroke.bounds().shift(ox, oy).intersect(view) else {
+                continue;
+            };
+            let key = InkKey {
+                serial: inked.serial,
+                points: stroke.points.len(),
+                clip: visible.shift(-ox, -oy),
+                frame: false,
+            };
+            let image = match self.ink_drawn.get(&key) {
+                Some(image) => *image,
+                None => {
+                    let Some(image) =
+                        stroke
+                            .paint(key.clip, (font.width, font.height))
+                            .and_then(|pixels| {
+                                kitty.upload(&pixels, visible.cols, visible.rows, INK_LAYER)
+                            })
+                    else {
+                        continue;
+                    };
+                    self.ink_drawn.insert(key, image);
+                    image
+                }
+            };
+            let rect = Rect {
+                x: visible.left as u16,
+                y: visible.top as u16,
+                width: visible.cols,
+                height: visible.rows,
+            };
+            self.placements.push((image, rect));
+            used.insert(key);
+        }
+        // The picked stroke's frame, with a handle at each corner.
+        let picked = self
+            .picked
+            .and_then(|serial| self.strokes.iter().find(|i| i.serial == serial));
+        if let Some(inked) = picked
+            && let Some(&(ox, oy)) = origins.get(&(inked.stroke.page, inked.stroke.anchor))
+            && let Some(visible) = inked.stroke.frame_bounds().shift(ox, oy).intersect(view)
+        {
+            let key = InkKey {
+                serial: inked.serial,
+                points: inked.stroke.points.len(),
+                clip: visible.shift(-ox, -oy),
+                frame: true,
+            };
+            let image = match self.ink_drawn.get(&key) {
+                Some(image) => Some(*image),
+                None => {
+                    stroke::paint_frame(inked.stroke.extent(), key.clip, (font.width, font.height))
+                        .and_then(|pixels| {
+                            kitty.upload(&pixels, visible.cols, visible.rows, FRAME_LAYER)
+                        })
+                        .inspect(|image| {
+                            self.ink_drawn.insert(key, *image);
+                        })
+                }
+            };
+            if let Some(image) = image {
+                let rect = Rect {
+                    x: visible.left as u16,
+                    y: visible.top as u16,
+                    width: visible.cols,
+                    height: visible.rows,
+                };
+                self.placements.push((image, rect));
+                used.insert(key);
+            }
+        }
+        self.ink_drawn.retain(|key, image| {
+            let kept = used.contains(key);
+            if !kept {
+                kitty.free(*image);
+            }
+            kept
+        });
     }
 
     /// The selection as ranges of page text, one per page it spans.
@@ -1475,7 +2795,12 @@ impl App {
         for page in start.page..=end.page {
             let text = self.laid(page).text.clone();
             let from = if page == start.page { start.offset } else { 0 }.min(text.len());
-            let to = if page == end.page { end.offset } else { text.len() }.min(text.len());
+            let to = if page == end.page {
+                end.offset
+            } else {
+                text.len()
+            }
+            .min(text.len());
             if from < to {
                 let slice: String = text[from..to].iter().collect();
                 ranges.push(Highlight {
@@ -1483,6 +2808,7 @@ impl App {
                     start: from,
                     end: to,
                     text: slice.trim_end_matches('\n').to_owned(),
+                    hue: self.hue,
                 });
             }
         }
@@ -1490,7 +2816,11 @@ impl App {
     }
 
     fn selected_text(&mut self) -> String {
-        self.selected_ranges().into_iter().map(|r| r.text).collect::<Vec<_>>().join("\n")
+        self.selected_ranges()
+            .into_iter()
+            .map(|r| r.text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Highlights the selection, or clears highlights it touches.
@@ -1504,13 +2834,34 @@ impl App {
         (self.options.on_highlights)(&self.highlights);
     }
 
+    /// Makes `hue` the color of new highlights and ink. A selection is
+    /// painted in it straight away: the highlights it touches change
+    /// color, or it becomes one.
+    fn pick_hue(&mut self, hue: Hue) {
+        self.hue = hue;
+        self.notice = Some(format!("{} picked", hue.name()));
+        if self.selection.is_none() {
+            return;
+        }
+        let ranges = highlight::merge(self.selected_ranges());
+        self.highlights = highlight::paint(&self.highlights, &ranges, hue);
+        self.selection = None;
+        (self.options.on_highlights)(&self.highlights);
+    }
+
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+        // Set when the loop woke only to follow the narration.
+        let mut quiet = false;
         loop {
             self.receive_images();
             self.advance_search(SEARCH_SLICE);
-            terminal.draw(|f| self.draw(f))?;
-            if let Some(kitty) = &mut self.kitty {
-                kitty.flush(&mut io::stdout(), &self.placements)?;
+            let narrated = self.narrate();
+            // Between words nothing on screen changes, so there's nothing to draw.
+            if narrated || !quiet {
+                terminal.draw(|f| self.draw(f))?;
+                if let Some(kitty) = &mut self.kitty {
+                    kitty.flush(&mut io::stdout(), &self.placements)?;
+                }
             }
             if let Some(text) = self.copy.take() {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(text);
@@ -1528,16 +2879,21 @@ impl App {
                 }
                 return Ok(());
             }
-            // A search keeps reading pages between keys, and images
-            // downloading are checked for often; otherwise sleep until something happens.
+            // A search keeps reading pages between keys, the word read aloud
+            // is followed closely, and images downloading are checked for
+            // often; otherwise sleep until something happens.
             let wait = if self.seeking() {
                 Some(Duration::ZERO)
+            } else if self.narrator.busy() {
+                Some(NARRATION_TICK)
             } else {
                 self.loading().then_some(Duration::from_millis(100))
             };
+            quiet = false;
             if let Some(wait) = wait
                 && !event::poll(wait)?
             {
+                quiet = !self.seeking() && !self.loading();
                 continue;
             }
             // Handle everything already waiting before drawing again.
@@ -1563,14 +2919,16 @@ impl App {
 
 /// Asks the terminal for its text (OSC 10) or background (OSC 11) color, so
 /// painted images and diagrams match the text.
-fn query_color(code: u8) -> Option<Rgb> {
+pub(crate) fn query_color(code: u8) -> Option<Rgb> {
     let mut out = io::stdout();
     write!(out, "\x1b]{code};?\x1b\\").ok()?;
     out.flush().ok()?;
     let mut reply = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+        let left = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as i32;
         let mut fd = libc::pollfd {
             fd: libc::STDIN_FILENO,
             events: libc::POLLIN,
@@ -1716,7 +3074,10 @@ mod tests {
             frame
                 .lines()
                 .enumerate()
-                .find_map(|(y, line)| line.find(text).map(|x| (line[..x].chars().count() as u16, y as u16)))
+                .find_map(|(y, line)| {
+                    line.find(text)
+                        .map(|x| (line[..x].chars().count() as u16, y as u16))
+                })
                 .expect("text is on screen")
         }
     }
@@ -1761,20 +3122,33 @@ mod tests {
             ViewerOptions::default(),
         );
         let frame = s.draw();
-        assert!(frame.contains("Alpha text") && !frame.contains("Bravo text"), "{frame}");
+        assert!(
+            frame.contains("Alpha text") && !frame.contains("Bravo text"),
+            "{frame}"
+        );
         assert!(frame.contains("1 / 3 · 33%"));
         let frame = s.press(KeyCode::Right);
-        assert!(frame.contains("Bravo text") && frame.contains("2 / 3"), "{frame}");
+        assert!(
+            frame.contains("Bravo text") && frame.contains("2 / 3"),
+            "{frame}"
+        );
         let frame = s.press(KeyCode::Char('G'));
         assert!(frame.contains("Charlie text") && frame.contains("3 / 3 · 100%"));
     }
 
     #[test]
     fn a_narrow_window_scrolls_through_pages_with_numbers_between() {
-        let mut s = Screen::new(book(&["Alpha text", "Bravo text"]), 60, 20, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["Alpha text", "Bravo text"]),
+            60,
+            20,
+            ViewerOptions::default(),
+        );
         let frame = s.draw();
         assert!(
-            frame.contains("Alpha text") && frame.contains("·  2  ·") && frame.contains("Bravo text"),
+            frame.contains("Alpha text")
+                && frame.contains("·  2  ·")
+                && frame.contains("Bravo text"),
             "{frame}"
         );
     }
@@ -1832,9 +3206,17 @@ mod tests {
     #[test]
     fn space_finishes_a_long_page_before_turning_it() {
         let long: String = (1..=60).map(|i| format!("Line {i}\n\n")).collect();
-        let mut s = Screen::new(book(&[&long, "Next page"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&[&long, "Next page"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         let frame = s.press(KeyCode::Char(' '));
-        assert!(!frame.contains("Next page") && frame.contains("1 / 2"), "{frame}");
+        assert!(
+            !frame.contains("Next page") && frame.contains("1 / 2"),
+            "{frame}"
+        );
         let mut frame = frame;
         for _ in 0..10 {
             if frame.contains("Next page") {
@@ -1844,7 +3226,10 @@ mod tests {
         }
         assert!(frame.contains("Next page"), "{frame}");
         let frame = s.press(KeyCode::Char('b'));
-        assert!(frame.contains("Line 60"), "b goes back to the end of the previous page: {frame}");
+        assert!(
+            frame.contains("Line 60"),
+            "b goes back to the end of the previous page: {frame}"
+        );
     }
 
     #[test]
@@ -1868,9 +3253,15 @@ mod tests {
         );
         s.press(KeyCode::Char('G'));
         let list = s.press(KeyCode::Char('\''));
-        assert!(list.contains("Bookmarks") && list.contains("Bravo text"), "{list}");
+        assert!(
+            list.contains("Bookmarks") && list.contains("Bravo text"),
+            "{list}"
+        );
         let frame = s.press(KeyCode::Enter);
-        assert!(frame.contains("Bravo text") && frame.contains("2 / 3"), "{frame}");
+        assert!(
+            frame.contains("Bravo text") && frame.contains("2 / 3"),
+            "{frame}"
+        );
         s.press(KeyCode::Char('m'));
         assert!(saved.borrow().is_empty());
     }
@@ -1963,7 +3354,9 @@ mod tests {
     #[test]
     fn go_to_page_takes_only_digits_within_the_book() {
         let mut s = Screen::new(
-            book(&["A1", "B2", "C3", "D4", "E5", "F6", "G7", "H8", "I9", "J10", "K11", "L12"]),
+            book(&[
+                "A1", "B2", "C3", "D4", "E5", "F6", "G7", "H8", "I9", "J10", "K11", "L12",
+            ]),
             120,
             30,
             ViewerOptions::default(),
@@ -1974,7 +3367,10 @@ mod tests {
         let frame = s.press(KeyCode::Char('2'));
         assert!(frame.contains("12▏ / 12"), "{frame}");
         let frame = s.press(KeyCode::Enter);
-        assert!(frame.contains("L12") && frame.contains("12 / 12"), "{frame}");
+        assert!(
+            frame.contains("L12") && frame.contains("12 / 12"),
+            "{frame}"
+        );
     }
 
     #[test]
@@ -1995,13 +3391,340 @@ mod tests {
         assert_eq!(saved.borrow().len(), 1);
         assert_eq!(saved.borrow()[0].text, "words");
         let cell = &s.terminal.backend().buffer()[(x, y)];
-        assert_eq!(cell.bg, MARK);
+        assert_eq!(cell.bg, Hue::Yellow.marker());
         // Selecting inside it and pressing y again clears it.
         s.mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y);
         s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 3, y);
         s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
         s.press(KeyCode::Char('y'));
         assert!(saved.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_number_key_paints_the_selection_and_recolors_a_highlight() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_highlights: Box::new(move |h| *heard.borrow_mut() = h.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Some words to select here."]), 120, 30, options);
+        let (x, y) = s.find("words");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        let frame = s.press(KeyCode::Char('3'));
+        assert!(frame.contains("blue picked"));
+        assert_eq!(s.terminal.backend().buffer()[(x, y)].bg, Hue::Blue.marker());
+        // A selection inside it turns it pink, and new highlights stay pink.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 2, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 2, y);
+        s.press(KeyCode::Char('4'));
+        assert_eq!(saved.borrow().len(), 1);
+        assert_eq!(saved.borrow()[0].hue, Hue::Pink);
+        assert_eq!(
+            s.terminal.backend().buffer()[(x + 4, y)].bg,
+            Hue::Pink.marker()
+        );
+        assert_eq!(s.app.hue, Hue::Pink);
+    }
+
+    /// A screen whose terminal takes kitty images, so ink can be drawn.
+    fn inking(text: &str, options: ViewerOptions) -> Screen {
+        let mut s = Screen::new(book(&[text]), 120, 30, options);
+        s.app.kitty = Some(Kitty::default());
+        s.draw();
+        s
+    }
+
+    fn ink_on_screen(s: &Screen) -> Vec<Rect> {
+        s.app
+            .placements
+            .iter()
+            .filter(|(image, _)| image.layer == INK_LAYER)
+            .map(|(_, rect)| *rect)
+            .collect()
+    }
+
+    #[test]
+    fn drawing_without_kitty_graphics_says_why_and_stays_selecting() {
+        let mut s = Screen::new(book(&["Some words"]), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('D'));
+        assert!(frame.contains("drawing needs Kitty graphics"));
+        assert_eq!(s.app.tool, Tool::Select);
+    }
+
+    #[test]
+    fn saved_ink_without_kitty_graphics_says_it_is_hidden() {
+        let options = ViewerOptions {
+            strokes: vec![Stroke::begin(0, 0, Hue::Red, Point { x: 0.5, y: 0.5 })],
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Some words"]), 120, 30, options);
+        assert!(s.draw().contains("drawings here need Kitty graphics"));
+    }
+
+    #[test]
+    fn a_stroke_shows_while_drawn_is_saved_and_follows_its_word_when_text_reflows() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let text = format!("{}target here.", "word ".repeat(12));
+        let mut s = inking(&text, options);
+        s.press(KeyCode::Char('D'));
+        s.press(KeyCode::Char('3'));
+        let (x, y) = s.find("target");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        assert_eq!(ink_on_screen(&s).len(), 1, "ink shows before letting go");
+        assert!(saved.borrow().is_empty());
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert_eq!(saved.borrow().len(), 1);
+        assert_eq!(saved.borrow()[0].hue, Hue::Blue);
+        assert_eq!(saved.borrow()[0].points.len(), 2);
+        let ink = ink_on_screen(&s)[0];
+        let from_word =
+            |rect: Rect, (x, y): (u16, u16)| (rect.x as i32 - x as i32, rect.y as i32 - y as i32);
+        let before = from_word(ink, (x, y));
+
+        // A narrower window wraps the word onto the next line; the ink goes with it.
+        s.terminal.backend_mut().resize(60, 30);
+        let moved = s.find("target");
+        assert_ne!(moved, (x, y));
+        assert_eq!(from_word(ink_on_screen(&s)[0], moved), before);
+        assert!(s.draw().contains("pen blue"));
+    }
+
+    #[test]
+    fn ink_on_a_document_without_pages_scrolls_with_its_line() {
+        let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(Doc::whole("Notes", text), 120, 30, options);
+        s.app.kitty = Some(Kitty::default());
+        s.press(KeyCode::Char('D'));
+        let (x, y) = s.find("Line 9");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        assert_eq!(saved.borrow()[0].page, 0);
+        let before = ink_on_screen(&s)[0];
+        s.press(KeyCode::Char('j'));
+        s.press(KeyCode::Char('j'));
+        let (mx, my) = s.find("Line 9");
+        assert_eq!(my, y - 2);
+        let after = ink_on_screen(&s)[0];
+        assert_eq!((after.x, after.y), (before.x + mx - x, before.y - 2));
+    }
+
+    #[test]
+    fn the_eraser_rubs_out_a_stroke_it_passes_over() {
+        let saved = Rc::new(RefCell::new(vec![Stroke::begin(
+            0,
+            0,
+            Hue::Red,
+            Point { x: 0.5, y: 0.5 },
+        )]));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            strokes: saved.borrow().clone(),
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = inking("Some words", options);
+        assert_eq!(ink_on_screen(&s).len(), 1, "saved ink comes back");
+        let (x, y) = s.find("Some");
+        s.press(KeyCode::Char('e'));
+        // Passing by a cell away leaves it.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        assert_eq!(saved.borrow().len(), 1);
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(saved.borrow().is_empty());
+        assert!(ink_on_screen(&s).is_empty());
+    }
+
+    #[test]
+    fn a_box_drawn_by_hand_is_saved_as_a_rectangle() {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let mut s = inking(&"Some words to draw around. ".repeat(20), options);
+        s.press(KeyCode::Char('d'));
+        let (x, y) = s.find("Some");
+        let mut path: Vec<(u16, u16)> = (0..=14).map(|i| (x + i, y)).collect();
+        path.extend((1..=5).map(|i| (x + 14, y + i)));
+        path.extend((0..14).rev().map(|i| (x + i, y + 5)));
+        path.extend((1..5).rev().map(|i| (x, y + i)));
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        for &(px, py) in &path[1..] {
+            s.mouse(MouseEventKind::Drag(MouseButton::Left), px, py);
+        }
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x, y + 1);
+        let strokes = saved.borrow();
+        assert_eq!(strokes.len(), 1);
+        assert_eq!(strokes[0].trace, Trace::Shape);
+        assert_eq!(strokes[0].points.len(), 5);
+        assert_eq!(ink_on_screen(&s).len(), 1);
+    }
+
+    /// A screen with a level line of ink under the start of "Some words",
+    /// six cells long, and the saved strokes as they're reported.
+    fn with_a_line() -> (Screen, Rc<RefCell<Vec<Stroke>>>, (u16, u16)) {
+        let line = Stroke {
+            points: vec![Point { x: 0.5, y: 0.5 }, Point { x: 6.5, y: 0.5 }],
+            trace: Trace::Shape,
+            ..Stroke::begin(0, 0, Hue::Red, Point { x: 0.5, y: 0.5 })
+        };
+        let saved = Rc::new(RefCell::new(vec![line.clone()]));
+        let heard = saved.clone();
+        let options = ViewerOptions {
+            strokes: vec![line],
+            on_strokes: Box::new(move |s| *heard.borrow_mut() = s.to_vec()),
+            ..ViewerOptions::default()
+        };
+        let text = "Some words here.\n\nAnother paragraph below it.\n\nAnd a third one.";
+        let mut s = inking(text, options);
+        let at = s.find("Some");
+        (s, saved, at)
+    }
+
+    fn frames_on_screen(s: &Screen) -> usize {
+        s.app
+            .placements
+            .iter()
+            .filter(|(image, _)| image.layer == FRAME_LAYER)
+            .count()
+    }
+
+    #[test]
+    fn the_move_tool_picks_a_stroke_and_carries_it() {
+        let (mut s, saved, (x, y)) = with_a_line();
+        s.press(KeyCode::Char('v'));
+        assert_eq!(s.app.tool, Tool::Move);
+        // A click away from any ink picks nothing.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y + 4);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y + 4);
+        assert_eq!(frames_on_screen(&s), 0);
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        assert_eq!(frames_on_screen(&s), 1, "a picked stroke shows its frame");
+        let before = ink_on_screen(&s)[0];
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y + 2);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y + 2);
+        let after = ink_on_screen(&s)[0];
+        assert_eq!((after.x, after.y), (before.x + 2, before.y + 2));
+        assert_eq!(saved.borrow().len(), 1);
+        // Carried onto another paragraph, it's pinned to the text there now.
+        assert_ne!(saved.borrow()[0].anchor, 0);
+        let extent = saved.borrow()[0].extent();
+        assert_eq!(extent.width(), 6.0);
+    }
+
+    #[test]
+    fn dragging_a_corner_handle_resizes_the_picked_stroke() {
+        let (mut s, saved, (x, y)) = with_a_line();
+        s.press(KeyCode::Char('v'));
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        // The bottom-right handle sits just past the line's right end.
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 6, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 12, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 12, y);
+        let extent = saved.borrow()[0].extent();
+        assert!(extent.width() > 10.0, "{extent:?}");
+        assert_eq!(extent.height(), 0.0, "a level line stays level");
+    }
+
+    #[test]
+    fn keys_nudge_resize_recolor_and_delete_the_picked_stroke() {
+        let (mut s, saved, (x, y)) = with_a_line();
+        s.press(KeyCode::Char('v'));
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        let before = ink_on_screen(&s)[0];
+        s.press(KeyCode::Right);
+        assert_eq!(ink_on_screen(&s)[0].x, before.x + 1);
+        s.press(KeyCode::Char('+'));
+        assert!((saved.borrow()[0].extent().width() - 6.0 * GROW).abs() < 0.01);
+        s.press(KeyCode::Char('3'));
+        assert_eq!(saved.borrow()[0].hue, Hue::Blue);
+        // Esc lets go of the stroke but keeps the move tool.
+        s.press(KeyCode::Esc);
+        assert_eq!(frames_on_screen(&s), 0);
+        assert_eq!(s.app.tool, Tool::Move);
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        s.press(KeyCode::Char('x'));
+        assert!(saved.borrow().is_empty());
+        assert!(ink_on_screen(&s).is_empty());
+        assert!(!s.app.quit);
+    }
+
+    #[test]
+    fn d_always_takes_the_pen_and_e_always_the_eraser() {
+        let mut s = inking("Some words", ViewerOptions::default());
+        for (key, tool) in [
+            ('d', Tool::Pen),
+            ('d', Tool::Pen),
+            ('e', Tool::Eraser),
+            ('E', Tool::Eraser),
+            ('D', Tool::Pen),
+        ] {
+            s.press(KeyCode::Char(key));
+            assert_eq!(s.app.tool, tool, "after {key}");
+        }
+    }
+
+    #[test]
+    fn ctrl_d_scrolls_half_a_screen_instead_of_taking_the_pen() {
+        let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
+        let mut s = Screen::new(Doc::whole("Notes", text), 120, 30, ViewerOptions::default());
+        s.app.kitty = Some(Kitty::default());
+        s.app.key(KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert!(s.app.offset > 0);
+        assert_eq!(s.app.tool, Tool::Select);
+    }
+
+    #[test]
+    fn bang_opens_the_mark_up_guide_and_closes_it() {
+        let mut s = Screen::new(book(&["Some words"]), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('!'));
+        assert!(frame.contains("Mark up"));
+        assert!(frame.contains("1 yellow"));
+        assert!(frame.contains("drag anywhere to draw"));
+        assert!(frame.contains("Drawing needs Kitty graphics"));
+        assert!(!s.press(KeyCode::Char('!')).contains("Mark up"));
+        assert!(!s.app.quit);
+    }
+
+    #[test]
+    fn escape_puts_the_pen_down_before_quitting() {
+        let mut s = inking("Some words", ViewerOptions::default());
+        s.press(KeyCode::Char('D'));
+        assert_eq!(s.app.tool, Tool::Pen);
+        s.press(KeyCode::Esc);
+        assert_eq!(s.app.tool, Tool::Select);
+        assert!(!s.app.quit);
+        s.press(KeyCode::Esc);
+        assert!(s.app.quit);
     }
 
     #[test]
@@ -2033,7 +3756,10 @@ mod tests {
             ViewerOptions::default(),
         );
         let frame = search(&mut s, "charLIE");
-        assert!(frame.contains("Charlie text") && frame.contains("3 / 4"), "{frame}");
+        assert!(
+            frame.contains("Charlie text") && frame.contains("3 / 4"),
+            "{frame}"
+        );
         assert!(frame.contains("\"charLIE\" n/N"), "{frame}");
         let (x, y) = s.find("Charlie");
         let buffer = s.terminal.backend().buffer();
@@ -2043,7 +3769,10 @@ mod tests {
 
     #[test]
     fn a_match_far_down_a_page_is_scrolled_into_view() {
-        let long: String = (1..=80).map(|i| format!("Filler paragraph {i}.\n\n")).collect::<String>() + "The needle is here.";
+        let long: String = (1..=80)
+            .map(|i| format!("Filler paragraph {i}.\n\n"))
+            .collect::<String>()
+            + "The needle is here.";
         let mut s = Screen::new(book(&[&long]), 120, 30, ViewerOptions::default());
         assert!(!s.draw().contains("needle"));
         assert!(search(&mut s, "needle").contains("The needle is here."));
@@ -2073,9 +3802,17 @@ mod tests {
 
     #[test]
     fn a_term_nowhere_in_the_book_says_so_and_n_turns_pages_again() {
-        let mut s = Screen::new(book(&["Alpha text", "Bravo text"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["Alpha text", "Bravo text"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         let frame = search(&mut s, "zulu");
-        assert!(frame.contains("1 / 2") && frame.contains("\"zulu\" not found"), "{frame}");
+        assert!(
+            frame.contains("1 / 2") && frame.contains("\"zulu\" not found"),
+            "{frame}"
+        );
         assert!(s.press(KeyCode::Char('n')).contains("Bravo text"));
     }
 
@@ -2091,7 +3828,12 @@ mod tests {
 
     #[test]
     fn escape_in_the_find_box_closes_it_without_searching() {
-        let mut s = Screen::new(book(&["Alpha text", "Bravo text"]), 120, 30, ViewerOptions::default());
+        let mut s = Screen::new(
+            book(&["Alpha text", "Bravo text"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
         s.press(KeyCode::Char('f'));
         s.press(KeyCode::Char('b'));
         assert!(s.draw().contains("Find"));
@@ -2119,16 +3861,305 @@ mod tests {
     #[test]
     fn a_document_without_pages_shows_scroll_percent() {
         let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
-        let mut s = Screen::new(Doc::whole("Article", text), 80, 20, ViewerOptions::default());
+        let mut s = Screen::new(
+            Doc::whole("Article", text),
+            80,
+            20,
+            ViewerOptions::default(),
+        );
         assert!(s.draw().contains("0%"));
         let frame = s.press(KeyCode::Char('G'));
-        assert!(frame.contains("100%") && frame.contains("Line 80"), "{frame}");
+        assert!(
+            frame.contains("100%") && frame.contains("Line 80"),
+            "{frame}"
+        );
+    }
+
+    fn aloud(options: ViewerOptions) -> ViewerOptions {
+        ViewerOptions {
+            speech: Backend::Silent(aloud::fake_synth()),
+            ..options
+        }
+    }
+
+    /// Lets the narrator take in speech until a word is being said, then
+    /// plays `seconds` more of it.
+    fn listen(s: &mut Screen, seconds: f32) -> String {
+        for _ in 0..500 {
+            s.app.narrate();
+            if s.app.narrator.said().is_some() {
+                break;
+            }
+            s.app.narrator.play_for(0.001);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        s.app.narrator.play_for(seconds);
+        s.app.narrate();
+        s.draw()
+    }
+
+    /// The word marked as being read aloud.
+    fn marked(s: &mut Screen) -> String {
+        s.draw();
+        let buffer = s.terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_reads_aloud_from_the_top_of_the_screen_marking_each_word() {
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma. Delta epsilon."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        let frame = listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Alpha");
+        assert!(frame.contains("▶ EmmaMultilingual 1×"), "{frame}");
+        listen(&mut s, 1.2);
+        assert_eq!(marked(&mut s), "beta");
+        // Paused, the word stays put however long goes by.
+        let frame = s.press(KeyCode::Char('a'));
+        assert!(frame.contains("❚❚"), "{frame}");
+        listen(&mut s, 5.0);
+        assert_eq!(marked(&mut s), "beta");
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 1.0);
+        assert_eq!(marked(&mut s), "gamma");
+    }
+
+    #[test]
+    fn reading_aloud_starts_at_the_selection() {
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma. Delta epsilon."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        let (x, y) = s.find("Delta");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Delta");
+    }
+
+    #[test]
+    fn brackets_change_the_speed_and_it_is_kept() {
+        let speeds = Rc::new(RefCell::new(Vec::new()));
+        let heard = speeds.clone();
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma delta epsilon zeta."]),
+            80,
+            20,
+            aloud(ViewerOptions {
+                on_speed: Box::new(move |speed| heard.borrow_mut().push(speed)),
+                ..ViewerOptions::default()
+            }),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        s.press(KeyCode::Char(']'));
+        let frame = s.press(KeyCode::Char(']'));
+        assert!(frame.contains("speed 1.5×"), "{frame}");
+        // A second and a half of speech goes by in one second.
+        listen(&mut s, 1.0);
+        assert_eq!(marked(&mut s), "beta");
+        listen(&mut s, 1.0);
+        assert_eq!(marked(&mut s), "delta");
+        s.press(KeyCode::Char('['));
+        assert_eq!(*speeds.borrow(), vec![1.25, 1.5, 1.25]);
+    }
+
+    #[test]
+    fn period_and_comma_skip_between_sentences() {
+        let mut s = Screen::new(
+            book(&["One two three. Four five six. Seven eight."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        s.press(KeyCode::Char('.'));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Four");
+        listen(&mut s, 2.2);
+        assert_eq!(marked(&mut s), "six");
+        // Well into a sentence, comma goes back to its start; at its start, to the one before.
+        s.press(KeyCode::Char(','));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Four");
+        s.press(KeyCode::Char(','));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "One");
+    }
+
+    #[test]
+    fn the_voice_picker_filters_and_picks_a_voice() {
+        let voices = Rc::new(RefCell::new(Vec::new()));
+        let heard = voices.clone();
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            90,
+            30,
+            aloud(ViewerOptions {
+                on_voice: Box::new(move |voice: &str| heard.borrow_mut().push(voice.to_owned())),
+                ..ViewerOptions::default()
+            }),
+        );
+        let frame = s.press(KeyCode::Char('s'));
+        assert!(
+            frame.contains("Voice") && frame.contains("Sonia"),
+            "{frame}"
+        );
+        for c in "kingdom".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        let frame = s.press(KeyCode::Down);
+        assert!(
+            frame.contains("2 of 14") && !frame.contains("Aria"),
+            "{frame}"
+        );
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("Ryan reads next"), "{frame}");
+        assert_eq!(*voices.borrow(), vec!["en-GB-RyanNeural".to_owned()]);
+        s.press(KeyCode::Char('a'));
+        let frame = listen(&mut s, 0.0);
+        assert!(frame.contains("▶ Ryan"), "{frame}");
+    }
+
+    #[test]
+    fn the_voice_list_shows_only_once_every_voice_is_there() {
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            90,
+            30,
+            aloud(ViewerOptions::default()),
+        );
+        let list = s.app.narrator.fetching_voices();
+        let frame = s.press(KeyCode::Char('s'));
+        assert!(frame.contains("Loading voices…"), "{frame}");
+        assert!(
+            !frame.contains("Sonia") && !frame.contains("Emma"),
+            "{frame}"
+        );
+        // The search takes typing while the list is on its way; enter waits for it.
+        for c in "hindi fem".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("search  hindi fem"), "{frame}");
+        let voice = |name: &str, locale: &str, language: &str, gender: &str| edge::Voice {
+            name: name.to_owned(),
+            locale: locale.to_owned(),
+            language: language.to_owned(),
+            gender: gender.to_owned(),
+        };
+        list.send(Ok(vec![
+            voice(
+                "en-US-AriaNeural",
+                "en-US",
+                "English (United States)",
+                "Female",
+            ),
+            voice("hi-IN-SwaraNeural", "hi-IN", "Hindi (India)", "Female"),
+            voice("hi-IN-MadhurNeural", "hi-IN", "Hindi (India)", "Male"),
+        ]))
+        .expect("the list is listened for");
+        s.app.narrate();
+        let frame = s.draw();
+        assert!(
+            frame.contains("1 of 3") && frame.contains("Swara"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("Madhur") && !frame.contains("Aria"),
+            "{frame}"
+        );
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("Swara reads next"), "{frame}");
+        assert_eq!(s.app.narrator.voice(), "hi-IN-SwaraNeural");
+    }
+
+    #[test]
+    fn a_voice_picked_while_reading_takes_over_from_the_word_being_read() {
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma delta."]),
+            90,
+            30,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 1.2);
+        assert_eq!(marked(&mut s), "beta");
+        s.press(KeyCode::Char('s'));
+        for c in "sonia".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        s.press(KeyCode::Enter);
+        let frame = listen(&mut s, 0.0);
+        assert!(frame.contains("▶ Sonia"), "{frame}");
+        assert_eq!(marked(&mut s), "beta");
+        listen(&mut s, 1.1);
+        assert_eq!(marked(&mut s), "gamma");
+    }
+
+    #[test]
+    fn the_screen_follows_the_word_read_aloud() {
+        let text: String = (1..=60)
+            .map(|i| format!("Sentence number {i}.\n\n"))
+            .collect();
+        let mut s = Screen::new(
+            Doc::whole("Article", text),
+            60,
+            12,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        for _ in 0..20 {
+            s.press(KeyCode::Char('.'));
+            listen(&mut s, 0.0);
+        }
+        let frame = s.draw();
+        assert!(frame.contains("Sentence number 21."), "{frame}");
+        assert_eq!(marked(&mut s), "Sentence");
+    }
+
+    #[test]
+    fn escape_stops_reading_aloud_before_quitting() {
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        s.press(KeyCode::Esc);
+        assert!(!s.app.narrator.active() && !s.app.quit);
+        assert_eq!(marked(&mut s), "");
+        s.press(KeyCode::Esc);
+        assert!(s.app.quit);
     }
 
     #[test]
     fn osc_color_replies_parse_in_any_digit_count() {
-        assert_eq!(parse_color_reply("\x1b]10;rgb:ffff/8080/0000\x1b\\"), Some([255, 128, 0]));
-        assert_eq!(parse_color_reply("\x1b]10;rgb:ff/00/80\x07"), Some([255, 0, 128]));
+        assert_eq!(
+            parse_color_reply("\x1b]10;rgb:ffff/8080/0000\x1b\\"),
+            Some([255, 128, 0])
+        );
+        assert_eq!(
+            parse_color_reply("\x1b]10;rgb:ff/00/80\x07"),
+            Some([255, 0, 128])
+        );
         assert_eq!(parse_color_reply("garbage"), None);
     }
 }

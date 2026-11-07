@@ -1,6 +1,5 @@
-//! Mermaid diagrams, drawn by Pele (vendored in `vendor/pele`) under
-//! whichever JavaScript runtime is installed, then rasterized with resvg.
-//! Without a runtime, or when Pele can't read a diagram, it stays a code block.
+//! Mermaid diagrams, drawn to SVG by Ondine's pure Rust compiler, then
+//! rasterized with resvg. A diagram Ondine can't read stays a code block.
 
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use std::collections::HashMap;
@@ -26,8 +25,14 @@ const MAX_RASTER_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_RASTER_DIMENSION: f64 = 16_384.0;
 /// Maximum depth of CSS variable nesting to resolve before giving up.
 const MAX_CSS_VAR_NESTING_DEPTH: usize = 4;
-/// Families tried for Pele's `sans-serif`, the first one installed wins.
-const SANS: &[&str] = &["Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "Noto Sans"];
+/// Families tried for Ondine's `sans-serif`, the first one installed wins.
+const SANS: &[&str] = &[
+    "Helvetica",
+    "Arial",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Noto Sans",
+];
 /// Host options for ondine::render — keeps pathological sources bounded.
 const RENDER_OPTIONS: &str = r#"{
   "responsive": false,
@@ -40,19 +45,21 @@ const RENDER_OPTIONS: &str = r#"{
 
 pub const DIAGRAM_PREFIX: &str = "mermaid-";
 
-// static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*?))?\s*\)").expect("pattern is valid"));
-static DECL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(--[\w-]+)\s*:\s*([^;"]+)"#).expect("pattern is valid"));
-static STYLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"style="([^"]*)""#).expect("pattern is valid"));
-static CUSTOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"--[\w-]+\s*:[^;]*;?").expect("pattern is valid"));
-/*static SIZE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<svg\b[^>]*?\bwidth="([\d.]+)"[^>]*?\bheight="([\d.]+)""#)
-        .expect("pattern is valid")
-});*/
+static DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(--[\w-]+)\s*:\s*([^;"]+)"#).expect("pattern is valid"));
+static STYLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"style="([^"]*)""#).expect("pattern is valid"));
+static CUSTOM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"--[\w-]+\s*:[^;]*;?").expect("pattern is valid"));
 
 static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
     let mut fonts = usvg::fontdb::Database::new();
     fonts.load_system_fonts();
-    let installed = |family: &&&str| fonts.faces().any(|face| face.families.iter().any(|(name, _)| name == **family));
+    let installed = |family: &&&str| {
+        fonts
+            .faces()
+            .any(|face| face.families.iter().any(|(name, _)| name == **family))
+    };
     if let Some(family) = SANS.iter().find(installed) {
         fonts.set_sans_serif_family(*family);
     }
@@ -82,7 +89,9 @@ pub fn diagrams(
 
     for (event, range) in Parser::new_ext(markdown, render::MARKDOWN).into_offset_iter() {
         match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if info.split_whitespace().next() == Some("mermaid") => {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if info.split_whitespace().next() == Some("mermaid") =>
+            {
                 open = Some((range.start, String::new()));
             }
             Event::Text(text) => {
@@ -103,7 +112,10 @@ pub fn diagrams(
         return (markdown.to_owned(), Vec::new());
     }
 
-    let candidates: Vec<_> = blocks.into_iter().filter(|(_, source)| looks_like_mermaid(source)).collect();
+    let candidates: Vec<_> = blocks
+        .into_iter()
+        .filter(|(_, source)| looks_like_mermaid(source))
+        .collect();
 
     if candidates.is_empty() {
         return (markdown.to_owned(), Vec::new());
@@ -152,9 +164,14 @@ pub fn render(sources: &[String]) -> Vec<DiagramResult> {
     sources
         .iter()
         .map(|src| {
-            let drawn = ondine::render(src, RENDER_OPTIONS, now).map_err(|err| DrawError::RenderError(format!("{err:?}")))?;
-            Diagram::new(drawn.svg, drawn.width, drawn.height)
-                .ok_or_else(|| DrawError::RenderError("Invalid diagram dimensions or another problem happened in `Diagram::new`.".into()))
+            let drawn = ondine::render(src, RENDER_OPTIONS, now)
+                .map_err(|err| DrawError::RenderError(format!("{err:?}")))?;
+            Diagram::new(drawn.svg, drawn.width, drawn.height).ok_or_else(|| {
+                DrawError::RenderError(
+                    "Invalid diagram dimensions or another problem happened in `Diagram::new`."
+                        .into(),
+                )
+            })
         })
         .collect()
 }
@@ -273,8 +290,8 @@ fn replace_vars(svg: &str, known: &HashMap<&str, &str>) -> String {
     out
 }
 
-/// Swaps the CSS variables Pele colors with for their values (resvg doesn't
-/// read variables). Pele declares its own variables from `--pele-*` ones,
+/// Swaps the CSS variables Ondine colors with for their values (resvg doesn't
+/// read variables). Ondine declares its own variables from `--ondine-*` ones,
 /// with fallbacks for those `set` leaves out. The declarations go once
 /// used: resvg drops a style that has any.
 fn resolve_vars(svg: &str, set: &[(&str, String)]) -> String {
@@ -287,11 +304,6 @@ fn resolve_vars(svg: &str, set: &[(&str, String)]) -> String {
             .filter(|(_, value)| !value.contains("var("))
             .collect();
         known.extend(set.iter().map(|(name, value)| (*name, value.as_str())));
-        /*let next = VAR.replace_all(&svg, |c: &regex::Captures| match (known.get(&c[1]), c.get(2)) {
-            (Some(value), _) => (*value).to_owned(),
-            (None, Some(fallback)) => fallback.as_str().to_owned(),
-            (None, None) => c[0].to_owned(),
-        });*/
         let next = replace_vars(&svg, &known);
         if next == svg {
             break;
@@ -299,7 +311,9 @@ fn resolve_vars(svg: &str, set: &[(&str, String)]) -> String {
         svg = next;
     }
     STYLE
-        .replace_all(&svg, |c: &regex::Captures| format!(r#"style="{}""#, CUSTOM.replace_all(&c[1], "")))
+        .replace_all(&svg, |c: &regex::Captures| {
+            format!(r#"style="{}""#, CUSTOM.replace_all(&c[1], ""))
+        })
         .into_owned()
 }
 
@@ -331,16 +345,22 @@ impl Diagram {
             fontdb: FONTS.clone(),
             ..Default::default()
         };
-        let tree = usvg::Tree::from_str(&resolve_vars(&self.svg, &palette(ink, paper)), &options).ok()?;
+        let tree =
+            usvg::Tree::from_str(&resolve_vars(&self.svg, &palette(ink, paper)), &options).ok()?;
         let tree_width = tree.size().width() as f64;
         let tree_height = tree.size().height() as f64;
 
-        if !tree_width.is_finite() || !tree_height.is_finite() || tree_width <= 0.0 || tree_height <= 0.0 {
+        if !tree_width.is_finite()
+            || !tree_height.is_finite()
+            || tree_width <= 0.0
+            || tree_height <= 0.0
+        {
             return None;
         }
 
         let requested_scale = width as f64 / tree_width;
-        let dimension_scale = (MAX_RASTER_DIMENSION / tree_width).min(MAX_RASTER_DIMENSION / tree_height);
+        let dimension_scale =
+            (MAX_RASTER_DIMENSION / tree_width).min(MAX_RASTER_DIMENSION / tree_height);
         let pixel_scale = (MAX_RASTER_PIXELS as f64 / (tree_width * tree_height)).sqrt();
 
         let scale = requested_scale.min(dimension_scale).min(pixel_scale);
@@ -348,7 +368,10 @@ impl Diagram {
             return None;
         }
 
-        let raster_width = (tree_width * scale).ceil().min(width as f64).min(MAX_RASTER_DIMENSION) as u32;
+        let raster_width = (tree_width * scale)
+            .ceil()
+            .min(width as f64)
+            .min(MAX_RASTER_DIMENSION) as u32;
         let raster_height = (tree_height * scale).ceil() as u32;
 
         if raster_width == 0
@@ -361,10 +384,6 @@ impl Diagram {
         }
 
         let mut pixmap = tiny_skia::Pixmap::new(raster_width, raster_height)?;
-        //let scale = width.max(1) as f32 / tree.size().width();
-        //let height = (tree.size().height() * scale).ceil() as u32;
-        //let mut pixmap = tiny_skia::Pixmap::new(width.max(1), height.max(1))?;
-        //resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
         resvg::render(
             &tree,
             tiny_skia::Transform::from_scale(scale as f32, scale as f32),
@@ -438,7 +457,10 @@ pub fn looks_like_mermaid(source: &str) -> bool {
         .find(|line| !line.is_empty() && !line.starts_with("%%"))
         .unwrap_or("");
     KEYWORDS.iter().any(|k| {
-        head == *k || head.starts_with(&format!("{k} ")) || head.starts_with(&format!("{k}\t")) || head.starts_with(&format!("{k}-"))
+        head == *k
+            || head.starts_with(&format!("{k} "))
+            || head.starts_with(&format!("{k}\t"))
+            || head.starts_with(&format!("{k}-"))
     })
 }
 
@@ -452,11 +474,17 @@ mod tests {
             "---\ntitle: Example\nconfig:\n  theme: dark\n---\nflowchart TD\n  A --> B"
         ));
 
-        assert!(looks_like_mermaid("+++\ntitle = 'Example'\n+++\nsequenceDiagram\n  A->>B: Hello"));
+        assert!(looks_like_mermaid(
+            "+++\ntitle = 'Example'\n+++\nsequenceDiagram\n  A->>B: Hello"
+        ));
 
-        assert!(looks_like_mermaid("---\r\ntitle: Example\r\n---\r\nflowchart TD\r\n  A --> B"));
+        assert!(looks_like_mermaid(
+            "---\r\ntitle: Example\r\n---\r\nflowchart TD\r\n  A --> B"
+        ));
 
-        assert!(!looks_like_mermaid("---\ntitle: Example\n---\nthis is not a diagram"));
+        assert!(!looks_like_mermaid(
+            "---\ntitle: Example\n---\nthis is not a diagram"
+        ));
 
         assert!(!looks_like_mermaid("---\ntitle: Example\nflowchart TD"));
     }
@@ -521,7 +549,11 @@ mod tests {
 
     #[test]
     fn diagram_accepts_dimensions_within_limits() {
-        let diagram = Diagram::new("<svg/>".into(), MAX_DIAGRAM_DIMENSION, MAX_DIAGRAM_DIMENSION);
+        let diagram = Diagram::new(
+            "<svg/>".into(),
+            MAX_DIAGRAM_DIMENSION,
+            MAX_DIAGRAM_DIMENSION,
+        );
 
         assert!(diagram.is_some());
     }
@@ -540,7 +572,10 @@ mod tests {
     fn variables_resolve_nested_fallbacks() {
         let svg = r##"<svg fill="var(--unknown,var(--known,#fff))"/>"##;
 
-        assert_eq!(resolve_vars(svg, &[("--known", "#eee".into())]), r##"<svg fill="#eee"/>"##);
+        assert_eq!(
+            resolve_vars(svg, &[("--known", "#eee".into())]),
+            r##"<svg fill="#eee"/>"##
+        );
     }
 
     #[test]
