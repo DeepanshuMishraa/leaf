@@ -1,11 +1,14 @@
 mod agent;
+mod aloud;
 mod article;
 mod comment;
 mod diff;
 mod diffview;
 mod doc;
+mod edge;
 mod find;
 mod font;
+mod gec;
 mod github;
 mod highlight;
 mod hue;
@@ -20,6 +23,7 @@ mod render;
 mod shape;
 mod stroke;
 mod syntax;
+mod tempo;
 mod viewer;
 
 use std::cell::RefCell;
@@ -120,6 +124,14 @@ fn resume(
         Ok(mode) => options.image_mode = mode.unwrap_or(options.image_mode),
         Err(e) => record(Err(e)),
     }
+    match store.borrow().load_voice() {
+        Ok(voice) => options.voice = voice.unwrap_or(options.voice),
+        Err(e) => record(Err(e)),
+    }
+    match store.borrow().load_speed() {
+        Ok(speed) => options.speed = speed.unwrap_or(options.speed),
+        Err(e) => record(Err(e)),
+    }
     match store.borrow().load_highlights(&key) {
         Ok(highlights) => options.highlights = highlights,
         Err(e) => record(Err(e)),
@@ -158,6 +170,14 @@ fn resume(
     options.on_image_mode = {
         let (store, record) = (store.clone(), record.clone());
         Box::new(move |mode| record(store.borrow().save_image_mode(mode)))
+    };
+    options.on_voice = {
+        let (store, record) = (store.clone(), record.clone());
+        Box::new(move |voice| record(store.borrow().save_voice(voice)))
+    };
+    options.on_speed = {
+        let (store, record) = (store.clone(), record.clone());
+        Box::new(move |speed| record(store.borrow().save_speed(speed)))
     };
     options.on_highlights = {
         let (store, record, key) = (store.clone(), record.clone(), key.clone());

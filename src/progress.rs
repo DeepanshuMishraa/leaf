@@ -318,27 +318,55 @@ impl Store {
             .map_err(self.failed(Operation::Save))
     }
 
-    pub fn load_image_mode(&self) -> Result<Option<ImageMode>, StoreFailed> {
-        let value: Option<String> = self
-            .db
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'image_mode'",
-                [],
-                |r| r.get(0),
-            )
+    fn setting(&self, key: &str) -> Result<Option<String>, StoreFailed> {
+        self.db
+            .query_row("SELECT value FROM settings WHERE key = ?", [key], |r| {
+                r.get(0)
+            })
             .optional()
-            .map_err(self.failed(Operation::Read))?;
-        Ok(value.as_deref().and_then(ImageMode::parse))
+            .map_err(self.failed(Operation::Read))
     }
 
-    pub fn save_image_mode(&self, mode: ImageMode) -> Result<(), StoreFailed> {
+    fn save_setting(&self, key: &str, value: &str) -> Result<(), StoreFailed> {
         self.db
             .execute(
-                "INSERT INTO settings (key, value) VALUES ('image_mode', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [mode.as_str()],
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [key, value],
             )
             .map(drop)
             .map_err(self.failed(Operation::Save))
+    }
+
+    pub fn load_image_mode(&self) -> Result<Option<ImageMode>, StoreFailed> {
+        Ok(self
+            .setting("image_mode")?
+            .as_deref()
+            .and_then(ImageMode::parse))
+    }
+
+    pub fn save_image_mode(&self, mode: ImageMode) -> Result<(), StoreFailed> {
+        self.save_setting("image_mode", mode.as_str())
+    }
+
+    /// The voice that reads aloud, by its service name.
+    pub fn load_voice(&self) -> Result<Option<String>, StoreFailed> {
+        self.setting("voice")
+    }
+
+    pub fn save_voice(&self, voice: &str) -> Result<(), StoreFailed> {
+        self.save_setting("voice", voice)
+    }
+
+    /// How fast reading aloud goes.
+    pub fn load_speed(&self) -> Result<Option<f32>, StoreFailed> {
+        Ok(self
+            .setting("speed")?
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0))
+    }
+
+    pub fn save_speed(&self, speed: f32) -> Result<(), StoreFailed> {
+        self.save_setting("speed", &speed.to_string())
     }
 
     pub fn load_highlights(&self, key: &str) -> Result<Vec<Highlight>, StoreFailed> {
@@ -890,6 +918,22 @@ mod tests {
         assert_eq!(store.load_image_mode().unwrap(), None);
         store.save_image_mode(ImageMode::Mono).unwrap();
         assert_eq!(store.load_image_mode().unwrap(), Some(ImageMode::Mono));
+    }
+
+    #[test]
+    fn the_voice_and_speed_are_remembered() {
+        let store = memory();
+        assert_eq!(store.load_voice().unwrap(), None);
+        assert_eq!(store.load_speed().unwrap(), None);
+        store.save_voice("en-GB-SoniaNeural").unwrap();
+        store.save_speed(1.75).unwrap();
+        store.save_speed(1.5).unwrap();
+        assert_eq!(
+            store.load_voice().unwrap().as_deref(),
+            Some("en-GB-SoniaNeural")
+        );
+        assert_eq!(store.load_speed().unwrap(), Some(1.5));
+        assert_eq!(store.load_image_mode().unwrap(), None);
     }
 
     #[test]

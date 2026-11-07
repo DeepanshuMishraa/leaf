@@ -24,8 +24,10 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 use unicode_width::UnicodeWidthChar;
 
+use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
 use crate::article;
 use crate::doc::{Doc, ImageRef};
+use crate::edge;
 use crate::find::Query;
 use crate::highlight::{self, Highlight};
 use crate::hue::Hue;
@@ -54,6 +56,9 @@ const KEPT_PAGES: usize = 4;
 const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
+/// How often the word read aloud is checked: fast enough that the mark
+/// keeps up with the voice at 4×.
+const NARRATION_TICK: Duration = Duration::from_millis(15);
 
 /// Ink is drawn over figures.
 const INK_LAYER: i32 = 1;
@@ -98,6 +103,12 @@ enum Dialog {
     },
     Bookmarks {
         selected: usize,
+    },
+    /// The voices to read aloud with, filtered by what's typed.
+    /// `selected` is the row moved to; until then, the voice reading now.
+    Voices {
+        typed: String,
+        selected: Option<usize>,
     },
 }
 
@@ -249,6 +260,8 @@ struct Marks<'a> {
     selection: Option<(TextPos, TextPos)>,
     found: &'a [(usize, usize)],
     here: Option<Match>,
+    /// The word being read aloud.
+    said: Option<Said>,
 }
 
 /// What a row on screen shows.
@@ -285,6 +298,14 @@ pub struct ViewerOptions {
     pub strokes: Vec<Stroke>,
     /// Hears every stroke there is, each time one is drawn or erased.
     pub on_strokes: StrokesListener,
+    /// The voice that reads aloud, by its service name.
+    pub voice: String,
+    /// How fast it reads, 1.0 being normal.
+    pub speed: f32,
+    pub on_voice: Box<dyn FnMut(&str)>,
+    pub on_speed: Box<dyn FnMut(f32)>,
+    /// Where speech comes from and goes.
+    pub speech: Backend,
 }
 
 impl Default for ViewerOptions {
@@ -302,6 +323,11 @@ impl Default for ViewerOptions {
             on_bookmarks: Box::new(|_| {}),
             strokes: Vec::new(),
             on_strokes: Box::new(|_| {}),
+            voice: edge::DEFAULT_VOICE.to_owned(),
+            speed: 1.0,
+            on_voice: Box::new(|_| {}),
+            on_speed: Box::new(|_| {}),
+            speech: Backend::Edge,
         }
     }
 }
@@ -359,7 +385,27 @@ pub struct App {
     reported_scroll: Option<Scroll>,
     copy: Option<String>,
     search: Option<Search>,
+    narrator: Narrator,
+    /// Whether the screen keeps the word being read aloud in view. Scrolling
+    /// away lets it go; it picks up again once the word is back on screen.
+    follow: bool,
     quit: bool,
+}
+
+/// The row picked in the voice list: the one moved to, or else the voice
+/// reading now when nothing's typed, or the best match when something is.
+fn picked_voice(
+    ranked: &[&edge::Voice],
+    current: &str,
+    typed: &str,
+    selected: Option<usize>,
+) -> usize {
+    selected
+        .unwrap_or_else(|| match typed {
+            "" => ranked.iter().position(|v| v.name == current).unwrap_or(0),
+            _ => 0,
+        })
+        .min(ranked.len().saturating_sub(1))
 }
 
 /// The character a key types.
@@ -390,7 +436,7 @@ fn handle_to_ink(corner: Corner, p: Point) -> Point {
 }
 
 impl App {
-    pub fn new(doc: Doc, options: ViewerOptions, picker: Picker) -> Self {
+    pub fn new(doc: Doc, mut options: ViewerOptions, picker: Picker) -> Self {
         let current = match (doc.page_count, options.start_page) {
             (Some(count), Some(start)) => start.clamp(1, count.max(1)) - 1,
             _ => 0,
@@ -408,7 +454,14 @@ impl App {
                 stroke: stroke.clone(),
             })
             .collect();
+        let narrator = Narrator::new(
+            options.voice.clone(),
+            options.speed,
+            std::mem::replace(&mut options.speech, Backend::Edge),
+        );
         App {
+            narrator,
+            follow: true,
             next_serial: strokes.len() as u64,
             strokes,
             tool: Tool::Select,
@@ -607,6 +660,19 @@ impl App {
                 )
             }
             Tool::Move => footer = format!("{footer} · move: click ink to pick it · esc stop"),
+        }
+        let mark = match self.narrator.status() {
+            Status::Idle => None,
+            Status::Loading => Some("…"),
+            Status::Speaking => Some("▶"),
+            Status::Paused => Some("❚❚"),
+        };
+        if let Some(mark) = mark {
+            footer = format!(
+                "{footer} · {mark} {} {}",
+                self.narrator.voice_label(),
+                aloud::speed_label(self.narrator.speed())
+            );
         }
         let hidden = self.no_ink().is_some() && {
             let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
@@ -891,6 +957,7 @@ impl App {
                 selection,
                 found: found.get(&page).map_or(&[], Vec::as_slice),
                 here: self.found_here(),
+                said: self.narrator.said(),
             };
             self.draw_row(f, page, row, self.column.y + y as u16, marks);
         }
@@ -920,6 +987,7 @@ impl App {
             }
             Dialog::Find { typed } => Some(self.draw_find(f, area, &typed)),
             Dialog::Bookmarks { selected } => Some(self.draw_bookmarks(f, area, selected)),
+            Dialog::Voices { typed, selected } => Some(self.draw_voices(f, area, &typed, selected)),
         };
         // Kitty images sit above the text, so any under a panel would hide it.
         if let Some(panel) = panel {
@@ -1000,6 +1068,16 @@ impl App {
                             .here
                             .is_some_and(|m| m.page == page && m.start <= offset && offset < m.end);
                         style = style.bg(if here { FOUND_HERE } else { FOUND }).fg(MARK_INK);
+                    }
+                    // The word being read aloud, in the terminal's own colors turned over.
+                    if marks
+                        .said
+                        .is_some_and(|s| s.page == page && s.start <= offset && offset < s.end)
+                    {
+                        style = style
+                            .fg(Color::Reset)
+                            .bg(Color::Reset)
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD);
                     }
                     if marks
                         .selection
@@ -1215,6 +1293,13 @@ impl App {
             ]);
         }
         rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
+        rows.extend([
+            ("a", "read aloud from here; pause / go on"),
+            ("A", "stop reading aloud"),
+            ("[  ]", "read slower / faster"),
+            (",  .", "previous / next sentence aloud"),
+            ("s", "pick a voice"),
+        ]);
         rows.push((
             "i",
             if self.image_mode == ImageMode::Color {
@@ -1404,6 +1489,387 @@ impl App {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
         Self::panel(f, area, "Bookmarks", lines, width)
+    }
+
+    /// The voice picker: a search box over every voice, or a word that
+    /// they're on their way. The list keeps its size as the search narrows it.
+    fn draw_voices(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        typed: &str,
+        selected: Option<usize>,
+    ) -> Rect {
+        let hint = "↑/↓ pick · enter use · esc close";
+        let current = self.narrator.voice().to_owned();
+        let search = Line::from(vec![
+            Span::styled("search  ", Style::default().fg(DIM)),
+            Span::styled(
+                typed.to_owned(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("▏"),
+            Span::styled(
+                if typed.is_empty() {
+                    "name, language or gender"
+                } else {
+                    ""
+                },
+                Style::default().fg(DIM),
+            ),
+        ]);
+        let Some(voices) = self.narrator.voices() else {
+            let lines = vec![
+                search,
+                Line::default(),
+                Line::from(Span::styled("Loading voices…", Style::default().fg(DIM))),
+            ];
+            return Self::panel(f, area, "Voice", lines, 52);
+        };
+        let ranked = aloud::rank(voices, typed);
+        let picked = picked_voice(&ranked, &current, typed, selected);
+        let room = (area.height as usize)
+            .saturating_sub(12)
+            .clamp(1, voices.len().max(1));
+        let first = picked
+            .saturating_sub(room - 1)
+            .min(ranked.len().saturating_sub(room));
+        // Sized for every voice, so the panel holds still while typing.
+        let name_width = voices
+            .iter()
+            .map(|v| v.short().chars().count())
+            .max()
+            .unwrap_or(0);
+        let about_width = voices
+            .iter()
+            .map(|v| v.language.chars().count() + v.gender.chars().count() + 3)
+            .max()
+            .unwrap_or(0);
+        let mut lines = vec![
+            search,
+            Line::from(Span::styled(
+                format!("{} of {}", ranked.len(), voices.len()),
+                Style::default().fg(DIM),
+            )),
+            Line::default(),
+        ];
+        if ranked.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No voice matches. Try a name, language or gender.",
+                Style::default().fg(DIM),
+            )));
+        }
+        lines.extend(
+            ranked
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(room)
+                .map(|(i, v)| {
+                    let style = if i == picked {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    let mark = match (i == picked, v.name == current) {
+                        (true, _) => "› ",
+                        (false, true) => "• ",
+                        (false, false) => "  ",
+                    };
+                    Line::from(vec![
+                        Span::styled(mark, style),
+                        Span::styled(format!("{:<name_width$}  ", v.short()), style),
+                        Span::styled(
+                            format!("{} · {}", v.language, v.gender.to_lowercase()),
+                            Style::default().fg(DIM),
+                        ),
+                    ])
+                }),
+        );
+        let shown = ranked.len().saturating_sub(first).min(room).max(1);
+        lines.extend((shown..room).map(|_| Line::default()));
+        let width = (name_width + about_width + 4).max(hint.chars().count()) as u16;
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
+        Self::panel(f, area, "Voice", lines, width)
+    }
+
+    /// Typing in the voice picker searches; enter reads in the picked voice
+    /// from the word being read. While the list loads, only the search works.
+    fn voices_key(&mut self, key: &KeyEvent, typed: String, selected: Option<usize>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let current = self.narrator.voice().to_owned();
+        let pick = self.narrator.voices().map(|voices| {
+            let ranked = aloud::rank(voices, &typed);
+            let at = picked_voice(&ranked, &current, &typed, selected);
+            (
+                at,
+                ranked.len(),
+                ranked
+                    .get(at)
+                    .map(|v| (v.name.clone(), v.short().to_owned())),
+            )
+        });
+        let up = matches!(key.code, KeyCode::Up | KeyCode::BackTab)
+            || (ctrl && matches!(key.code, KeyCode::Char('p' | 'k')));
+        let down = matches!(key.code, KeyCode::Down | KeyCode::Tab)
+            || (ctrl && matches!(key.code, KeyCode::Char('n' | 'j')));
+        match (key.code, pick) {
+            (KeyCode::Esc, _) => self.dialog = Dialog::None,
+            (KeyCode::Enter, Some((_, _, Some((name, short))))) => {
+                self.dialog = Dialog::None;
+                (self.options.on_voice)(&name);
+                let reading = self.narrator.active();
+                self.narrator.set_voice(name);
+                self.follow = true;
+                self.notice = Some(if reading {
+                    format!("reading in {short}")
+                } else {
+                    format!("{short} reads next · a to start")
+                });
+            }
+            (_, Some((at, _, _))) if up => {
+                self.dialog = Dialog::Voices {
+                    typed,
+                    selected: Some(at.saturating_sub(1)),
+                }
+            }
+            (_, Some((at, count, _))) if down => {
+                self.dialog = Dialog::Voices {
+                    typed,
+                    selected: Some((at + 1).min(count.saturating_sub(1))),
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                let mut typed = typed;
+                typed.pop();
+                self.dialog = Dialog::Voices {
+                    typed,
+                    selected: None,
+                };
+            }
+            (KeyCode::Char(c), _) if !ctrl => {
+                self.dialog = Dialog::Voices {
+                    typed: format!("{typed}{c}"),
+                    selected: None,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the voice picker on the voice reading now.
+    fn open_voices(&mut self) {
+        self.narrator.prepare_voices();
+        self.dialog = Dialog::Voices {
+            typed: String::new(),
+            selected: None,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading aloud.
+
+    /// Where the text on screen starts: the sentence the top line is in, if it
+    /// began just above.
+    fn screen_top(&mut self) -> Spot {
+        for slot in self.screen.clone().into_iter().flatten() {
+            let prefix = self.prefix(slot.page);
+            if slot.row < prefix {
+                continue;
+            }
+            let laid = self.laid(slot.page);
+            let first = laid
+                .rows
+                .get(slot.row - prefix)
+                .and_then(|row| row.segs.iter().find_map(|seg| seg.offset));
+            if let Some(offset) = first {
+                let start = aloud::sentence_start(&laid.text, offset);
+                return Spot {
+                    page: slot.page,
+                    offset: if offset - start <= MAX_TEXT_WIDTH as usize {
+                        start
+                    } else {
+                        offset
+                    },
+                };
+            }
+        }
+        Spot {
+            page: self.current,
+            offset: 0,
+        }
+    }
+
+    /// The screen row character `offset` of `page` is on, as last drawn.
+    fn screen_row(&mut self, page: usize, offset: usize) -> Option<usize> {
+        let row = self.laid(page).locate(offset).0 + self.prefix(page);
+        self.screen
+            .iter()
+            .position(|s| s.is_some_and(|s| s.page == page && s.row == row))
+    }
+
+    /// Scrolls so character `offset` of `page` sits a third of the way down.
+    fn show(&mut self, page: usize, offset: usize) {
+        let row = self.laid(page).locate(offset).0 + self.prefix(page);
+        self.current = page.min(self.last());
+        let offset = row.saturating_sub(self.view() / 3);
+        match self.mode {
+            Mode::Paged => self.offset = offset.min(self.max_offset()),
+            Mode::Scroll => {
+                self.offset = offset;
+                self.clamp_end();
+            }
+        }
+    }
+
+    /// `a`: reads aloud from the selection, from where reading stopped if
+    /// that's on screen, or from the top of the screen; while reading, pauses
+    /// and carries on.
+    fn read_aloud(&mut self) {
+        self.follow = true;
+        if self.narrator.active() {
+            return self.narrator.toggle();
+        }
+        let from = match self.selection.map(Selection::range) {
+            Some((start, end)) if start != end => {
+                self.selection = None;
+                Spot {
+                    page: start.page,
+                    offset: start.offset,
+                }
+            }
+            _ => match self.narrator.resume() {
+                Some(spot) if self.screen_row(spot.page, spot.offset).is_some() => spot,
+                _ => self.screen_top(),
+            },
+        };
+        self.narrator.start(from);
+    }
+
+    /// `,` and `.`: back to the start of this sentence (or the one before,
+    /// just after one starts), or on to the next.
+    fn skip_sentence(&mut self, direction: Direction) {
+        let Some(here) = self.narrator.here() else {
+            return;
+        };
+        let laid = self.laid(here.page);
+        let text = &laid.text;
+        let target = match direction {
+            Direction::Forward => {
+                let end = aloud::sentence_end(text, here.offset);
+                if text[end.min(text.len())..]
+                    .iter()
+                    .any(|c| c.is_alphanumeric())
+                {
+                    Spot {
+                        page: here.page,
+                        offset: end,
+                    }
+                } else if here.page < self.last() {
+                    Spot {
+                        page: here.page + 1,
+                        offset: 0,
+                    }
+                } else {
+                    return;
+                }
+            }
+            Direction::Backward => {
+                let start = aloud::sentence_start(text, here.offset);
+                // Just into a sentence, back goes to the one before.
+                let words_in = text[start..here.offset.min(text.len())]
+                    .iter()
+                    .filter(|c| c.is_whitespace())
+                    .count();
+                if words_in >= 2 {
+                    Spot {
+                        page: here.page,
+                        offset: start,
+                    }
+                } else if start > 0 {
+                    let mut before = start;
+                    while before > 0 && text[before - 1].is_whitespace() {
+                        before -= 1;
+                    }
+                    Spot {
+                        page: here.page,
+                        offset: aloud::sentence_start(text, before.saturating_sub(1)),
+                    }
+                } else if here.page > 0 {
+                    let previous = self.laid(here.page - 1);
+                    let last = previous.text.len().saturating_sub(2);
+                    Spot {
+                        page: here.page - 1,
+                        offset: aloud::sentence_start(&previous.text, last),
+                    }
+                } else {
+                    Spot {
+                        page: here.page,
+                        offset: 0,
+                    }
+                }
+            }
+        };
+        self.follow = true;
+        if !self.narrator.seek(target) {
+            self.narrator.start(target);
+        }
+    }
+
+    fn change_speed(&mut self, faster: bool) {
+        let speed = aloud::step_speed(self.narrator.speed(), faster);
+        if speed != self.narrator.speed() {
+            self.narrator.set_speed(speed);
+            (self.options.on_speed)(speed);
+        }
+        self.notice = Some(format!("speed {}", aloud::speed_label(speed)));
+    }
+
+    /// Feeds the narrator text, takes in its speech, and keeps the word being
+    /// read in view. True when the screen should be drawn again.
+    fn narrate(&mut self) -> bool {
+        let pages = self.pages();
+        // A run of empty pages is crossed a few at a time, between keys.
+        for _ in 0..8 {
+            let Some((from, budget)) = self.narrator.wants() else {
+                break;
+            };
+            let cut = if from.page >= pages {
+                Cut::End
+            } else {
+                let laid = self.laid(from.page);
+                match aloud::cut(&laid.text, from.offset, budget) {
+                    Some((start, end)) => Cut::Passage {
+                        page: from.page,
+                        start,
+                        text: laid.text[start..end].to_vec(),
+                    },
+                    None => Cut::PageDone,
+                }
+            };
+            self.narrator.give(cut);
+        }
+        let before = self.narrator.said();
+        let mut changed = self.narrator.tick();
+        if let Some(notice) = self.narrator.take_notice() {
+            self.notice = Some(notice);
+            changed = true;
+        }
+        if let Some(said) = self.narrator.said()
+            && Some(said) != before
+        {
+            let y = self.screen_row(said.page, said.start);
+            if y.is_some() {
+                self.follow = true;
+            }
+            // Turn before the word reaches the very bottom, so the next line shows too.
+            let near_bottom = |y: usize| self.view() > 6 && y + 2 >= self.view();
+            if self.follow && y.is_none_or(near_bottom) {
+                self.show(said.page, said.start);
+            }
+        }
+        changed
     }
 
     // -----------------------------------------------------------------------
@@ -1676,6 +2142,15 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        let place = (self.current, self.offset);
+        self.act(key);
+        // Scrolling away from the word being read stops the screen following it.
+        if place != (self.current, self.offset) {
+            self.follow = false;
+        }
+    }
+
+    fn act(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -1683,6 +2158,7 @@ impl App {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
             Dialog::Find { typed } => return self.find_key(&key, typed),
             Dialog::Bookmarks { selected } => return self.bookmarks_key(&key, selected),
+            Dialog::Voices { typed, selected } => return self.voices_key(&key, typed, selected),
             Dialog::Help | Dialog::Guide => {
                 if matches!(
                     key.code,
@@ -1749,6 +2225,13 @@ impl App {
             Some('d') | Some('D') => self.take_tool(Tool::Pen),
             Some('e') | Some('E') => self.take_tool(Tool::Eraser),
             Some('v') | Some('V') => self.take_tool(Tool::Move),
+            Some('a') if key.kind == KeyEventKind::Press => self.read_aloud(),
+            Some('A') if self.narrator.active() => self.narrator.stop(),
+            Some('s') | Some('S') => self.open_voices(),
+            Some('[') => self.change_speed(false),
+            Some(']') => self.change_speed(true),
+            Some(',') => self.skip_sentence(Direction::Backward),
+            Some('.') => self.skip_sentence(Direction::Forward),
             _ => match key.code {
                 // Esc lets go of a picked stroke, puts the pen down, then lets
                 // go of a selection, then a search, then quits.
@@ -1756,7 +2239,11 @@ impl App {
                 KeyCode::Esc if self.tool != Tool::Select => self.tool = Tool::Select,
                 KeyCode::Esc => {
                     if self.selection.take().is_none() && self.search.take().is_none() {
-                        self.quit = true;
+                        if self.narrator.active() {
+                            self.narrator.stop();
+                        } else {
+                            self.quit = true;
+                        }
                     }
                 }
                 KeyCode::Down => self.scroll_by(1),
@@ -1954,8 +2441,14 @@ impl App {
                     }
                 }
             }
-            (MouseEventKind::ScrollDown, _) => self.scroll_by(WHEEL_STEP),
-            (MouseEventKind::ScrollUp, _) => self.scroll_by(-WHEEL_STEP),
+            (MouseEventKind::ScrollDown, _) => {
+                self.follow = false;
+                self.scroll_by(WHEEL_STEP)
+            }
+            (MouseEventKind::ScrollUp, _) => {
+                self.follow = false;
+                self.scroll_by(-WHEEL_STEP)
+            }
             _ => {}
         }
     }
@@ -2354,12 +2847,18 @@ impl App {
     }
 
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+        // Set when the loop woke only to follow the narration.
+        let mut quiet = false;
         loop {
             self.receive_images();
             self.advance_search(SEARCH_SLICE);
-            terminal.draw(|f| self.draw(f))?;
-            if let Some(kitty) = &mut self.kitty {
-                kitty.flush(&mut io::stdout(), &self.placements)?;
+            let narrated = self.narrate();
+            // Between words nothing on screen changes, so there's nothing to draw.
+            if narrated || !quiet {
+                terminal.draw(|f| self.draw(f))?;
+                if let Some(kitty) = &mut self.kitty {
+                    kitty.flush(&mut io::stdout(), &self.placements)?;
+                }
             }
             if let Some(text) = self.copy.take() {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(text);
@@ -2377,16 +2876,21 @@ impl App {
                 }
                 return Ok(());
             }
-            // A search keeps reading pages between keys, and images
-            // downloading are checked for often; otherwise sleep until something happens.
+            // A search keeps reading pages between keys, the word read aloud
+            // is followed closely, and images downloading are checked for
+            // often; otherwise sleep until something happens.
             let wait = if self.seeking() {
                 Some(Duration::ZERO)
+            } else if self.narrator.busy() {
+                Some(NARRATION_TICK)
             } else {
                 self.loading().then_some(Duration::from_millis(100))
             };
+            quiet = false;
             if let Some(wait) = wait
                 && !event::poll(wait)?
             {
+                quiet = !self.seeking() && !self.loading();
                 continue;
             }
             // Handle everything already waiting before drawing again.
@@ -3366,6 +3870,281 @@ mod tests {
             frame.contains("100%") && frame.contains("Line 80"),
             "{frame}"
         );
+    }
+
+    fn aloud(options: ViewerOptions) -> ViewerOptions {
+        ViewerOptions {
+            speech: Backend::Silent(aloud::fake_synth()),
+            ..options
+        }
+    }
+
+    /// Lets the narrator take in speech until a word is being said, then
+    /// plays `seconds` more of it.
+    fn listen(s: &mut Screen, seconds: f32) -> String {
+        for _ in 0..500 {
+            s.app.narrate();
+            if s.app.narrator.said().is_some() {
+                break;
+            }
+            s.app.narrator.play_for(0.001);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        s.app.narrator.play_for(seconds);
+        s.app.narrate();
+        s.draw()
+    }
+
+    /// The word marked as being read aloud.
+    fn marked(s: &mut Screen) -> String {
+        s.draw();
+        let buffer = s.terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_reads_aloud_from_the_top_of_the_screen_marking_each_word() {
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma. Delta epsilon."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        let frame = listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Alpha");
+        assert!(frame.contains("▶ EmmaMultilingual 1×"), "{frame}");
+        listen(&mut s, 1.2);
+        assert_eq!(marked(&mut s), "beta");
+        // Paused, the word stays put however long goes by.
+        let frame = s.press(KeyCode::Char('a'));
+        assert!(frame.contains("❚❚"), "{frame}");
+        listen(&mut s, 5.0);
+        assert_eq!(marked(&mut s), "beta");
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 1.0);
+        assert_eq!(marked(&mut s), "gamma");
+    }
+
+    #[test]
+    fn reading_aloud_starts_at_the_selection() {
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma. Delta epsilon."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        let (x, y) = s.find("Delta");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Delta");
+    }
+
+    #[test]
+    fn brackets_change_the_speed_and_it_is_kept() {
+        let speeds = Rc::new(RefCell::new(Vec::new()));
+        let heard = speeds.clone();
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma delta epsilon zeta."]),
+            80,
+            20,
+            aloud(ViewerOptions {
+                on_speed: Box::new(move |speed| heard.borrow_mut().push(speed)),
+                ..ViewerOptions::default()
+            }),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        s.press(KeyCode::Char(']'));
+        let frame = s.press(KeyCode::Char(']'));
+        assert!(frame.contains("speed 1.5×"), "{frame}");
+        // A second and a half of speech goes by in one second.
+        listen(&mut s, 1.0);
+        assert_eq!(marked(&mut s), "beta");
+        listen(&mut s, 1.0);
+        assert_eq!(marked(&mut s), "delta");
+        s.press(KeyCode::Char('['));
+        assert_eq!(*speeds.borrow(), vec![1.25, 1.5, 1.25]);
+    }
+
+    #[test]
+    fn period_and_comma_skip_between_sentences() {
+        let mut s = Screen::new(
+            book(&["One two three. Four five six. Seven eight."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        s.press(KeyCode::Char('.'));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Four");
+        listen(&mut s, 2.2);
+        assert_eq!(marked(&mut s), "six");
+        // Well into a sentence, comma goes back to its start; at its start, to the one before.
+        s.press(KeyCode::Char(','));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "Four");
+        s.press(KeyCode::Char(','));
+        listen(&mut s, 0.0);
+        assert_eq!(marked(&mut s), "One");
+    }
+
+    #[test]
+    fn the_voice_picker_filters_and_picks_a_voice() {
+        let voices = Rc::new(RefCell::new(Vec::new()));
+        let heard = voices.clone();
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            90,
+            30,
+            aloud(ViewerOptions {
+                on_voice: Box::new(move |voice: &str| heard.borrow_mut().push(voice.to_owned())),
+                ..ViewerOptions::default()
+            }),
+        );
+        let frame = s.press(KeyCode::Char('s'));
+        assert!(
+            frame.contains("Voice") && frame.contains("Sonia"),
+            "{frame}"
+        );
+        for c in "kingdom".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        let frame = s.press(KeyCode::Down);
+        assert!(
+            frame.contains("2 of 14") && !frame.contains("Aria"),
+            "{frame}"
+        );
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("Ryan reads next"), "{frame}");
+        assert_eq!(*voices.borrow(), vec!["en-GB-RyanNeural".to_owned()]);
+        s.press(KeyCode::Char('a'));
+        let frame = listen(&mut s, 0.0);
+        assert!(frame.contains("▶ Ryan"), "{frame}");
+    }
+
+    #[test]
+    fn the_voice_list_shows_only_once_every_voice_is_there() {
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            90,
+            30,
+            aloud(ViewerOptions::default()),
+        );
+        let list = s.app.narrator.fetching_voices();
+        let frame = s.press(KeyCode::Char('s'));
+        assert!(frame.contains("Loading voices…"), "{frame}");
+        assert!(
+            !frame.contains("Sonia") && !frame.contains("Emma"),
+            "{frame}"
+        );
+        // The search takes typing while the list is on its way; enter waits for it.
+        for c in "hindi fem".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("search  hindi fem"), "{frame}");
+        let voice = |name: &str, locale: &str, language: &str, gender: &str| edge::Voice {
+            name: name.to_owned(),
+            locale: locale.to_owned(),
+            language: language.to_owned(),
+            gender: gender.to_owned(),
+        };
+        list.send(Ok(vec![
+            voice(
+                "en-US-AriaNeural",
+                "en-US",
+                "English (United States)",
+                "Female",
+            ),
+            voice("hi-IN-SwaraNeural", "hi-IN", "Hindi (India)", "Female"),
+            voice("hi-IN-MadhurNeural", "hi-IN", "Hindi (India)", "Male"),
+        ]))
+        .expect("the list is listened for");
+        s.app.narrate();
+        let frame = s.draw();
+        assert!(
+            frame.contains("1 of 3") && frame.contains("Swara"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("Madhur") && !frame.contains("Aria"),
+            "{frame}"
+        );
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("Swara reads next"), "{frame}");
+        assert_eq!(s.app.narrator.voice(), "hi-IN-SwaraNeural");
+    }
+
+    #[test]
+    fn a_voice_picked_while_reading_takes_over_from_the_word_being_read() {
+        let mut s = Screen::new(
+            book(&["Alpha beta gamma delta."]),
+            90,
+            30,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 1.2);
+        assert_eq!(marked(&mut s), "beta");
+        s.press(KeyCode::Char('s'));
+        for c in "sonia".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        s.press(KeyCode::Enter);
+        let frame = listen(&mut s, 0.0);
+        assert!(frame.contains("▶ Sonia"), "{frame}");
+        assert_eq!(marked(&mut s), "beta");
+        listen(&mut s, 1.1);
+        assert_eq!(marked(&mut s), "gamma");
+    }
+
+    #[test]
+    fn the_screen_follows_the_word_read_aloud() {
+        let text: String = (1..=60)
+            .map(|i| format!("Sentence number {i}.\n\n"))
+            .collect();
+        let mut s = Screen::new(
+            Doc::whole("Article", text),
+            60,
+            12,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        for _ in 0..20 {
+            s.press(KeyCode::Char('.'));
+            listen(&mut s, 0.0);
+        }
+        let frame = s.draw();
+        assert!(frame.contains("Sentence number 21."), "{frame}");
+        assert_eq!(marked(&mut s), "Sentence");
+    }
+
+    #[test]
+    fn escape_stops_reading_aloud_before_quitting() {
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            80,
+            20,
+            aloud(ViewerOptions::default()),
+        );
+        s.press(KeyCode::Char('a'));
+        listen(&mut s, 0.0);
+        s.press(KeyCode::Esc);
+        assert!(!s.app.narrator.active() && !s.app.quit);
+        assert_eq!(marked(&mut s), "");
+        s.press(KeyCode::Esc);
+        assert!(s.app.quit);
     }
 
     #[test]

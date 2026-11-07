@@ -2,6 +2,9 @@
 
 Open with `cargo run -- open examples/code.md`. Each section says what you should see.
 
+
+
+
 ## Fenced languages
 
 Each should be colored: keywords, strings, comments, numbers, function names.
