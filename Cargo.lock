@@ -389,6 +389,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "compiler"
+version = "0.0.0"
+source = "git+https://github.com/wevm/ondine?rev=c8e8034c009bb6f987258e1c36045e080f46fde3#c8e8034c009bb6f987258e1c36045e080f46fde3"
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1835,6 +1840,7 @@ name = "leaf-reader"
 version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
+ "compiler",
  "crossterm",
  "dom_smoothie",
  "htmd",

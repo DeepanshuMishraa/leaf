@@ -645,6 +645,7 @@ impl Ctx<'_> {
         // The terminal has one font size, so rank comes from size where it fits
         // (large letters for a short title), then weight and space.
         if depth == 1 && font::width(&text) <= width as usize {
+            self.record(&text);
             let w = font::width(&text) as u16;
             let x = if align == Align::Center {
                 x + (width - w) / 2
@@ -1332,6 +1333,14 @@ mod tests {
             draw("Fact[^1].\n\n[^1]: Source here.", 40),
             vec!["Fact[1].", "", "[1] Source here.", ""]
         );
+    }
+
+    #[test]
+    fn fitting_level_one_headings_are_recorded_in_page_text() {
+        let laid = layout("# Hello", 40, (8, 16), &no_images);
+        let text: String = laid.text.iter().collect();
+
+        assert_eq!(text, "Hello\n");
     }
 
     #[test]

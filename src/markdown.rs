@@ -9,12 +9,12 @@ use std::rc::Rc;
 use std::sync::LazyLock;
 
 use image::RgbaImage;
-use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Parser, Tag};
 use regex::Regex;
 use url::Url;
 
 use crate::doc::{Doc, Source};
-use crate::mermaid::{self, Diagram};
+use crate::mermaid::{self, DIAGRAM_PREFIX, Diagram, diagrams, splice};
 use crate::mono::Rgb;
 use crate::render;
 
@@ -95,76 +95,6 @@ fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
     (splice(markdown, edits), files)
 }
 
-/// The id of the `index`th diagram in a document.
-const DIAGRAM: &str = "mermaid-";
-
-/// Replaces each ```mermaid block that can be drawn with a figure of the
-/// drawing. Returns the markdown and the diagrams, by index.
-fn diagrams(
-    markdown: &str,
-    draw: impl FnOnce(&[String]) -> Vec<Option<Diagram>>,
-) -> (String, Vec<Diagram>) {
-    let mut blocks: Vec<(Range<usize>, String)> = Vec::new();
-    let mut open: Option<(Range<usize>, String)> = None;
-    for (event, range) in Parser::new_ext(markdown, render::MARKDOWN).into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
-                if info.split_whitespace().next() == Some("mermaid") =>
-            {
-                open = Some((range, String::new()))
-            }
-            Event::Text(text) => {
-                if let Some((_, source)) = &mut open {
-                    source.push_str(&text);
-                }
-            }
-            Event::End(TagEnd::CodeBlock) => blocks.extend(open.take()),
-            _ => {}
-        }
-    }
-    if blocks.is_empty() {
-        return (markdown.to_owned(), Vec::new());
-    }
-    let drawn = draw(
-        &blocks
-            .iter()
-            .map(|(_, source)| source.clone())
-            .collect::<Vec<_>>(),
-    );
-    let mut found = Vec::new();
-    let mut edits = Vec::new();
-    for ((range, _), diagram) in blocks.into_iter().zip(drawn) {
-        let Some(diagram) = diagram else { continue };
-        // A paragraph of its own, so it's a figure and not part of the text before or after.
-        edits.push((
-            range,
-            format!(
-                "\n![]({})\n",
-                Doc::image_href(&format!("{DIAGRAM}{}", found.len()))
-            ),
-        ));
-        found.push(diagram);
-    }
-    (splice(markdown, edits), found)
-}
-
-/// `markdown` with each range replaced by its text.
-fn splice(markdown: &str, edits: Vec<(Range<usize>, String)>) -> String {
-    let mut out = String::with_capacity(markdown.len());
-    let mut at = 0;
-    for (range, text) in edits {
-        // Each image and HTML piece is its own span; none sits inside another.
-        if range.start < at {
-            continue;
-        }
-        out.push_str(&markdown[at..range.start]);
-        out.push_str(&text);
-        at = range.end;
-    }
-    out.push_str(&markdown[at..]);
-    out
-}
-
 struct MarkdownSource {
     text: Rc<str>,
     images: Vec<PathBuf>,
@@ -181,7 +111,7 @@ impl MarkdownSource {
 
     fn diagram(&self, id: &str) -> Option<&Diagram> {
         self.diagrams
-            .get(id.strip_prefix(DIAGRAM)?.parse::<usize>().ok()?)
+            .get(id.strip_prefix(DIAGRAM_PREFIX)?.parse::<usize>().ok()?)
     }
 }
 
@@ -254,7 +184,11 @@ pub fn from_url(title: String, text: &str, url: &Url) -> Doc {
 
 fn document(title: String, text: &str, base: Base) -> Doc {
     let (markdown, images) = localize(&FRONT_MATTER.replace(text, ""), base);
-    let (markdown, diagrams) = diagrams(&markdown, mermaid::render);
+    let (markdown, diagrams) = diagrams(
+        &markdown,
+        |i| format!("{}{i}", DIAGRAM_PREFIX),
+        mermaid::render,
+    );
     Doc {
         title,
         page_count: None,
@@ -306,38 +240,11 @@ mod tests {
         assert!(files.is_empty());
     }
 
-    #[test]
-    fn mermaid_blocks_that_draw_become_figures() {
-        let md = "Text\n```mermaid\ngraph LR\n  A-->B\n```\nMore text\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n";
-        let mut asked = Vec::new();
-        let (out, found) = diagrams(md, |sources| {
-            asked = sources.to_vec();
-            vec![Diagram::new(r#"<svg width="10" height="5"></svg>"#), None]
-        });
-        assert_eq!(asked, vec!["graph LR\n  A-->B\n", "not a diagram\n"]);
-        assert_eq!(
-            out,
-            "Text\n\n![](leaf-image:mermaid-0)\n\nMore text\n\n```mermaid\nnot a diagram\n```\n\n```rust\nfn main() {}\n```\n"
-        );
-        assert_eq!(found.len(), 1);
-    }
-
-    /// Runs `examples/mermaid.md` through the real runtime and rasterizer.
-    /// Skipped when neither bun nor node is installed.
+    /// Runs `examples/mermaid.md` through Ondine and the rasterizer.
     #[test]
     fn sample_diagrams_draw_and_rasterize() {
-        let runtime = ["bun", "node"].iter().any(|r| {
-            std::process::Command::new(r)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        });
-        if !runtime {
-            eprintln!("skipped: no bun or node on PATH");
-            return;
-        }
         let md = include_str!("../examples/mermaid.md");
-        let (out, found) = diagrams(md, mermaid::render);
+        let (out, found) = mermaid::diagrams(md, |i| format!("{i}"), mermaid::render);
         // 10 mermaid blocks; only the invalid one stays as code.
         assert_eq!(found.len(), 9, "markdown after drawing:\n{out}");
         assert!(out.contains("```mermaid\nthis is not a diagram at all\n```"));
@@ -348,6 +255,7 @@ mod tests {
         );
         let (ink, paper) = ([230, 230, 230], [20, 20, 20]);
         for (i, diagram) in found.iter().enumerate() {
+            eprintln!("Diagram {i}: {:?}", diagram.size);
             assert!(
                 diagram.size.0 > 0 && diagram.size.1 > 0,
                 "diagram {i} has no size"
@@ -356,7 +264,15 @@ mod tests {
                 .rasterize(800, ink, paper)
                 .unwrap_or_else(|| panic!("diagram {i} did not rasterize"));
             assert!(image.width() <= 800);
-            let inked = image.pixels().filter(|p| p[3] > 128 && p[0] > 180).count();
+            let inked = image
+                .pixels()
+                .filter(|p| {
+                    p[3] > 128
+                        && p[0].abs_diff(ink[0]) < 20
+                        && p[1].abs_diff(ink[1]) < 20
+                        && p[2].abs_diff(ink[2]) < 20
+                })
+                .count();
             assert!(
                 inked > 50,
                 "diagram {i} has almost no ink-colored pixels ({inked})"

@@ -283,7 +283,13 @@ impl Store {
                 "INSERT INTO progress (key, page, page_count, percent, updated_at) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(key) DO UPDATE SET page = excluded.page, page_count = excluded.page_count,
                    percent = excluded.percent, updated_at = excluded.updated_at",
-                params![key, progress.page as i64, progress.page_count as i64, progress.percent as i64, now()],
+                params![
+                    key,
+                    progress.page as i64,
+                    progress.page_count as i64,
+                    progress.percent as i64,
+                    now()
+                ],
             )
             .map(drop)
             .map_err(self.failed(Operation::Save))
