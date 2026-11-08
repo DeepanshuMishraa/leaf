@@ -581,10 +581,7 @@ impl App {
 
     fn at_bottom(&mut self) -> bool {
         match self.mode {
-            Mode::Paged => {
-                let max = self.max_offset();
-                self.offset >= max
-            }
+            Mode::Paged => self.offset >= self.max_offset(),
             Mode::Scroll => self.rows_to_end() <= self.view(),
         }
     }

@@ -15,9 +15,7 @@ use mupdf::{
 use regex::Regex;
 
 use crate::doc::{Doc, Source};
-use crate::mermaid::Diagram;
-use crate::mono::Rgb;
-use crate::{memory, mermaid};
+use crate::memory;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -339,12 +337,7 @@ fn code_text(lines: &[Line]) -> String {
 fn fenced(code: &str) -> String {
     let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(3.max(longest + 1));
-    // tag mermaid so diagrams() can find it
-    if crate::mermaid::looks_like_mermaid(code) {
-        format!("{fence}mermaid\n{code}\n{fence}")
-    } else {
-        format!("{fence}\n{code}\n{fence}")
-    }
+    format!("{fence}\n{code}\n{fence}")
 }
 
 /// What line spacing is judged against.
@@ -424,7 +417,7 @@ fn split_by_gap(lines: Vec<Line>, spacing: Spacing) -> Vec<Vec<Line>> {
             Some(group)
                 if group
                     .last()
-                    .is_some_and(|prev| line.top > prev.top && wraps(prev, &line, spacing)) =>
+                    .is_some_and(|prev| line.top <= prev.top || wraps(prev, &line, spacing)) =>
             {
                 group.push(line)
             }
@@ -960,9 +953,13 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
         text.is_empty() || layout.running.contains(&running_key(text)) || PAGE_LABEL.is_match(text)
     };
     let mut pieces: Vec<Piece> = Vec::new();
-    let push_code = |lines: &[Line], pieces: &mut Vec<Piece>| {
-        let source = code_text(lines);
-        pieces.push(Piece::bare(fenced(&source)));
+    // Back-to-back code blocks gather here and print as one fence.
+    let mut code: Vec<String> = Vec::new();
+    let flush_code = |code: &mut Vec<String>, pieces: &mut Vec<Piece>| {
+        if !code.is_empty() {
+            pieces.push(Piece::bare(fenced(&code.join("\n\n"))));
+        }
+        code.clear();
     };
     for page in pages {
         // Headers and footers go before tables are found, so they don't join one as a row.
@@ -980,23 +977,27 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
                 Laid::Text(lines)
                     if lines.iter().all(|l| l.mono) && block_size(&lines) <= layout.body =>
                 {
-                    push_code(&lines, &mut pieces);
+                    code.push(code_text(&lines));
                     continue;
                 }
                 Laid::Text(lines) => lines,
                 Laid::Image(id) => {
+                    flush_code(&mut code, &mut pieces);
                     pieces.push(Piece::bare(format!("![]({})", Doc::image_href(&id))));
                     continue;
                 }
                 Laid::Note(text) => {
+                    flush_code(&mut code, &mut pieces);
                     pieces.push(Piece::bare(format!("> *{text}*")));
                     continue;
                 }
                 Laid::Table(rows) => {
+                    flush_code(&mut code, &mut pieces);
                     pieces.push(Piece::bare(table_markdown(&rows)));
                     continue;
                 }
             };
+            flush_code(&mut code, &mut pieces);
             let text = collapse_leaders(&block_text(&lines));
             if furniture(&text) {
                 continue;
@@ -1042,6 +1043,7 @@ pub fn render(pages: &[Vec<Block>], layout: &Layout) -> String {
             pieces.push(piece);
         }
     }
+    flush_code(&mut code, &mut pieces);
     join_pieces(&pieces, layout.measure)
 }
 
@@ -1380,7 +1382,6 @@ struct PdfSource {
     layout: Layout,
     /// Markdown of pages read lately, so turning back and forth reads nothing twice.
     pages: RefCell<HashMap<usize, Rc<str>>>,
-    diagrams: RefCell<HashMap<usize, Vec<Diagram>>>,
     images: RefCell<HashMap<String, PdfImage>>,
 }
 
@@ -1407,7 +1408,6 @@ impl PdfSource {
         }
         if let Some(&far) = pages.keys().max_by_key(|&&page| page.abs_diff(index)) {
             pages.remove(&far);
-            self.diagrams.borrow_mut().remove(&far);
             self.images
                 .borrow_mut()
                 .retain(|_, image| image.page() != far);
@@ -1435,12 +1435,6 @@ impl PdfSource {
             ),
         }
     }
-
-    fn diagram_ref(&self, id: &str) -> Option<(usize, usize)> {
-        let rest = id.strip_prefix(mermaid::DIAGRAM_PREFIX)?;
-        let (p_s, idx_s) = rest.split_once("-")?;
-        Some((p_s.parse().ok()?, idx_s.parse().ok()?))
-    }
 }
 
 impl Source for PdfSource {
@@ -1449,25 +1443,13 @@ impl Source for PdfSource {
             return page.clone();
         }
         self.evict(index);
-        let blocks = self.read(index);
-        let raw = render(&[blocks], &self.layout);
-        let (md, found) = mermaid::diagrams(
-            &raw,
-            |i| format!("{}{index}-{i}", mermaid::DIAGRAM_PREFIX),
-            mermaid::render,
-        );
-        let page: Rc<str> = md.into();
+        let page: Rc<str> = render(&[self.read(index)], &self.layout).into();
         memory::shrink_mupdf_cache(PAGE_CACHE_SHARE);
         self.pages.borrow_mut().insert(index, page.clone());
-        self.diagrams.borrow_mut().insert(index, found);
         page
     }
 
     fn image_size(&self, id: &str) -> Option<(u32, u32)> {
-        if let Some((page, i)) = self.diagram_ref(id) {
-            return self.diagrams.borrow().get(&page)?.get(i).map(|d| d.size);
-        }
-
         self.images.borrow().get(id).map(PdfImage::size)
     }
 
@@ -1475,25 +1457,11 @@ impl Source for PdfSource {
     // An image mupdf cannot decode is left out; the text around it still shows.
     // Drawings render sharp at the width they're shown; embedded images never beyond their own pixels.
     fn decode(&self, id: &str, width: u32) -> Option<RgbaImage> {
-        if mermaid::is_diagram_id(id) {
-            return None;
-        }
-
         let width = width.clamp(1, MAX_RENDER_PIXELS_WIDE);
         let drawn = self.draw(self.images.borrow().get(id)?, width);
         // The decoded pixels are the bulk of what mupdf now holds, and are kept by the viewer while shown.
         memory::shrink_mupdf_cache(0);
         drawn.ok().flatten()
-    }
-
-    fn is_diagram(&self, id: &str) -> bool {
-        mermaid::is_diagram_id(id) && self.diagram_ref(id).is_some()
-    }
-
-    fn draw(&self, id: &str, width: u32, ink: Rgb, paper: Rgb) -> Option<RgbaImage> {
-        let (page, i) = self.diagram_ref(id)?;
-        let diagram = self.diagrams.borrow();
-        diagram.get(&page)?.get(i)?.rasterize(width, ink, paper)
     }
 }
 
@@ -1552,7 +1520,6 @@ fn from_document(
     mupdf::Context::get().disable_icc();
     let document = document.map_err(failed)?;
     let page_count = document.page_count().map_err(failed)?.max(0) as usize;
-    let diagrams = RefCell::new(HashMap::new());
     let images = RefCell::new(HashMap::new());
     let sample: Vec<Vec<Block>> = sample_pages(page_count, SAMPLE_PAGES)
         .into_iter()
@@ -1577,7 +1544,6 @@ fn from_document(
             document: RefCell::new((document, 0)),
             layout,
             pages: RefCell::new(HashMap::new()),
-            diagrams,
             images,
         }),
     })
@@ -1830,8 +1796,7 @@ mod tests {
             text(vec![code("a = 1", 20.0)]),
             text(vec![code("b = 2", 50.0)]),
         ]);
-        assert!(out.contains("```\na = 1\n```"), "{out}");
-        assert!(out.contains("```\nb = 2\n```"), "{out}");
+        assert!(out.contains("```\na = 1\n\nb = 2\n```"), "{out}");
         let out = md(vec![
             prose(0.0),
             text(vec![code("SELECT 1", 12.0)]),
@@ -1927,10 +1892,7 @@ mod tests {
             ]),
             text(vec![line("4. Scheduler: picks a worker.", 100.0)]),
         ]);
-        assert!(
-            out.contains("\n\n3. Registry: keeps track of every worker and its health.\n4. Scheduler: picks a worker."),
-            "{out}"
-        );
+        assert!(out.contains("\n\n3. Registry: keeps track of every worker and its health.\n4. Scheduler: picks a worker."), "{out}");
     }
 
     #[test]
