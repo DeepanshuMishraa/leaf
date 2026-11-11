@@ -266,7 +266,7 @@ function M.setup(opts)
     description = "Pick which installed agent CLI gets questions about a selection in a Leaf"
       .. " document or diff. Its open pane gets them; with none open, leaf starts it beside.",
     category = "Leaf",
-    keywords = "leaf agent claude codex opencode gemini grok cursor default send ask picker",
+    keywords = "leaf agent claude codex opencode gemini grok pi cursor default send ask picker",
     run = function(ctx)
       popover(ctx, "Agent", pane_command(ctx, "agents"), cwd(ctx))
     end,
@@ -297,7 +297,7 @@ function M.setup(opts)
         .. " the file, the page or side, the line numbers and the lines around it."
         .. " Without question, leaf asks you to type one. In leaf itself: @ or ctrl+enter.",
       category = "Leaf",
-      keywords = "leaf agent claude codex grok selection ask quote explain diff",
+      keywords = "leaf agent claude codex grok pi selection ask quote explain diff",
       args = { question = "string?" },
       run = function(ctx, args)
         local question = args.question or ""

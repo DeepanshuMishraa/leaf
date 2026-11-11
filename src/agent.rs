@@ -31,6 +31,7 @@ const AGENTS: &[&str] = &[
     "copilot",
     "auggie",
     "grok",
+    "pi",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +41,7 @@ pub enum AgentFailed {
     )]
     NoTmux,
     #[error(
-        "No agent pane (claude, codex, opencode, gemini, grok, aider…) is open in this Rex session. The text was copied to the clipboard instead. Set LEAF_AGENT_PANE to a Rex block id."
+        "No agent pane (claude, codex, opencode, gemini, grok, pi, aider…) is open in this Rex session. The text was copied to the clipboard instead. Set LEAF_AGENT_PANE to a Rex block id."
     )]
     NoAgent,
     #[error(
@@ -69,6 +70,7 @@ const PICKABLE: &[&str] = &[
     "gemini",
     "cursor-agent",
     "grok",
+    "pi",
     "copilot",
     "amp",
     "aider",
@@ -88,6 +90,8 @@ fn start_command(agent: &str, prompt: &str) -> Option<Vec<String>> {
         "claude" | "codex" | "cursor-agent" | "grok" => None,
         "gemini" | "qwen" | "copilot" => Some("-i"),
         "opencode" => Some("--prompt"),
+        // `--` ends pi's options, so a prompt starting with `-` stays a message.
+        "pi" => Some("--"),
         _ => return None,
     };
     let mut command = vec![agent.to_owned()];
@@ -848,6 +852,7 @@ mod tests {
     fn command_names_lose_their_wrappers() {
         assert_eq!(agent_name("/usr/local/bin/codex"), Some("codex"));
         assert_eq!(agent_name("opencode.exe"), Some("opencode"));
+        assert_eq!(agent_name("/opt/homebrew/bin/pi"), Some("pi"));
         assert_eq!(agent_name("node"), None);
         assert_eq!(agent_name("vim"), None);
     }
@@ -958,6 +963,10 @@ mod tests {
         assert_eq!(
             start_command("opencode", "why?"),
             Some(vec!["opencode".into(), "--prompt".into(), "why?".into()])
+        );
+        assert_eq!(
+            start_command("pi", "-why?"),
+            Some(vec!["pi".into(), "--".into(), "-why?".into()])
         );
         assert_eq!(start_command("aider", "why?"), None);
     }
