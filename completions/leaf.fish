@@ -14,6 +14,7 @@ complete -c leaf -n '__fish_seen_subcommand_from ask' -l title -x -d 'Document n
 complete -c leaf -n '__fish_seen_subcommand_from ask' -l question -x -d 'Question to send with the selection'
 complete -c leaf -n __fish_use_subcommand -a rex -d 'Add or remove the Rex command palette actions'
 complete -c leaf -n '__fish_seen_subcommand_from rex plugin' -a 'install uninstall' -d 'Rex plugin'
+complete -c leaf -n __fish_use_subcommand -a agents -d 'Pick the installed agent questions go to'
 complete -c leaf -n __fish_use_subcommand -a voice -d 'Show or set the voice that reads aloud'
 complete -c leaf -n '__fish_seen_subcommand_from voice' -a 'en-US-EmmaMultilingualNeural en-US-AriaNeural en-US-GuyNeural en-GB-SoniaNeural en-GB-RyanNeural en-AU-NatashaNeural en-IN-NeerjaNeural' -d 'Voice'
 complete -c leaf -n __fish_use_subcommand -a comments -d 'List saved diff comments'

@@ -1,5 +1,6 @@
 # leaf
 
+WOW
 Read PDFs, markdown files and web articles in the terminal, and review diffs.
 
 ```sh
@@ -81,6 +82,7 @@ Always there:
 
 - **Open Document…** floats a picker over the window, like Rex's Go to Directory. The field holds a path, starting at the pane's folder; type to narrow that folder's folders and documents, `tab` or `enter` on a folder goes into it, and `enter` on a document reads it. Documents read lately come first, with how far in. A typed `https://` link opens as it is. `leaf open` with no file, or plain `leaf`, shows the same picker in place.
 - **Review Diff**, **Review Staged Changes** and **Review This Branch** open the diff reviewer.
+- **Choose Agent…** floats a list of the agent CLIs installed here (claude, codex, opencode, gemini, grok…), with the one picked now ticked. Questions then go to the pane already running that agent, so its conversation goes on; with none open, leaf starts it in a new pane beside, already asked, and later questions go there. **Any agent pane** sends to whichever agent pane is open: the focused one, else one in the same tab. `leaf agents` shows the same list in place.
 
 While a document or a diff is open:
 

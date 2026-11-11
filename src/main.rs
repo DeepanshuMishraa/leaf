@@ -1,4 +1,5 @@
 mod agent;
+mod agentpick;
 mod aloud;
 mod article;
 mod comment;
@@ -49,6 +50,7 @@ const USAGE: &str = "Usage: leaf open [file.pdf | file.epub | file.md | url]   (
        leaf rex install | uninstall   add leaf to Rex's command palette
        leaf voice [name]        show or set the voice that reads aloud
        leaf voices              pick a voice from every voice there is
+       leaf agents              pick the installed agent questions go to
 
 Diff options:
   --staged           staged changes
@@ -245,6 +247,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        "agents" => agents_command(),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
                 println!("{USAGE}");
@@ -342,6 +345,38 @@ fn voices_command(reader: Option<&str>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("leaf: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Shows the installed agents; the one picked gets every question from now on.
+fn agents_command() -> ExitCode {
+    let store = match Store::open(&progress::default_path()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let current = store.load_agent().ok().flatten();
+    let installed = agent::installed();
+    let pick = match agentpick::pick(&installed, current.as_deref()) {
+        Ok(Some(pick)) => pick,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: the terminal failed ({e}). The agent is unchanged.");
+            return ExitCode::from(1);
+        }
+    };
+    let name = match pick {
+        agentpick::Pick::Any => None,
+        agentpick::Pick::Agent(name) => Some(name),
+    };
+    match store.save_agent(name) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: {e} Questions still go to the agent picked before.");
             ExitCode::from(1)
         }
     }

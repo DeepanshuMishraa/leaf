@@ -51,6 +51,92 @@ pub enum AgentFailed {
         "Could not send to the agent pane {pane} ({cause}). The text was copied to the clipboard instead."
     )]
     Tmux { pane: String, cause: String },
+    #[error(
+        "leaf can't start {agent} with a question. Pick another agent with Leaf: Choose Agent…, or Any agent pane to send to one already open. The text was copied to the clipboard instead."
+    )]
+    CantStart { agent: String },
+    #[error(
+        "Starting {agent} in a new pane failed ({cause}). The text was copied to the clipboard instead."
+    )]
+    StartFailed { agent: String, cause: String },
+}
+
+/// The agent CLIs the picker offers, in the order it lists them.
+const PICKABLE: &[&str] = &[
+    "claude",
+    "codex",
+    "opencode",
+    "gemini",
+    "cursor-agent",
+    "grok",
+    "copilot",
+    "amp",
+    "aider",
+    "goose",
+    "crush",
+    "droid",
+    "qwen",
+    "kilo",
+    "cline",
+    "auggie",
+];
+
+/// The command that starts `agent` already asked `prompt`, for the CLIs that
+/// take a first prompt and stay open; `None` for the others.
+fn start_command(agent: &str, prompt: &str) -> Option<Vec<String>> {
+    let flag = match agent {
+        "claude" | "codex" | "cursor-agent" | "grok" => None,
+        "gemini" | "qwen" | "copilot" => Some("-i"),
+        "opencode" => Some("--prompt"),
+        _ => return None,
+    };
+    let mut command = vec![agent.to_owned()];
+    command.extend(flag.map(str::to_owned));
+    command.push(prompt.to_owned());
+    Some(command)
+}
+
+/// An agent CLI found on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub name: &'static str,
+    pub path: PathBuf,
+}
+
+/// The agent CLIs on `PATH`, plus the folders their installers use.
+pub fn installed() -> Vec<Installed> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    for extra in [
+        ".local/bin",
+        ".bun/bin",
+        ".npm-global/bin",
+        ".cargo/bin",
+        ".opencode/bin",
+        ".grok/bin",
+    ] {
+        dirs.push(Path::new(&home).join(extra));
+    }
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    PICKABLE
+        .iter()
+        .filter_map(|name| {
+            dirs.iter()
+                .map(|dir| dir.join(name))
+                .find(|path| path.is_file())
+                .map(|path| Installed { name, path })
+        })
+        .collect()
+}
+
+/// The agent picked with `leaf agents`, when one was.
+pub fn default_agent() -> Option<String> {
+    crate::progress::Store::open(&crate::progress::default_path())
+        .and_then(|store| store.load_agent())
+        .ok()
+        .flatten()
 }
 
 /// An agent pane the comment can go to.
@@ -64,14 +150,6 @@ impl Agent {
     pub fn describe(&self) -> String {
         format!("{} in {}", self.command, self.pane)
     }
-}
-
-/// The agent block to send to: one already open in this Rex session.
-pub fn find() -> Result<Agent, AgentFailed> {
-    let Some(session) = rex_session() else {
-        return Err(AgentFailed::NoTmux);
-    };
-    find_rex(&session)
 }
 
 /// Sends `text` to the agent: a bracketed paste, then Enter outside it.
@@ -490,13 +568,18 @@ struct Candidate {
 }
 
 /// Prefers the focused agent, then one in the same window as the document.
+/// With `picked`, only panes running that agent count.
 fn best_candidate<'a>(
     candidates: &'a [Candidate],
     own_window: &str,
     focused: &str,
+    picked: Option<&str>,
 ) -> Option<&'a Candidate> {
     let mut best: Option<(u8, &Candidate)> = None;
-    for candidate in candidates {
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| picked.is_none_or(|name| candidate.command == name))
+    {
         let tier = if candidate.id == focused {
             3
         } else if !own_window.is_empty() && candidate.window == own_window {
@@ -548,7 +631,7 @@ fn submission(text: &str) -> String {
     format!("\u{1b}[200~{text}\u{1b}[201~\r")
 }
 
-fn find_rex(session: &str) -> Result<Agent, AgentFailed> {
+fn find_rex(session: &str, picked: Option<&str>) -> Result<Agent, AgentFailed> {
     let listed = rex_cmd(
         &[
             "block".into(),
@@ -609,12 +692,53 @@ fn find_rex(session: &str) -> Result<Agent, AgentFailed> {
             command,
         });
     }
-    best_candidate(&candidates, &own_window, &focused)
+    best_candidate(&candidates, &own_window, &focused, picked)
         .map(|candidate| Agent {
             pane: candidate.id.clone(),
             command: candidate.command.clone(),
         })
         .ok_or(AgentFailed::NoAgent)
+}
+
+/// Starts `agent` in a pane beside this one, already asked `text`.
+fn start_rex(session: &str, agent: &str, text: &str) -> Result<Agent, AgentFailed> {
+    let Some(command) = start_command(agent, text) else {
+        return Err(AgentFailed::CantStart {
+            agent: agent.to_owned(),
+        });
+    };
+    let failed = |cause: String| AgentFailed::StartFailed {
+        agent: agent.to_owned(),
+        cause,
+    };
+    let mut args: Vec<String> = vec!["split".into(), "-s".into(), session.into()];
+    if let Some(own) = std::env::var("REX_BLOCK")
+        .ok()
+        .filter(|own| !own.is_empty())
+    {
+        args.extend(["-b".into(), own]);
+    }
+    if let Ok(dir) = std::env::current_dir() {
+        args.extend(["-c".into(), dir.display().to_string()]);
+    }
+    args.extend([
+        "--split=right".into(),
+        "--focus=false".into(),
+        "--label".into(),
+        agent.into(),
+        "--json".into(),
+        "--".into(),
+    ]);
+    args.extend(command);
+    let printed = rex_output(&args).map_err(failed)?;
+    let pane = serde_json::from_str::<serde_json::Value>(&printed)
+        .ok()
+        .and_then(|value| value["block_ids"][0].as_str().map(str::to_owned))
+        .ok_or_else(|| failed(format!("rex split printed no block id: {printed}")))?;
+    Ok(Agent {
+        pane,
+        command: agent.to_owned(),
+    })
 }
 
 fn agent_from_rex_process(session: &str, block: &str) -> Option<String> {
@@ -678,9 +802,16 @@ fn rex_focus(session: &str) -> (String, String) {
     (window, focused)
 }
 
+/// Pastes `text` into the agent pane already open, so the conversation there
+/// goes on. With an agent picked in `leaf agents`, only a pane running it
+/// counts, and with none open, leaf starts it in a new pane, already asked.
 fn deliver_rex(text: &str) -> Result<Agent, AgentFailed> {
     let session = rex_session().ok_or(AgentFailed::NoTmux)?;
-    let agent = find()?;
+    let picked = default_agent();
+    let agent = match (find_rex(&session, picked.as_deref()), picked) {
+        (Err(AgentFailed::NoAgent), Some(agent)) => return start_rex(&session, &agent, text),
+        (found, _) => found?,
+    };
     let payload = serde_json::json!({ "data": submission(text) }).to_string();
     let output = rex_cmd(
         &[
@@ -788,10 +919,47 @@ mod tests {
                 command: "claude".into(),
             },
         ];
-        let best = best_candidate(&candidates, "window:b", "block:other").unwrap();
+        let best = best_candidate(&candidates, "window:b", "block:other", None).unwrap();
         assert_eq!(best.command, "codex");
-        let beside = best_candidate(&candidates, "window:b", "block:none").unwrap();
+        let beside = best_candidate(&candidates, "window:b", "block:none", None).unwrap();
         assert_eq!(beside.command, "claude");
+    }
+
+    #[test]
+    fn a_picked_agent_goes_to_its_own_open_pane_or_none() {
+        let candidates = vec![
+            Candidate {
+                id: "block:focused".into(),
+                window: "window:a".into(),
+                command: "codex".into(),
+            },
+            Candidate {
+                id: "block:far".into(),
+                window: "window:z".into(),
+                command: "claude".into(),
+            },
+        ];
+        let best =
+            best_candidate(&candidates, "window:a", "block:focused", Some("claude")).unwrap();
+        assert_eq!(best.id, "block:far");
+        assert!(best_candidate(&candidates, "window:a", "block:focused", Some("gemini")).is_none());
+    }
+
+    #[test]
+    fn agents_that_take_a_first_prompt_start_already_asked() {
+        assert_eq!(
+            start_command("claude", "why?"),
+            Some(vec!["claude".into(), "why?".into()])
+        );
+        assert_eq!(
+            start_command("gemini", "why?"),
+            Some(vec!["gemini".into(), "-i".into(), "why?".into()])
+        );
+        assert_eq!(
+            start_command("opencode", "why?"),
+            Some(vec!["opencode".into(), "--prompt".into(), "why?".into()])
+        );
+        assert_eq!(start_command("aider", "why?"), None);
     }
 
     #[test]

@@ -260,6 +260,18 @@ function M.setup(opts)
     run = function(ctx) place(ctx, "branch", "diff", "--branch") end,
   }
 
+  rex.action{
+    name = "leaf_agent",
+    title = "Leaf: Choose Agent…",
+    description = "Pick which installed agent CLI gets questions about a selection in a Leaf"
+      .. " document or diff. Its open pane gets them; with none open, leaf starts it beside.",
+    category = "Leaf",
+    keywords = "leaf agent claude codex opencode gemini grok cursor default send ask picker",
+    run = function(ctx)
+      popover(ctx, "Agent", pane_command(ctx, "agents"), cwd(ctx))
+    end,
+  }
+
   -- While a document or a diff is open --------------------------------------------
   --
   -- Rex can't hide an action per pane, so these are only defined while leaf

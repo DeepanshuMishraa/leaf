@@ -381,6 +381,15 @@ impl Store {
         self.save_setting("voice", voice)
     }
 
+    /// The agent CLI questions go to, such as `claude`; `None` means any agent pane.
+    pub fn load_agent(&self) -> Result<Option<String>, StoreFailed> {
+        Ok(self.setting("agent")?.filter(|name| !name.is_empty()))
+    }
+
+    pub fn save_agent(&self, agent: Option<&str>) -> Result<(), StoreFailed> {
+        self.save_setting("agent", agent.unwrap_or(""))
+    }
+
     /// How fast reading aloud goes.
     pub fn load_speed(&self) -> Result<Option<f32>, StoreFailed> {
         Ok(self
@@ -989,6 +998,16 @@ mod tests {
         );
         assert_eq!(store.load_speed().unwrap(), Some(1.5));
         assert_eq!(store.load_image_mode().unwrap(), None);
+    }
+
+    #[test]
+    fn the_default_agent_is_remembered_and_can_go_back_to_any() {
+        let store = memory();
+        assert_eq!(store.load_agent().unwrap(), None);
+        store.save_agent(Some("codex")).unwrap();
+        assert_eq!(store.load_agent().unwrap().as_deref(), Some("codex"));
+        store.save_agent(None).unwrap();
+        assert_eq!(store.load_agent().unwrap(), None);
     }
 
     #[test]
