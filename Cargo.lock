@@ -1858,6 +1858,7 @@ dependencies = [
  "ureq",
  "url",
  "wasmtime",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]

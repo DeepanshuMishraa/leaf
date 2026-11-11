@@ -39,3 +39,9 @@ unicode-width = "0.2"
 ureq = "3"
 url = "2"
 wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "runtime", "std"] }
+
+# Load fontconfig at run time instead of linking it, so building on Linux
+# doesn't need its development package (libfontconfig1-dev). mupdf's
+# system-fonts feature pulls it in through font-kit.
+[target.'cfg(not(any(target_family = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))'.dependencies]
+yeslogic-fontconfig-sys = { version = "6", features = ["dlopen"] }
