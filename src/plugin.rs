@@ -60,6 +60,10 @@ pub fn uninstall() -> Result<String, String> {
     if plugin_path.is_file() {
         fs::remove_file(&plugin_path).map_err(|e| e.to_string())?;
     }
+    // Its folder too, unless something else was put there.
+    if let Some(folder) = plugin_path.parent() {
+        let _ = fs::remove_dir(folder);
+    }
     Ok("Removed Leaf from the command palette.".into())
 }
 
