@@ -42,6 +42,7 @@ wasmtime = { version = "50.0.0", default-features = false, features = ["cranelif
 
 # Load fontconfig at run time instead of linking it, so building on Linux
 # doesn't need its development package (libfontconfig1-dev). mupdf's
-# system-fonts feature pulls it in through font-kit.
+# system-fonts feature pulls it in through font-kit; this turns on font-kit's
+# dlopen mode, which also sets yeslogic-fontconfig-sys/dlopen.
 [target.'cfg(not(any(target_family = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))'.dependencies]
-yeslogic-fontconfig-sys = { version = "6", features = ["dlopen"] }
+font-kit = { version = "0.14", default-features = false, features = ["source-fontconfig-dlopen"] }

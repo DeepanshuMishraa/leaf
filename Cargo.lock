@@ -1837,6 +1837,7 @@ dependencies = [
  "base64 0.22.1",
  "crossterm",
  "dom_smoothie",
+ "font-kit",
  "htmd",
  "image",
  "libc",
@@ -1858,7 +1859,6 @@ dependencies = [
  "ureq",
  "url",
  "wasmtime",
- "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
