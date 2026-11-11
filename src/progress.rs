@@ -821,9 +821,19 @@ mod tests {
 
     #[test]
     fn a_store_that_cant_be_created_is_an_error() {
-        let failure = Store::open(Path::new("/nonexistent-dir/leaf.db"))
-            .err()
-            .expect("open fails");
+        // A file where the folder should be: no one, root included, can
+        // create a directory there.
+        let blocker = std::env::temp_dir().join(format!("leaf-blocker-{}", std::process::id()));
+        // create_new refuses an existing file or symlink, so the cleanup
+        // below only ever removes the file made here.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&blocker)
+            .unwrap();
+        let opened = Store::open(&blocker.join("leaf.db"));
+        std::fs::remove_file(&blocker).unwrap();
+        let failure = opened.err().expect("open fails");
         assert_eq!(failure.operation, Operation::Open);
         assert!(
             failure

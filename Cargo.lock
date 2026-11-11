@@ -1837,6 +1837,7 @@ dependencies = [
  "base64 0.22.1",
  "crossterm",
  "dom_smoothie",
+ "font-kit",
  "htmd",
  "image",
  "libc",
