@@ -67,7 +67,7 @@ Local diffs need a Git repository. A patch file and a GitHub pull request, commi
 
 Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. Added and removed lines are tinted, with the changed words picked out.
 
-Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `v` enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `C` comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
+Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `v` enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `@` (or `ctrl+enter`) asks the agent pane about the range, or the current line: type the question and press enter. `C` comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
 
 The message names the file, the side, and the line range, and includes the hunk around that range, then the comment. It is sent, not left sitting in the agent's input. An agent pane is found from `LEAF_AGENT_PANE`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini`, `grok` or another known agent. With no Rex session or no agent, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
@@ -75,15 +75,27 @@ The message names the file, the side, and the line range, and includes the hunk 
 
 `leaf rex install` adds Leaf to Rex's command palette. Press `cmd+shift+p` and type Leaf.
 
-- **Open Document…** opens a picker beside you: documents read lately (with how far in), then every PDF, EPUB and markdown file under the pane's folder. Type to narrow it; a path or an `https://` link typed out opens as it is. Pass `target` to skip the picker. `leaf open` with no file, or plain `leaf`, shows the same picker.
-- **Review Diff**, **Review Staged Changes** and **Review This Branch** open the diff reviewer beside you.
-- **Ask Agent About Selection** sends the text selected in the open document, with the file, the page, the line numbers and the lines around it, to the agent pane open in the session. Pass `question` to send it straight away; without one, the reader asks you to type it.
-- **Read Aloud / Pause**, **Stop Reading Aloud**, **Read Faster**, **Read Slower**, **Next Sentence** and **Previous Sentence** drive reading aloud in the open document.
-- **Voice — Sonia**, **Voice — Ryan** and the other built-in voices switch who reads. **Search Every Voice…** opens the reader's search over every voice, and **Use Voice by Name** takes any of them, such as `fr-FR-DeniseNeural`. With no document open, the voice becomes the default (`leaf voice NAME` does the same from a shell).
+Documents and diffs open in the pane the palette was called from. leaf runs in a layer laid exactly over that pane, so nothing is typed into its shell: quitting leaf leaves the shell as it was, with no command on screen or in its history. A document already open there gives way to the new one. A pane busy with something else, such as an editor or an agent, keeps it, and leaf opens beside it.
 
-The reading and voice actions need a document open in a Leaf pane in the session, and say so otherwise. Rex has no way to grey out a palette action, so they stay listed. `@` inside the document asks without leaving the page, and a diff comment's `ctrl+enter` uses the same agent pane.
+Always there:
 
-Remote sessions work too. Rex runs the actions on your Mac and sends pane and block calls to the host, so documents and diffs open on the host, from the host's files. A host without leaf builds it with `cargo install leaf-reader` the first time; it needs Rust there. Commands reach a reader by being typed into its pane (F12, then one line), so they don't depend on which machine it's on. A reader tells Rex it's there with a program-status record (`leaf/reader`).
+- **Open Document…** floats a picker over the window, like Rex's Go to Directory. The field holds a path, starting at the pane's folder; type to narrow that folder's folders and documents, `tab` or `enter` on a folder goes into it, and `enter` on a document reads it. Documents read lately come first, with how far in. A typed `https://` link opens as it is. `leaf open` with no file, or plain `leaf`, shows the same picker in place.
+- **Review Diff**, **Review Staged Changes** and **Review This Branch** open the diff reviewer.
+
+While a document or a diff is open:
+
+- **Ask Agent About Selection**, `⇧⌘A`, asks the agent pane open in the session about the selection: in a document, with the file, the page, the line numbers and the lines around it; in a diff, with the file, the side, the line range and the hunk around it. Pass `question` to send it straight away; without one, leaf asks you to type it. Inside leaf, `@` or `ctrl+enter` does the same, and `?` lists it.
+
+While a document is open:
+
+- **Read Aloud / Pause**, **Stop Reading Aloud**, **Read Faster**, **Read Slower**, **Next Sentence** and **Previous Sentence** drive reading aloud.
+- **Change Voice…** floats a list of every Microsoft voice over the window, searchable by name, language or gender, with the one reading now ticked. `enter` switches the reader to it.
+
+Rex can't hide an action per pane, so the plugin defines these only while leaf shows a document or a diff on this machine. When that changes, leaf rewrites the `-- open:` line in its block of `init.lua` and reloads the config, quietly; the plugin then asks `leaf rex state` which actions to define. The line has to change: the Rex app fetches its actions again only when `init.lua` itself changed. `leaf voice NAME` sets the default voice from a shell.
+
+Rex's own pickers (themes, Go to Directory) are built into the app, and this version gives a plugin no way to fill one with its own list, so leaf's pickers are drawn to match them in a floating layer.
+
+Remote sessions work too. Rex runs the actions on your Mac and sends pane and block calls to the host, so documents and diffs open on the host, from the host's files. A host without leaf builds it with `cargo install leaf-reader` the first time; it needs Rust there. Commands reach a reader by being typed into its pane (F12, then one line), so they don't depend on which machine it's on. A reader tells Rex it's there with a program-status record (`leaf/reader`). A reader on a remote host can't reload your Mac's config, so the reading actions show there only while a reader is also open on this machine; the keys inside the reader always work.
 
 Rex puts the `rex` command on `PATH` only inside its own panes. leaf also looks in `REX_BIN_DIR` and in Rex's application folder, and `LEAF_REX` names the binary when neither is available. `LEAF_AGENT_PANE` names the block to send to.
 

@@ -379,6 +379,57 @@ pub(crate) fn rex_program() -> Result<PathBuf, String> {
     )
 }
 
+/// Runs `rex` with `args` in this pane's session; the error is what rex said.
+pub(crate) fn rex_run(args: &[String], stdin: Option<&[u8]>) -> Result<(), String> {
+    let output = rex_cmd(args, stdin)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "rex {} failed: {}",
+            args.join(" "),
+            stderr(&output)
+        ))
+    }
+}
+
+/// Runs `rex` with `args` and returns what it printed.
+pub(crate) fn rex_output(args: &[String]) -> Result<String, String> {
+    let output = rex_cmd(args, None)?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "rex {} failed: {}",
+            args.join(" "),
+            stderr(&output)
+        ))
+    }
+}
+
+/// Types `data` into a Rex block in this session, as if from the keyboard.
+pub(crate) fn rex_write(block: &str, data: &str) -> Result<(), String> {
+    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let payload = serde_json::json!({ "data": data }).to_string();
+    rex_run(
+        &[
+            "block".into(),
+            "call".into(),
+            "-s".into(),
+            session,
+            "-b".into(),
+            block.into(),
+            "write".into(),
+            "-".into(),
+        ],
+        Some(payload.as_bytes()),
+    )
+}
+
+pub(crate) fn rex_session_id() -> Option<String> {
+    rex_session()
+}
+
 fn rex_cmd(args: &[String], stdin: Option<&[u8]>) -> Result<std::process::Output, String> {
     let mut command = Command::new(rex_program()?);
     command

@@ -29,6 +29,7 @@ use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
 use crate::github;
 use crate::progress::{SavedComment, Store, StoreFailed};
+use crate::remote;
 use crate::render::DIM;
 use crate::syntax;
 
@@ -193,6 +194,15 @@ impl Toast {
     }
 }
 
+/// What enter does with the text written in the box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// Saves it as a review comment (`C`).
+    Comment,
+    /// Sends it to the agent pane as a question about the lines (`@`).
+    Ask,
+}
+
 /// The comment being written, and the lines it hangs off.
 #[derive(Clone)]
 struct Composer {
@@ -201,6 +211,7 @@ struct Composer {
     anchor: Anchor,
     first: usize,
     last: usize,
+    purpose: Purpose,
 }
 
 enum Job {
@@ -434,6 +445,8 @@ struct App {
     focus: Option<(usize, usize)>,
     drag_origin: Option<usize>,
     composer: Option<Composer>,
+    /// A command from Rex's command palette, being typed in after F12.
+    rex_command: Option<String>,
     dialog: Dialog,
     comments: Vec<SavedComment>,
     /// Rows a saved comment marks, and its state, for the gutter.
@@ -471,6 +484,7 @@ impl App {
             focus: None,
             drag_origin: None,
             composer: None,
+            rex_command: None,
             dialog: Dialog::None,
             comments: options.comments,
             marks: HashMap::new(),
@@ -754,8 +768,11 @@ pub fn run(loaded: Loaded, options: Options) -> io::Result<()> {
         EnableBracketedPaste,
         SetTitle(&loaded.title)
     );
+    // Lets Rex's command palette find this diff; Rex drops it if leaf dies.
+    remote::announce(remote::Kind::Diff, &loaded.title);
     let mut app = App::new(loaded, options);
     let result = setup.and_then(|_| app.event_loop(&mut terminal));
+    remote::withdraw(remote::Kind::Diff);
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
@@ -792,13 +809,14 @@ enum Edit {
 }
 
 impl Composer {
-    fn new(anchor: Anchor, first: usize, last: usize) -> Self {
+    fn new(anchor: Anchor, first: usize, last: usize, purpose: Purpose) -> Self {
         Composer {
             text: Vec::new(),
             cursor: 0,
             anchor,
             first,
             last,
+            purpose,
         }
     }
 
@@ -810,6 +828,7 @@ impl Composer {
             anchor: comment.anchor.clone(),
             first,
             last,
+            purpose: Purpose::Comment,
         }
     }
 
@@ -986,6 +1005,23 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        // Before dialogs and the comment box, which would take it as typing.
+        if key.code == remote::WAKE {
+            self.rex_command = Some(String::new());
+            return;
+        }
+        if let Some(mut line) = self.rex_command.take() {
+            match key.code {
+                KeyCode::Enter => self.obey_rex(remote::Command::parse(&line)),
+                KeyCode::Esc => {}
+                KeyCode::Char(c) if line.len() < remote::LONGEST => {
+                    line.push(c);
+                    self.rex_command = Some(line);
+                }
+                _ => self.rex_command = Some(line),
+            }
+            return;
+        }
         if self.dialog_kind().is_some() {
             self.dialog_key(key);
             return;
@@ -1025,7 +1061,11 @@ impl App {
             KeyCode::Char('[') | KeyCode::Char('N') => self.next_file(false),
             KeyCode::Char('F') | KeyCode::Char('f') => self.show_files(),
             KeyCode::Char('v') => self.toggle_selection(),
-            KeyCode::Char('C') => self.compose(),
+            KeyCode::Char('C') => self.compose(Purpose::Comment),
+            KeyCode::Char('@') => self.compose(Purpose::Ask),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.compose(Purpose::Ask)
+            }
             KeyCode::Char('m') => self.show_comments(),
             KeyCode::Char('y') => self.copy_payload(false),
             KeyCode::Char('Y') => self.copy_payload(true),
@@ -1044,12 +1084,13 @@ impl App {
     }
 
     fn composer_key(&mut self, key: KeyEvent) {
-        let action = match &mut self.composer {
-            Some(composer) => composer.edit(key),
-            None => Edit::None,
+        let (action, purpose) = match &mut self.composer {
+            Some(composer) => (composer.edit(key), composer.purpose),
+            None => (Edit::None, Purpose::Comment),
         };
         match action {
             Edit::None => {}
+            Edit::Save if purpose == Purpose::Ask => self.send_to_agent(),
             Edit::Save => self.save_comment(),
             Edit::Cancel => self.cancel_composer(),
             Edit::Agent => self.send_to_agent(),
@@ -1467,7 +1508,29 @@ impl App {
         (anchor.min(self.cursor), anchor.max(self.cursor))
     }
 
-    fn compose(&mut self) {
+    /// Carries out what Rex's command palette asked for.
+    fn obey_rex(&mut self, command: Result<remote::Command, String>) {
+        match command {
+            Ok(remote::Command::Ask(question)) => {
+                self.dialog = Dialog::None;
+                if self.composer.is_none() {
+                    self.compose(Purpose::Ask);
+                }
+                if !question.trim().is_empty()
+                    && let Some(composer) = &mut self.composer
+                {
+                    composer.purpose = Purpose::Ask;
+                    composer.insert(&question);
+                    self.send_to_agent();
+                }
+            }
+            Ok(remote::Command::Quit) => self.quit = true,
+            Ok(_) => self.toast("Reading aloud and voices work in documents, not diffs."),
+            Err(message) => self.toast(message),
+        }
+    }
+
+    fn compose(&mut self, purpose: Purpose) {
         let (start, end) = self.range();
         let rows = self.split.rows_between(start, end);
         let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
@@ -1481,7 +1544,7 @@ impl App {
                     self.selection = Some(first_line);
                     self.follow_focus(first_line, last_line);
                 }
-                self.composer = Some(Composer::new(anchor, first, last));
+                self.composer = Some(Composer::new(anchor, first, last, purpose));
             }
             None => self.fail(
                 "That range has no code line to comment on. Move to a line that changed, then press C.",
@@ -1853,12 +1916,17 @@ impl App {
             };
             let text = clip(&toast.text, area.width.saturating_sub(2) as usize);
             Line::from(Span::styled(format!(" {text}"), style))
-        } else if self.composer.is_some() {
+        } else if let Some(composer) = &self.composer {
+            let keys = match composer.purpose {
+                Purpose::Comment => {
+                    " enter comment · ctrl+enter send · alt+enter line · ctrl+g github · esc cancel"
+                }
+                Purpose::Ask => {
+                    " ask the agent about these lines · enter send · alt+enter line · esc cancel"
+                }
+            };
             Line::from(Span::styled(
-                clip(
-                    " enter comment · ctrl+enter send · alt+enter line · ctrl+g github · esc cancel",
-                    area.width as usize,
-                ),
+                clip(keys, area.width as usize),
                 Style::default().fg(DIM),
             ))
         } else {
@@ -2711,6 +2779,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("f", "files: filter by path, open one"),
         ("v", "visual mode; move to select, esc clears"),
         ("C", "comment on the line or selection"),
+        (
+            "@  ^enter",
+            "ask the agent about the line or selection (⇧⌘A in Rex)",
+        ),
         ("m", "comments: jump, resend, delete, post"),
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
@@ -3079,6 +3151,59 @@ diff --git a/b.rs b/b.rs
         assert!(text.contains("-let b = 2;\n+let b = 3;"));
         assert!(text.contains("let a = 1;"));
         assert!(text.ends_with("why?\n"));
+    }
+
+    #[test]
+    fn at_asks_the_agent_about_the_line_with_enter() {
+        let sent = Rc::new(RefCell::new(None));
+        let mut app = app();
+        let captured = sent.clone();
+        app.deliver = Box::new(move |text| {
+            *captured.borrow_mut() = Some(text.to_owned());
+            Ok(agent::Agent {
+                pane: "%3".to_owned(),
+                command: "claude".to_owned(),
+            })
+        });
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('@'));
+        let screen = draw(&mut app, 100, 16);
+        assert!(screen.contains("ask the agent"), "{screen}");
+        type_text(&mut app, "is this safe?");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.composer.is_none());
+        let text = sent.borrow().clone().expect("the payload");
+        assert!(text.contains("> src/main.rs L11"));
+        assert!(text.ends_with("is this safe?\n"));
+        // ctrl+enter outside the box opens the same question box.
+        press_ctrl(&mut app, KeyCode::Enter);
+        assert_eq!(app.composer.as_ref().map(|c| c.purpose), Some(Purpose::Ask));
+    }
+
+    #[test]
+    fn a_question_from_the_rex_palette_is_sent_about_the_line() {
+        let sent = Rc::new(RefCell::new(None));
+        let mut app = app();
+        let captured = sent.clone();
+        app.deliver = Box::new(move |text| {
+            *captured.borrow_mut() = Some(text.to_owned());
+            Ok(agent::Agent {
+                pane: "%3".to_owned(),
+                command: "claude".to_owned(),
+            })
+        });
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, remote::WAKE);
+        type_text(&mut app, "ask why this change?");
+        press(&mut app, KeyCode::Enter);
+        let text = sent.borrow().clone().expect("the payload");
+        assert!(text.contains("> src/main.rs L11"));
+        assert!(text.ends_with("why this change?\n"));
+        // Without a question it opens the box to type one.
+        press(&mut app, remote::WAKE);
+        type_text(&mut app, "ask");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.composer.as_ref().map(|c| c.purpose), Some(Purpose::Ask));
     }
 
     #[test]

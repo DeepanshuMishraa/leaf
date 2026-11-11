@@ -19,7 +19,9 @@ mod mermaid;
 mod mono;
 mod pdf;
 mod picker;
+mod place;
 mod plugin;
+mod popover;
 mod progress;
 mod remote;
 mod render;
@@ -28,6 +30,7 @@ mod stroke;
 mod syntax;
 mod tempo;
 mod viewer;
+mod voicepick;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -45,6 +48,7 @@ const USAGE: &str = "Usage: leaf open [file.pdf | file.epub | file.md | url]   (
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
        leaf voice [name]        show or set the voice that reads aloud
+       leaf voices              pick a voice from every voice there is
 
 Diff options:
   --staged           staged changes
@@ -218,15 +222,24 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
         if std::io::stdout().is_terminal() {
-            return pick_and_open();
+            return pick_and_open(None);
         }
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     match command.as_str() {
         "open" => match rest {
-            [] => pick_and_open(),
+            [] => pick_and_open(None),
+            [flag, block] if flag == "--beside" => pick_and_open(Some(block)),
             [target] => open(target),
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        "voices" => match rest {
+            [] => voices_command(None),
+            [flag, block] if flag == "--reader" => voices_command(Some(block)),
             _ => {
                 eprintln!("{USAGE}");
                 ExitCode::from(2)
@@ -267,7 +280,9 @@ fn main() -> ExitCode {
 }
 
 /// Shows the document picker over this folder, then reads what was picked.
-fn pick_and_open() -> ExitCode {
+/// Shows the document picker over this folder, then reads what was picked:
+/// here, or (from Rex's popover) in a new pane beside `beside`.
+fn pick_and_open(beside: Option<&str>) -> ExitCode {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let recent = Store::open(&progress::default_path())
         .and_then(|store| store.recent(30))
@@ -275,11 +290,58 @@ fn pick_and_open() -> ExitCode {
             eprintln!("leaf: {e} The picker still lists files here.");
             Vec::new()
         });
-    match picker::pick(&root, recent) {
-        Ok(Some(target)) => open(&target),
-        Ok(None) => ExitCode::SUCCESS,
+    let target = match picker::pick(&root, recent) {
+        Ok(Some(target)) => target,
+        Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("leaf: the terminal failed ({e}). Name a document instead: leaf open FILE");
+            return ExitCode::from(1);
+        }
+    };
+    let Some(block) = beside else {
+        return open(&target);
+    };
+    let label = target.rsplit('/').next().unwrap_or(&target).to_owned();
+    match place::run_in(block, &["open".into(), target.clone()], &label) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: couldn't open {target} in that pane ({e}). Opening it here instead.");
+            open(&target)
+        }
+    }
+}
+
+/// Shows the voices; the one picked reads in the reader pane `reader`, or
+/// else becomes the default.
+fn voices_command(reader: Option<&str>) -> ExitCode {
+    let store = Store::open(&progress::default_path());
+    let current = store
+        .as_ref()
+        .ok()
+        .and_then(|s| s.load_voice().ok().flatten())
+        .unwrap_or_else(|| edge::DEFAULT_VOICE.to_owned());
+    let name = match voicepick::pick(&current) {
+        Ok(Some(name)) => name,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: the terminal failed ({e}). Set a voice with leaf voice NAME.");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(block) = reader {
+        // The reader saves it as the default when it switches.
+        let line = format!("{}voice {name}\r", "\x1b[24~");
+        match agent::rex_write(block, &line) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("leaf: the reader didn't get the voice ({e}). Saving it for next time.")
+            }
+        }
+    }
+    match store.and_then(|s| s.save_voice(&name)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: {e}");
             ExitCode::from(1)
         }
     }
@@ -449,6 +511,33 @@ fn voice_command(args: &[String]) -> ExitCode {
 
 fn plugin_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
+        // The plugin asks at load which actions to offer: the kinds open,
+        // such as "document diff", or "idle".
+        Some("state") => {
+            println!("{}", remote::state());
+            ExitCode::SUCCESS
+        }
+        // leaf rex place BLOCK LABEL -- ARGS: the palette's way to run leaf
+        // in the pane it was called from.
+        Some("place") => match args {
+            [_, block, label, dash, rest @ ..] if dash == "--" && !rest.is_empty() => {
+                match place::run_in(block, rest, label) {
+                    Ok(place::Placed::InPane) => ExitCode::SUCCESS,
+                    Ok(place::Placed::Beside) => {
+                        println!("That pane was busy, so leaf opened beside it.");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("leaf: {e}");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            _ => {
+                eprintln!("leaf: use leaf rex place BLOCK LABEL -- ARGS");
+                ExitCode::from(2)
+            }
+        },
         Some("install") => match plugin::install() {
             Ok(message) => {
                 println!("{message}");

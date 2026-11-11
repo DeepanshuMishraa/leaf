@@ -29,7 +29,7 @@ pub fn install() -> Result<String, String> {
     }
     let reloaded = rex(&["config", "reload"]).is_ok();
     Ok(format!(
-        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… picks a file here or one read lately.\n  Select text, then @ (or Leaf: Ask Agent About Selection) sends it, with the lines around it, to the agent pane.\n  Leaf: Read Aloud / Pause plays the open document; Leaf: Voice — … picks who reads.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
+        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
         if reloaded {
             ""
         } else {
@@ -78,27 +78,53 @@ fn config_path() -> PathBuf {
 }
 
 fn loader(plugin_path: &Path, bin: &Path) -> String {
-    let voices: Vec<String> = crate::edge::built_in()
-        .iter()
-        .map(|voice| {
-            format!(
-                "{{ name = {}, short = {}, about = {} }}",
-                lua_string(&voice.name),
-                lua_string(voice.short()),
-                lua_string(&format!(
-                    "{}, {}",
-                    voice.language,
-                    voice.gender.to_lowercase()
-                )),
-            )
-        })
-        .collect();
     format!(
-        "{BEGIN}\n-- Managed by `leaf rex install`; `leaf rex uninstall` removes it.\ndofile({}).setup({{\n  bin = {{ {} }},\n  voices = {{\n    {},\n  }},\n}})\n{END}\n",
+        "{BEGIN}\n-- Managed by `leaf rex install`; `leaf rex uninstall` removes it.\ndofile({}).setup({{ bin = {{ {} }} }})\n{OPEN}idle\n{END}\n",
         lua_string(&plugin_path.display().to_string()),
         lua_string(&bin.display().to_string()),
-        voices.join(",\n    "),
     )
+}
+
+/// The line in the managed block that names what leaf shows, such as `document diff`.
+const OPEN: &str = "-- open: ";
+
+/// `content` with the managed block's open line saying `open`; unchanged
+/// when there's no managed block.
+pub fn with_open(content: &str, open: &str) -> String {
+    let Some(start) = content.find(BEGIN) else {
+        return content.to_owned();
+    };
+    let Some(end_at) = content[start..].find(END) else {
+        return content.to_owned();
+    };
+    let end = start + end_at;
+    let block: Vec<&str> = content[start..end]
+        .lines()
+        .filter(|line| !line.starts_with(OPEN))
+        .collect();
+    format!(
+        "{}{}\n{OPEN}{open}\n{}",
+        &content[..start],
+        block.join("\n"),
+        &content[end..]
+    )
+}
+
+/// Tells Rex's apps what leaf shows, so the palette offers the right actions.
+///
+/// The Rex app refetches its actions after a config reload only when
+/// init.lua changed, so the managed block carries a line naming what's open.
+/// Rewriting it and reloading updates the palette without a reload notice.
+pub fn note_open(open: &str) -> Result<(), String> {
+    let config = config_path();
+    let previous = fs::read_to_string(&config)
+        .map_err(|e| format!("couldn't read {}: {e}", config.display()))?;
+    let next = with_open(&previous, open);
+    if next == previous {
+        return Ok(());
+    }
+    write_if_changed(&config, &next)?;
+    rex(&["config", "reload"])
 }
 
 fn lua_string(value: &str) -> String {
@@ -160,6 +186,19 @@ fn rex(args: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_open_line_is_rewritten_inside_the_block_only() {
+        let block = loader(Path::new("/p/init.lua"), Path::new("/bin/leaf"));
+        let config = format!("rex.bind(\"cmd+b\", \"x\")\n\n{block}-- after\n");
+        assert!(config.contains("-- open: idle\n-- <<< leaf <<<"));
+        let open = with_open(&config, "document diff");
+        assert!(open.contains("-- open: document diff\n-- <<< leaf <<<"));
+        assert!(!open.contains("-- open: idle"));
+        assert!(open.starts_with("rex.bind") && open.ends_with("-- after\n"));
+        assert_eq!(with_open(&open, "idle"), config);
+        assert_eq!(with_open("no block here\n", "diff"), "no block here\n");
+    }
 
     #[test]
     fn a_block_is_appended_and_replaced_and_removed() {

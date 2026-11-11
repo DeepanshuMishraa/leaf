@@ -16,6 +16,9 @@ local M = {}
 local SHELL = "com.superlogical.terminal.shell"
 local TERMINAL = "com.superlogical.terminal"
 local RECORD = "leaf/reader"
+local DIFF_RECORD = "leaf/diff"
+-- Asks the agent pane about the selection, in a document or a diff.
+local ASK_KEY = "shift+cmd+a"
 local WAKE = "\27[24~"
 
 local DEFAULT_PATH = table.concat({
@@ -68,28 +71,6 @@ function M.setup(opts)
     return out
   end
 
-  -- Runs leaf on this machine and returns what it printed.
-  local function run(extra, stdin, ...)
-    local command = argv(...)
-    local merged = {}
-    for key, value in pairs(env) do merged[key] = value end
-    for key, value in pairs(extra or {}) do merged[key] = value end
-    local result, err = rex.exec(command, { env = merged, stdin = stdin, timeout = 20 })
-    local shown = table.concat(command, " ")
-    if result == nil then
-      error("leaf: couldn't start `" .. shown .. "`: " .. tostring(err)
-        .. ". Install leaf with `cargo install leaf-reader`, then run `leaf rex install`.", 0)
-    end
-    if result.timed_out then
-      error("leaf: `" .. shown .. "` timed out after 20s.", 0)
-    end
-    if not result.ok then
-      error("leaf: `" .. shown .. "` exited " .. tostring(result.code) .. ":\n"
-        .. (result.stdout or "") .. (result.stderr or ""), 0)
-    end
-    return result.stdout or ""
-  end
-
   local function file_path(url)
     if type(url) ~= "string" then return nil end
     local path = url:match("^file://[^/]*(/.*)$")
@@ -99,8 +80,15 @@ function M.setup(opts)
     end))
   end
 
+  -- Where the program in front works, which is right for a reader too; or
+  -- else what the shell last reported.
   local function cwd(ctx)
     if ctx.block_id == nil then return nil end
+    local info = rex.block.call(TERMINAL, "process", { block_id = ctx.block_id })
+    if type(info) == "table" and type(info.foreground) == "table"
+      and type(info.foreground.cwd) == "string" and info.foreground.cwd ~= "" then
+      return info.foreground.cwd
+    end
     local pwd = rex.block.call(TERMINAL, "pwd", { block_id = ctx.block_id })
     if type(pwd) ~= "table" then return nil end
     return file_path(pwd.pwd)
@@ -125,15 +113,48 @@ function M.setup(opts)
     if err ~= nil then error("leaf: couldn't open a pane: " .. tostring(err), 0) end
   end
 
+  -- Runs leaf in the pane the palette was called from: typed at its prompt,
+  -- or in place of the document it shows; beside it when it's busy. On a
+  -- remote host, a new pane beside, which can install leaf there first.
+  local function place(ctx, label, ...)
+    if ctx.server ~= nil or ctx.block_id == nil then
+      open_pane(ctx, label, pane_command(ctx, ...), cwd(ctx))
+      return
+    end
+    -- Detached: closing a reader there reloads this config, which would
+    -- stop a command this action is still waiting on.
+    local merged = { REX_SESSION = ctx.session_id or "" }
+    for key, value in pairs(env) do merged[key] = value end
+    local _, err = rex.exec.start(argv("rex", "place", ctx.block_id, label, "--", ...),
+      { env = merged, detach = true })
+    if err ~= nil then
+      error("leaf: couldn't start leaf (" .. tostring(err) .. "). Install it with `cargo install leaf-reader`.", 0)
+    end
+  end
+
+  -- A picker floating over the window, like Rex's own; it closes when its
+  -- program exits.
+  local function popover(ctx, label, command, dir)
+    local options = { command = command }
+    if dir ~= nil and dir ~= "" then options.cwd = dir end
+    local _, err = rex.session.new_layer{
+      bounds = { 0.22, 0.1, 0.56, 0.62 },
+      focus = true,
+      layout = { block = { flavor = SHELL, label = label, options = options } },
+    }
+    if err ~= nil then error("leaf: couldn't open the picker: " .. tostring(err), 0) end
+  end
+
   -- Readers -----------------------------------------------------------------
 
-  -- A pane is a reader while the record leaf left is owned by the process in front.
-  local function reader_in(block_id)
+  -- A pane shows a leaf document (or, with `diffs`, a diff) while the record
+  -- leaf left is owned by the process in front.
+  local function reader_in(block_id, diffs)
     local status = rex.block.call(TERMINAL, "program_status", { block_id = block_id })
     if type(status) ~= "table" or type(status.records) ~= "table" then return nil end
     local record
     for _, r in ipairs(status.records) do
-      if r.id == RECORD then record = r end
+      if r.id == RECORD or (diffs and r.id == DIFF_RECORD) then record = r end
     end
     if record == nil then return nil end
     local info = rex.block.call(TERMINAL, "process", { block_id = block_id })
@@ -145,16 +166,16 @@ function M.setup(opts)
   end
 
   -- The focused pane when it is a reader, or else the first reader in the session.
-  local function find_reader(ctx)
+  local function find_reader(ctx, diffs)
     if ctx.block_id ~= nil then
-      local here = reader_in(ctx.block_id)
+      local here = reader_in(ctx.block_id, diffs)
       if here ~= nil then return here end
     end
     local listed = rex.session.list_blocks{ session_id = ctx.session_id }
     if type(listed) ~= "table" or type(listed.blocks) ~= "table" then return nil end
     for _, block in ipairs(listed.blocks) do
       if block.block_id ~= nil and block.block_id ~= ctx.block_id then
-        local found = reader_in(block.block_id)
+        local found = reader_in(block.block_id, diffs)
         if found ~= nil then return found end
       end
     end
@@ -183,8 +204,8 @@ function M.setup(opts)
   rex.action{
     name = "leaf_open",
     title = "Leaf: Open Document…",
-    description = "Pick a PDF, EPUB or markdown file under this folder, or a document read lately,"
-      .. " and read it in a pane beside you. Give target to open one directly.",
+    description = "Browse this folder for a PDF, EPUB or markdown file, or pick one read lately,"
+      .. " and read it in this pane.",
     category = "Leaf",
     keywords = "leaf pdf markdown epub read document article book file picker",
     args = { target = "string?" },
@@ -192,103 +213,94 @@ function M.setup(opts)
       local target = args.target or ""
       local dir = cwd(ctx)
       if target == "" then
-        open_pane(ctx, "leaf", pane_command(ctx, "open"), dir)
+        if ctx.block_id == nil then
+          open_pane(ctx, "leaf", pane_command(ctx, "open"), dir)
+        else
+          popover(ctx, "Open", pane_command(ctx, "open", "--beside", ctx.block_id), dir)
+        end
         return
       end
-      if target:match("^https?://") == nil then
-        local parent = target:match("^(.*)/[^/]+$")
-        if parent ~= nil and parent ~= "" and target:sub(1, 1) == "/" then dir = parent end
-      end
-      open_pane(ctx, target:match("([^/]+)$") or "leaf", pane_command(ctx, "open", target), dir)
+      place(ctx, target:match("([^/]+)$") or "leaf", "open", target)
     end,
   }
 
   rex.action{
     name = "leaf_diff",
     title = "Leaf: Review Diff",
-    description = "Review the working tree, a revision, a patch, or a GitHub link in a pane beside you."
+    description = "Review the working tree, a revision, a patch, or a GitHub link in this pane."
       .. " Comments go to the agent pane with ctrl+enter.",
     category = "Leaf",
     keywords = "leaf diff review pull request patch git changes",
     args = { target = "string?" },
     run = function(ctx, args)
       local target = args.target
-      local command = (target ~= nil and target ~= "") and pane_command(ctx, "diff", target)
-        or pane_command(ctx, "diff")
-      open_pane(ctx, "diff", command, cwd(ctx))
+      if target ~= nil and target ~= "" then
+        place(ctx, "diff", "diff", target)
+      else
+        place(ctx, "diff", "diff")
+      end
     end,
   }
 
   rex.action{
     name = "leaf_review_staged",
     title = "Leaf: Review Staged Changes",
-    description = "Review what's staged for the next commit in a pane beside you.",
+    description = "Review what's staged for the next commit in this pane.",
     category = "Leaf",
     keywords = "leaf diff staged index commit review",
-    run = function(ctx)
-      open_pane(ctx, "staged", pane_command(ctx, "diff", "--staged"), cwd(ctx))
-    end,
+    run = function(ctx) place(ctx, "staged", "diff", "--staged") end,
   }
 
   rex.action{
     name = "leaf_review_branch",
     title = "Leaf: Review This Branch",
-    description = "Review this branch against its base branch in a pane beside you.",
+    description = "Review this branch against its base branch in this pane.",
     category = "Leaf",
     keywords = "leaf diff branch pull request pr review",
-    run = function(ctx)
-      open_pane(ctx, "branch", pane_command(ctx, "diff", "--branch"), cwd(ctx))
-    end,
+    run = function(ctx) place(ctx, "branch", "diff", "--branch") end,
   }
 
-  -- Asking --------------------------------------------------------------------
+  -- While a document or a diff is open --------------------------------------------
+  --
+  -- Rex can't hide an action per pane, so these are only defined while leaf
+  -- shows something on this machine: leaf reloads Rex's config when what's
+  -- open changes, and this asks it what that is ("document diff", or "idle").
 
-  local function selection(ctx)
-    if ctx.block_id == nil then return "" end
-    local clip = rex.block.call(TERMINAL, "clipboard_read", { block_id = ctx.block_id })
-    if type(clip) ~= "table" then return "" end
-    return clip.data or ""
+  local function open_kinds()
+    local result = rex.exec(argv("rex", "state"), { env = env, timeout = 5 })
+    local kinds = {}
+    if result ~= nil and result.ok then
+      for word in (result.stdout or ""):gmatch("%a+") do kinds[word] = true end
+    end
+    return kinds
   end
 
-  local function block_label(ctx)
-    if ctx.block_id == nil then return "this document" end
-    local info = rex.session.describe_block{ block_id = ctx.block_id }
-    if type(info) ~= "table" then return "this document" end
-    local label = (info.block or info).label
-    if type(label) == "string" and label ~= "" and label ~= "shell" then return label end
-    return "this document"
-  end
+  local open = open_kinds()
 
-  rex.action{
-    name = "leaf_ask",
-    title = "Leaf: Ask Agent About Selection",
-    description = "Send the text selected in a Leaf document, with the file, the page, the line numbers"
-      .. " and the lines around it, to the agent pane open in this session. Without question,"
-      .. " the reader asks you to type one.",
-    category = "Leaf",
-    keywords = "leaf agent claude codex grok selection ask quote explain",
-    args = { question = "string?" },
-    run = function(ctx, args)
-      local question = args.question or ""
-      local reader = find_reader(ctx)
-      if reader ~= nil then
+  if open.document or open.diff then
+    rex.action{
+      name = "leaf_ask",
+      title = "Leaf: Ask Agent About Selection",
+      description = "Ask the agent pane about the selection in a Leaf document or diff, sent with"
+        .. " the file, the page or side, the line numbers and the lines around it."
+        .. " Without question, leaf asks you to type one. In leaf itself: @ or ctrl+enter.",
+      category = "Leaf",
+      keywords = "leaf agent claude codex grok selection ask quote explain diff",
+      args = { question = "string?" },
+      run = function(ctx, args)
+        local question = args.question or ""
+        local reader = find_reader(ctx, true)
+        if reader == nil then
+          error("leaf: no document or diff is open in a Leaf pane in this session.", 0)
+        end
         tell(reader, "ask " .. question)
         if question == "" then focus(reader.block_id) end
-        return
-      end
-      -- No reader: the clipboard, with the context the last reader saved.
-      if ctx.server ~= nil then error(NO_READER, 0) end
-      local text = selection(ctx)
-      if text:gsub("%s", "") == "" then
-        error("leaf: select some text in a Leaf document first.", 0)
-      end
-      local output = run({ REX_SESSION = ctx.session_id or "", REX_BLOCK = ctx.block_id or "" },
-        text, "ask", "--title", block_label(ctx), "--question", question)
-      local block = output:match("LEAF_AGENT_BLOCK=(%S+)")
-      if block ~= nil and block:sub(1, 6) == "block:" then focus(block) end
-      return { output = (output:gsub("\n?LEAF_AGENT_BLOCK=%S+", "")) }
-    end,
-  }
+      end,
+    }
+    rex.bind(ASK_KEY, "leaf_ask")
+  end
+
+  local function reading_actions()
 
   -- Reading aloud -------------------------------------------------------------
 
@@ -321,49 +333,22 @@ function M.setup(opts)
     keywords = "skip forward", description = "Skip ahead a sentence while reading aloud." }
   reader_action{ name = "leaf_previous_sentence", title = "Leaf: Previous Sentence", command = "previous",
     keywords = "back rewind", description = "Go back a sentence while reading aloud." }
-  reader_action{ name = "leaf_voices", title = "Leaf: Search Every Voice…", command = "voices", focus = true,
-    keywords = "language accent picker",
-    description = "Open the reader's search over every voice Microsoft offers, in every language." }
-
-  -- With no reader open, a voice becomes the one leaf reads in next time.
-  local function use_voice(ctx, name)
-    local reader = find_reader(ctx)
-    if reader ~= nil then
-      tell(reader, "voice " .. name)
-      return
-    end
-    if ctx.server ~= nil then error(NO_READER, 0) end
-    run(nil, nil, "voice", name)
-    return { output = "Leaf will read in " .. name .. " from now on." }
-  end
-
   rex.action{
     name = "leaf_voice",
-    title = "Leaf: Use Voice by Name",
-    description = "Read in any Edge voice, such as fr-FR-DeniseNeural. With no document open, it becomes the default.",
+    title = "Leaf: Change Voice…",
+    description = "Pick who reads aloud from every voice Microsoft offers, searchable by name, language or gender.",
     category = "Leaf",
-    keywords = "leaf voice speech tts language",
-    args = { voice = "string" },
-    run = function(ctx, args)
-      local name = args.voice or ""
-      if not name:match("^[%w%-]+$") or not name:find("-", 1, true) then
-        error("leaf: name a voice like en-GB-SoniaNeural. Leaf: Search Every Voice… lists them all.", 0)
-      end
-      return use_voice(ctx, name)
+    keywords = "leaf voice speech tts language accent picker",
+    run = function(ctx)
+      local reader = find_reader(ctx)
+      if reader == nil then error(NO_READER, 0) end
+      popover(ctx, "Voice", pane_command(ctx, "voices", "--reader", reader.block_id))
     end,
   }
 
-  for _, voice in ipairs(opts.voices or {}) do
-    rex.action{
-      name = "leaf_voice_" .. (voice.name:lower():gsub("[^%w]", "_")),
-      title = "Leaf: Voice — " .. voice.short,
-      description = "Read aloud in " .. voice.short .. " (" .. voice.about .. ")."
-        .. " With no document open, it becomes the default.",
-      category = "Leaf",
-      keywords = "leaf voice speech tts " .. voice.name .. " " .. voice.about,
-      run = function(ctx) return use_voice(ctx, voice.name) end,
-    }
-  end
+  end -- reading_actions
+
+  if open.document then reading_actions() end
 
   for short, key in pairs(opts.keys or {}) do
     rex.bind(key, "leaf_" .. short)

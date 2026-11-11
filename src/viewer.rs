@@ -1329,7 +1329,7 @@ impl App {
         ));
         rows.extend([
             ("drag", "select and copy text"),
-            ("@  ^enter", "ask an agent about the selection"),
+            ("@  ^enter", "ask an agent about the selection (⇧⌘A in Rex)"),
             ("y", "highlight selection, or clear one"),
             ("1-6", "pick a color; paints the selection"),
             ("d", "pen: drag to draw"),
@@ -1753,6 +1753,7 @@ impl App {
                 Ok(Command::Next) => self.skip_sentence(Direction::Forward),
                 Ok(Command::Previous) => self.skip_sentence(Direction::Backward),
                 Ok(Command::Voices) => self.open_voices(),
+                Ok(Command::Quit) => self.quit = true,
                 Ok(Command::Voice(name)) => {
                     let short = edge::built_in()
                         .iter()
@@ -3203,10 +3204,10 @@ pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<()> {
     let setup = execute!(io::stdout(), EnableMouseCapture, SetTitle(&doc.title));
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     // Lets Rex's command palette find this reader; Rex drops it if leaf dies.
-    remote::announce(&doc.title);
+    remote::announce(remote::Kind::Document, &doc.title);
     let mut app = App::new(doc, options, picker);
     let result = setup.and_then(|_| app.event_loop(&mut terminal));
-    remote::withdraw();
+    remote::withdraw(remote::Kind::Document);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
