@@ -761,14 +761,18 @@ pub fn run(loaded: Loaded, options: Options) -> io::Result<()> {
     result
 }
 
-/// The text pasted into an agent or posted as a comment: a quoted line range,
-/// the patch lines, then the comment.
+/// The text sent to an agent or posted as a comment: the file and line range,
+/// the hunk around that range, then the comment.
 fn payload(diff: &Diff, anchor: &Anchor, first: usize, last: usize, body: &str) -> String {
+    let side = match anchor.side {
+        Side::New => "new side",
+        Side::Old => "old side",
+    };
     let mut out = format!(
-        "> {} {}:\n\n```diff\n{}\n```",
+        "> {} {} ({side}). The diff includes the lines around that range:\n\n```diff\n{}\n```",
         anchor.file,
         anchor.range_label(),
-        diff.snippet(first, last)
+        diff.neighborhood(first, last, 8)
     );
     let body = body.trim();
     if !body.is_empty() {
@@ -1511,7 +1515,7 @@ impl App {
             Ok(agent) => {
                 self.add_comment(comment);
                 self.selection = self.split.line_for_row(composer.first);
-                self.toast(format!("Pasted into {}", agent.describe()));
+                self.toast(format!("Sent to {}", agent.describe()));
             }
             Err(e) => {
                 self.add_comment(Comment {
@@ -1597,7 +1601,7 @@ impl App {
                 if let Some(index) = index {
                     self.set_state(index, State::Agent);
                 }
-                self.toast(format!("Pasted into {}", agent.describe()));
+                self.toast(format!("Sent to {}", agent.describe()));
             }
             Err(e) => {
                 self.copy = Some(text);
@@ -1852,7 +1856,7 @@ impl App {
         } else if self.composer.is_some() {
             Line::from(Span::styled(
                 clip(
-                    " enter comment · ctrl+enter agent · alt+enter line · ctrl+g github · esc cancel",
+                    " enter comment · ctrl+enter send · alt+enter line · ctrl+g github · esc cancel",
                     area.width as usize,
                 ),
                 Style::default().fg(DIM),
@@ -3070,8 +3074,10 @@ diff --git a/b.rs b/b.rs
         assert_eq!(app.comments[0].comment.state, State::Agent);
 
         let text = sent.borrow().clone().expect("the payload");
-        assert!(text.contains("> src/main.rs L11:"));
-        assert!(text.contains("```diff\n-let b = 2;\n+let b = 3;\n```"));
+        assert!(text.contains("> src/main.rs L11"));
+        assert!(text.contains("fn main()"));
+        assert!(text.contains("-let b = 2;\n+let b = 3;"));
+        assert!(text.contains("let a = 1;"));
         assert!(text.ends_with("why?\n"));
     }
 
@@ -3087,7 +3093,7 @@ diff --git a/b.rs b/b.rs
         assert_eq!(app.comments[0].comment.state, State::Draft);
         assert!(app.comments.is_empty() || app.comments[0].comment.body == "check this");
         let copied = app.copy.clone().expect("clipboard fallback");
-        assert!(copied.contains("> src/main.rs L10:"));
+        assert!(copied.contains("> src/main.rs L10"));
         assert!(copied.contains(" let a = 1;"));
         assert!(app.toast.as_ref().is_some_and(|toast| toast.error));
     }
@@ -3126,7 +3132,9 @@ diff --git a/b.rs b/b.rs
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('y'));
         let copied = app.copy.clone().expect("copied");
-        assert!(copied.starts_with("> src/main.rs L11-L12:\n\n```diff\n"));
+        assert!(copied.starts_with(
+            "> src/main.rs L11-L12 (new side). The diff includes the lines around that range:\n\n```diff\n"
+        ));
         assert!(copied.contains("-let b = 2;\n+let b = 3;\n+let c = 4;"));
         assert!(!copied.contains("why?"));
     }
@@ -3249,7 +3257,7 @@ diff --git a/x b/x
         let text = payload(&diff, &anchor, 4, 5, "both new");
         assert_eq!(
             text,
-            "> src/main.rs L11-L12:\n\n```diff\n+let b = 3;\n+let c = 4;\n```\n\nboth new\n"
+            "> src/main.rs L11-L12 (new side). The diff includes the lines around that range:\n\n```diff\n@@ -10,3 +10,4 @@ fn main() {\n let a = 1;\n-let b = 2;\n+let b = 3;\n+let c = 4;\n }\n```\n\nboth new\n"
         );
     }
 

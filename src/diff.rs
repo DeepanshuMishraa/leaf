@@ -268,6 +268,38 @@ impl Diff {
         ))
     }
 
+    /// The hunk header and up to `pad` lines on either side of `first..=last`,
+    /// without leaving that hunk.
+    pub fn neighborhood(&self, first: usize, last: usize, pad: usize) -> String {
+        let (start, end) = self.neighborhood_bounds(first, last, pad);
+        self.snippet(start, end)
+    }
+
+    fn neighborhood_bounds(&self, first: usize, last: usize, pad: usize) -> (usize, usize) {
+        if self.rows.is_empty() {
+            return (0, 0);
+        }
+        let last_row = self.rows.len() - 1;
+        let first = first.min(last).min(last_row);
+        let last = first.max(last).min(last_row);
+        let Some(row) = self.rows.get(first) else {
+            return (first, last);
+        };
+        if row.hunk == u32::MAX {
+            return (first, last);
+        }
+        let Some(file) = self.files.get(row.file as usize) else {
+            return (first, last);
+        };
+        let Some(hunk) = file.hunks.get(row.hunk as usize) else {
+            return (first, last);
+        };
+        let header = hunk.first.saturating_sub(1);
+        let from = first.saturating_sub(pad).max(hunk.first);
+        let to = (last + pad).min(hunk.end.saturating_sub(1));
+        (header.min(from), to.max(last).min(last_row))
+    }
+
     /// The patch lines `first..=last`, without the final line ending.
     pub fn snippet(&self, first: usize, last: usize) -> String {
         let (first, last) = (first.min(last), first.max(last));

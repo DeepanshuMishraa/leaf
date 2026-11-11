@@ -30,7 +30,7 @@ impl Side {
 pub enum State {
     /// Saved but not delivered anywhere yet.
     Draft,
-    /// Pasted into an agent's prompt.
+    /// Sent to an agent.
     Agent,
     /// Posted as a GitHub pull request review comment.
     Github,

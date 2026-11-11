@@ -289,6 +289,30 @@ impl Store {
             .map_err(self.failed(Operation::Save))
     }
 
+    /// Documents read lately, newest first: paths and links, with how far in.
+    pub fn recent(&self, limit: usize) -> Result<Vec<(String, usize)>, StoreFailed> {
+        let mut statement = self
+            .db
+            .prepare(
+                // With MAX() in the result, SQLite takes `percent` from the newest row.
+                "SELECT key, percent, MAX(updated_at) AS at FROM (
+                   SELECT key, percent, updated_at FROM progress
+                   UNION ALL SELECT key, percent, updated_at FROM scroll)
+                 GROUP BY key ORDER BY at DESC LIMIT ?",
+            )
+            .map_err(self.failed(Operation::Read))?;
+        let rows = statement
+            .query_map([limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(self.failed(Operation::Read))?;
+        rows.map(|row| {
+            row.map(|(key, percent)| (key, count(percent).unwrap_or(0)))
+                .map_err(self.failed(Operation::Read))
+        })
+        .collect()
+    }
+
     pub fn load_scroll(&self, key: &str) -> Result<Option<Scroll>, StoreFailed> {
         let row = self
             .db
@@ -687,6 +711,37 @@ mod tests {
 
     fn memory() -> Store {
         Store::open(Path::new(":memory:")).expect("in-memory store opens")
+    }
+
+    #[test]
+    fn recent_documents_come_newest_first_once_each() {
+        let store = memory();
+        store.save("/a.pdf", Progress::of(5, 10)).unwrap();
+        store
+            .save_scroll(
+                "https://x.dev/post",
+                Scroll {
+                    anchor: 0,
+                    percent: 40,
+                },
+            )
+            .unwrap();
+        store
+            .db
+            .execute_batch(
+                "UPDATE progress SET updated_at = 100 WHERE key = '/a.pdf';
+                 UPDATE scroll SET updated_at = 200;
+                 INSERT INTO scroll (key, anchor, percent, updated_at) VALUES ('/a.pdf', 0, 50, 50);",
+            )
+            .unwrap();
+        assert_eq!(
+            store.recent(10).unwrap(),
+            vec![
+                ("https://x.dev/post".to_owned(), 40),
+                ("/a.pdf".to_owned(), 50)
+            ]
+        );
+        assert_eq!(store.recent(1).unwrap().len(), 1);
     }
 
     #[test]

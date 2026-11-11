@@ -1,7 +1,7 @@
 # Completions for leaf. Install: ln -s (pwd)/completions/leaf.fish ~/.config/fish/completions/
 complete -c leaf -f
 complete -c leaf -n __fish_use_subcommand -a open -d 'Read a PDF, markdown file or web page'
-complete -c leaf -n '__fish_seen_subcommand_from open' -a '(__fish_complete_suffix .pdf .md .markdown)'
+complete -c leaf -n '__fish_seen_subcommand_from open' -a '(__fish_complete_suffix .pdf .epub .md .markdown)'
 complete -c leaf -n __fish_use_subcommand -a diff -d 'Review a diff'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -s s -l staged -d 'Staged changes'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -s b -l branch -d 'This branch against its base branch'
@@ -9,5 +9,12 @@ complete -c leaf -n '__fish_seen_subcommand_from diff' -l base -x -a '(__fish_gi
 complete -c leaf -n '__fish_seen_subcommand_from diff' -s r -l range -x -d 'Revision or revision range'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -l patch -r -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
+complete -c leaf -n __fish_use_subcommand -a ask -d 'Ask an open agent about selected text'
+complete -c leaf -n '__fish_seen_subcommand_from ask' -l title -x -d 'Document name quoted in the prompt'
+complete -c leaf -n '__fish_seen_subcommand_from ask' -l question -x -d 'Question to send with the selection'
+complete -c leaf -n __fish_use_subcommand -a rex -d 'Add or remove the Rex command palette actions'
+complete -c leaf -n '__fish_seen_subcommand_from rex plugin' -a 'install uninstall' -d 'Rex plugin'
+complete -c leaf -n __fish_use_subcommand -a voice -d 'Show or set the voice that reads aloud'
+complete -c leaf -n '__fish_seen_subcommand_from voice' -a 'en-US-EmmaMultilingualNeural en-US-AriaNeural en-US-GuyNeural en-GB-SoniaNeural en-GB-RyanNeural en-AU-NatashaNeural en-IN-NeerjaNeural' -d 'Voice'
 complete -c leaf -n __fish_use_subcommand -a comments -d 'List saved diff comments'
 complete -c leaf -n '__fish_seen_subcommand_from comments' -l json -d 'Machine-readable JSON'

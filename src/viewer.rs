@@ -24,6 +24,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 use unicode_width::UnicodeWidthChar;
 
+use crate::agent::{self, Agent, AgentFailed};
 use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
 use crate::article;
 use crate::doc::{Doc, ImageRef};
@@ -34,6 +35,7 @@ use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
 use crate::mono::{self, Rgb};
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
+use crate::remote::{self, Command};
 use crate::render::{self, DIM, Laid};
 use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
 
@@ -87,7 +89,8 @@ enum Mode {
 }
 
 /// What floats over the text: nothing, the key list, the go-to-page box,
-/// the find box with what's typed so far, or the bookmark list with the one picked.
+/// the find box with what's typed so far, the question for an agent, or the
+/// bookmark list with the one picked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Dialog {
     None,
@@ -100,6 +103,11 @@ enum Dialog {
     },
     Find {
         typed: String,
+    },
+    /// A question about `passage`, the selection copied when the box opened.
+    Ask {
+        typed: String,
+        passage: String,
     },
     Bookmarks {
         selected: usize,
@@ -306,6 +314,8 @@ pub struct ViewerOptions {
     pub on_speed: Box<dyn FnMut(f32)>,
     /// Where speech comes from and goes.
     pub speech: Backend,
+    /// Path or URL this document was opened from, when leaf knows it.
+    pub source: Option<String>,
 }
 
 impl Default for ViewerOptions {
@@ -328,6 +338,7 @@ impl Default for ViewerOptions {
             on_voice: Box::new(|_| {}),
             on_speed: Box::new(|_| {}),
             speech: Backend::Edge,
+            source: None,
         }
     }
 }
@@ -354,6 +365,11 @@ pub struct App {
     hue: Hue,
     /// A word in the footer about the last key, gone at the next one.
     notice: Option<String>,
+    /// Where a question about a selection is sent. Tests stand in for the
+    /// agent pane; otherwise leaf finds one in this Rex session.
+    ask: Option<Box<dyn FnMut(&str) -> Result<Agent, AgentFailed>>>,
+    /// A command from Rex's command palette, being typed in after F12.
+    rex_command: Option<String>,
     bookmarks: Vec<Bookmark>,
     selection: Option<Selection>,
     tool: Tool,
@@ -472,6 +488,8 @@ impl App {
             highlights: options.highlights.clone(),
             hue: Hue::default(),
             notice: None,
+            ask: None,
+            rex_command: None,
             bookmarks: options.bookmarks.clone(),
             doc,
             options,
@@ -986,6 +1004,7 @@ impl App {
                 Some(self.draw_goto(f, area, &digits, page_count))
             }
             Dialog::Find { typed } => Some(self.draw_find(f, area, &typed)),
+            Dialog::Ask { typed, passage } => Some(self.draw_ask(f, area, &typed, &passage)),
             Dialog::Bookmarks { selected } => Some(self.draw_bookmarks(f, area, selected)),
             Dialog::Voices { typed, selected } => Some(self.draw_voices(f, area, &typed, selected)),
         };
@@ -1310,6 +1329,7 @@ impl App {
         ));
         rows.extend([
             ("drag", "select and copy text"),
+            ("@  ^enter", "ask an agent about the selection"),
             ("y", "highlight selection, or clear one"),
             ("1-6", "pick a color; paints the selection"),
             ("d", "pen: drag to draw"),
@@ -1372,6 +1392,7 @@ impl App {
         let mut lines = vec![
             heading("Highlight"),
             step("drag", "select text; it's copied as you let go"),
+            step("@", "ask an open agent about that selection"),
             step("y", "highlight it, or clear a highlight it touches"),
             Line::raw(""),
             heading("Colors"),
@@ -1439,6 +1460,31 @@ impl App {
         ];
         let width = (hint.chars().count() as u16).max(typed.chars().count() as u16 + 1);
         Self::panel(f, area, "Find", lines, width)
+    }
+
+    fn draw_ask(&self, f: &mut Frame, area: Rect, typed: &str, passage: &str) -> Rect {
+        let hint = "enter ask · alt+enter line · esc cancel";
+        let preview: String = passage.chars().take(42).collect();
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("“{preview}”"),
+                Style::default().fg(DIM),
+            )),
+            Line::default(),
+            Line::from(vec![
+                Span::styled(
+                    typed.to_owned(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("▏"),
+            ]),
+            Line::default(),
+            Line::from(Span::styled(hint, Style::default().fg(DIM))).centered(),
+        ];
+        let width = (hint.chars().count() as u16)
+            .max(preview.chars().count() as u16 + 2)
+            .max(typed.chars().count() as u16 + 1);
+        Self::panel(f, area, "Ask", lines, width)
     }
 
     fn draw_bookmarks(&self, f: &mut Frame, area: Rect, selected: usize) -> Rect {
@@ -1618,15 +1664,7 @@ impl App {
             (KeyCode::Esc, _) => self.dialog = Dialog::None,
             (KeyCode::Enter, Some((_, _, Some((name, short))))) => {
                 self.dialog = Dialog::None;
-                (self.options.on_voice)(&name);
-                let reading = self.narrator.active();
-                self.narrator.set_voice(name);
-                self.follow = true;
-                self.notice = Some(if reading {
-                    format!("reading in {short}")
-                } else {
-                    format!("{short} reads next · a to start")
-                });
+                self.use_voice(name, &short);
             }
             (_, Some((at, _, _))) if up => {
                 self.dialog = Dialog::Voices {
@@ -1655,6 +1693,77 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Reads in `name` from now on, and remembers it for next time.
+    fn use_voice(&mut self, name: String, short: &str) {
+        (self.options.on_voice)(&name);
+        let reading = self.narrator.active();
+        self.narrator.set_voice(name);
+        self.follow = true;
+        self.notice = Some(if reading {
+            format!("reading in {short}")
+        } else {
+            format!("{short} reads next · a to start")
+        });
+    }
+
+    /// Collects the command line Rex types after F12; enter carries it out.
+    fn rex_key(&mut self, key: &KeyEvent, mut line: String) {
+        match key.code {
+            KeyCode::Enter => {
+                self.rex_command = None;
+                self.obey_rex(remote::Command::parse(&line));
+            }
+            KeyCode::Esc => self.rex_command = None,
+            KeyCode::Char(c) if line.len() < remote::LONGEST => {
+                line.push(c);
+                self.rex_command = Some(line);
+            }
+            _ => self.rex_command = Some(line),
+        }
+    }
+
+    /// Carries out what Rex's command palette asked for.
+    fn obey_rex(&mut self, command: Result<Command, String>) {
+        self.notice = None;
+        {
+            match command {
+                Ok(Command::Ask(question)) => {
+                    let passage = self.selected_text();
+                    if passage.trim().is_empty() {
+                        self.notice = Some("select some text, then ask".into());
+                    } else if question.trim().is_empty() {
+                        self.open_ask();
+                    } else {
+                        self.dialog = Dialog::None;
+                        self.submit_ask(&passage, &question);
+                    }
+                }
+                Ok(Command::Play) => self.read_aloud(),
+                Ok(Command::Stop) => {
+                    if self.narrator.active() {
+                        self.narrator.stop();
+                    }
+                    self.notice = Some("stopped reading aloud".into());
+                }
+                Ok(Command::Faster) => self.change_speed(true),
+                Ok(Command::Slower) => self.change_speed(false),
+                Ok(Command::Next) => self.skip_sentence(Direction::Forward),
+                Ok(Command::Previous) => self.skip_sentence(Direction::Backward),
+                Ok(Command::Voices) => self.open_voices(),
+                Ok(Command::Voice(name)) => {
+                    let short = edge::built_in()
+                        .iter()
+                        .chain(self.narrator.voices().unwrap_or(&[]))
+                        .find(|voice| voice.name == name)
+                        .map(|voice| voice.short().to_owned())
+                        .unwrap_or_else(|| name.clone());
+                    self.use_voice(name, &short);
+                }
+                Err(message) => self.notice = Some(message),
+            }
         }
     }
 
@@ -2110,6 +2219,106 @@ impl App {
         }
     }
 
+    /// `@` or ctrl+enter: ask an agent about the selection.
+    fn open_ask(&mut self) {
+        let passage = self.selected_text();
+        if passage.trim().is_empty() {
+            self.notice = Some("select some text, then ask".into());
+            return;
+        }
+        self.dialog = Dialog::Ask {
+            typed: String::new(),
+            passage,
+        };
+        agent::report_status("blocked", "Question about the selection");
+    }
+
+    fn ask_key(&mut self, key: &KeyEvent, mut typed: String, passage: String) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.dialog = Dialog::None;
+                agent::report_status("idle", "Reading");
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                typed.push('\n');
+                self.dialog = Dialog::Ask { typed, passage };
+            }
+            KeyCode::Enter => {
+                if typed.trim().is_empty() {
+                    self.notice = Some("type a question".into());
+                    self.dialog = Dialog::Ask { typed, passage };
+                    return;
+                }
+                self.dialog = Dialog::None;
+                self.submit_ask(&passage, &typed);
+            }
+            KeyCode::Backspace => {
+                typed.pop();
+                self.dialog = Dialog::Ask { typed, passage };
+            }
+            KeyCode::Char(c) if !ctrl => {
+                typed.push(c);
+                self.dialog = Dialog::Ask { typed, passage };
+            }
+            _ => {}
+        }
+    }
+
+    /// Sends `passage`, the lines around it and `question` to the agent pane.
+    /// When no agent takes it, the whole prompt is copied instead.
+    fn submit_ask(&mut self, passage: &str, question: &str) {
+        let context = self.selection_context(passage);
+        agent::remember(passage, &context);
+        let prompt = agent::with_question(&context, question);
+        match self.send_ask(&prompt) {
+            Ok(found) => {
+                self.notice = Some(format!("sent to {}", found.command));
+                agent::report_status("idle", &format!("Sent to {}", found.command));
+            }
+            Err(error) => {
+                self.copy = Some(prompt);
+                self.notice = Some(error.to_string());
+                agent::report_status("error", "Couldn't reach the agent");
+            }
+        }
+    }
+
+    /// Document, page and the lines around `fallback`, which is the selection.
+    fn selection_context(&mut self, fallback: &str) -> String {
+        let mut excerpts: Vec<agent::Excerpt> = self
+            .selected_ranges()
+            .into_iter()
+            .map(|range| agent::Excerpt {
+                page: self.doc.page_count.map(|_| range.page + 1),
+                text: self.laid(range.page).text.iter().collect(),
+                start: range.start,
+                end: range.end,
+            })
+            .collect();
+        if excerpts.is_empty() && !fallback.trim().is_empty() {
+            excerpts.push(agent::Excerpt {
+                page: None,
+                text: fallback.to_owned(),
+                start: 0,
+                end: fallback.chars().count(),
+            });
+        }
+        agent::prompt(
+            &self.doc.title,
+            self.options.source.as_deref(),
+            &excerpts,
+            "",
+        )
+    }
+
+    fn send_ask(&mut self, text: &str) -> Result<Agent, AgentFailed> {
+        if let Some(deliver) = self.ask.as_mut() {
+            return deliver(text);
+        }
+        agent::deliver(text)
+    }
+
     /// Typing in the find box; enter searches from the page being read.
     fn find_key(&mut self, key: &KeyEvent, typed: String) {
         match key.code {
@@ -2154,9 +2363,18 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Before any dialog, which would otherwise take the keys as typing.
+        if key.code == remote::WAKE {
+            self.rex_command = Some(String::new());
+            return;
+        }
+        if let Some(line) = self.rex_command.take() {
+            return self.rex_key(&key, line);
+        }
         match self.dialog.clone() {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
             Dialog::Find { typed } => return self.find_key(&key, typed),
+            Dialog::Ask { typed, passage } => return self.ask_key(&key, typed, passage),
             Dialog::Bookmarks { selected } => return self.bookmarks_key(&key, selected),
             Dialog::Voices { typed, selected } => return self.voices_key(&key, typed, selected),
             Dialog::Help | Dialog::Guide => {
@@ -2208,6 +2426,7 @@ impl App {
             Some('N') => self.next_match(Direction::Backward),
             Some('q') => self.quit = true,
             Some('y') => self.toggle_highlight(),
+            Some('@') => self.open_ask(),
             Some('j') => self.scroll_by(1),
             Some('k') => self.scroll_by(-1),
             // Plain d is the pen, so half a screen down is ctrl+d, as in vim.
@@ -2233,6 +2452,12 @@ impl App {
             Some(',') => self.skip_sentence(Direction::Backward),
             Some('.') => self.skip_sentence(Direction::Forward),
             _ => match key.code {
+                KeyCode::Enter
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.kind == KeyEventKind::Press =>
+                {
+                    self.open_ask()
+                }
                 // Esc lets go of a picked stroke, puts the pen down, then lets
                 // go of a selection, then a search, then quits.
                 KeyCode::Esc if self.picked.take().is_some() => {}
@@ -2416,6 +2641,8 @@ impl App {
                             self.selection = None;
                         } else {
                             // Taking over the mouse turns off the terminal's own selection, so copy here.
+                            let context = self.selection_context(&text);
+                            agent::remember(&text, &context);
                             self.copy = Some(text);
                         }
                     }
@@ -2975,8 +3202,11 @@ pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<()> {
     // The title names the terminal tab; on screen it would only take rows from the text.
     let setup = execute!(io::stdout(), EnableMouseCapture, SetTitle(&doc.title));
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // Lets Rex's command palette find this reader; Rex drops it if leaf dies.
+    remote::announce(&doc.title);
     let mut app = App::new(doc, options, picker);
     let result = setup.and_then(|_| app.event_loop(&mut terminal));
+    remote::withdraw();
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -3842,6 +4072,46 @@ mod tests {
     }
 
     #[test]
+    fn asking_without_a_selection_says_to_select_first() {
+        let mut s = Screen::new(book(&["Alpha text"]), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('@'));
+        assert!(frame.contains("select some text, then ask"), "{frame}");
+    }
+
+    #[test]
+    fn a_question_about_a_selection_is_pasted_to_the_agent() {
+        let sent = Rc::new(RefCell::new(None));
+        let mut s = Screen::new(book(&["Alpha text"]), 120, 30, ViewerOptions::default());
+        s.app.selection = Some(Selection {
+            anchor: TextPos { page: 0, offset: 0 },
+            head: TextPos {
+                page: 0,
+                offset: 200,
+            },
+        });
+        let captured = sent.clone();
+        s.app.ask = Some(Box::new(move |text| {
+            *captured.borrow_mut() = Some(text.to_owned());
+            Ok(Agent {
+                pane: "block:agent".into(),
+                command: "claude".into(),
+            })
+        }));
+        assert!(s.press(KeyCode::Char('@')).contains("Ask"));
+        s.press(KeyCode::Char('w'));
+        s.press(KeyCode::Char('h'));
+        s.press(KeyCode::Char('y'));
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("sent to claude"), "{frame}");
+        let text = sent.borrow().clone().expect("sent");
+        assert!(text.contains("From Book"), "{text}");
+        assert!(text.contains("page 1"), "{text}");
+        assert!(text.contains("Alpha"), "{text}");
+        assert!(text.contains(">>"), "{text}");
+        assert!(text.trim_end().ends_with("why"), "{text}");
+    }
+
+    #[test]
     fn centered_blocks_sit_in_the_middle_of_the_column() {
         let mut s = Screen::new(
             book(&["<div align=\"center\">\nSubmitted By\n</div>\n\nLeft text."]),
@@ -3996,6 +4266,35 @@ mod tests {
         s.press(KeyCode::Char(','));
         listen(&mut s, 0.0);
         assert_eq!(marked(&mut s), "One");
+    }
+
+    #[test]
+    fn a_voice_from_the_rex_palette_is_used_even_with_a_dialog_open() {
+        let voices = Rc::new(RefCell::new(Vec::new()));
+        let heard = voices.clone();
+        let mut s = Screen::new(
+            book(&["Alpha beta."]),
+            90,
+            30,
+            aloud(ViewerOptions {
+                on_voice: Box::new(move |voice: &str| heard.borrow_mut().push(voice.to_owned())),
+                ..ViewerOptions::default()
+            }),
+        );
+        let command = |s: &mut Screen, line: &str| {
+            s.press(remote::WAKE);
+            for c in line.chars() {
+                s.press(KeyCode::Char(c));
+            }
+            s.press(KeyCode::Enter)
+        };
+        s.press(KeyCode::Char('f'));
+        let frame = command(&mut s, "voice en-GB-RyanNeural");
+        assert!(frame.contains("Ryan reads next"), "{frame}");
+        assert_eq!(*voices.borrow(), vec!["en-GB-RyanNeural".to_owned()]);
+        command(&mut s, "play");
+        let frame = listen(&mut s, 0.0);
+        assert!(frame.contains("▶ Ryan"), "{frame}");
     }
 
     #[test]

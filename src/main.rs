@@ -18,7 +18,10 @@ mod memory;
 mod mermaid;
 mod mono;
 mod pdf;
+mod picker;
+mod plugin;
 mod progress;
+mod remote;
 mod render;
 mod shape;
 mod stroke;
@@ -36,9 +39,12 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf open <file.pdf | file.epub | file.md | url>
+const USAGE: &str = "Usage: leaf open [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
        leaf comments [--json]
+       leaf ask --title <name> [--question <text>]   (selection on stdin)
+       leaf rex install | uninstall   add leaf to Rex's command palette
+       leaf voice [name]        show or set the voice that reads aloud
 
 Diff options:
   --staged           staged changes
@@ -53,7 +59,9 @@ side, r reload, ? keys, q quit
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
 
-Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit";
+Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, @ or ctrl+enter send the selection, with the lines around it, to an agent, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit
+
+Rex: leaf rex install puts Leaf in the command palette: open (with a picker), review diffs, ask the agent pane about a selection, read aloud and pick a voice. In a remote session, leaf is installed on the host with cargo the first time.";
 
 fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
@@ -120,6 +128,7 @@ fn resume(
     };
 
     let mut options = ViewerOptions::default();
+    options.source = Some(key.clone());
     match store.borrow().load_image_mode() {
         Ok(mode) => options.image_mode = mode.unwrap_or(options.image_mode),
         Err(e) => record(Err(e)),
@@ -208,17 +217,21 @@ fn main() -> ExitCode {
     memory::without_large_cache();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
+        if std::io::stdout().is_terminal() {
+            return pick_and_open();
+        }
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     match command.as_str() {
-        "open" => {
-            let [target] = rest else {
+        "open" => match rest {
+            [] => pick_and_open(),
+            [target] => open(target),
+            _ => {
                 eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            };
-            open(target)
-        }
+                ExitCode::from(2)
+            }
+        },
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
                 println!("{USAGE}");
@@ -233,6 +246,15 @@ fn main() -> ExitCode {
             }
             comments_command(rest)
         }
+        "ask" => {
+            if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            ask_command(rest)
+        }
+        "rex" | "plugin" => plugin_command(rest),
+        "voice" => voice_command(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -240,6 +262,25 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Shows the document picker over this folder, then reads what was picked.
+fn pick_and_open() -> ExitCode {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let recent = Store::open(&progress::default_path())
+        .and_then(|store| store.recent(30))
+        .unwrap_or_else(|e| {
+            eprintln!("leaf: {e} The picker still lists files here.");
+            Vec::new()
+        });
+    match picker::pick(&root, recent) {
+        Ok(Some(target)) => open(&target),
+        Ok(None) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: the terminal failed ({e}). Name a document instead: leaf open FILE");
+            ExitCode::from(1)
         }
     }
 }
@@ -299,6 +340,142 @@ fn diff_command(args: &[String]) -> ExitCode {
                 "leaf: the terminal failed ({e}). Comments written up to now are saved when the store is writable."
             );
             ExitCode::from(1)
+        }
+    }
+}
+
+/// Pastes a selected passage, and an optional question, into an open agent pane.
+fn ask_command(args: &[String]) -> ExitCode {
+    let mut title = "this document".to_owned();
+    let mut question = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--title" => {
+                i += 1;
+                title = args.get(i).cloned().unwrap_or_default();
+            }
+            "--question" => {
+                i += 1;
+                question = args.get(i).cloned().unwrap_or_default();
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("leaf: unknown option {other}. The selection is read from stdin.");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let mut passage = String::new();
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        if std::io::stdin().read_to_string(&mut passage).is_err() {
+            eprintln!("leaf: could not read the selection.");
+            return ExitCode::from(1);
+        }
+    }
+    if passage.trim().is_empty() {
+        eprintln!("leaf: select some text in the document first.");
+        return ExitCode::from(2);
+    }
+    let context = agent::recall(&passage).unwrap_or_else(|| {
+        agent::prompt(
+            &title,
+            None,
+            &[agent::Excerpt {
+                page: None,
+                text: passage.clone(),
+                start: 0,
+                end: passage.chars().count(),
+            }],
+            "",
+        )
+    });
+    let prompt = agent::with_question(&context, &question);
+    match agent::deliver(&prompt) {
+        Ok(found) => {
+            println!("Sent to {}.", found.command);
+            println!("LEAF_AGENT_BLOCK={}", found.pane);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Shows the voice that reads aloud, or makes `name` the one from now on.
+fn voice_command(args: &[String]) -> ExitCode {
+    let store = match Store::open(&progress::default_path()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match args {
+        [] => {
+            let voice = store
+                .load_voice()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| edge::DEFAULT_VOICE.to_owned());
+            println!("{voice}");
+            ExitCode::SUCCESS
+        }
+        [name] if remote::is_voice_name(name) => match store.save_voice(name) {
+            Ok(()) => {
+                println!("leaf reads in {name} from now on.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("leaf: {e}");
+                ExitCode::from(1)
+            }
+        },
+        _ => {
+            eprintln!(
+                "leaf: name one voice, such as en-GB-SoniaNeural. In a document, s searches every voice."
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn plugin_command(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("install") => match plugin::install() {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("leaf: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Some("uninstall") => match plugin::uninstall() {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("leaf: {e}");
+                ExitCode::from(1)
+            }
+        },
+        Some("-h" | "--help") | None => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("leaf: unknown command {other}. Use leaf rex install or leaf rex uninstall.");
+            ExitCode::from(2)
         }
     }
 }
