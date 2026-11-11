@@ -17,14 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The packages the README tells Linux users to install, and no more.
+      # The packages the README tells Linux users to install, plus curl and
+      # ca-certificates to fetch rustup, and fontconfig's runtime library,
+      # which every desktop already has and leaf loads when it starts.
       # fontconfig's development package is left out on purpose: leaf must
       # build without it (issue #3).
       - name: Install build dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl build-essential pkg-config libclang-dev libasound2-dev
+            ca-certificates curl build-essential pkg-config libclang-dev libasound2-dev \
+            libfontconfig1
           if pkg-config --exists fontconfig; then
             echo "fontconfig development files are installed; the check below would prove nothing" >&2
             exit 1
@@ -32,8 +35,19 @@ jobs:
 
       - name: Install Rust
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          curl -sSf -o rustup-init.sh https://sh.rustup.rs
+          sh rustup-init.sh -y --profile minimal
+          rm rustup-init.sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.image }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.image }}-cargo-
 
       - name: Build
         run: cargo build --locked
