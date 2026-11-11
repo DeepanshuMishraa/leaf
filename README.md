@@ -7,10 +7,10 @@ Read PDFs, markdown files and web articles in the terminal, and review diffs.
 cargo install leaf-reader   # installs the `leaf` command to ~/.cargo/bin
 ```
 
-On Linux, install a C toolchain, the libclang development files and the ALSA headers first. Debian and Ubuntu:
+On Linux, install a C toolchain, the libclang development files, the ALSA headers and fontconfig first. Debian and Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libasound2-dev
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev libfontconfig1
 ```
 
 If `leaf` isn't found after installing, add `~/.cargo/bin` to your PATH (fish: `fish_add_path ~/.cargo/bin`). Then:
