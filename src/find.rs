@@ -1,15 +1,24 @@
 //! Finding text: where a query occurs in a page's text.
 
-/// What the reader is looking for. Matching ignores case, and a space in the
-/// query matches any run of whitespace, so a phrase is found across a line break.
+/// What the reader is looking for. Matching ignores case and the difference
+/// between typed and typeset punctuation, and a space in the query matches any
+/// run of whitespace, so a phrase is found across a line break.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     typed: String,
     folded: Vec<char>,
 }
 
+/// One character for each, so a match's range in the folded text is its range in the page.
+/// Curly quotes and Unicode hyphens fold to what a keyboard types: PDFs and
+/// articles set "don’t" and "state‐of‐the‐art", and readers search for "don't".
 fn fold(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
+    match c {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{02BC}' | '\u{2032}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' => '"',
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2212}' => '-',
+        c => c.to_lowercase().next().unwrap_or(c),
+    }
 }
 
 impl Query {
@@ -122,5 +131,49 @@ mod tests {
             Query::new("  Leader Election ").map(|q| q.typed().to_owned()),
             Some("Leader Election".to_owned())
         );
+    }
+
+    #[test]
+    fn a_typed_apostrophe_finds_a_curly_one() {
+        assert_eq!(
+            found("don't", "I don\u{2019}t know, I don't"),
+            vec![(2, 7), (16, 21)]
+        );
+    }
+
+    #[test]
+    fn a_curly_apostrophe_in_the_query_finds_a_typed_one() {
+        assert_eq!(found("don\u{2019}t", "I don't know"), vec![(2, 7)]);
+    }
+
+    #[test]
+    fn typed_quotes_find_curly_quotes() {
+        assert_eq!(
+            found("\"total order\"", "a \u{201C}total order\u{201D} holds"),
+            vec![(2, 15)]
+        );
+    }
+
+    #[test]
+    fn typed_quotes_find_low_quotes_and_the_modifier_apostrophe() {
+        assert_eq!(
+            found("\"zitat\"", "ein \u{201E}Zitat\u{201C} hier"),
+            vec![(4, 11)]
+        );
+        assert_eq!(found("don't", "don\u{02BC}t"), vec![(0, 5)]);
+    }
+
+    #[test]
+    fn a_typed_hyphen_finds_unicode_hyphens_and_dashes() {
+        assert_eq!(
+            found("state-of-the-art", "state\u{2010}of\u{2011}the\u{2010}art"),
+            vec![(0, 16)]
+        );
+        assert_eq!(found("pages 3-9", "pages 3\u{2013}9"), vec![(0, 9)]);
+    }
+
+    #[test]
+    fn an_em_dash_is_not_a_hyphen() {
+        assert_eq!(found("well-known", "well\u{2014}known"), vec![]);
     }
 }
