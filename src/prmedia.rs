@@ -4,11 +4,13 @@
 //! it's installed) under a play button, and a click opens it. A terminal
 //! without Kitty graphics keeps a one-line placeholder for each.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use image::{Rgba, RgbaImage};
 use ratatui::layout::Rect;
@@ -23,6 +25,17 @@ use crate::video::{self, PlayFailed, Playback};
 const USER_AGENT: &str = "Mozilla/5.0 (leaf reader)";
 /// An image larger than this is left as a placeholder rather than held in memory.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const UNPLAYABLE: &str = "The video couldn't be played: it didn't load, or ffmpeg can't read it. Click it to try again, or press o to open the pull request in the browser.";
+/// Frames kept of one GIF; the rest are left out of the loop.
+const MAX_GIF_FRAMES: usize = 600;
+/// Bytes of decoded frames kept of one GIF.
+const MAX_GIF_BYTES: usize = 384 * 1024 * 1024;
+/// A GIF frame asking for less than this shows for `GIF_DEFAULT_DELAY`, as browsers do.
+const GIF_MIN_DELAY: Duration = Duration::from_millis(20);
+const GIF_DEFAULT_DELAY: Duration = Duration::from_millis(100);
+/// How long the loading ring takes per step, of `RING_STEPS` a turn.
+const RING_STEP: Duration = Duration::from_millis(80);
+const RING_STEPS: u64 = 12;
 /// An SVG's longer side is drawn at most this many pixels.
 const MAX_SVG_SIDE: f32 = 4096.0;
 /// The card a video gets when no frame of it can be taken.
@@ -177,9 +190,53 @@ pub fn prepare(body: &str) -> Prepared {
 enum Slot {
     Loading,
     Image(RgbaImage),
+    /// A GIF with more than one frame, which plays on its own and loops.
+    Animation(Animation),
     /// A frame of the video under a play button, or a card with one.
     Video(RgbaImage),
     Failed,
+}
+
+/// A video started in place: its link being signed, then playing.
+enum Play {
+    Signing {
+        rx: Receiver<String>,
+        size: (u32, u32),
+    },
+    Running(Playback),
+}
+
+/// An animated GIF's frames and how long each shows.
+struct Animation {
+    frames: Vec<(RgbaImage, Duration)>,
+    length: Duration,
+}
+
+impl Animation {
+    /// `None` unless there are at least two frames to play.
+    fn new(frames: Vec<(RgbaImage, Duration)>) -> Option<Self> {
+        if frames.len() < 2 {
+            return None;
+        }
+        let length = frames.iter().map(|(_, delay)| *delay).sum();
+        Some(Animation { frames, length })
+    }
+
+    /// The frame showing `elapsed` into the loop, and its index.
+    fn at(&self, elapsed: Duration) -> (usize, &RgbaImage) {
+        let mut left = elapsed.as_millis() % self.length.as_millis().max(1);
+        for (index, (frame, delay)) in self.frames.iter().enumerate() {
+            if left < delay.as_millis() {
+                return (index, frame);
+            }
+            left -= delay.as_millis();
+        }
+        (0, &self.frames[0].0)
+    }
+
+    fn first(&self) -> &RgbaImage {
+        &self.frames[0].0
+    }
 }
 
 /// What's known of one figure, for what to show in its place.
@@ -197,8 +254,18 @@ struct Upload {
     cols: u16,
     from: u16,
     to: u16,
-    /// The video frame shown, or 0 for a still picture.
-    frame: u64,
+    /// What is drawn: 0 for a still picture, else a video frame, a GIF frame
+    /// or a step of the loading ring.
+    frame: Frame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Frame {
+    Still,
+    Video(u64),
+    Gif(usize),
+    /// The poster under a loading ring, at this step of its turn.
+    Buffering(u64),
 }
 
 /// The description's media, and what of it the terminal holds.
@@ -218,7 +285,11 @@ pub struct Gallery {
     used: HashSet<Upload>,
     placements: Vec<(kitty::Image, Rect)>,
     /// The video playing in place, and its link.
-    playing: Option<(String, Playback)>,
+    playing: Option<(String, Play)>,
+    /// When the gallery was made: GIFs and the loading ring run on this clock.
+    epoch: Instant,
+    /// Whether a GIF was placed on screen last frame, so the screen is redrawn for it.
+    moving: bool,
     /// Bumped when media arrives or a video starts or stops, so layouts and labels are redone.
     pub generation: u64,
 }
@@ -239,20 +310,34 @@ impl Gallery {
             used: HashSet::new(),
             placements: Vec::new(),
             playing: None,
+            epoch: Instant::now(),
+            moving: false,
             generation: 0,
         }
     }
 
     /// Plays a video in its figure, `width` pixels across.
+    /// The loading ring shows at once, while the link is signed and the
+    /// first frame arrives; signing goes over the network, so it's done aside.
     pub fn play(&mut self, href: &str, width: u32) -> Result<(), PlayFailed> {
         let native = match self.slots.get(href) {
             Some(Slot::Video(poster)) => poster.dimensions(),
             _ => CARD,
         };
         self.stop();
-        let source = self.presigned(href).unwrap_or_else(|| signed(href));
-        let playback = Playback::start(&source, video::decode_size(native, width))?;
-        self.playing = Some((href.to_owned(), playback));
+        let size = video::decode_size(native, width);
+        let play = match self.presigned(href) {
+            Some(source) => Play::Running(Playback::start(&source, size)?),
+            None => {
+                let (tx, rx) = mpsc::channel();
+                let href = href.to_owned();
+                std::thread::spawn(move || {
+                    let _ = tx.send(signed(&href));
+                });
+                Play::Signing { rx, size }
+            }
+        };
+        self.playing = Some((href.to_owned(), play));
         self.generation += 1;
         Ok(())
     }
@@ -272,18 +357,59 @@ impl Gallery {
         self.playing.is_some()
     }
 
-    /// Takes the playing video's newest frame, and stops it when it has ended.
-    pub fn tick(&mut self) {
-        let ended = match &mut self.playing {
-            Some((_, playback)) => {
-                playback.poll();
-                playback.ended()
-            }
-            None => false,
-        };
-        if ended {
-            self.stop();
+    /// Whether a GIF is on screen, or a video is playing or loading: the
+    /// screen is redrawn often while one is.
+    pub fn moving(&self) -> bool {
+        self.moving || self.playing.is_some()
+    }
+
+    /// Whether the video at `href` was started and has no frame to show yet.
+    pub fn is_buffering(&self, href: &str) -> bool {
+        match &self.playing {
+            Some((at, play)) if at == href => match play {
+                Play::Signing { .. } => true,
+                Play::Running(playback) => playback.current().is_none(),
+            },
+            _ => false,
         }
+    }
+
+    /// Takes the playing video's newest frame, and stops it when it has
+    /// ended. Says why when it ended before showing anything.
+    pub fn tick(&mut self) -> Option<String> {
+        let Some((_, play)) = &mut self.playing else {
+            return None;
+        };
+        if let Play::Signing { rx, size } = play {
+            let source = match rx.try_recv() {
+                Ok(source) => source,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.stop();
+                    return Some(UNPLAYABLE.to_owned());
+                }
+            };
+            match Playback::start(&source, *size) {
+                Ok(playback) => *play = Play::Running(playback),
+                Err(e) => {
+                    self.stop();
+                    return Some(e.to_string());
+                }
+            }
+        }
+        let Play::Running(playback) = play else {
+            return None;
+        };
+        // The first frame turns the loading ring into the video, and its label too.
+        if playback.poll() && playback.frame == 1 {
+            self.generation += 1;
+        }
+        if !playback.ended() {
+            return None;
+        }
+        let never_played = playback.frame == 0;
+        self.stop();
+        never_played.then(|| UNPLAYABLE.to_owned())
     }
 
     /// Asks the terminal what it can draw. Call it once the terminal is in raw mode.
@@ -321,6 +447,7 @@ impl Gallery {
         }
         match self.slots.get(href)? {
             Slot::Image(pixels) | Slot::Video(pixels) => Some(pixels.dimensions()),
+            Slot::Animation(animation) => Some(animation.first().dimensions()),
             Slot::Loading | Slot::Failed => None,
         }
     }
@@ -328,7 +455,7 @@ impl Gallery {
     pub fn shown(&self, href: &str) -> Shown {
         match self.slots.get(href) {
             None | Some(Slot::Loading) => Shown::Loading,
-            Some(Slot::Image(_)) => Shown::Image,
+            Some(Slot::Image(_) | Slot::Animation(_)) => Shown::Image,
             Some(Slot::Video(_)) => Shown::Video,
             Some(Slot::Failed) => Shown::Failed,
         }
@@ -403,23 +530,43 @@ impl Gallery {
     pub fn begin(&mut self) {
         self.placements.clear();
         self.used.clear();
+        self.moving = false;
     }
 
     /// Places the part of `figure` that's on screen. `area` is where the body
     /// is drawn, showing its rows from `scroll`.
     pub fn place(&mut self, figure: &Figure, area: Rect, scroll: usize) {
         let Some(kitty) = &mut self.kitty else { return };
-        // A playing video shows its newest frame over the poster.
-        let frame = self
+        let elapsed = self.epoch.elapsed();
+        // A playing video shows its newest frame over the poster, and its
+        // poster under a loading ring until the first frame comes.
+        let playing = self
             .playing
             .as_ref()
             .filter(|(at, _)| *at == figure.href)
-            .and_then(|(_, playback)| Some((playback.current()?, playback.frame)));
-        let (pixels, frame) = match (frame, self.slots.get(&figure.href)) {
-            (Some((pixels, frame)), _) => (pixels, frame),
-            (None, Some(Slot::Image(pixels) | Slot::Video(pixels))) => (pixels, 0),
+            .map(|(_, play)| match play {
+                Play::Running(playback) => {
+                    playback.current().map(|pixels| (pixels, playback.frame))
+                }
+                Play::Signing { .. } => None,
+            });
+        let (pixels, frame) = match (playing, self.slots.get(&figure.href)) {
+            (Some(Some((pixels, frame))), _) => (Cow::Borrowed(pixels), Frame::Video(frame)),
+            (Some(None), Some(Slot::Video(poster))) => {
+                let step = (elapsed.as_millis() / RING_STEP.as_millis()) as u64 % RING_STEPS;
+                (Cow::Owned(buffering(poster, step)), Frame::Buffering(step))
+            }
+            (_, Some(Slot::Animation(animation))) => {
+                self.moving = true;
+                let (index, pixels) = animation.at(elapsed);
+                (Cow::Borrowed(pixels), Frame::Gif(index))
+            }
+            (_, Some(Slot::Image(pixels) | Slot::Video(pixels))) => {
+                (Cow::Borrowed(pixels), Frame::Still)
+            }
             _ => return,
         };
+        let pixels = pixels.as_ref();
         let (top, bottom) = (figure.top, figure.top + figure.rows as usize);
         let (first, last) = (scroll, scroll + area.height as usize);
         if bottom <= first || top >= last {
@@ -563,12 +710,13 @@ fn fetch(url: &str, presigned: Option<String>, video: bool) -> Slot {
         let Some(bytes) = path.and_then(|p| std::fs::read(p).ok()) else {
             continue;
         };
-        if let Some(pixels) = decode(&bytes) {
-            return if is_video {
-                Slot::Video(pixels)
-            } else {
-                Slot::Image(pixels)
-            };
+        let slot = if is_video {
+            decode(&bytes).map(Slot::Video)
+        } else {
+            picture(&bytes)
+        };
+        if let Some(slot) = slot {
+            return slot;
         }
     }
     let source = presigned.unwrap_or_else(|| signed(url));
@@ -583,7 +731,7 @@ fn fetch(url: &str, presigned: Option<String>, video: bool) -> Slot {
                 keep(kept(url, true), &png);
             }
         }
-        Slot::Image(_) | Slot::Loading | Slot::Failed => {}
+        Slot::Image(_) | Slot::Animation(_) | Slot::Loading | Slot::Failed => {}
     }
     slot
 }
@@ -679,13 +827,50 @@ fn download(key: &str, url: &str, video: bool) -> Slot {
     else {
         return Slot::Failed;
     };
-    match decode(&bytes) {
-        Some(pixels) => {
+    match picture(&bytes) {
+        Some(slot) => {
             keep(kept(key, false), &bytes);
-            Slot::Image(pixels)
+            slot
         }
         None => Slot::Failed,
     }
+}
+
+/// A picture ready to draw: a GIF with more than one frame plays, any other
+/// picture is still.
+fn picture(bytes: &[u8]) -> Option<Slot> {
+    if bytes.starts_with(b"GIF8")
+        && let Some(animation) = animation(bytes)
+    {
+        return Some(Slot::Animation(animation));
+    }
+    decode(bytes).map(Slot::Image)
+}
+
+/// A GIF's frames, composed as they show; `None` for one frame, which is
+/// drawn as a still picture.
+fn animation(bytes: &[u8]) -> Option<Animation> {
+    use image::AnimationDecoder;
+
+    let decoder = image::codecs::gif::GifDecoder::new(io::Cursor::new(bytes)).ok()?;
+    let mut frames = Vec::new();
+    let mut held = 0usize;
+    for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {
+        let Ok(frame) = frame else { break };
+        let delay = Duration::from(frame.delay());
+        let delay = if delay < GIF_MIN_DELAY {
+            GIF_DEFAULT_DELAY
+        } else {
+            delay
+        };
+        let pixels = frame.into_buffer();
+        held += pixels.as_raw().len();
+        if held > MAX_GIF_BYTES {
+            break;
+        }
+        frames.push((pixels, delay));
+    }
+    Animation::new(frames)
 }
 
 /// A picture's pixels: any format the image crate reads, or an SVG drawn at
@@ -769,6 +954,34 @@ fn playable(frame: Option<RgbaImage>) -> RgbaImage {
             let dim = |c: u8| (u16::from(c) * 2 / 5) as u8;
             Rgba([dim(r), dim(g), dim(b), 255])
         };
+    }
+    image
+}
+
+/// The poster with a loading ring where its play button was, the ring's
+/// bright head at `step` of `RING_STEPS` round.
+fn buffering(poster: &RgbaImage, step: u64) -> RgbaImage {
+    let mut image = poster.clone();
+    let (w, h) = (image.width() as f32, image.height() as f32);
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let radius = (w.min(h) / 7.0).max(12.0);
+    let head = step as f32 / RING_STEPS as f32 * std::f32::consts::TAU;
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+        let distance = (dx * dx + dy * dy).sqrt();
+        if distance > radius {
+            continue;
+        }
+        // Covers the play button, then draws a ring that fades behind its head.
+        let mut shade = Rgba([24, 24, 24, 255]);
+        if (0.5..=0.75).contains(&(distance / radius)) {
+            let angle = dy.atan2(dx).rem_euclid(std::f32::consts::TAU);
+            let behind = (head - angle).rem_euclid(std::f32::consts::TAU);
+            let lit = (1.0 - behind / (std::f32::consts::TAU * 0.75)).max(0.0);
+            let mix = |c: u8| (f32::from(c) + (255.0 - f32::from(c)) * lit) as u8;
+            shade = Rgba([mix(shade[0]), mix(shade[1]), mix(shade[2]), 255]);
+        }
+        *pixel = shade;
     }
     image
 }
@@ -869,6 +1082,61 @@ mod tests {
         assert_eq!(pixels.dimensions(), (40, 20));
         assert_eq!(pixels.get_pixel(20, 10), &Rgba([255, 0, 0, 255]));
         assert!(decode(b"not a picture").is_none());
+    }
+
+    #[test]
+    fn gifs_with_frames_play_on_their_delays_and_loop() {
+        let frame = |c: u8, ms: u32| {
+            image::Frame::from_parts(
+                RgbaImage::from_pixel(4, 2, Rgba([c, 0, 0, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(ms, 1),
+            )
+        };
+        let mut gif = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+            encoder
+                .encode_frames([frame(255, 100), frame(0, 300)])
+                .expect("frames encode");
+        }
+        let Some(Slot::Animation(animation)) = picture(&gif) else {
+            panic!("a GIF with two frames animates");
+        };
+        assert_eq!(animation.length, Duration::from_millis(400));
+        assert_eq!(animation.at(Duration::from_millis(50)).0, 0);
+        assert_eq!(animation.at(Duration::from_millis(150)).0, 1);
+        assert_eq!(animation.at(Duration::from_millis(450)).0, 0);
+
+        let mut still = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut still);
+            encoder
+                .encode_frames([frame(255, 100)])
+                .expect("frame encodes");
+        }
+        assert!(matches!(picture(&still), Some(Slot::Image(_))));
+        // Delays too short to honor show as long as a browser shows them.
+        assert_eq!(
+            Animation::new(vec![
+                (RgbaImage::new(1, 1), GIF_DEFAULT_DELAY),
+                (RgbaImage::new(1, 1), GIF_DEFAULT_DELAY),
+            ])
+            .map(|a| a.length),
+            Some(Duration::from_millis(200))
+        );
+    }
+
+    #[test]
+    fn a_loading_video_covers_its_play_button_with_a_ring() {
+        let poster = playable(None);
+        let ring = buffering(&poster, 0);
+        let (cx, cy) = (CARD.0 / 2, CARD.1 / 2);
+        assert_eq!(poster.get_pixel(cx, cy), &Rgba([255, 255, 255, 255]));
+        assert_eq!(ring.get_pixel(cx, cy), &Rgba([24, 24, 24, 255]));
+        assert_eq!(ring.get_pixel(2, 2), poster.get_pixel(2, 2));
+        assert_ne!(buffering(&poster, 3), ring, "the ring turns");
     }
 
     const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";

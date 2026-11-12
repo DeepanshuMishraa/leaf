@@ -3145,8 +3145,36 @@ impl App {
 /// Asks the terminal for its text (OSC 10) or background (OSC 11) color, so
 /// painted images and diagrams match the text.
 pub(crate) fn query_color(code: u8) -> Option<Rgb> {
+    let reply = query_terminal(&format!("\x1b]{code};?\x1b\\"), |reply| {
+        reply.ends_with(b"\x07") || reply.ends_with(b"\x1b\\")
+    })?;
+    parse_color_reply(&String::from_utf8_lossy(&reply))
+}
+
+/// Asks the terminal whether it shows its light or dark theme (`CSI ? 996 n`,
+/// which Rex and Ghostty answer); `Some(true)` for light.
+pub(crate) fn query_color_scheme() -> Option<bool> {
+    let reply = query_terminal("\x1b[?996n", |reply| {
+        reply.ends_with(b"n") && reply.windows(5).any(|w| w == b"?997;")
+    })?;
+    parse_scheme_reply(&reply)
+}
+
+/// Reads "ESC [ ? 997 ; 1 n" (dark) or "; 2 n" (light).
+fn parse_scheme_reply(reply: &[u8]) -> Option<bool> {
+    let at = reply.windows(5).position(|w| w == b"?997;")?;
+    match reply.get(at + 5..at + 7)? {
+        b"1n" => Some(false),
+        b"2n" => Some(true),
+        _ => None,
+    }
+}
+
+/// Writes `request` and reads stdin a byte at a time until `done`, for up to
+/// half a second. Byte at a time, so no key typed after the reply is taken.
+fn query_terminal(request: &str, done: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     let mut out = io::stdout();
-    write!(out, "\x1b]{code};?\x1b\\").ok()?;
+    out.write_all(request.as_bytes()).ok()?;
     out.flush().ok()?;
     let mut reply = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -3163,18 +3191,18 @@ pub(crate) fn query_color(code: u8) -> Option<Rgb> {
         if unsafe { libc::poll(&mut fd, 1, left.max(1)) } <= 0 {
             break;
         }
-        let mut buf = [0u8; 64];
-        // SAFETY: reads into a stack buffer of the length given.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        let mut byte = 0u8;
+        // SAFETY: reads one byte into a stack variable.
+        let n = unsafe { libc::read(libc::STDIN_FILENO, (&raw mut byte).cast(), 1) };
         if n <= 0 {
             break;
         }
-        reply.extend_from_slice(&buf[..n as usize]);
-        if reply.ends_with(b"\x07") || reply.ends_with(b"\x1b\\") {
-            break;
+        reply.push(byte);
+        if done(&reply) {
+            return Some(reply);
         }
     }
-    parse_color_reply(&String::from_utf8_lossy(&reply))
+    None
 }
 
 /// Reads "rgb:RRRR/GGGG/BBBB" (one to four hex digits a channel) from an OSC
@@ -4465,5 +4493,13 @@ mod tests {
             Some([255, 255, 255])
         );
         assert_eq!(parse_color_reply("garbage"), None);
+    }
+
+    #[test]
+    fn color_scheme_replies_say_light_or_dark() {
+        assert_eq!(parse_scheme_reply(b"\x1b[?997;1n"), Some(false));
+        assert_eq!(parse_scheme_reply(b"\x1b[?997;2n"), Some(true));
+        assert_eq!(parse_scheme_reply(b"\x1b[?997;3n"), None);
+        assert_eq!(parse_scheme_reply(b"\x1b[?62;22c"), None);
     }
 }

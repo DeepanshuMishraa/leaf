@@ -45,6 +45,8 @@ const HIGHLIGHT_CACHE: usize = 64;
 const HIGHLIGHT_BYTES: usize = 128 * 1024;
 /// How many rows one wheel notch moves.
 const WHEEL_ROWS: usize = 3;
+/// How often a terminal that reports its light or dark theme is asked again.
+const SCHEME_EVERY: Duration = Duration::from_secs(1);
 
 /// Colors chosen to sit on the terminal's own paper instead of painting over it.
 /// Exact RGB, not the 256-color palette: some terminals derive that palette
@@ -58,28 +60,12 @@ struct Palette {
 }
 
 impl Palette {
-    #[cfg(not(test))]
-    fn detect() -> Self {
-        use std::io::IsTerminal;
-
-        if !io::stdin().is_terminal() {
-            return Palette::dark();
-        }
-        let theme = std::env::var("LEAF_THEME").ok();
-        let light = theme_hint(theme.as_deref())
-            .or_else(|| crate::viewer::query_color(11).map(is_light))
-            .or_else(|| colorfgbg_hint(std::env::var("COLORFGBG").ok().as_deref()))
-            .unwrap_or_else(system_is_light);
+    fn new(light: bool) -> Self {
         if light {
             Palette::light()
         } else {
             Palette::dark()
         }
-    }
-
-    #[cfg(test)]
-    fn detect() -> Self {
-        Palette::dark()
     }
 
     fn dark() -> Self {
@@ -92,7 +78,6 @@ impl Palette {
         }
     }
 
-    #[cfg_attr(test, allow(dead_code))]
     fn light() -> Self {
         Palette {
             added: Color::Rgb(0xd7, 0xff, 0xd7),
@@ -104,42 +89,94 @@ impl Palette {
     }
 }
 
+/// How the palette was picked, which says whether it can change while open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    /// From `LEAF_THEME`, the background color, or the dark default.
+    Fixed { light: bool },
+    /// The terminal reports its light or dark theme (Rex does), so it is asked
+    /// again every `SCHEME_EVERY` and the palette follows an appearance switch.
+    Followed { light: bool, checked: Instant },
+}
+
+impl Scheme {
+    /// `LEAF_THEME` first, then the terminal's light or dark theme, then its
+    /// background color; dark when none of them says.
+    #[cfg(not(test))]
+    fn detect() -> Self {
+        use std::io::IsTerminal;
+
+        if !io::stdin().is_terminal() {
+            return Scheme::Fixed { light: false };
+        }
+        if let Some(light) = theme_hint(std::env::var("LEAF_THEME").ok().as_deref()) {
+            return Scheme::Fixed { light };
+        }
+        if let Some(light) = crate::viewer::query_color_scheme() {
+            return Scheme::Followed {
+                light,
+                checked: Instant::now(),
+            };
+        }
+        Scheme::Fixed {
+            light: crate::viewer::query_color(11).is_some_and(is_light),
+        }
+    }
+
+    #[cfg(test)]
+    fn detect() -> Self {
+        Scheme::Fixed { light: false }
+    }
+
+    fn light(self) -> bool {
+        match self {
+            Scheme::Fixed { light } | Scheme::Followed { light, .. } => light,
+        }
+    }
+
+    /// Asks the terminal again once `SCHEME_EVERY` has passed; `true` when
+    /// it switched between light and dark.
+    fn refresh(&mut self) -> bool {
+        let Scheme::Followed { light, checked } = self else {
+            return false;
+        };
+        if checked.elapsed() < SCHEME_EVERY {
+            return false;
+        }
+        *checked = Instant::now();
+        match crate::viewer::query_color_scheme() {
+            Some(now) if now != *light => {
+                *light = now;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How long the event loop may sleep before the scheme is due again.
+    fn due(self) -> Option<Duration> {
+        match self {
+            Scheme::Fixed { .. } => None,
+            Scheme::Followed { checked, .. } => {
+                Some(SCHEME_EVERY.saturating_sub(checked.elapsed()))
+            }
+        }
+    }
+}
+
 /// Whether a background color is light enough for the light palette.
 #[cfg_attr(test, allow(dead_code))]
 fn is_light([r, g, b]: [u8; 3]) -> bool {
     (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 140
 }
 
-/// `LEAF_THEME=light` or `dark` picks the palette for a terminal that doesn't
-/// report its background.
+/// `LEAF_THEME=light` or `dark` sets the palette outright.
 fn theme_hint(value: Option<&str>) -> Option<bool> {
     match value?.trim().to_ascii_lowercase().as_str() {
         "light" => Some(true),
         "dark" => Some(false),
         _ => None,
     }
-}
-
-/// `COLORFGBG` ("15;0", "0;default;15") ends with the background's ANSI
-/// index: white (7) and the bright colors but dark gray (9 to 15) are light.
-fn colorfgbg_hint(value: Option<&str>) -> Option<bool> {
-    let index: u8 = value?.rsplit(';').next()?.trim().parse().ok()?;
-    Some(index == 7 || (9..=15).contains(&index))
-}
-
-/// The last guess, for a terminal that follows the system's appearance: on
-/// macOS the dark appearance sets AppleInterfaceStyle, and light leaves it unset.
-#[cfg(not(test))]
-fn system_is_light() -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
-    }
-    std::process::Command::new("defaults")
-        .args(["read", "-g", "AppleInterfaceStyle"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).contains("Dark"))
 }
 
 /// Comments and the store they persist in.
@@ -482,6 +519,7 @@ impl Split {
 struct App {
     loaded: Loaded,
     palette: Palette,
+    scheme: Scheme,
     /// The split line the cursor is on.
     cursor: usize,
     /// First split line on screen.
@@ -528,9 +566,11 @@ impl App {
         let split = Split::new(&loaded.diff);
         let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
+        let scheme = Scheme::detect();
         let mut app = App {
             loaded,
-            palette: Palette::detect(),
+            palette: Palette::new(scheme.light()),
+            scheme,
             cursor,
             scroll: 0,
             left: 0,
@@ -566,6 +606,10 @@ impl App {
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         loop {
             self.receive_job();
+            // Only while no key is waiting, so the reply is read before any key.
+            if !event::poll(Duration::ZERO)? && self.scheme.refresh() {
+                self.palette = Palette::new(self.scheme.light());
+            }
             terminal.draw(|f| self.draw(f))?;
             if let Some(text) = self.copy.take() {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(text);
@@ -2913,16 +2957,20 @@ fn panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, widt
 
 impl App {
     fn wait_duration(&self) -> Option<Duration> {
-        if self.job.is_some() {
-            return Some(Duration::from_millis(40));
+        let wait = if self.job.is_some() {
+            Some(Duration::from_millis(40))
+        } else if let Some(toast) = &self.toast {
+            Some(toast.until.saturating_duration_since(Instant::now()))
+        } else if self.has_pending_highlight() {
+            Some(Duration::from_millis(16))
+        } else {
+            None
+        };
+        // Wakes in time to ask the terminal whether it switched light or dark.
+        match (wait, self.scheme.due()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
-        if let Some(toast) = &self.toast {
-            return Some(toast.until.saturating_duration_since(Instant::now()));
-        }
-        if self.has_pending_highlight() {
-            return Some(Duration::from_millis(16));
-        }
-        None
     }
 }
 
@@ -2940,12 +2988,16 @@ mod tests {
         assert_eq!(theme_hint(Some("dark")), Some(false));
         assert_eq!(theme_hint(Some("solarized")), None);
         assert_eq!(theme_hint(None), None);
-        assert_eq!(colorfgbg_hint(Some("0;15")), Some(true));
-        assert_eq!(colorfgbg_hint(Some("0;default;7")), Some(true));
-        assert_eq!(colorfgbg_hint(Some("15;0")), Some(false));
-        assert_eq!(colorfgbg_hint(Some("7;8")), Some(false));
-        assert_eq!(colorfgbg_hint(Some("15;default")), None);
-        assert_eq!(colorfgbg_hint(None), None);
+        assert!(!Scheme::Fixed { light: false }.light());
+        assert_eq!(Scheme::Fixed { light: true }.due(), None);
+        let mut fixed = Scheme::Fixed { light: true };
+        assert!(!fixed.refresh());
+        let followed = Scheme::Followed {
+            light: true,
+            checked: Instant::now(),
+        };
+        assert!(followed.light());
+        assert!(followed.due().is_some_and(|wait| wait <= SCHEME_EVERY));
     }
     use crate::diff::Origin;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
