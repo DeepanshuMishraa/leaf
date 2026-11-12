@@ -4,6 +4,16 @@ WOW
 Read PDFs, markdown files and web articles in the terminal, and review diffs.
 
 ```sh
+curl -fsSL https://leaf.dipxsy.app | sh
+```
+
+This installs a prebuilt `leaf` for macOS (11 or later) or Linux (glibc 2.35 or later, such as Ubuntu 22.04), on x86_64 or arm64, to `~/.local/bin`. If `leaf` is already installed, from `cargo install` too, it's updated where it is. The download is checked against its published SHA-256 and run once before it replaces anything. Set `LEAF_INSTALL_DIR` to install somewhere else, or `LEAF_VERSION` for a release other than the newest. On Linux, leaf needs the ALSA sound library (`libasound2t64` or `libasound2` on Debian and Ubuntu), which desktops already have.
+
+`leaf version` prints the version, and `leaf upgrade` installs the newest release in place, checked the same way (`leaf upgrade --check` only says whether there is one). Releases are listed at https://github.com/DeepanshuMishraa/leaf/releases.
+
+To build from source instead, use Cargo:
+
+```sh
 cargo install leaf-reader   # installs the `leaf` command to ~/.cargo/bin
 ```
 
@@ -141,3 +151,5 @@ Built in Rust with ratatui and mupdf.
 cargo test
 cargo clippy
 ```
+
+To release, set `version` in `Cargo.toml` (and `package.nix`), run `cargo check` so `Cargo.lock` follows, commit, then push a matching tag: `git tag v0.12.0 && git push origin v0.12.0`. The release workflow checks the tag against `Cargo.toml` and runs the tests. It then builds and runs leaf for each of the four targets, and only once all four pass publishes a GitHub release with `leaf-<target>.tar.gz`, a `.sha256` for each and `SHA256SUMS`. Last, it installs that release with the install script on macOS and Linux. Pull requests that touch the build run the same builds without publishing. The site, which serves the install script, deploys with `cd site && wrangler deploy`.

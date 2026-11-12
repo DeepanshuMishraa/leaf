@@ -1,0 +1,271 @@
+# Builds leaf for macOS and Linux and publishes a GitHub release.
+#
+# Release: bump `version` in Cargo.toml, commit, then push a matching tag:
+#   git tag v0.12.0 && git push origin v0.12.0
+#
+# The tag must match Cargo.toml, the tests must pass, and every target must
+# build and run before anything is published, so a release is never partial.
+# Each target ships as leaf-<target>.tar.gz beside a .sha256 file; the names
+# carry no version, which is what `leaf upgrade` and install.sh rely on.
+#
+# Pull requests that touch the build, and manual runs, build every target
+# without publishing, so a broken release is caught before a tag is pushed.
+
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - site/public/install.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # A tag's release run is never cut off halfway; a newer push to a pull request is.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  # Builds for macOS 11 and later, whichever macOS the runner has.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  check:
+    name: Check version and test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version, and match it against the tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::No version line in [package]."
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match Cargo.toml's version ${version}. Bump Cargo.toml (and Cargo.lock) and tag v${version}, or delete the tag."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Building leaf ${version}"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libclang-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check the install script parses
+        run: sh -n site/public/install.sh
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          # Cross-built on Apple silicon (Intel runners are being retired)
+          # and run under Rosetta for the smoke test.
+          - target: x86_64-apple-darwin
+            os: macos-15
+            run: arch -x86_64
+          # The oldest supported Ubuntu, so the binary needs the oldest glibc (2.35).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libclang-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage
+          cp "target/$TARGET/release/leaf" README.md LICENSE stage/
+          archive="leaf-$TARGET.tar.gz"
+          tar -czf "dist/$archive" -C stage leaf README.md LICENSE
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - name: Install Rosetta for the x86_64 smoke test
+        if: matrix.run == 'arch -x86_64'
+        run: |
+          arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Run the packaged binary
+        shell: bash
+        env:
+          RUN: ${{ matrix.run }}
+        run: |
+          set -euo pipefail
+          mkdir smoke
+          tar -xzf "dist/leaf-$TARGET.tar.gz" -C smoke
+          said=$($RUN ./smoke/leaf version)
+          echo "$said"
+          if [ "$said" != "leaf $VERSION" ]; then
+            echo "::error::The packaged leaf says '$said', expected 'leaf $VERSION'."
+            exit 1
+          fi
+          $RUN ./smoke/leaf --help > /dev/null
+          if [ "$RUNNER_OS" = Linux ]; then
+            ldd ./smoke/leaf
+            objdump -T ./smoke/leaf | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1
+          else
+            otool -L ./smoke/leaf
+            lipo -archs ./smoke/leaf
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leaf-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: [check, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: leaf-*
+          merge-multiple: true
+
+      - name: Check every archive is here and matches its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            test -f "leaf-$target.tar.gz" || { echo "::error::leaf-$target.tar.gz is missing."; exit 1; }
+            test -f "leaf-$target.tar.gz.sha256" || { echo "::error::leaf-$target.tar.gz.sha256 is missing."; exit 1; }
+          done
+          cat *.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A version with a suffix (v1.2.0-rc.1) is a pre-release, which
+          # `releases/latest`, `leaf upgrade` and install.sh never pick.
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # A re-run replaces the files of the release made before.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "leaf $VERSION" --generate-notes "${flags[@]}"
+          fi
+
+  verify:
+    name: Install from the release (${{ matrix.os }})
+    needs: [check, release]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-22.04, ubuntu-24.04-arm]
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # leaf links the ALSA sound library on Linux, as a desktop has it.
+      - name: Install the ALSA runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2t64 || sudo apt-get install -y --no-install-recommends libasound2
+
+      - name: Install with install.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/bin"
+          LEAF_VERSION="$VERSION" LEAF_INSTALL_DIR="$dir" sh site/public/install.sh
+          said=$("$dir/leaf" version)
+          echo "$said"
+          test "$said" = "leaf $VERSION"
+
+      - name: Run install.sh again over the installed leaf
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/bin"
+          # With leaf on the PATH and no LEAF_INSTALL_DIR, it's found and left as it is.
+          out=$(PATH="$dir:$PATH" LEAF_VERSION="$VERSION" sh site/public/install.sh)
+          echo "$out"
+          echo "$out" | grep -q "already installed at $dir/leaf"
+          # And `leaf upgrade` agrees there's nothing newer.
+          "$dir/leaf" upgrade --check

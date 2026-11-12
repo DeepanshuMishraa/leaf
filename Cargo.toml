@@ -1,6 +1,6 @@
 [package]
 name = "leaf-reader"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2024"
 description = "Read PDFs, markdown files and web articles in the terminal"
 license = "MIT"
@@ -31,6 +31,7 @@ resvg = { version = "0.48", default-features = false, features = ["text", "syste
 rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }
 thiserror = "2"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
