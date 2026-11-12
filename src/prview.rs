@@ -144,8 +144,14 @@ struct List {
     /// The pull request a press on the picked row landed on, which opens on
     /// release unless the mouse was dragged or the list changed under it.
     pressed: Option<PrRef>,
-    /// What ctrl+y copied, shown in the footer until the next key.
+    /// What ctrl+y or a drag copied, shown in the footer until the next key.
     copied: Option<String>,
+    /// The rows' lines as drawn last, and where, so a drag can select their text.
+    shown: Vec<Line<'static>>,
+    shown_area: Rect,
+    /// Text dragged over in `shown`.
+    selection: Option<Selection>,
+    dragging: bool,
 }
 
 impl List {
@@ -237,6 +243,29 @@ impl Selection {
         };
         Some((from, to))
     }
+
+    /// The text of `lines` it covers, as drawn.
+    fn text(self, lines: &[Line<'static>]) -> String {
+        let out: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let (from, to) = self.columns(index)?;
+                Some(columns(&plain(line), from, to).trim_end().to_owned())
+            })
+            .collect();
+        out.join("\n").trim().to_owned()
+    }
+}
+
+/// The point under a screen cell in lines drawn in `area` from `scroll` on,
+/// clamped into the area.
+fn point_in(area: Rect, scroll: usize, column: u16, row: u16) -> Point {
+    let y = row.clamp(area.y, (area.y + area.height).saturating_sub(1)) - area.y;
+    (
+        scroll + y as usize,
+        column.saturating_sub(area.x).min(area.width),
+    )
 }
 
 /// A tab's lines, and the figures drawn over them.
@@ -307,31 +336,14 @@ impl Page {
 
     /// The body point under a screen cell, clamped into the body.
     fn point(&self, column: u16, row: u16) -> Point {
-        let area = self.body_area;
-        let y = row.clamp(area.y, (area.y + area.height).saturating_sub(1)) - area.y;
-        (
-            self.scroll + y as usize,
-            column.saturating_sub(area.x).min(area.width),
-        )
+        point_in(self.body_area, self.scroll, column, row)
     }
 
     fn selected_text(&self) -> String {
         let (Some(selection), Some((_, body))) = (self.selection, &self.cache) else {
             return String::new();
         };
-        let (start, end) = selection.ordered();
-        let mut out = Vec::new();
-        for index in start.0..=end.0.min(body.lines.len().saturating_sub(1)) {
-            let Some((from, to)) = selection.columns(index) else {
-                continue;
-            };
-            out.push(
-                columns(&plain(&body.lines[index]), from, to)
-                    .trim_end()
-                    .to_owned(),
-            );
-        }
-        out.join("\n").trim().to_owned()
+        selection.text(&body.lines)
     }
 }
 
@@ -421,6 +433,10 @@ impl App {
             hits: Vec::new(),
             pressed: None,
             copied: None,
+            shown: Vec::new(),
+            shown_area: Rect::default(),
+            selection: None,
+            dragging: false,
         });
     }
 
@@ -839,10 +855,23 @@ impl App {
     fn list_mouse(&mut self, mouse: MouseEvent) {
         let Some(list) = &mut self.list else { return };
         let last = list.count().saturating_sub(1);
+        let point = point_in(list.shown_area, 0, mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::ScrollDown => list.selected = (list.selected + 1).min(last),
-            MouseEventKind::ScrollUp => list.selected = list.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                list.selection = None;
+                list.selected = (list.selected + 1).min(last);
+            }
+            MouseEventKind::ScrollUp => {
+                list.selection = None;
+                list.selected = list.selected.saturating_sub(1);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A drag from here selects the text it passes over.
+                list.selection = Some(Selection {
+                    anchor: point,
+                    head: point,
+                });
+                list.dragging = true;
                 let Some(&(_, _, index)) = list
                     .hits
                     .iter()
@@ -859,8 +888,28 @@ impl App {
                 };
                 list.selected = index;
             }
-            MouseEventKind::Drag(MouseButton::Left) => list.pressed = None,
+            MouseEventKind::Drag(MouseButton::Left) => {
+                list.pressed = None;
+                if list.dragging
+                    && let Some(selection) = &mut list.selection
+                {
+                    selection.head = point;
+                }
+            }
             MouseEventKind::Up(MouseButton::Left) => {
+                if std::mem::take(&mut list.dragging) {
+                    match list.selection {
+                        Some(s) if s.anchor != s.head => {
+                            let text = s.text(&list.shown);
+                            if !text.is_empty() {
+                                copy(&text);
+                                list.copied =
+                                    Some(format!("Copied {} characters", text.chars().count()));
+                            }
+                        }
+                        _ => list.selection = None,
+                    }
+                }
                 // Still the same pull request: a search can reorder rows mid-click.
                 if let Some(pr) = list.pressed.take()
                     && list.picked().as_ref() == Some(&pr)
@@ -883,6 +932,7 @@ impl App {
         let rows = list.count();
         let picked = list.picked();
         list.copied = None;
+        list.selection = None;
         match key.code {
             // Letters filter the list, so copying the number takes ctrl.
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1241,6 +1291,8 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64) {
     let room = bottom.saturating_sub(top) as usize;
 
     if total == 0 {
+        list.shown.clear();
+        list.selection = None;
         let text = if list.loading() {
             format!("{}  Loading your pull requests", spinner())
         } else if let Some(e) = list.failure().filter(|_| list.typed.is_empty()) {
@@ -1322,7 +1374,19 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64) {
             }
             shown.push(line);
         }
-        f.render_widget(Paragraph::new(shown), Rect::new(x, top, width, room as u16));
+        let drawn: Vec<Line> = shown
+            .iter()
+            .enumerate()
+            .map(
+                |(index, line)| match list.selection.and_then(|s| s.columns(index)) {
+                    Some((from, to)) => highlight(line, from, to),
+                    None => line.clone(),
+                },
+            )
+            .collect();
+        list.shown = shown;
+        list.shown_area = Rect::new(x, top, width, room as u16);
+        f.render_widget(Paragraph::new(drawn), list.shown_area);
     }
 
     let footer = match (list.failure(), &list.copied) {
@@ -2333,6 +2397,10 @@ mod tests {
             hits: Vec::new(),
             pressed: None,
             copied: None,
+            shown: Vec::new(),
+            shown_area: Rect::default(),
+            selection: None,
+            dragging: false,
         };
         assert_eq!(list.count(), 2);
         assert!(list.loading());
@@ -2373,6 +2441,30 @@ mod tests {
                 .iter()
                 .any(|s| s.content == "world" && s.style.add_modifier.contains(Modifier::REVERSED))
         );
+    }
+
+    #[test]
+    fn a_drag_on_the_list_selects_a_rows_title_and_number() {
+        let shown = vec![
+            Line::default(),
+            spread(
+                vec![Span::raw("▌ "), Span::raw("●  "), Span::raw("Fix gifs")],
+                vec![Span::raw("leaf #16")],
+                30,
+            ),
+        ];
+        let area = Rect::new(10, 5, 30, 10);
+        // The title, then the number at the row's right end.
+        let title = Selection {
+            anchor: point_in(area, 0, 15, 6),
+            head: point_in(area, 0, 22, 6),
+        };
+        assert_eq!(title.text(&shown), "Fix gifs");
+        let number = Selection {
+            anchor: point_in(area, 0, 37, 6),
+            head: point_in(area, 0, 39, 6),
+        };
+        assert_eq!(number.text(&shown), "#16");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "leaf-reader"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 description = "Read PDFs, markdown files and web articles in the terminal"
 license = "MIT"
@@ -47,3 +47,6 @@ wasmtime = { version = "50.0.0", default-features = false, features = ["cranelif
 # dlopen mode, which also sets yeslogic-fontconfig-sys/dlopen.
 [target.'cfg(not(any(target_family = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))'.dependencies]
 font-kit = { version = "0.14", default-features = false, features = ["source-fontconfig-dlopen"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.10.3"

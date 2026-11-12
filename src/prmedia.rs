@@ -820,6 +820,18 @@ fn fetch(url: &str, presigned: Option<String>, video: bool, budget: &Arc<AtomicU
             return slot;
         }
     }
+    if !video
+        && !is_video_file(url)
+        && let Some(bytes) = repo_file(url)
+    {
+        return match picture(&bytes, budget) {
+            Some(slot) => {
+                keep(kept(url, false), &bytes);
+                slot
+            }
+            None => Slot::Failed,
+        };
+    }
     let source = presigned.unwrap_or_else(|| signed(url));
     let slot = download(url, &source, video, budget);
     match &slot {
@@ -885,6 +897,61 @@ fn signed(url: &str) -> String {
         })
         .filter(|location| location.starts_with("https://"))
         .unwrap_or_else(|| url.to_owned())
+}
+
+/// Most ways to split a file link's "ref/path" that are tried.
+const MAX_REF_SPLITS: usize = 4;
+
+/// The API requests that may fetch a file committed to a repository, from a
+/// link to it (`github.com/o/r/blob|raw/ref/path` or
+/// `raw.githubusercontent.com/o/r/ref/path`), shortest ref first: a ref can
+/// hold slashes, so where it ends is only known by asking.
+fn repo_file_requests(link: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(link) else {
+        return Vec::new();
+    };
+    let Some(segments) = parsed.path_segments() else {
+        return Vec::new();
+    };
+    let segments: Vec<&str> = segments.filter(|s| !s.is_empty()).collect();
+    let rest = match (parsed.host_str(), segments.as_slice()) {
+        (Some("github.com"), [_, _, "blob" | "raw", rest @ ..]) => rest,
+        (Some("raw.githubusercontent.com"), [_, _, rest @ ..]) => rest,
+        _ => return Vec::new(),
+    };
+    let (owner, repo) = (segments[0], segments[1]);
+    (1..rest.len())
+        .take(MAX_REF_SPLITS)
+        .map(|split| {
+            let (git_ref, path) = rest.split_at(split);
+            format!(
+                "https://api.github.com/repos/{owner}/{repo}/contents/{}?ref={}",
+                path.join("/"),
+                git_ref.join("/")
+            )
+        })
+        .collect()
+}
+
+/// A file committed to a repository, read through the API with the GitHub
+/// token. A private repository's file links answer 404 to a token on
+/// github.com, so this is the only way to them; `None` when it isn't such a
+/// link, there's no token, or no request found it.
+fn repo_file(link: &str) -> Option<Vec<u8>> {
+    let token = TOKEN.as_deref()?;
+    repo_file_requests(link).into_iter().find_map(|request| {
+        ureq::get(&request)
+            .header("user-agent", USER_AGENT)
+            .header("accept", "application/vnd.github.raw")
+            .header("authorization", &format!("Bearer {token}"))
+            .call()
+            .ok()?
+            .into_body()
+            .with_config()
+            .limit(MAX_BYTES)
+            .read_to_vec()
+            .ok()
+    })
 }
 
 /// The signed links in a pull request's rendered body (`body_html`), by
@@ -1188,6 +1255,28 @@ mod tests {
             signed("http://github.com/user-attachments/assets/a"),
             "http://github.com/user-attachments/assets/a"
         );
+    }
+
+    #[test]
+    fn repository_file_links_are_read_through_the_api() {
+        assert_eq!(
+            repo_file_requests("https://github.com/o/r/blob/feat/x/docs/a.gif?raw=true"),
+            [
+                "https://api.github.com/repos/o/r/contents/x/docs/a.gif?ref=feat",
+                "https://api.github.com/repos/o/r/contents/docs/a.gif?ref=feat/x",
+                "https://api.github.com/repos/o/r/contents/a.gif?ref=feat/x/docs",
+            ]
+        );
+        assert_eq!(
+            repo_file_requests("https://raw.githubusercontent.com/o/r/main/a.png"),
+            ["https://api.github.com/repos/o/r/contents/a.png?ref=main"]
+        );
+        assert_eq!(
+            repo_file_requests("https://github.com/o/r/raw/main/a.png"),
+            ["https://api.github.com/repos/o/r/contents/a.png?ref=main"]
+        );
+        assert!(repo_file_requests("https://github.com/user-attachments/assets/abc").is_empty());
+        assert!(repo_file_requests("https://example.com/o/r/blob/main/a.png").is_empty());
     }
 
     #[test]

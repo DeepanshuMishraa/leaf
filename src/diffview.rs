@@ -31,7 +31,9 @@ use crate::github;
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::remote;
 use crate::render::DIM;
+use crate::rextheme;
 use crate::syntax;
+use crate::theme::{self, Theme};
 
 const ACCENT: Color = Color::Indexed(12);
 const ADDED_FG: Color = Color::Indexed(2);
@@ -48,9 +50,11 @@ const WHEEL_ROWS: usize = 3;
 /// How often a terminal that reports its light or dark theme is asked again.
 const SCHEME_EVERY: Duration = Duration::from_secs(1);
 
-/// Colors chosen to sit on the terminal's own paper instead of painting over it.
-/// Exact RGB, not the 256-color palette: some terminals derive that palette
-/// from the theme, which turns the light shades dark on a light background.
+/// Line tints: the theme's own green, red and blue mixed over its background
+/// when the theme is known, otherwise fixed shades. Exact RGB either way, not
+/// the 256-color palette: some terminals derive that palette from the theme,
+/// which turns the light shades dark on a light background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Palette {
     added: Color,
     removed: Color,
@@ -58,6 +62,11 @@ struct Palette {
     removed_word: Color,
     focus: Color,
 }
+
+/// How strongly each tint shows over the theme's background.
+const LINE_TINT: f32 = 0.2;
+const WORD_TINT: f32 = 0.4;
+const FOCUS_TINT: f32 = 0.3;
 
 impl Palette {
     fn new(light: bool) -> Self {
@@ -87,88 +96,121 @@ impl Palette {
             focus: Color::Rgb(0xaf, 0xd7, 0xff),
         }
     }
+
+    fn from_theme(theme: Theme) -> Self {
+        let tint = |color, amount| {
+            let [r, g, b] = theme::mix(theme.background, color, amount);
+            Color::Rgb(r, g, b)
+        };
+        Palette {
+            added: tint(theme.green, LINE_TINT),
+            removed: tint(theme.red, LINE_TINT),
+            added_word: tint(theme.green, WORD_TINT),
+            removed_word: tint(theme.red, WORD_TINT),
+            focus: tint(theme.blue, FOCUS_TINT),
+        }
+    }
+
+    /// The terminal's colors when it gave them, else the fixed shades.
+    fn of_terminal(theme: Option<Theme>, light: bool) -> Self {
+        theme.map_or_else(|| Palette::new(light), Palette::from_theme)
+    }
 }
 
-/// How the palette was picked, which says whether it can change while open.
+/// Where the palette came from, which says whether and how it's rechecked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scheme {
-    /// From `LEAF_THEME`, the background color, or the dark default.
-    Fixed { light: bool },
-    /// The terminal reports its light or dark theme (Rex does), so it is asked
-    /// again every `SCHEME_EVERY` and the palette follows an appearance switch.
+    /// `LEAF_THEME`, or a terminal that won't say when its theme changes.
+    Fixed,
+    /// Rex's saved theme, read again when Rex's or macOS's settings change.
+    Rex {
+        stamp: rextheme::Stamp,
+        checked: Instant,
+    },
+    /// The terminal reports its light or dark theme (Ghostty does), so it is
+    /// asked again every `SCHEME_EVERY`, and its colors read again on a switch.
     Followed { light: bool, checked: Instant },
 }
 
 impl Scheme {
-    /// `LEAF_THEME` first, then the terminal's light or dark theme, then its
-    /// background color; dark when none of them says.
+    /// `LEAF_THEME` first, then Rex's theme, then the terminal's colors, then
+    /// its light or dark theme or background; the dark shades when none say.
     #[cfg(not(test))]
-    fn detect() -> Self {
+    fn detect() -> (Self, Palette) {
         use std::io::IsTerminal;
 
         // The setting holds even when stdin isn't a terminal to ask.
         if let Some(light) = theme_hint(std::env::var("LEAF_THEME").ok().as_deref()) {
-            return Scheme::Fixed { light };
+            return (Scheme::Fixed, Palette::new(light));
+        }
+        let stamp = rextheme::stamp();
+        if let Some(theme) = rextheme::active() {
+            let checked = Instant::now();
+            return (Scheme::Rex { stamp, checked }, Palette::from_theme(theme));
         }
         if !io::stdin().is_terminal() {
-            return Scheme::Fixed { light: false };
+            return (Scheme::Fixed, Palette::dark());
         }
+        let colors = Theme::query();
         if let Some(light) = crate::viewer::query_color_scheme() {
-            return Scheme::Followed {
-                light,
-                checked: Instant::now(),
-            };
+            let checked = Instant::now();
+            return (
+                Scheme::Followed { light, checked },
+                Palette::of_terminal(colors, light),
+            );
         }
-        Scheme::Fixed {
-            light: crate::viewer::query_color(11).is_some_and(is_light),
-        }
+        let light = colors.map_or_else(
+            || crate::viewer::query_color(11).is_some_and(theme::is_light),
+            Theme::is_light,
+        );
+        (Scheme::Fixed, Palette::of_terminal(colors, light))
     }
 
     #[cfg(test)]
-    fn detect() -> Self {
-        Scheme::Fixed { light: false }
+    fn detect() -> (Self, Palette) {
+        (Scheme::Fixed, Palette::dark())
     }
 
-    fn light(self) -> bool {
-        match self {
-            Scheme::Fixed { light } | Scheme::Followed { light, .. } => light,
-        }
-    }
-
-    /// Asks the terminal again once `SCHEME_EVERY` has passed; `true` when
-    /// it switched between light and dark.
-    fn refresh(&mut self) -> bool {
-        let Scheme::Followed { light, checked } = self else {
-            return false;
+    /// Checks again once `SCHEME_EVERY` has passed; the new palette when the
+    /// theme changed.
+    fn refresh(&mut self) -> Option<Palette> {
+        let checked = match self {
+            Scheme::Fixed => return None,
+            Scheme::Rex { checked, .. } | Scheme::Followed { checked, .. } => checked,
         };
         if checked.elapsed() < SCHEME_EVERY {
-            return false;
+            return None;
         }
         *checked = Instant::now();
-        match crate::viewer::query_color_scheme() {
-            Some(now) if now != *light => {
-                *light = now;
-                true
+        match self {
+            Scheme::Fixed => None,
+            Scheme::Rex { stamp, .. } => {
+                let now = rextheme::stamp();
+                if now == *stamp {
+                    return None;
+                }
+                *stamp = now;
+                rextheme::active().map(Palette::from_theme)
             }
-            _ => false,
+            Scheme::Followed { light, .. } => match crate::viewer::query_color_scheme() {
+                Some(now) if now != *light => {
+                    *light = now;
+                    Some(Palette::of_terminal(Theme::query(), now))
+                }
+                _ => None,
+            },
         }
     }
 
     /// How long the event loop may sleep before the scheme is due again.
     fn due(self) -> Option<Duration> {
         match self {
-            Scheme::Fixed { .. } => None,
-            Scheme::Followed { checked, .. } => {
+            Scheme::Fixed => None,
+            Scheme::Rex { checked, .. } | Scheme::Followed { checked, .. } => {
                 Some(SCHEME_EVERY.saturating_sub(checked.elapsed()))
             }
         }
     }
-}
-
-/// Whether a background color is light enough for the light palette.
-#[cfg_attr(test, allow(dead_code))]
-fn is_light([r, g, b]: [u8; 3]) -> bool {
-    (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 140
 }
 
 /// `LEAF_THEME=light` or `dark` sets the palette outright.
@@ -570,10 +612,10 @@ impl App {
         let split = Split::new(&loaded.diff);
         let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
-        let scheme = Scheme::detect();
+        let (scheme, palette) = Scheme::detect();
         let mut app = App {
             loaded,
-            palette: Palette::new(scheme.light()),
+            palette,
             scheme,
             last_input: Instant::now(),
             cursor,
@@ -615,8 +657,11 @@ impl App {
             // could be taken with it: ask only while the reader is idle (no
             // key waiting, none in the last second, not writing a comment).
             let idle = self.composer.is_none() && self.last_input.elapsed() >= SCHEME_EVERY;
-            if idle && !event::poll(Duration::ZERO)? && self.scheme.refresh() {
-                self.palette = Palette::new(self.scheme.light());
+            if idle
+                && !event::poll(Duration::ZERO)?
+                && let Some(palette) = self.scheme.refresh()
+            {
+                self.palette = palette;
             }
             terminal.draw(|f| self.draw(f))?;
             if let Some(text) = self.copy.take() {
@@ -2994,22 +3039,49 @@ mod tests {
 
     #[test]
     fn the_palette_follows_hints_when_the_terminal_wont_say() {
-        assert!(is_light([255, 255, 255]));
-        assert!(!is_light([30, 30, 30]));
         assert_eq!(theme_hint(Some("Light")), Some(true));
         assert_eq!(theme_hint(Some("dark")), Some(false));
         assert_eq!(theme_hint(Some("solarized")), None);
         assert_eq!(theme_hint(None), None);
-        assert!(!Scheme::Fixed { light: false }.light());
-        assert_eq!(Scheme::Fixed { light: true }.due(), None);
-        let mut fixed = Scheme::Fixed { light: true };
-        assert!(!fixed.refresh());
-        let followed = Scheme::Followed {
+        assert_eq!(Scheme::Fixed.due(), None);
+        let mut fixed = Scheme::Fixed;
+        assert_eq!(fixed.refresh(), None);
+        let mut followed = Scheme::Followed {
             light: true,
             checked: Instant::now(),
         };
-        assert!(followed.light());
         assert!(followed.due().is_some_and(|wait| wait <= SCHEME_EVERY));
+        // Not due yet, so the terminal isn't asked.
+        assert_eq!(followed.refresh(), None);
+        let mut rex = Scheme::Rex {
+            stamp: rextheme::stamp(),
+            checked: Instant::now(),
+        };
+        assert!(rex.due().is_some_and(|wait| wait <= SCHEME_EVERY));
+        assert_eq!(rex.refresh(), None);
+        assert_eq!(Palette::of_terminal(None, true), Palette::light());
+        assert_eq!(Palette::of_terminal(None, false), Palette::dark());
+    }
+
+    #[test]
+    fn the_palette_is_mixed_from_the_themes_own_colors() {
+        let theme = Theme {
+            background: [0x16, 0x16, 0x16],
+            red: [0xd9, 0x6a, 0x4d],
+            green: [0x9a, 0xab, 0x84],
+            blue: [0x8a, 0xa0, 0xb4],
+        };
+        let palette = Palette::of_terminal(Some(theme), true);
+        assert_eq!(palette, Palette::from_theme(theme));
+        // A fifth of the theme's green over its background; the changed words
+        // twice as strong, so they stand out within the line.
+        assert_eq!(palette.added, Color::Rgb(0x30, 0x34, 0x2c));
+        assert_eq!(palette.added_word, Color::Rgb(0x4b, 0x52, 0x42));
+        assert_eq!(palette.removed, Color::Rgb(0x3d, 0x27, 0x21));
+        let Color::Rgb(r, g, b) = palette.focus else {
+            panic!("the focus tint is exact RGB, got {:?}", palette.focus);
+        };
+        assert!(b > r && b > g, "the focus row leans blue: {r} {g} {b}");
     }
     use crate::diff::Origin;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};

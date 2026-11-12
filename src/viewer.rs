@@ -3149,6 +3149,13 @@ pub(crate) fn query_color(code: u8) -> Option<Rgb> {
     parse_color_reply(&String::from_utf8_lossy(&reply))
 }
 
+/// Asks the terminal for one of its 256 palette colors (OSC 4).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn query_palette(index: u8) -> Option<Rgb> {
+    let reply = query_terminal(&format!("\x1b]4;{index};?\x1b\\"))?;
+    parse_color_reply(&String::from_utf8_lossy(&reply))
+}
+
 /// Asks the terminal whether it shows its light or dark theme (`CSI ? 996 n`,
 /// which Rex and Ghostty answer); `Some(true)` for light.
 pub(crate) fn query_color_scheme() -> Option<bool> {
