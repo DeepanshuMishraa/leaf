@@ -1135,21 +1135,26 @@ impl Request {
         })
     }
 
+    /// A GitHub patch already fetched, ready to show; keeping the patch lets
+    /// it be shown again without asking GitHub.
+    pub fn github(&self, patch: String, resource: github::Resource) -> Loaded {
+        let label = resource.label();
+        Loaded {
+            diff: Diff::parse(patch),
+            title: format!("leaf diff · {label}"),
+            key: format!("diff:github:{}", resource.key()),
+            label,
+            request: self.clone(),
+            github: Some(resource),
+            branch: None,
+        }
+    }
+
     pub fn load(&self) -> Result<Loaded, DiffFailed> {
         match &self.origin {
             Origin::Github { url } => {
                 let fetched = github::fetch(url)?;
-                let key = format!("diff:github:{}", fetched.resource.key());
-                let label = fetched.resource.label();
-                Ok(Loaded {
-                    diff: Diff::parse(fetched.patch),
-                    title: format!("leaf diff · {label}"),
-                    key,
-                    label,
-                    request: self.clone(),
-                    github: Some(fetched.resource),
-                    branch: None,
-                })
+                Ok(self.github(fetched.patch, fetched.resource))
             }
             Origin::Patch { path } => {
                 let bytes = std::fs::read(path).map_err(|e| DiffFailed::Read {

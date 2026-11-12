@@ -23,13 +23,17 @@ mod picker;
 mod place;
 mod plugin;
 mod popover;
+mod pr;
+mod prmedia;
 mod progress;
+mod prview;
 mod remote;
 mod render;
 mod shape;
 mod stroke;
 mod syntax;
 mod tempo;
+mod video;
 mod viewer;
 mod voicepick;
 
@@ -45,6 +49,7 @@ use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf open [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
+       leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -61,6 +66,9 @@ Diff options:
 
 Diff keys: j/k move, v visual, C comment, m comments, f files, y copy, o other
 side, r reload, ? keys, q quit
+
+Pull request keys: tab summary/timeline, 3 code, m merge, x close/reopen, r ready/draft,
+a approve, c comment, o browser, y copy checkout, R reload, ? keys, q back
 
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
@@ -222,6 +230,18 @@ fn resume(
 fn main() -> ExitCode {
     memory::without_large_cache();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A leaf updated with `cargo install` brings its Rex plugin up to date. A
+    // plugin that can't be refreshed keeps working as it was, so this is quiet.
+    let installing = matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("rex" | "plugin"), Some("install" | "uninstall"))
+    );
+    if !installing {
+        let _ = plugin::refresh();
+    }
     let Some((command, rest)) = args.split_first() else {
         if std::io::stdout().is_terminal() {
             return pick_and_open(None);
@@ -254,6 +274,13 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             diff_command(rest)
+        }
+        "pr" => {
+            if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            pr_command(rest)
         }
         "comments" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -426,7 +453,7 @@ fn diff_command(args: &[String]) -> ExitCode {
     };
     let failure = Rc::new(RefCell::new(None));
     let options = diff_options(&loaded.key, failure.clone());
-    let result = diffview::run(loaded, options);
+    let result = diffview::run(loaded, options).map(|_| ());
     if let Some(message) = failure.borrow().as_ref() {
         eprintln!("leaf: {message}");
     }
@@ -436,6 +463,33 @@ fn diff_command(args: &[String]) -> ExitCode {
             eprintln!(
                 "leaf: the terminal failed ({e}). Comments written up to now are saved when the store is writable."
             );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `leaf pr`: lists your open pull requests, or opens the one named.
+fn pr_command(args: &[String]) -> ExitCode {
+    let here = pr::current_repo();
+    let start = match args {
+        [] => prview::Start::List,
+        [target] => match pr::PrRef::parse(target, here.as_deref()) {
+            Ok(pr) => prview::Start::Pr(pr),
+            Err(e) => {
+                eprintln!("leaf: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    std::thread::spawn(syntax::warm);
+    match prview::run(start, here, pr::current_branch()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: the terminal failed ({e}). Nothing was changed on GitHub after that.");
             ExitCode::from(1)
         }
     }
@@ -693,6 +747,7 @@ fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Op
         comments: Vec::new(),
         store: None,
         failure: failure.clone(),
+        tabs: false,
     };
     match Store::open(&progress::default_path()) {
         Ok(store) => {

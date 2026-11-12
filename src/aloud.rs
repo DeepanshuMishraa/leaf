@@ -440,7 +440,7 @@ impl rodio::Source for Playhead {
 /// device's own buffer size comes first, then each config the device lists,
 /// then the other output devices. Stream errors are dropped rather than
 /// printed over the reader.
-fn open_device() -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
+pub(crate) fn open_device() -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
     use rodio::{DeviceSinkBuilder, cpal};
 

@@ -6,7 +6,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "leaf";
-  version = "0.10.1";
+  version = "0.11.0";
   src = lib.cleanSource ./.;
 
   cargoLock.lockFile = ./Cargo.lock;

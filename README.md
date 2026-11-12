@@ -78,9 +78,34 @@ Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens 
 
 The message names the file, the side, and the line range, and includes the hunk around that range, then the comment. It is sent, not left sitting in the agent's input. An agent pane is found from `LEAF_AGENT_PANE`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini`, `grok`, `pi` or another known agent. With no Rex session or no agent, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
+## Pull requests
+
+`leaf pr` lists the open pull requests that concern you: this branch's first, then this repository's, yours across GitHub, the ones waiting on your review, and the rest in repositories you own. Type to filter by title, repository, number or author, and press `enter` to open one. Name one to open it directly:
+
+```sh
+leaf pr                                  # pick from your open pull requests
+leaf pr 12                               # #12 in this repository
+leaf pr owner/repo#12                    # any repository
+leaf pr https://github.com/owner/repo/pull/12
+```
+
+The list shows what it found last time at once and refreshes behind it, each heading as its answer arrives. Each pull request takes two lines, its title over who opened it and when; `↑/↓` or the wheel move, a click picks a row and a second click opens it. The pull request under the cursor is read ahead, so `enter` opens it without waiting, and one read before opens at once while it's read again. Answers, diffs and pictures are cached in `$XDG_CACHE_HOME/leaf/pr` (default `~/.cache/leaf/pr`).
+
+A pull request opens on its title, one line of state, number, author and size, and its tabs. **Summary** shows whether it can merge, the branch, reviewers and labels when it has them, checks that are failing or running, and the description. **Timeline** shows commits, comments, reviews and line comments in order; long bot comments are cut short until `e` expands them. **Code** opens the diff in the reviewer above. The diff is fetched while the page loads and kept against the head commit, so Code opens at once and only fetches again after a push. In Code, `1`, `2` and `←` go back to Summary and Timeline (`h`/`l` scroll sideways there).
+
+Pictures in the description are drawn in place on terminals with the Kitty graphics protocol (Kitty, Ghostty, WezTerm, Rex; not inside tmux), as the reader draws its figures. Images in a table stack under their column's heading. A video shows its first frame under a play button. Click it to play it right there, with its sound: `ffmpeg` decodes it at the video's own pace, the frames are drawn like any picture and the sound goes to the same output as reading aloud. A click or `esc` stops it, as does leaving the Summary. Without `ffmpeg` a click opens the video in the browser instead. A click on an image shows it full size in the browser. Elsewhere each picture is a one-line placeholder.
+
+Drag over text in Summary or Timeline to select it; it's copied when you let go, and `esc` clears the selection.
+
+Keys: `←/→`, `tab`, `1`, `2`, `3` switch tabs (a click on a tab too), `j/k`, `ctrl+d/u`, `space/b`, `g/G` scroll. `m` merges: pick squash (`s`), merge commit (`m`) or rebase (`r`), then confirm. `x` closes, or reopens a closed one, `r` marks a draft ready or converts it back, `a` approves, `c` comments (`enter` posts, `alt+enter` adds a line). `o` opens it on GitHub, `y` copies `gh pr checkout N`, `Y` the link, `R` reloads, `?` lists the keys, `q` goes back to the list. The footer lists the main keys. Merging and closing ask first.
+
+Everything goes through the GitHub CLI, so `gh` must be installed and signed in (`gh auth login`).
+
 ## Rex
 
 `leaf rex install` adds Leaf to Rex's command palette. Press `cmd+shift+p` and type Leaf.
+
+Updating leaf updates the plugin too: after `cargo install leaf-reader` installs a new version, the plugin brings itself up to date the next time leaf runs. That includes when Rex loads its config, which runs leaf to ask what's open. There's no need to run `leaf rex install` again. Only the leaf the plugin was installed for does this; a development build run by hand leaves it alone.
 
 Documents and diffs open in the pane the palette was called from. leaf runs in a layer laid exactly over that pane, so nothing is typed into its shell: quitting leaf leaves the shell as it was, with no command on screen or in its history. A document already open there gives way to the new one. A pane busy with something else, such as an editor or an agent, keeps it, and leaf opens beside it.
 
@@ -88,6 +113,7 @@ Always there:
 
 - **Open Document…** floats a picker over the window, like Rex's Go to Directory. The field holds a path, starting at the pane's folder; type to narrow that folder's folders and documents, `tab` or `enter` on a folder goes into it, and `enter` on a document reads it. Documents read lately come first, with how far in. A typed `https://` link opens as it is. `leaf open` with no file, or plain `leaf`, shows the same picker in place.
 - **Review Diff**, **Review Staged Changes** and **Review This Branch** open the diff reviewer.
+- **Pull Requests** opens `leaf pr` in the pane; pass `target` (a number, `owner/repo#N` or a link) to open one directly.
 - **Choose Agent…** floats a list of the agent CLIs installed here (claude, codex, opencode, gemini, grok, pi…), with the one picked now ticked. Questions then go to the pane already running that agent, so its conversation goes on; with none open, leaf starts it in a new pane beside, already asked, and later questions go there. **Any agent pane** sends to whichever agent pane is open: the focused one, else one in the same tab. `leaf agents` shows the same list in place.
 
 While a document or a diff is open:

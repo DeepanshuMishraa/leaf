@@ -109,6 +109,9 @@ pub struct Options {
     pub store: Option<Store>,
     /// Store failures are reported after the terminal is restored.
     pub failure: Rc<RefCell<Option<String>>>,
+    /// Opened as a pull request's Code tab: `1`, `2` and `←` go back to its
+    /// other tabs, and `h`/`l` scroll sideways.
+    pub tabs: bool,
 }
 
 impl Default for Options {
@@ -117,8 +120,18 @@ impl Default for Options {
             comments: Vec::new(),
             store: None,
             failure: Rc::new(RefCell::new(None)),
+            tabs: false,
         }
     }
+}
+
+/// How the reviewer was left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leave {
+    Quit,
+    /// For a pull request's Code tab: to its Summary or Timeline.
+    Summary,
+    Timeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,6 +471,9 @@ struct App {
     job: Option<Job>,
     copy: Option<String>,
     quit: bool,
+    /// Where `quit` goes, for a pull request's Code tab.
+    leave: Leave,
+    tabs: bool,
     split: Split,
     /// The diff's lines on screen.
     view: Rect,
@@ -495,6 +511,8 @@ impl App {
             job: None,
             copy: None,
             quit: false,
+            leave: Leave::Quit,
+            tabs: options.tabs,
             split,
             view: Rect::default(),
             composer_view: 0,
@@ -754,8 +772,8 @@ impl App {
 
 // PART2
 
-/// Opens the reviewer on a loaded patch.
-pub fn run(loaded: Loaded, options: Options) -> io::Result<()> {
+/// Opens the reviewer on a loaded patch, and says how it was left.
+pub fn run(loaded: Loaded, options: Options) -> io::Result<Leave> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
@@ -775,7 +793,7 @@ pub fn run(loaded: Loaded, options: Options) -> io::Result<()> {
     remote::withdraw(remote::Kind::Diff);
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    result
+    result.map(|()| app.leave)
 }
 
 /// The text sent to an agent or posted as a comment: the file and line range,
@@ -1071,6 +1089,15 @@ impl App {
             KeyCode::Char('Y') => self.copy_payload(true),
             KeyCode::Char('o') => self.other_side(),
             KeyCode::Char('r') => self.reload(),
+            KeyCode::Char('1') if self.tabs => {
+                self.leave = Leave::Summary;
+                self.quit = true;
+            }
+            KeyCode::Char('2') | KeyCode::Left if self.tabs => {
+                self.leave = Leave::Timeline;
+                self.quit = true;
+            }
+            KeyCode::Char('3') | KeyCode::Right if self.tabs => {}
             KeyCode::Char('h') | KeyCode::Left => {
                 self.left = self.left.saturating_sub(4);
             }
@@ -1970,7 +1997,11 @@ impl App {
             left.push_str(&format!("  {mode}{lines} {unit} · C comment"));
         }
         let (added, removed) = totals(diff);
-        let stats = format!("+{added} −{removed} ");
+        let stats = if self.tabs {
+            format!("1 summary · 2 timeline   +{added} −{removed} ")
+        } else {
+            format!("+{added} −{removed} ")
+        };
         let left_width = (width as usize).saturating_sub(cells(&stats) + 1);
         let left = clip(&left, left_width);
         let pad = (width as usize).saturating_sub(1 + cells(&left) + cells(&stats));
