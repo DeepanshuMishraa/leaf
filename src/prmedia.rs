@@ -234,7 +234,7 @@ impl Gallery {
             _ => CARD,
         };
         self.stop();
-        let playback = Playback::start(href, video::decode_size(native, width))?;
+        let playback = Playback::start(&signed(href), video::decode_size(native, width))?;
         self.playing = Some((href.to_owned(), playback));
         self.generation += 1;
         Ok(())
@@ -539,7 +539,58 @@ fn fetch(url: &str, video: bool) -> Slot {
     slot
 }
 
+/// The GitHub token, from GH_TOKEN, GITHUB_TOKEN or `gh auth token`.
+static TOKEN: LazyLock<Option<String>> = LazyLock::new(|| {
+    let from_env = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok());
+    let token = from_env.or_else(|| {
+        let output = Command::new("gh")
+            .args(["auth", "token"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        String::from_utf8(output.stdout).ok()
+    })?;
+    Some(token.trim().to_owned()).filter(|t| !t.is_empty())
+});
+
+/// Uploads to a private repository answer 404 without sign-in. With the
+/// GitHub token, github.com redirects to a signed link that works for a few
+/// minutes, so that's what is fetched. The token goes only to github.com;
+/// any other link, or one that doesn't redirect, is used as it is.
+fn signed(url: &str) -> String {
+    let Some(token) = TOKEN
+        .as_deref()
+        .filter(|_| url.starts_with("https://github.com/"))
+    else {
+        return url.to_owned();
+    };
+    let response = ureq::get(url)
+        .config()
+        .max_redirects(0)
+        .build()
+        .header("user-agent", USER_AGENT)
+        .header("authorization", &format!("Bearer {token}"))
+        .call();
+    response
+        .ok()
+        .filter(|r| r.status().is_redirection())
+        .and_then(|r| {
+            r.headers()
+                .get("location")?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .filter(|location| location.starts_with("https://"))
+        .unwrap_or_else(|| url.to_owned())
+}
+
 fn download(url: &str, video: bool) -> Slot {
+    let url = &signed(url);
     if video || is_video_file(url) {
         return Slot::Video(playable(poster(url)));
     }
@@ -708,6 +759,15 @@ mod tests {
         assert_eq!(card.get_pixel(2, 2), &Rgba([24, 24, 24, 255]));
         assert!(is_video_file("https://x/a.MP4?raw=1"));
         assert!(!is_video_file("https://x/a.png"));
+    }
+
+    #[test]
+    fn only_github_links_are_signed() {
+        assert_eq!(signed("https://x/a.png"), "https://x/a.png");
+        assert_eq!(
+            signed("http://github.com/user-attachments/assets/a"),
+            "http://github.com/user-attachments/assets/a"
+        );
     }
 
     #[test]
