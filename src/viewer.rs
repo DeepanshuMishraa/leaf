@@ -3177,9 +3177,12 @@ pub(crate) fn query_color(code: u8) -> Option<Rgb> {
     parse_color_reply(&String::from_utf8_lossy(&reply))
 }
 
-/// Reads "rgb:RRRR/GGGG/BBBB" (one to four hex digits a channel) from an OSC color reply.
+/// Reads "rgb:RRRR/GGGG/BBBB" (one to four hex digits a channel) from an OSC
+/// color reply; some terminals answer "rgba:" with an alpha channel after.
 fn parse_color_reply(reply: &str) -> Option<Rgb> {
-    let rgb = reply.split("rgb:").nth(1)?;
+    let (_, rgb) = reply
+        .split_once("rgb:")
+        .or_else(|| reply.split_once("rgba:"))?;
     let channels: Vec<u8> = rgb
         .split(['/', '\x07', '\x1b'])
         .take(3)
@@ -4456,6 +4459,10 @@ mod tests {
         assert_eq!(
             parse_color_reply("\x1b]10;rgb:ff/00/80\x07"),
             Some([255, 0, 128])
+        );
+        assert_eq!(
+            parse_color_reply("\x1b]11;rgba:ffff/ffff/ffff/ffff\x1b\\"),
+            Some([255, 255, 255])
         );
         assert_eq!(parse_color_reply("garbage"), None);
     }

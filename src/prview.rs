@@ -976,10 +976,10 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
-            KeyCode::Tab | KeyCode::BackTab => page.show(match page.tab {
-                Tab::Summary => Tab::Timeline,
-                Tab::Timeline => Tab::Summary,
-            }),
+            // Tab cycles Summary → Timeline → Code; shift-tab goes the other way.
+            KeyCode::Tab if page.tab == Tab::Summary => page.show(Tab::Timeline),
+            KeyCode::BackTab if page.tab == Tab::Timeline => page.show(Tab::Summary),
+            KeyCode::Tab | KeyCode::BackTab => self.open_code(terminal)?,
             KeyCode::Char('1') => page.show(Tab::Summary),
             KeyCode::Char('2') => page.show(Tab::Timeline),
             KeyCode::Left | KeyCode::Char('h') => page.show(Tab::Summary),
@@ -1849,6 +1849,7 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
     lines.push(Line::default());
     lines.push(Line::default());
     let offset = lines.len();
+    gallery.sign(&detail.media);
     let description = description(&detail.body, width as u16, gallery);
     lines.extend(description.lines);
     Body {
@@ -2138,6 +2139,7 @@ mod tests {
             mergeability: Mergeability::Ready,
             methods: vec![MergeMethod::Squash, MergeMethod::Merge],
             can_write: true,
+            media: Default::default(),
             timeline: vec![
                 pr::Event {
                     at: "2026-11-12T03:00:00Z".into(),

@@ -14,6 +14,7 @@ use image::{Rgba, RgbaImage};
 use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 use regex::{Captures, Regex};
+use resvg::{tiny_skia, usvg};
 
 use crate::kitty::{self, Kitty};
 use crate::render::Figure;
@@ -22,6 +23,8 @@ use crate::video::{self, PlayFailed, Playback};
 const USER_AGENT: &str = "Mozilla/5.0 (leaf reader)";
 /// An image larger than this is left as a placeholder rather than held in memory.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// An SVG's longer side is drawn at most this many pixels.
+const MAX_SVG_SIDE: f32 = 4096.0;
 /// The card a video gets when no frame of it can be taken.
 const CARD: (u32, u32) = (640, 360);
 
@@ -33,6 +36,16 @@ static ATTR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(src|alt|width|height)\s*=\s*["']([^"']*)["']"#).expect("pattern is valid")
 });
 /// A link on a line of its own to an upload or a video file: GitHub shows these as players.
+/// An upload's id: the UUID in both its github.com link and its signed link.
+static UPLOAD_ID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        .expect("pattern is valid")
+});
+/// A signed link to an upload in a private repository, as the rendered body has it.
+static SIGNED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https://private-user-images\.githubusercontent\.com/[^"'\s<>]+"#)
+        .expect("pattern is valid")
+});
 static BARE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?im)^[ \t]*(https://github\.com/user-attachments/assets/[A-Za-z0-9-]+|https?://\S+\.(?:mp4|mov|webm))[ \t]*$",
@@ -197,6 +210,8 @@ pub struct Gallery {
     slots: HashMap<String, Slot>,
     hints: HashMap<String, (u32, u32)>,
     videos: HashSet<String>,
+    /// Signed links to uploads, by upload id, from the rendered body.
+    signed: HashMap<String, String>,
     tx: Sender<(String, Slot)>,
     rx: Receiver<(String, Slot)>,
     uploads: HashMap<Upload, kitty::Image>,
@@ -217,6 +232,7 @@ impl Gallery {
             slots: HashMap::new(),
             hints: HashMap::new(),
             videos: HashSet::new(),
+            signed: HashMap::new(),
             tx,
             rx,
             uploads: HashMap::new(),
@@ -234,7 +250,8 @@ impl Gallery {
             _ => CARD,
         };
         self.stop();
-        let playback = Playback::start(&signed(href), video::decode_size(native, width))?;
+        let source = self.presigned(href).unwrap_or_else(|| signed(href));
+        let playback = Playback::start(&source, video::decode_size(native, width))?;
         self.playing = Some((href.to_owned(), playback));
         self.generation += 1;
         Ok(())
@@ -321,6 +338,36 @@ impl Gallery {
         self.videos.contains(href) || self.shown(href) == Shown::Video
     }
 
+    /// Takes the rendered body's signed links. A figure that failed and now
+    /// has a new link is fetched again, so a reload recovers expired links.
+    pub fn sign(&mut self, links: &HashMap<String, String>) {
+        let mut changed = false;
+        for (id, link) in links {
+            if self.signed.get(id) == Some(link) {
+                continue;
+            }
+            self.signed.insert(id.clone(), link.clone());
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        let ids: Vec<String> = self.signed.keys().cloned().collect();
+        self.slots.retain(|href, slot| {
+            !matches!(slot, Slot::Failed) || !ids.iter().any(|id| href.contains(id.as_str()))
+        });
+        self.generation += 1;
+    }
+
+    /// The rendered body's signed link for a github.com upload, when it had one.
+    fn presigned(&self, href: &str) -> Option<String> {
+        if !href.starts_with("https://github.com/") {
+            return None;
+        }
+        let id = UPLOAD_ID.find(href)?;
+        self.signed.get(id.as_str()).cloned()
+    }
+
     /// Starts fetching a figure the first time it's asked for.
     pub fn want(&mut self, href: &str) {
         if self.kitty.is_none() || self.slots.contains_key(href) {
@@ -328,8 +375,9 @@ impl Gallery {
         }
         self.slots.insert(href.to_owned(), Slot::Loading);
         let (tx, url, video) = (self.tx.clone(), href.to_owned(), self.videos.contains(href));
+        let presigned = self.presigned(href);
         std::thread::spawn(move || {
-            let slot = fetch(&url, video);
+            let slot = fetch(&url, presigned, video);
             let _ = tx.send((url, slot));
         });
     }
@@ -508,14 +556,14 @@ fn keep(path: Option<std::path::PathBuf>, bytes: &[u8]) {
 }
 
 /// A link's picture: from the cache when it was fetched before, which links
-/// to uploads allow, since an upload never changes.
-fn fetch(url: &str, video: bool) -> Slot {
+/// to uploads allow, since an upload never changes. `presigned` is the
+/// rendered body's signed link for it, when it had one.
+fn fetch(url: &str, presigned: Option<String>, video: bool) -> Slot {
     for (is_video, path) in [(true, kept(url, true)), (false, kept(url, false))] {
         let Some(bytes) = path.and_then(|p| std::fs::read(p).ok()) else {
             continue;
         };
-        if let Ok(image) = image::load_from_memory(&bytes) {
-            let pixels = image.to_rgba8();
+        if let Some(pixels) = decode(&bytes) {
             return if is_video {
                 Slot::Video(pixels)
             } else {
@@ -523,7 +571,8 @@ fn fetch(url: &str, video: bool) -> Slot {
             };
         }
     }
-    let slot = download(url, video);
+    let source = presigned.unwrap_or_else(|| signed(url));
+    let slot = download(url, &source, video);
     match &slot {
         Slot::Video(pixels) => {
             let mut png = Vec::new();
@@ -589,8 +638,23 @@ fn signed(url: &str) -> String {
         .unwrap_or_else(|| url.to_owned())
 }
 
-fn download(url: &str, video: bool) -> Slot {
-    let url = &signed(url);
+/// The signed links in a pull request's rendered body (`body_html`), by
+/// upload id. github.com signs uploads only for a browser session where SAML
+/// SSO is enforced, but these links download without any token.
+pub fn signed_links(html: &str) -> HashMap<String, String> {
+    SIGNED
+        .find_iter(html)
+        .filter_map(|link| {
+            let link = link.as_str().replace("&amp;", "&");
+            let id = UPLOAD_ID.find(&link)?.as_str().to_owned();
+            Some((id, link))
+        })
+        .collect()
+}
+
+/// Fetches `url` (the link itself, or a signed link to it), keeping an image
+/// under `key`, the link as written: a signed link changes every time.
+fn download(key: &str, url: &str, video: bool) -> Slot {
     if video || is_video_file(url) {
         return Slot::Video(playable(poster(url)));
     }
@@ -615,13 +679,41 @@ fn download(url: &str, video: bool) -> Slot {
     else {
         return Slot::Failed;
     };
-    match image::load_from_memory(&bytes) {
-        Ok(image) => {
-            keep(kept(url, false), &bytes);
-            Slot::Image(image.to_rgba8())
+    match decode(&bytes) {
+        Some(pixels) => {
+            keep(kept(key, false), &bytes);
+            Slot::Image(pixels)
         }
-        Err(_) => Slot::Failed,
+        None => Slot::Failed,
     }
+}
+
+/// A picture's pixels: any format the image crate reads, or an SVG drawn at
+/// its own size.
+fn decode(bytes: &[u8]) -> Option<RgbaImage> {
+    if let Ok(image) = image::load_from_memory(bytes) {
+        return Some(image.to_rgba8());
+    }
+    let options = usvg::Options {
+        fontdb: crate::mermaid::FONTS.clone(),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_data(bytes, &options).ok()?;
+    let size = tree.size();
+    let scale = (MAX_SVG_SIDE / size.width().max(size.height())).min(1.0);
+    let width = (size.width() * scale).ceil() as u32;
+    let height = (size.height() * scale).ceil() as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(width.max(1), height.max(1))?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let pixels = pixmap.pixels().iter().flat_map(|p| {
+        let c = p.demultiply();
+        [c.red(), c.green(), c.blue(), c.alpha()]
+    });
+    RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixels.collect())
 }
 
 /// A frame from early in the video, taken with ffmpeg when it's installed.
@@ -768,6 +860,56 @@ mod tests {
             signed("http://github.com/user-attachments/assets/a"),
             "http://github.com/user-attachments/assets/a"
         );
+    }
+
+    #[test]
+    fn svgs_are_drawn_at_their_own_size() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#ff0000"/></svg>"##;
+        let pixels = decode(svg).expect("an SVG decodes");
+        assert_eq!(pixels.dimensions(), (40, 20));
+        assert_eq!(pixels.get_pixel(20, 10), &Rgba([255, 0, 0, 255]));
+        assert!(decode(b"not a picture").is_none());
+    }
+
+    const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+
+    #[test]
+    fn rendered_body_links_are_found_by_upload_id() {
+        let html = format!(
+            r#"<p><a href="https://private-user-images.githubusercontent.com/12/412345678-{ID}.png?jwt=a.b&amp;x=1"><img src="https://private-user-images.githubusercontent.com/12/412345678-{ID}.png?jwt=a.b&amp;x=1" alt="shot"></a> <img src="https://x/other.png"></p>"#
+        );
+        let links = signed_links(&html);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[ID],
+            format!(
+                "https://private-user-images.githubusercontent.com/12/412345678-{ID}.png?jwt=a.b&x=1"
+            )
+        );
+    }
+
+    #[test]
+    fn uploads_use_the_rendered_body_link_and_failures_are_retried() {
+        let upload = format!("https://github.com/user-attachments/assets/{ID}");
+        let mut gallery = Gallery::plain();
+        assert_eq!(gallery.presigned(&upload), None);
+        gallery.slots.insert(upload.clone(), Slot::Failed);
+        gallery.slots.insert("https://x/a.png".into(), Slot::Failed);
+
+        let link = format!("https://private-user-images.githubusercontent.com/1/2-{ID}.png?jwt=t");
+        gallery.sign(&HashMap::from([(ID.to_owned(), link.clone())]));
+        assert_eq!(gallery.presigned(&upload), Some(link));
+        assert_eq!(gallery.presigned(&format!("https://x/{ID}.png")), None);
+        // The upload that failed is fetched again; other failures stay.
+        assert_eq!(gallery.shown(&upload), Shown::Loading);
+        assert!(!gallery.slots.contains_key(&upload));
+        assert_eq!(gallery.shown("https://x/a.png"), Shown::Failed);
+
+        // The same links again change nothing.
+        let generation = gallery.generation;
+        let same = gallery.signed.clone();
+        gallery.sign(&same);
+        assert_eq!(gallery.generation, generation);
     }
 
     #[test]

@@ -47,6 +47,8 @@ const HIGHLIGHT_BYTES: usize = 128 * 1024;
 const WHEEL_ROWS: usize = 3;
 
 /// Colors chosen to sit on the terminal's own paper instead of painting over it.
+/// Exact RGB, not the 256-color palette: some terminals derive that palette
+/// from the theme, which turns the light shades dark on a light background.
 struct Palette {
     added: Color,
     removed: Color,
@@ -63,27 +65,15 @@ impl Palette {
         if !io::stdin().is_terminal() {
             return Palette::dark();
         }
-        let light = crate::viewer::query_color(11)
-            .map(|[r, g, b]| {
-                (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 140
-            })
-            .unwrap_or(false);
+        let theme = std::env::var("LEAF_THEME").ok();
+        let light = theme_hint(theme.as_deref())
+            .or_else(|| crate::viewer::query_color(11).map(is_light))
+            .or_else(|| colorfgbg_hint(std::env::var("COLORFGBG").ok().as_deref()))
+            .unwrap_or_else(system_is_light);
         if light {
-            Palette {
-                added: Color::Indexed(194),
-                removed: Color::Indexed(224),
-                added_word: Color::Indexed(157),
-                removed_word: Color::Indexed(217),
-                focus: Color::Indexed(153),
-            }
+            Palette::light()
         } else {
-            Palette {
-                added: Color::Indexed(22),
-                removed: Color::Indexed(52),
-                added_word: Color::Indexed(28),
-                removed_word: Color::Indexed(88),
-                focus: Color::Indexed(24),
-            }
+            Palette::dark()
         }
     }
 
@@ -94,13 +84,62 @@ impl Palette {
 
     fn dark() -> Self {
         Palette {
-            added: Color::Indexed(22),
-            removed: Color::Indexed(52),
-            added_word: Color::Indexed(28),
-            removed_word: Color::Indexed(88),
-            focus: Color::Indexed(24),
+            added: Color::Rgb(0x00, 0x5f, 0x00),
+            removed: Color::Rgb(0x5f, 0x00, 0x00),
+            added_word: Color::Rgb(0x00, 0x87, 0x00),
+            removed_word: Color::Rgb(0x87, 0x00, 0x00),
+            focus: Color::Rgb(0x00, 0x5f, 0x87),
         }
     }
+
+    #[cfg_attr(test, allow(dead_code))]
+    fn light() -> Self {
+        Palette {
+            added: Color::Rgb(0xd7, 0xff, 0xd7),
+            removed: Color::Rgb(0xff, 0xd7, 0xd7),
+            added_word: Color::Rgb(0xaf, 0xff, 0xaf),
+            removed_word: Color::Rgb(0xff, 0xaf, 0xaf),
+            focus: Color::Rgb(0xaf, 0xd7, 0xff),
+        }
+    }
+}
+
+/// Whether a background color is light enough for the light palette.
+#[cfg_attr(test, allow(dead_code))]
+fn is_light([r, g, b]: [u8; 3]) -> bool {
+    (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 140
+}
+
+/// `LEAF_THEME=light` or `dark` picks the palette for a terminal that doesn't
+/// report its background.
+fn theme_hint(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "light" => Some(true),
+        "dark" => Some(false),
+        _ => None,
+    }
+}
+
+/// `COLORFGBG` ("15;0", "0;default;15") ends with the background's ANSI
+/// index: white (7) and the bright colors but dark gray (9 to 15) are light.
+fn colorfgbg_hint(value: Option<&str>) -> Option<bool> {
+    let index: u8 = value?.rsplit(';').next()?.trim().parse().ok()?;
+    Some(index == 7 || (9..=15).contains(&index))
+}
+
+/// The last guess, for a terminal that follows the system's appearance: on
+/// macOS the dark appearance sets AppleInterfaceStyle, and light leaves it unset.
+#[cfg(not(test))]
+fn system_is_light() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).contains("Dark"))
 }
 
 /// Comments and the store they persist in.
@@ -1089,11 +1128,11 @@ impl App {
             KeyCode::Char('Y') => self.copy_payload(true),
             KeyCode::Char('o') => self.other_side(),
             KeyCode::Char('r') => self.reload(),
-            KeyCode::Char('1') if self.tabs => {
+            KeyCode::Char('1') | KeyCode::Tab if self.tabs => {
                 self.leave = Leave::Summary;
                 self.quit = true;
             }
-            KeyCode::Char('2') | KeyCode::Left if self.tabs => {
+            KeyCode::Char('2') | KeyCode::Left | KeyCode::BackTab if self.tabs => {
                 self.leave = Leave::Timeline;
                 self.quit = true;
             }
@@ -2892,6 +2931,22 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_palette_follows_hints_when_the_terminal_wont_say() {
+        assert!(is_light([255, 255, 255]));
+        assert!(!is_light([30, 30, 30]));
+        assert_eq!(theme_hint(Some("Light")), Some(true));
+        assert_eq!(theme_hint(Some("dark")), Some(false));
+        assert_eq!(theme_hint(Some("solarized")), None);
+        assert_eq!(theme_hint(None), None);
+        assert_eq!(colorfgbg_hint(Some("0;15")), Some(true));
+        assert_eq!(colorfgbg_hint(Some("0;default;7")), Some(true));
+        assert_eq!(colorfgbg_hint(Some("15;0")), Some(false));
+        assert_eq!(colorfgbg_hint(Some("7;8")), Some(false));
+        assert_eq!(colorfgbg_hint(Some("15;default")), None);
+        assert_eq!(colorfgbg_hint(None), None);
+    }
     use crate::diff::Origin;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::Terminal;
