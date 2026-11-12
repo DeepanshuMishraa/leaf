@@ -46,7 +46,8 @@ static SIZE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("pattern is valid")
 });
 
-static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+/// System fonts for text in an SVG, with a sans-serif family that's installed.
+pub(crate) static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
     let mut fonts = usvg::fontdb::Database::new();
     fonts.load_system_fonts();
     let installed = |family: &&&str| {

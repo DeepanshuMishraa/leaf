@@ -141,6 +141,11 @@ struct List {
     resting: Option<(PrRef, Instant)>,
     /// Where each row was drawn, for clicks: its screen rows and its index.
     hits: Vec<(u16, u16, usize)>,
+    /// The pull request a press on the picked row landed on, which opens on
+    /// release unless the mouse was dragged or the list changed under it.
+    pressed: Option<PrRef>,
+    /// What ctrl+y copied, shown in the footer until the next key.
+    copied: Option<String>,
 }
 
 impl List {
@@ -260,6 +265,8 @@ struct Page {
     /// Where the body was drawn last, for the mouse.
     body_area: Rect,
     tab_hits: Vec<(Rect, TabHit)>,
+    /// Where the header shows the pull request's number; a click copies it.
+    number_hit: Option<Rect>,
 }
 
 impl Page {
@@ -279,6 +286,7 @@ impl Page {
             cache: None,
             body_area: Rect::default(),
             tab_hits: Vec::new(),
+            number_hit: None,
         }
     }
 
@@ -411,6 +419,8 @@ impl App {
             selected: 0,
             resting: None,
             hits: Vec::new(),
+            pressed: None,
+            copied: None,
         });
     }
 
@@ -419,7 +429,14 @@ impl App {
         let known = self
             .details
             .get(&pr)
-            .map(|(detail, _)| detail.clone())
+            .map(|(detail, at)| {
+                let mut detail = detail.clone();
+                // Signed upload links expire within minutes; the fresh read brings new ones.
+                if at.elapsed() >= prmedia::SIGNED_LINKS_LAST {
+                    detail.media.clear();
+                }
+                detail
+            })
             .or_else(|| pr::cached_view(&pr));
         let detail = match known {
             Some(detail) => {
@@ -676,19 +693,27 @@ impl App {
             if self.page.as_ref().is_none_or(|p| p.tab != Tab::Summary) {
                 self.gallery.stop();
             }
-            self.gallery.tick();
+            if let Some(failed) = self.gallery.tick()
+                && let Some(page) = &mut self.page
+            {
+                page.toast = Some(failed);
+            }
             self.prefetch();
             self.now = pr::now();
             self.gallery.begin();
             terminal.draw(|f| self.draw(f))?;
             self.gallery.flush()?;
-            let wait = if self.gallery.any_playing() {
-                Duration::from_millis(30)
-            } else if self.animating() {
+            // Drawn again when the next thing on screen changes: a video or
+            // GIF frame, the loading ring, a spinner, or the half-second clock.
+            let idle = if self.animating() {
                 Duration::from_millis(80)
             } else {
                 Duration::from_millis(500)
             };
+            let wait = self
+                .gallery
+                .next_redraw()
+                .map_or(idle, |next| next.clamp(Duration::from_millis(5), idle));
             if !event::poll(wait)? {
                 continue;
             }
@@ -727,6 +752,12 @@ impl App {
                         TabHit::Timeline => page.show(Tab::Timeline),
                         TabHit::Code => return self.open_code(terminal),
                     }
+                    return Ok(());
+                }
+                if page.number_hit.is_some_and(inside) {
+                    let label = page.pr.label();
+                    copy(&label);
+                    page.toast = Some(format!("Copied {label}"));
                     return Ok(());
                 }
                 if !inside(page.body_area) {
@@ -819,13 +850,22 @@ impl App {
                 else {
                     return;
                 };
-                // A click picks a row; a click on the picked row opens it.
-                if index == list.selected {
-                    if let Some(pr) = list.picked() {
-                        self.open_page(pr);
-                    }
+                // A click picks a row; a click on the picked row opens it once
+                // let go, so a drag (to select its number) never opens it.
+                list.pressed = if index == list.selected {
+                    list.picked()
                 } else {
-                    list.selected = index;
+                    None
+                };
+                list.selected = index;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => list.pressed = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Still the same pull request: a search can reorder rows mid-click.
+                if let Some(pr) = list.pressed.take()
+                    && list.picked().as_ref() == Some(&pr)
+                {
+                    self.open_page(pr);
                 }
             }
             _ => {}
@@ -842,7 +882,17 @@ impl App {
         };
         let rows = list.count();
         let picked = list.picked();
+        list.copied = None;
         match key.code {
+            // Letters filter the list, so copying the number takes ctrl.
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(pr) = &picked {
+                    let number = format!("#{}", pr.number);
+                    copy(&number);
+                    list.copied = Some(format!("Copied {number}"));
+                }
+                return Ok(true);
+            }
             KeyCode::PageDown => {
                 list.selected = (list.selected + 8).min(rows.saturating_sub(1));
                 return Ok(true);
@@ -976,10 +1026,10 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
-            KeyCode::Tab | KeyCode::BackTab => page.show(match page.tab {
-                Tab::Summary => Tab::Timeline,
-                Tab::Timeline => Tab::Summary,
-            }),
+            // Tab cycles Summary → Timeline → Code; shift-tab goes the other way.
+            KeyCode::Tab if page.tab == Tab::Summary => page.show(Tab::Timeline),
+            KeyCode::BackTab if page.tab == Tab::Timeline => page.show(Tab::Summary),
+            KeyCode::Tab | KeyCode::BackTab => self.open_code(terminal)?,
             KeyCode::Char('1') => page.show(Tab::Summary),
             KeyCode::Char('2') => page.show(Tab::Timeline),
             KeyCode::Left | KeyCode::Char('h') => page.show(Tab::Summary),
@@ -1009,6 +1059,11 @@ impl App {
             KeyCode::Char('Y') => {
                 copy(&page.pr.url());
                 page.toast = Some(format!("Copied {}", page.pr.url()));
+            }
+            KeyCode::Char('n') => {
+                let number = format!("#{}", page.pr.number);
+                copy(&number);
+                page.toast = Some(format!("Copied {number}"));
             }
             KeyCode::Char('c') if page.busy.is_none() => {
                 page.mode = Mode::Compose {
@@ -1270,13 +1325,15 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64) {
         f.render_widget(Paragraph::new(shown), Rect::new(x, top, width, room as u16));
     }
 
-    let footer = match list.failure() {
-        Some(e) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
+    let footer = match (list.failure(), &list.copied) {
+        (_, Some(copied)) => Line::from(Span::styled(clip(copied, w), dim)),
+        (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
         _ => keys_line(
             &[
                 ("↑↓", "move"),
                 ("enter", "open"),
                 ("type", "filter"),
+                ("^y", "copy #"),
                 ("esc", "quit"),
             ],
             w,
@@ -1473,6 +1530,14 @@ fn draw_page(f: &mut Frame, page: &mut Page, gallery: &mut Gallery, now: i64, re
     if refreshing {
         meta.push(Span::styled(format!("   {}", spinner()), dim));
     }
+    let label_x = x + format!("● {}   ", detail.state.label()).width() as u16;
+    let label_width = (detail.pr.label().width() as u16).min((x + width).saturating_sub(label_x));
+    page.number_hit = Some(Rect::new(
+        label_x,
+        area.y + header.len() as u16,
+        label_width,
+        1,
+    ));
     header.push(spread(
         meta,
         vec![
@@ -1702,7 +1767,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("a", "approve"),
         ("c", "comment"),
         ("o", "open on GitHub"),
-        ("y, Y", "copy the checkout command, the link"),
+        ("y, Y, n", "copy the checkout command, link, number"),
+        ("click #", "the number in the header copies it"),
         ("R", "reload"),
         ("q, esc", "back to the list, or quit"),
     ];
@@ -1849,6 +1915,7 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
     lines.push(Line::default());
     lines.push(Line::default());
     let offset = lines.len();
+    gallery.sign(&detail.media);
     let description = description(&detail.body, width as u16, gallery);
     lines.extend(description.lines);
     Body {
@@ -1913,7 +1980,9 @@ fn description(body: &str, width: u16, gallery: &mut Gallery) -> Body {
         if !gallery.is_video(&figure.href) {
             continue;
         }
-        let label = if gallery.is_playing(&figure.href) {
+        let label = if gallery.is_buffering(&figure.href) {
+            "◌  loading video · click or esc to stop"
+        } else if gallery.is_playing(&figure.href) {
             "■  playing · click or esc to stop"
         } else {
             "▶  video · click to play"
@@ -2138,6 +2207,7 @@ mod tests {
             mergeability: Mergeability::Ready,
             methods: vec![MergeMethod::Squash, MergeMethod::Merge],
             can_write: true,
+            media: Default::default(),
             timeline: vec![
                 pr::Event {
                     at: "2026-11-12T03:00:00Z".into(),
@@ -2261,6 +2331,8 @@ mod tests {
             selected: 0,
             resting: None,
             hits: Vec::new(),
+            pressed: None,
+            copied: None,
         };
         assert_eq!(list.count(), 2);
         assert!(list.loading());
