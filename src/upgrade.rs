@@ -66,10 +66,10 @@ impl Version {
         parts.next().is_none().then_some(version)
     }
 
-    /// The version this binary was built as.
-    pub fn current() -> Version {
+    /// The version this binary was built as; `None` for a pre-release
+    /// (`1.2.0-rc.1`), which `leaf upgrade` leaves alone.
+    pub fn current() -> Option<Version> {
         Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("Cargo.toml's version is major.minor.patch")
     }
 }
 
@@ -85,6 +85,10 @@ pub enum UpgradeFailed {
         "Prebuilt leaf binaries cover macOS and Linux (glibc) on x86_64 and arm64, not this machine. Build it from source instead: cargo install leaf-reader"
     )]
     UnsupportedPlatform,
+    #[error(
+        "This leaf ({0}) is a pre-release build, and leaf upgrade only moves between releases. Install the newest release with: curl -fsSL https://leaf.dipxsy.app | sh"
+    )]
+    PreRelease(&'static str),
     #[error(
         "Couldn't reach GitHub to find the newest release ({0}). Nothing was changed; check the connection and run leaf upgrade again."
     )]
@@ -124,10 +128,10 @@ pub enum UpgradeFailed {
 /// What `leaf upgrade` found or did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Already the newest; `newer` is a local build ahead of the release.
+    /// Already the newest, or a local build ahead of it.
     Current {
+        installed: Version,
         newest: Version,
-        newer: bool,
     },
     /// `--check` only: a newer release is out.
     Available {
@@ -143,23 +147,16 @@ pub enum Outcome {
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Outcome::Current {
-                newest,
-                newer: false,
-            } => {
+            Outcome::Current { installed, newest } if installed > newest => write!(
+                f,
+                "This leaf ({installed}) is newer than the newest release ({newest}); nothing to do."
+            ),
+            Outcome::Current { newest, .. } => {
                 write!(
                     f,
                     "leaf {newest} is the newest release, and it's installed."
                 )
             }
-            Outcome::Current {
-                newest,
-                newer: true,
-            } => write!(
-                f,
-                "This leaf ({}) is newer than the newest release ({newest}); nothing to do.",
-                Version::current()
-            ),
             Outcome::Available { from, to } => {
                 write!(
                     f,
@@ -174,12 +171,12 @@ impl fmt::Display for Outcome {
 /// Finds the newest release and, unless `check_only`, installs it over this binary.
 pub fn run(check_only: bool) -> Result<Outcome, UpgradeFailed> {
     let target = TARGET.ok_or(UpgradeFailed::UnsupportedPlatform)?;
-    let current = Version::current();
+    let current = Version::current().ok_or(UpgradeFailed::PreRelease(env!("CARGO_PKG_VERSION")))?;
     let newest = latest()?;
     if newest <= current {
         return Ok(Outcome::Current {
+            installed: current,
             newest,
-            newer: newest < current,
         });
     }
     if check_only {
@@ -395,7 +392,10 @@ mod tests {
         for bad in ["", "1.2", "1.2.3.4", "1.2.x", "1.2.3-rc.1", "v", "1..2"] {
             assert_eq!(v(bad), None, "{bad:?}");
         }
-        assert_eq!(Version::current().to_string(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            Version::current().map(|v| v.to_string()).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

@@ -8,19 +8,25 @@
 # Each target ships as leaf-<target>.tar.gz beside a .sha256 file; the names
 # carry no version, which is what `leaf upgrade` and install.sh rely on.
 #
-# Pull requests that touch the build, and manual runs, build every target
+# Pull requests that change the source or the build, and manual runs, build every target
 # without publishing, so a broken release is caught before a tag is pushed.
 
 name: Release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    # Any v tag; the check job holds it to Cargo.toml's exact version.
+    tags: ["v*"]
   pull_request:
+    # Everything the binary or the install path is built from.
     paths:
       - .github/workflows/release.yml
       - Cargo.toml
       - Cargo.lock
+      - src/**
+      - vendor/**
+      - lua/**
+      - examples/**
       - site/public/install.sh
   workflow_dispatch:
 
@@ -267,5 +273,9 @@ jobs:
           out=$(PATH="$dir:$PATH" LEAF_VERSION="$VERSION" sh site/public/install.sh)
           echo "$out"
           echo "$out" | grep -q "already installed at $dir/leaf"
-          # And `leaf upgrade` agrees there's nothing newer.
-          "$dir/leaf" upgrade --check
+          # And `leaf upgrade` agrees there's nothing newer (a pre-release
+          # build declines to upgrade, by design).
+          case "$VERSION" in
+            *-*) ;;
+            *) "$dir/leaf" upgrade --check ;;
+          esac

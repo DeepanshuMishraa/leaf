@@ -38,9 +38,28 @@ fetch() { # url → stdout
 fetch_to() { # url file
   if has curl; then
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
-  else
+  elif has wget; then
     wget -q -O "$2" "$1"
+  else
+    fail "needs curl or wget to download leaf. Install one and run this again."
   fi
+}
+
+# The file a path names, with every symlink followed. Portable: macOS's
+# readlink has no -f before macOS 12.3.
+resolve() { # path → path
+  path=$1
+  hops=0
+  while [ -L "$path" ] && [ "$hops" -lt 40 ]; do
+    link=$(readlink "$path")
+    case "$link" in
+      /*) path=$link ;;
+      *) path=$(dirname "$path")/$link ;;
+    esac
+    hops=$((hops + 1))
+  done
+  parent=$(cd -P "$(dirname "$path")" 2>/dev/null && pwd) || parent=$(dirname "$path")
+  printf '%s/%s' "$parent" "$(basename "$path")"
 }
 
 # The release target for this machine, as the release workflow names archives.
@@ -119,7 +138,7 @@ main() {
       say "leaf $version is already installed at $existing; it's the newest release."
       return 0
     fi
-    real=$(readlink -f "$existing" 2>/dev/null || printf '%s' "$existing")
+    real=$(resolve "$existing")
     if [ -w "$(dirname "$real")" ]; then
       dest=$real
       say "Updating ${current:-the leaf} at $existing to leaf $version"
@@ -132,6 +151,9 @@ main() {
     dest="$dir/leaf"
   fi
   dir=$(dirname "$dest")
+  # Checked before downloading, so an unwritable folder fails fast.
+  mkdir -p "$dir" 2>/dev/null || fail "couldn't create $dir. Pick another folder with LEAF_INSTALL_DIR=..."
+  [ -w "$dir" ] || fail "can't write to $dir. Pick another folder with LEAF_INSTALL_DIR=..., or run this with sudo."
   base="https://github.com/$REPO/releases/download/v$version/leaf-$target.tar.gz"
 
   tmp=$(mktemp -d 2>/dev/null || mktemp -d -t leaf)
@@ -160,18 +182,21 @@ main() {
   fi
   [ "$said" = "leaf $version" ] || fail "the downloaded leaf reports \"$said\", not leaf $version. Nothing was installed."
 
-  mkdir -p "$dir" 2>/dev/null || fail "couldn't create $dir. Pick another folder with LEAF_INSTALL_DIR=..."
-  [ -w "$dir" ] || fail "can't write to $dir. Pick another folder with LEAF_INSTALL_DIR=..., or run this with sudo."
-  # Copied beside the old one, then renamed over it: never a half-written leaf.
-  cp "$tmp/leaf" "$dir/.leaf-install.$$"
-  mv -f "$dir/.leaf-install.$$" "$dest"
+  # Copied beside the old one, then renamed over it: never a half-written
+  # leaf. The staging file is made fresh by mktemp, so nothing planted
+  # under a guessable name can redirect the copy.
+  staged=$(mktemp "$dir/.leaf-install.XXXXXX") || fail "couldn't create a file in $dir."
+  if ! cp "$tmp/leaf" "$staged" || ! chmod 755 "$staged" || ! mv -f "$staged" "$dest"; then
+    rm -f "$staged"
+    fail "couldn't put leaf in place at $dest. The leaf there, if any, is unchanged."
+  fi
 
   say "Installed leaf $version to $dest"
   case ":$PATH:" in
     *":$dir:"*)
       found=$(command -v leaf 2>/dev/null || true)
-      found_real=$(readlink -f "$found" 2>/dev/null || printf '%s' "$found")
-      if [ -n "$found" ] && [ "$found_real" != "$dest" ]; then
+      found_real=$(resolve "$found")
+      if [ -n "$found" ] && [ "$found_real" != "$(resolve "$dest")" ]; then
         say "Note: $found comes first on your PATH, so \`leaf\` still runs that one. Remove it, or put $dir earlier on your PATH."
       fi
       ;;
