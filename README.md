@@ -24,7 +24,7 @@ leaf open https://example.com/post
 
 Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `ctrl+d`/`u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `?` all keys, `q` quit.
 
-Press `f` to find text: type a word or phrase and press enter. leaf turns to the next page that has it and marks every match in orange. `n` and `N` go to the next and previous match, wrapping round the book, and `esc` clears the search. Case doesn't matter, and a phrase is found across line breaks.
+Press `f` to find text: type a word or phrase and press enter. leaf turns to the next page that has it and marks every match in orange. `n` and `N` go to the next and previous match, wrapping round the book, and `esc` clears the search. Case doesn't matter, typed quotes and hyphens find curly quotes and Unicode hyphens (`don't` finds `don’t`), and a phrase is found across line breaks.
 
 Drag with the mouse to select text; it's copied to the clipboard when you let go. Press `@` (or `ctrl+enter`) to ask an agent about that selection: type the question and press enter. leaf sends the document, the line, the lines around the selection, and the question to an agent pane already open in Rex, and submits it. Press `y` to highlight the selection, or `y` on a selection that touches a highlight to clear it. `1`–`6` pick the color (yellow, green, blue, pink, purple, red) for new highlights and ink; pressed with a selection, they paint it, or recolor the highlights it touches. Highlights are saved with your reading place.
 
