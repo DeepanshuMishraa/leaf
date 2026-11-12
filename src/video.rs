@@ -50,18 +50,17 @@ pub fn decode_size(native: (u32, u32), width: u32) -> (u32, u32) {
     (target, height)
 }
 
-/// Whether ffmpeg runs here; asked once.
+/// Whether an executable `ffmpeg` is on PATH. Looked up in the folders, not
+/// run, so asking from the UI thread costs no process start.
 pub fn has_ffmpeg() -> bool {
-    static FOUND: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        Command::new("ffmpeg")
-            .arg("-version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    });
-    *FOUND
+    use std::os::unix::fs::PermissionsExt;
+
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join("ffmpeg"))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 fn ffmpeg(args: &[String]) -> Result<Child, PlayFailed> {

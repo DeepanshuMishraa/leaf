@@ -955,7 +955,14 @@ fn picture(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Slot> {
 fn animation(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Animation> {
     use image::AnimationDecoder;
 
-    let decoder = image::codecs::gif::GifDecoder::new(io::Cursor::new(bytes)).ok()?;
+    use image::ImageDecoder;
+
+    let mut decoder = image::codecs::gif::GifDecoder::new(io::Cursor::new(bytes)).ok()?;
+    // Caps what decoding itself allocates (the canvas a GIF declares can be
+    // 65535 × 65535): nothing larger than one GIF's share could be kept anyway.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_GIF_BYTES as u64);
+    decoder.set_limits(limits).ok()?;
     let mut frames = Vec::new();
     let mut held = Held::none(budget);
     for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {

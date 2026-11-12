@@ -521,6 +521,9 @@ struct App {
     loaded: Loaded,
     palette: Palette,
     scheme: Scheme,
+    /// When the last key, click or paste came, so the terminal is asked
+    /// about its theme only once the reader has paused.
+    last_input: Instant,
     /// The split line the cursor is on.
     cursor: usize,
     /// First split line on screen.
@@ -572,6 +575,7 @@ impl App {
             loaded,
             palette: Palette::new(scheme.light()),
             scheme,
+            last_input: Instant::now(),
             cursor,
             scroll: 0,
             left: 0,
@@ -607,8 +611,11 @@ impl App {
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         loop {
             self.receive_job();
-            // Only while no key is waiting, so the reply is read before any key.
-            if !event::poll(Duration::ZERO)? && self.scheme.refresh() {
+            // The reply is read straight from stdin, so a key typed meanwhile
+            // could be taken with it: ask only while the reader is idle (no
+            // key waiting, none in the last second, not writing a comment).
+            let idle = self.composer.is_none() && self.last_input.elapsed() >= SCHEME_EVERY;
+            if idle && !event::poll(Duration::ZERO)? && self.scheme.refresh() {
                 self.palette = Palette::new(self.scheme.light());
             }
             terminal.draw(|f| self.draw(f))?;
@@ -628,7 +635,11 @@ impl App {
                 continue;
             }
             loop {
-                match event::read()? {
+                let event = event::read()?;
+                if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+                    self.last_input = Instant::now();
+                }
+                match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
                     Event::Mouse(mouse) => self.mouse(mouse),
                     Event::Paste(text) => self.paste(&text),
