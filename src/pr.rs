@@ -343,6 +343,9 @@ pub struct Detail {
     pub methods: Vec<MergeMethod>,
     /// Whether you may merge, close and relabel (write access or above).
     pub can_write: bool,
+    /// Signed links to the description's uploads, by upload id, taken from the
+    /// rendered body. They expire within minutes, so they are never cached.
+    pub media: std::collections::HashMap<String, String>,
     pub timeline: Vec<Event>,
 }
 
@@ -730,6 +733,21 @@ pub fn view(pr: &PrRef) -> Result<Detail, PrFailed> {
         );
         std::thread::spawn(move || gh_json(&["api", &path]))
     };
+    // The rendered body carries signed links to uploads, which work where
+    // github.com wants a browser session (repositories enforcing SAML SSO).
+    let rendered = {
+        let path = format!("repos/{}/pulls/{}", pr.repo, pr.number);
+        std::thread::spawn(move || {
+            gh(&[
+                "api",
+                &path,
+                "-H",
+                "Accept: application/vnd.github.full+json",
+                "--jq",
+                ".body_html",
+            ])
+        })
+    };
     let number = pr.number.to_string();
     let page = gh_json(&["pr", "view", &number, "-R", &pr.repo, "--json", VIEW_FIELDS])?;
     // Without the settings, offer every method and let GitHub refuse.
@@ -745,7 +763,12 @@ pub fn view(pr: &PrRef) -> Result<Detail, PrFailed> {
         .unwrap_or(Value::Null);
     let saved = serde_json::json!({ "page": page, "settings": settings, "inline": inline });
     store(&view_key(pr), &saved.to_string());
-    Ok(parse_saved(pr.clone(), &saved))
+    let mut detail = parse_saved(pr.clone(), &saved);
+    // Without the rendered body, uploads are signed through github.com instead.
+    if let Some(html) = rendered.join().ok().and_then(Result::ok) {
+        detail.media = crate::prmedia::signed_links(&html);
+    }
+    Ok(detail)
 }
 
 fn patch_key(pr: &PrRef, head: &str) -> String {
@@ -862,6 +885,7 @@ fn parse_detail(pr: PrRef, page: &Value, settings: Option<&Value>, inline: &Valu
         ),
         methods,
         can_write,
+        media: std::collections::HashMap::new(),
         timeline: timeline(page, inline, &author, &created, state),
         author,
         pr,
