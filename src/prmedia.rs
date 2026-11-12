@@ -8,8 +8,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use image::{Rgba, RgbaImage};
@@ -29,7 +30,14 @@ const UNPLAYABLE: &str = "The video couldn't be played: it didn't load, or ffmpe
 /// Frames kept of one GIF; the rest are left out of the loop.
 const MAX_GIF_FRAMES: usize = 600;
 /// Bytes of decoded frames kept of one GIF.
-const MAX_GIF_BYTES: usize = 384 * 1024 * 1024;
+const MAX_GIF_BYTES: usize = 192 * 1024 * 1024;
+/// Bytes of decoded GIF frames one gallery holds at once, across all its GIFs.
+const GALLERY_GIF_BYTES: usize = 512 * 1024 * 1024;
+/// How often the screen is drawn while a video starts or plays.
+const VIDEO_REDRAW: Duration = Duration::from_millis(30);
+/// How long the signed upload links in a rendered body are trusted; GitHub's
+/// last about five minutes.
+pub const SIGNED_LINKS_LAST: Duration = Duration::from_secs(4 * 60);
 /// A GIF frame asking for less than this shows for `GIF_DEFAULT_DELAY`, as browsers do.
 const GIF_MIN_DELAY: Duration = Duration::from_millis(20);
 const GIF_DEFAULT_DELAY: Duration = Duration::from_millis(100);
@@ -210,28 +218,70 @@ enum Play {
 struct Animation {
     frames: Vec<(RgbaImage, Duration)>,
     length: Duration,
+    /// The frames' bytes, taken from the gallery's GIF budget until dropped.
+    _held: Held,
+}
+
+/// Bytes taken from a shared budget, given back when dropped.
+struct Held {
+    bytes: usize,
+    budget: Arc<AtomicUsize>,
+}
+
+impl Held {
+    fn none(budget: &Arc<AtomicUsize>) -> Self {
+        Held {
+            bytes: 0,
+            budget: budget.clone(),
+        }
+    }
+
+    /// Takes `bytes` more when the budget has them.
+    fn take(&mut self, bytes: usize) -> bool {
+        let taken = self
+            .budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(bytes)
+            })
+            .is_ok();
+        if taken {
+            self.bytes += bytes;
+        }
+        taken
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.budget.fetch_add(self.bytes, Ordering::AcqRel);
+    }
 }
 
 impl Animation {
     /// `None` unless there are at least two frames to play.
-    fn new(frames: Vec<(RgbaImage, Duration)>) -> Option<Self> {
+    fn new(frames: Vec<(RgbaImage, Duration)>, held: Held) -> Option<Self> {
         if frames.len() < 2 {
             return None;
         }
         let length = frames.iter().map(|(_, delay)| *delay).sum();
-        Some(Animation { frames, length })
+        Some(Animation {
+            frames,
+            length,
+            _held: held,
+        })
     }
 
-    /// The frame showing `elapsed` into the loop, and its index.
-    fn at(&self, elapsed: Duration) -> (usize, &RgbaImage) {
-        let mut left = elapsed.as_millis() % self.length.as_millis().max(1);
+    /// The frame showing `elapsed` into the loop, its index, and how long it shows on.
+    fn at(&self, elapsed: Duration) -> (usize, &RgbaImage, Duration) {
+        let mut into = elapsed.as_millis() % self.length.as_millis().max(1);
         for (index, (frame, delay)) in self.frames.iter().enumerate() {
-            if left < delay.as_millis() {
-                return (index, frame);
+            if into < delay.as_millis() {
+                let left = Duration::from_millis((delay.as_millis() - into) as u64);
+                return (index, frame, left);
             }
-            left -= delay.as_millis();
+            into -= delay.as_millis();
         }
-        (0, &self.frames[0].0)
+        (0, &self.frames[0].0, self.frames[0].1)
     }
 
     fn first(&self) -> &RgbaImage {
@@ -277,10 +327,16 @@ pub struct Gallery {
     slots: HashMap<String, Slot>,
     hints: HashMap<String, (u32, u32)>,
     videos: HashSet<String>,
-    /// Signed links to uploads, by upload id, from the rendered body.
-    signed: HashMap<String, String>,
-    tx: Sender<(String, Slot)>,
-    rx: Receiver<(String, Slot)>,
+    /// Signed links to uploads, by upload id, from the rendered body, and when
+    /// they were taken: they expire after `SIGNED_LINKS_LAST`.
+    signed: HashMap<String, (String, Instant)>,
+    /// The fetch each figure is waiting on; a result from any other is stale.
+    requests: HashMap<String, u64>,
+    next_request: u64,
+    /// Bytes of GIF frames the gallery may still decode, shared by its fetches.
+    gif_budget: Arc<AtomicUsize>,
+    tx: Sender<(String, u64, Slot)>,
+    rx: Receiver<(String, u64, Slot)>,
     uploads: HashMap<Upload, kitty::Image>,
     used: HashSet<Upload>,
     placements: Vec<(kitty::Image, Rect)>,
@@ -288,8 +344,9 @@ pub struct Gallery {
     playing: Option<(String, Play)>,
     /// When the gallery was made: GIFs and the loading ring run on this clock.
     epoch: Instant,
-    /// Whether a GIF was placed on screen last frame, so the screen is redrawn for it.
-    moving: bool,
+    /// When something placed last frame changes next (a GIF's frame, the
+    /// loading ring's step), so the screen is redrawn then and not sooner.
+    next_change: Option<Duration>,
     /// Bumped when media arrives or a video starts or stops, so layouts and labels are redone.
     pub generation: u64,
 }
@@ -304,6 +361,9 @@ impl Gallery {
             hints: HashMap::new(),
             videos: HashSet::new(),
             signed: HashMap::new(),
+            requests: HashMap::new(),
+            next_request: 0,
+            gif_budget: Arc::new(AtomicUsize::new(GALLERY_GIF_BYTES)),
             tx,
             rx,
             uploads: HashMap::new(),
@@ -311,7 +371,7 @@ impl Gallery {
             placements: Vec::new(),
             playing: None,
             epoch: Instant::now(),
-            moving: false,
+            next_change: None,
             generation: 0,
         }
     }
@@ -325,6 +385,10 @@ impl Gallery {
             _ => CARD,
         };
         self.stop();
+        // Known now, so the caller can open the browser instead.
+        if !video::has_ffmpeg() {
+            return Err(PlayFailed::NoFfmpeg);
+        }
         let size = video::decode_size(native, width);
         let play = match self.presigned(href) {
             Some(source) => Play::Running(Playback::start(&source, size)?),
@@ -357,10 +421,16 @@ impl Gallery {
         self.playing.is_some()
     }
 
-    /// Whether a GIF is on screen, or a video is playing or loading: the
-    /// screen is redrawn often while one is.
-    pub fn moving(&self) -> bool {
-        self.moving || self.playing.is_some()
+    /// How soon the screen should be drawn again for what's moving on it: a
+    /// playing video's next frame, a GIF's next frame, or the loading ring's
+    /// next step. `None` when nothing on screen moves.
+    pub fn next_redraw(&self) -> Option<Duration> {
+        // A video starting or playing is polled often, for its link and its frames.
+        let video = self.playing.is_some().then_some(VIDEO_REDRAW);
+        match (video, self.next_change) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Whether the video at `href` was started and has no frame to show yet.
@@ -465,34 +535,48 @@ impl Gallery {
         self.videos.contains(href) || self.shown(href) == Shown::Video
     }
 
-    /// Takes the rendered body's signed links. A figure that failed and now
-    /// has a new link is fetched again, so a reload recovers expired links.
+    /// Takes the rendered body's signed links. An upload that failed, or is
+    /// still loading on an older link, is fetched again with the new one (the
+    /// older fetch's result is dropped), so a reload recovers expired links.
     pub fn sign(&mut self, links: &HashMap<String, String>) {
-        let mut changed = false;
+        let now = Instant::now();
+        let mut changed = Vec::new();
         for (id, link) in links {
-            if self.signed.get(id) == Some(link) {
+            if self.signed.get(id).is_some_and(|(known, _)| known == link) {
                 continue;
             }
-            self.signed.insert(id.clone(), link.clone());
-            changed = true;
+            self.signed.insert(id.clone(), (link.clone(), now));
+            changed.push(id.clone());
         }
-        if !changed {
+        if changed.is_empty() {
             return;
         }
-        let ids: Vec<String> = self.signed.keys().cloned().collect();
-        self.slots.retain(|href, slot| {
-            !matches!(slot, Slot::Failed) || !ids.iter().any(|id| href.contains(id.as_str()))
-        });
+        let stale: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(href, slot)| {
+                matches!(slot, Slot::Failed | Slot::Loading)
+                    && changed.iter().any(|id| href.contains(id.as_str()))
+            })
+            .map(|(href, _)| href.clone())
+            .collect();
+        for href in stale {
+            self.slots.remove(&href);
+            self.requests.remove(&href);
+        }
         self.generation += 1;
     }
 
-    /// The rendered body's signed link for a github.com upload, when it had one.
+    /// The rendered body's signed link for a github.com upload, while it's fresh.
     fn presigned(&self, href: &str) -> Option<String> {
         if !href.starts_with("https://github.com/") {
             return None;
         }
         let id = UPLOAD_ID.find(href)?;
-        self.signed.get(id.as_str()).cloned()
+        self.signed
+            .get(id.as_str())
+            .filter(|(_, at)| at.elapsed() < SIGNED_LINKS_LAST)
+            .map(|(link, _)| link.clone())
     }
 
     /// Starts fetching a figure the first time it's asked for.
@@ -501,18 +585,26 @@ impl Gallery {
             return;
         }
         self.slots.insert(href.to_owned(), Slot::Loading);
+        self.next_request += 1;
+        let request = self.next_request;
+        self.requests.insert(href.to_owned(), request);
         let (tx, url, video) = (self.tx.clone(), href.to_owned(), self.videos.contains(href));
-        let presigned = self.presigned(href);
+        let (presigned, budget) = (self.presigned(href), self.gif_budget.clone());
         std::thread::spawn(move || {
-            let slot = fetch(&url, presigned, video);
-            let _ = tx.send((url, slot));
+            let slot = fetch(&url, presigned, video, &budget);
+            let _ = tx.send((url, request, slot));
         });
     }
 
-    /// Takes in media that arrived; `true` when any did.
+    /// Takes in media that arrived; `true` when any did. A result from a
+    /// fetch that was since replaced is dropped.
     pub fn receive(&mut self) -> bool {
         let mut any = false;
-        while let Ok((href, slot)) = self.rx.try_recv() {
+        while let Ok((href, request, slot)) = self.rx.try_recv() {
+            if self.requests.get(&href) != Some(&request) {
+                continue;
+            }
+            self.requests.remove(&href);
             self.slots.insert(href, slot);
             any = true;
         }
@@ -530,7 +622,7 @@ impl Gallery {
     pub fn begin(&mut self) {
         self.placements.clear();
         self.used.clear();
-        self.moving = false;
+        self.next_change = None;
     }
 
     /// Places the part of `figure` that's on screen. `area` is where the body
@@ -550,23 +642,27 @@ impl Gallery {
                 }
                 Play::Signing { .. } => None,
             });
-        let (pixels, frame) = match (playing, self.slots.get(&figure.href)) {
-            (Some(Some((pixels, frame))), _) => (Cow::Borrowed(pixels), Frame::Video(frame)),
+        // The pixels to show, and which frame they are; the loading ring is
+        // drawn only when its step isn't uploaded already.
+        let (source, frame) = match (playing, self.slots.get(&figure.href)) {
+            (Some(Some((pixels, frame))), _) => (pixels, Frame::Video(frame)),
             (Some(None), Some(Slot::Video(poster))) => {
-                let step = (elapsed.as_millis() / RING_STEP.as_millis()) as u64 % RING_STEPS;
-                (Cow::Owned(buffering(poster, step)), Frame::Buffering(step))
+                let ticks = elapsed.as_millis() / RING_STEP.as_millis();
+                let into_step = elapsed.as_millis() % RING_STEP.as_millis();
+                sooner(
+                    &mut self.next_change,
+                    RING_STEP.saturating_sub(Duration::from_millis(into_step as u64)),
+                );
+                (poster, Frame::Buffering(ticks as u64 % RING_STEPS))
             }
             (_, Some(Slot::Animation(animation))) => {
-                self.moving = true;
-                let (index, pixels) = animation.at(elapsed);
-                (Cow::Borrowed(pixels), Frame::Gif(index))
+                let (index, pixels, left) = animation.at(elapsed);
+                sooner(&mut self.next_change, left);
+                (pixels, Frame::Gif(index))
             }
-            (_, Some(Slot::Image(pixels) | Slot::Video(pixels))) => {
-                (Cow::Borrowed(pixels), Frame::Still)
-            }
+            (_, Some(Slot::Image(pixels) | Slot::Video(pixels))) => (pixels, Frame::Still),
             _ => return,
         };
-        let pixels = pixels.as_ref();
         let (top, bottom) = (figure.top, figure.top + figure.rows as usize);
         let (first, last) = (scroll, scroll + area.height as usize);
         if bottom <= first || top >= last {
@@ -582,6 +678,11 @@ impl Gallery {
             frame,
         };
         if !self.uploads.contains_key(&key) {
+            let pixels = match frame {
+                Frame::Buffering(step) => Cow::Owned(buffering(source, step)),
+                Frame::Still | Frame::Video(_) | Frame::Gif(_) => Cow::Borrowed(source),
+            };
+            let pixels = pixels.as_ref();
             // Only the rows on screen are sent: a placement can't clip an image's top.
             let (w, h) = pixels.dimensions();
             let rows = u32::from(figure.rows.max(1));
@@ -705,7 +806,7 @@ fn keep(path: Option<std::path::PathBuf>, bytes: &[u8]) {
 /// A link's picture: from the cache when it was fetched before, which links
 /// to uploads allow, since an upload never changes. `presigned` is the
 /// rendered body's signed link for it, when it had one.
-fn fetch(url: &str, presigned: Option<String>, video: bool) -> Slot {
+fn fetch(url: &str, presigned: Option<String>, video: bool, budget: &Arc<AtomicUsize>) -> Slot {
     for (is_video, path) in [(true, kept(url, true)), (false, kept(url, false))] {
         let Some(bytes) = path.and_then(|p| std::fs::read(p).ok()) else {
             continue;
@@ -713,14 +814,14 @@ fn fetch(url: &str, presigned: Option<String>, video: bool) -> Slot {
         let slot = if is_video {
             decode(&bytes).map(Slot::Video)
         } else {
-            picture(&bytes)
+            picture(&bytes, budget)
         };
         if let Some(slot) = slot {
             return slot;
         }
     }
     let source = presigned.unwrap_or_else(|| signed(url));
-    let slot = download(url, &source, video);
+    let slot = download(url, &source, video, budget);
     match &slot {
         Slot::Video(pixels) => {
             let mut png = Vec::new();
@@ -802,7 +903,7 @@ pub fn signed_links(html: &str) -> HashMap<String, String> {
 
 /// Fetches `url` (the link itself, or a signed link to it), keeping an image
 /// under `key`, the link as written: a signed link changes every time.
-fn download(key: &str, url: &str, video: bool) -> Slot {
+fn download(key: &str, url: &str, video: bool, budget: &Arc<AtomicUsize>) -> Slot {
     if video || is_video_file(url) {
         return Slot::Video(playable(poster(url)));
     }
@@ -827,7 +928,7 @@ fn download(key: &str, url: &str, video: bool) -> Slot {
     else {
         return Slot::Failed;
     };
-    match picture(&bytes) {
+    match picture(&bytes, budget) {
         Some(slot) => {
             keep(kept(key, false), &bytes);
             slot
@@ -838,9 +939,9 @@ fn download(key: &str, url: &str, video: bool) -> Slot {
 
 /// A picture ready to draw: a GIF with more than one frame plays, any other
 /// picture is still.
-fn picture(bytes: &[u8]) -> Option<Slot> {
+fn picture(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Slot> {
     if bytes.starts_with(b"GIF8")
-        && let Some(animation) = animation(bytes)
+        && let Some(animation) = animation(bytes, budget)
     {
         return Some(Slot::Animation(animation));
     }
@@ -848,13 +949,15 @@ fn picture(bytes: &[u8]) -> Option<Slot> {
 }
 
 /// A GIF's frames, composed as they show; `None` for one frame, which is
-/// drawn as a still picture.
-fn animation(bytes: &[u8]) -> Option<Animation> {
+/// drawn as a still picture. Frames come out of the gallery's shared budget
+/// and stop at this GIF's own limit; a GIF that gets fewer than two plays
+/// as its first frame.
+fn animation(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Animation> {
     use image::AnimationDecoder;
 
     let decoder = image::codecs::gif::GifDecoder::new(io::Cursor::new(bytes)).ok()?;
     let mut frames = Vec::new();
-    let mut held = 0usize;
+    let mut held = Held::none(budget);
     for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {
         let Ok(frame) = frame else { break };
         let delay = Duration::from(frame.delay());
@@ -864,13 +967,13 @@ fn animation(bytes: &[u8]) -> Option<Animation> {
             delay
         };
         let pixels = frame.into_buffer();
-        held += pixels.as_raw().len();
-        if held > MAX_GIF_BYTES {
+        let size = pixels.as_raw().len();
+        if held.bytes + size > MAX_GIF_BYTES || !held.take(size) {
             break;
         }
         frames.push((pixels, delay));
     }
-    Animation::new(frames)
+    Animation::new(frames, held)
 }
 
 /// A picture's pixels: any format the image crate reads, or an SVG drawn at
@@ -956,6 +1059,11 @@ fn playable(frame: Option<RgbaImage>) -> RgbaImage {
         };
     }
     image
+}
+
+/// Keeps the sooner of two deadlines.
+fn sooner(known: &mut Option<Duration>, after: Duration) {
+    *known = Some(known.map_or(after, |known| known.min(after)));
 }
 
 /// The poster with a loading ring where its play button was, the ring's
@@ -1101,13 +1209,31 @@ mod tests {
                 .encode_frames([frame(255, 100), frame(0, 300)])
                 .expect("frames encode");
         }
-        let Some(Slot::Animation(animation)) = picture(&gif) else {
+        let budget = Arc::new(AtomicUsize::new(GALLERY_GIF_BYTES));
+        let Some(Slot::Animation(animation)) = picture(&gif, &budget) else {
             panic!("a GIF with two frames animates");
         };
         assert_eq!(animation.length, Duration::from_millis(400));
-        assert_eq!(animation.at(Duration::from_millis(50)).0, 0);
-        assert_eq!(animation.at(Duration::from_millis(150)).0, 1);
-        assert_eq!(animation.at(Duration::from_millis(450)).0, 0);
+        let at = |ms| {
+            let (index, _, left) = animation.at(Duration::from_millis(ms));
+            (index, left.as_millis())
+        };
+        assert_eq!(at(50), (0, 50));
+        assert_eq!(at(150), (1, 250));
+        assert_eq!(at(450), (0, 50));
+        // Its frames (two of 4×2 RGBA) are held from the budget until it's dropped.
+        assert_eq!(budget.load(Ordering::Acquire), GALLERY_GIF_BYTES - 64);
+        drop(animation);
+        assert_eq!(budget.load(Ordering::Acquire), GALLERY_GIF_BYTES);
+
+        // With the budget spent, a GIF shows its first frame, still.
+        let spent = Arc::new(AtomicUsize::new(40));
+        assert!(matches!(picture(&gif, &spent), Some(Slot::Image(_))));
+        assert_eq!(
+            spent.load(Ordering::Acquire),
+            40,
+            "what it took is given back"
+        );
 
         let mut still = Vec::new();
         {
@@ -1116,16 +1242,7 @@ mod tests {
                 .encode_frames([frame(255, 100)])
                 .expect("frame encodes");
         }
-        assert!(matches!(picture(&still), Some(Slot::Image(_))));
-        // Delays too short to honor show as long as a browser shows them.
-        assert_eq!(
-            Animation::new(vec![
-                (RgbaImage::new(1, 1), GIF_DEFAULT_DELAY),
-                (RgbaImage::new(1, 1), GIF_DEFAULT_DELAY),
-            ])
-            .map(|a| a.length),
-            Some(Duration::from_millis(200))
-        );
+        assert!(matches!(picture(&still, &budget), Some(Slot::Image(_))));
     }
 
     #[test]
@@ -1166,7 +1283,7 @@ mod tests {
 
         let link = format!("https://private-user-images.githubusercontent.com/1/2-{ID}.png?jwt=t");
         gallery.sign(&HashMap::from([(ID.to_owned(), link.clone())]));
-        assert_eq!(gallery.presigned(&upload), Some(link));
+        assert_eq!(gallery.presigned(&upload), Some(link.clone()));
         assert_eq!(gallery.presigned(&format!("https://x/{ID}.png")), None);
         // The upload that failed is fetched again; other failures stay.
         assert_eq!(gallery.shown(&upload), Shown::Loading);
@@ -1175,9 +1292,48 @@ mod tests {
 
         // The same links again change nothing.
         let generation = gallery.generation;
-        let same = gallery.signed.clone();
-        gallery.sign(&same);
+        gallery.sign(&HashMap::from([(ID.to_owned(), link.clone())]));
         assert_eq!(gallery.generation, generation);
+
+        // An expired link isn't used; the upload is signed through github.com instead.
+        let stale = Instant::now().checked_sub(SIGNED_LINKS_LAST);
+        if let Some(stale) = stale {
+            gallery.signed.insert(ID.to_owned(), (link, stale));
+            assert_eq!(gallery.presigned(&upload), None);
+        }
+    }
+
+    #[test]
+    fn a_fetch_replaced_by_a_new_link_is_dropped_when_it_lands() {
+        let upload = format!("https://github.com/user-attachments/assets/{ID}");
+        let mut gallery = Gallery::plain();
+        // A fetch on the old link is under way.
+        gallery.slots.insert(upload.clone(), Slot::Loading);
+        gallery.requests.insert(upload.clone(), 1);
+
+        let link = format!("https://private-user-images.githubusercontent.com/1/2-{ID}.png?jwt=t");
+        gallery.sign(&HashMap::from([(ID.to_owned(), link)]));
+        assert!(
+            !gallery.slots.contains_key(&upload),
+            "fetched again with the new link"
+        );
+
+        // The old fetch then fails; its result is stale and dropped.
+        gallery
+            .tx
+            .send((upload.clone(), 1, Slot::Failed))
+            .expect("channel open");
+        assert!(!gallery.receive());
+        assert_eq!(gallery.shown(&upload), Shown::Loading);
+
+        // The current fetch's result is taken.
+        gallery.requests.insert(upload.clone(), 2);
+        gallery
+            .tx
+            .send((upload.clone(), 2, Slot::Image(RgbaImage::new(1, 1))))
+            .expect("channel open");
+        assert!(gallery.receive());
+        assert_eq!(gallery.shown(&upload), Shown::Image);
     }
 
     #[test]

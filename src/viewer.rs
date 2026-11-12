@@ -3145,19 +3145,14 @@ impl App {
 /// Asks the terminal for its text (OSC 10) or background (OSC 11) color, so
 /// painted images and diagrams match the text.
 pub(crate) fn query_color(code: u8) -> Option<Rgb> {
-    let reply = query_terminal(&format!("\x1b]{code};?\x1b\\"), |reply| {
-        reply.ends_with(b"\x07") || reply.ends_with(b"\x1b\\")
-    })?;
+    let reply = query_terminal(&format!("\x1b]{code};?\x1b\\"))?;
     parse_color_reply(&String::from_utf8_lossy(&reply))
 }
 
 /// Asks the terminal whether it shows its light or dark theme (`CSI ? 996 n`,
 /// which Rex and Ghostty answer); `Some(true)` for light.
 pub(crate) fn query_color_scheme() -> Option<bool> {
-    let reply = query_terminal("\x1b[?996n", |reply| {
-        reply.ends_with(b"n") && reply.windows(5).any(|w| w == b"?997;")
-    })?;
-    parse_scheme_reply(&reply)
+    parse_scheme_reply(&query_terminal("\x1b[?996n")?)
 }
 
 /// Reads "ESC [ ? 997 ; 1 n" (dark) or "; 2 n" (light).
@@ -3170,11 +3165,15 @@ fn parse_scheme_reply(reply: &[u8]) -> Option<bool> {
     }
 }
 
-/// Writes `request` and reads stdin a byte at a time until `done`, for up to
-/// half a second. Byte at a time, so no key typed after the reply is taken.
-fn query_terminal(request: &str, done: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
+/// Writes `request` and then a primary device attributes request (`CSI c`),
+/// which every terminal answers, and in order: the read stops at that
+/// answer, so a terminal that ignores `request` costs one round trip, not
+/// the whole half-second deadline. Returns what came before the answer.
+/// Reads a byte at a time, so no key typed after it is taken.
+fn query_terminal(request: &str) -> Option<Vec<u8>> {
     let mut out = io::stdout();
     out.write_all(request.as_bytes()).ok()?;
+    out.write_all(b"\x1b[c").ok()?;
     out.flush().ok()?;
     let mut reply = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -3198,11 +3197,26 @@ fn query_terminal(request: &str, done: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>
             break;
         }
         reply.push(byte);
-        if done(&reply) {
+        if let Some(at) = device_attributes_at(&reply) {
+            reply.truncate(at);
             return Some(reply);
         }
     }
-    None
+    // No attributes answer: the terminal said nothing, or only part of a reply.
+    (!reply.is_empty()).then_some(reply)
+}
+
+/// Where the reply ends in a device attributes answer, `ESC [ ? 6 2 ; 2 2 c`.
+fn device_attributes_at(reply: &[u8]) -> Option<usize> {
+    if !reply.ends_with(b"c") {
+        return None;
+    }
+    let start = reply.windows(3).rposition(|w| w == b"\x1b[?")?;
+    let params = &reply[start + 3..reply.len() - 1];
+    params
+        .iter()
+        .all(|b| b.is_ascii_digit() || *b == b';')
+        .then_some(start)
 }
 
 /// Reads "rgb:RRRR/GGGG/BBBB" (one to four hex digits a channel) from an OSC
@@ -4493,6 +4507,20 @@ mod tests {
             Some([255, 255, 255])
         );
         assert_eq!(parse_color_reply("garbage"), None);
+    }
+
+    #[test]
+    fn a_query_reply_ends_at_the_device_attributes_answer() {
+        let rex = b"\x1b[?997;2n\x1b[?62;22c";
+        assert_eq!(device_attributes_at(rex), Some(9));
+        assert_eq!(parse_scheme_reply(&rex[..9]), Some(true));
+        // A terminal that ignores the query answers only the attributes.
+        assert_eq!(device_attributes_at(b"\x1b[?1;2c"), Some(0));
+        assert_eq!(device_attributes_at(b"\x1b[?997;1n"), None);
+        assert_eq!(
+            device_attributes_at(b"\x1b]11;rgb:ffff/ffff/ffff\x07"),
+            None
+        );
     }
 
     #[test]

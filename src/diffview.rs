@@ -106,11 +106,12 @@ impl Scheme {
     fn detect() -> Self {
         use std::io::IsTerminal;
 
-        if !io::stdin().is_terminal() {
-            return Scheme::Fixed { light: false };
-        }
+        // The setting holds even when stdin isn't a terminal to ask.
         if let Some(light) = theme_hint(std::env::var("LEAF_THEME").ok().as_deref()) {
             return Scheme::Fixed { light };
+        }
+        if !io::stdin().is_terminal() {
+            return Scheme::Fixed { light: false };
         }
         if let Some(light) = crate::viewer::query_color_scheme() {
             return Scheme::Followed {
@@ -3063,6 +3064,32 @@ diff --git a/b.rs b/b.rs
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
+    }
+
+    #[test]
+    fn tab_cycles_from_a_pull_requests_code_tab_to_its_other_tabs() {
+        let as_code_tab = || Options {
+            tabs: true,
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(PATCH), as_code_tab());
+        press(&mut app, KeyCode::Tab);
+        assert!(app.quit);
+        assert_eq!(app.leave, Leave::Summary, "tab goes on, round to Summary");
+
+        let mut app = App::new(loaded(PATCH), as_code_tab());
+        press(&mut app, KeyCode::BackTab);
+        assert!(app.quit);
+        assert_eq!(
+            app.leave,
+            Leave::Timeline,
+            "shift-tab goes back to Timeline"
+        );
+
+        // Outside a pull request, tab is not a way out.
+        let mut app = App::new(loaded(PATCH), Options::default());
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.quit);
     }
 
     fn press_ctrl(app: &mut App, code: KeyCode) {

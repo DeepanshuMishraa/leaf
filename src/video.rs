@@ -50,6 +50,20 @@ pub fn decode_size(native: (u32, u32), width: u32) -> (u32, u32) {
     (target, height)
 }
 
+/// Whether ffmpeg runs here; asked once.
+pub fn has_ffmpeg() -> bool {
+    static FOUND: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    *FOUND
+}
+
 fn ffmpeg(args: &[String]) -> Result<Child, PlayFailed> {
     Command::new("ffmpeg")
         .args(args)

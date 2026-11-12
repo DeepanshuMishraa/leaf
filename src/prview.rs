@@ -141,8 +141,9 @@ struct List {
     resting: Option<(PrRef, Instant)>,
     /// Where each row was drawn, for clicks: its screen rows and its index.
     hits: Vec<(u16, u16, usize)>,
-    /// The row a press landed on, which opens on release unless the mouse was dragged.
-    pressed: Option<usize>,
+    /// The pull request a press on the picked row landed on, which opens on
+    /// release unless the mouse was dragged or the list changed under it.
+    pressed: Option<PrRef>,
     /// What ctrl+y copied, shown in the footer until the next key.
     copied: Option<String>,
 }
@@ -428,7 +429,14 @@ impl App {
         let known = self
             .details
             .get(&pr)
-            .map(|(detail, _)| detail.clone())
+            .map(|(detail, at)| {
+                let mut detail = detail.clone();
+                // Signed upload links expire within minutes; the fresh read brings new ones.
+                if at.elapsed() >= prmedia::SIGNED_LINKS_LAST {
+                    detail.media.clear();
+                }
+                detail
+            })
             .or_else(|| pr::cached_view(&pr));
         let detail = match known {
             Some(detail) => {
@@ -695,13 +703,17 @@ impl App {
             self.gallery.begin();
             terminal.draw(|f| self.draw(f))?;
             self.gallery.flush()?;
-            let wait = if self.gallery.moving() {
-                Duration::from_millis(30)
-            } else if self.animating() {
+            // Drawn again when the next thing on screen changes: a video or
+            // GIF frame, the loading ring, a spinner, or the half-second clock.
+            let idle = if self.animating() {
                 Duration::from_millis(80)
             } else {
                 Duration::from_millis(500)
             };
+            let wait = self
+                .gallery
+                .next_redraw()
+                .map_or(idle, |next| next.clamp(Duration::from_millis(5), idle));
             if !event::poll(wait)? {
                 continue;
             }
@@ -840,13 +852,18 @@ impl App {
                 };
                 // A click picks a row; a click on the picked row opens it once
                 // let go, so a drag (to select its number) never opens it.
-                list.pressed = (index == list.selected).then_some(index);
+                list.pressed = if index == list.selected {
+                    list.picked()
+                } else {
+                    None
+                };
                 list.selected = index;
             }
             MouseEventKind::Drag(MouseButton::Left) => list.pressed = None,
             MouseEventKind::Up(MouseButton::Left) => {
-                if list.pressed.take() == Some(list.selected)
-                    && let Some(pr) = list.picked()
+                // Still the same pull request: a search can reorder rows mid-click.
+                if let Some(pr) = list.pressed.take()
+                    && list.picked().as_ref() == Some(&pr)
                 {
                     self.open_page(pr);
                 }
