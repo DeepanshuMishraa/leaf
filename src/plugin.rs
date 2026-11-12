@@ -29,7 +29,7 @@ pub fn install() -> Result<String, String> {
     }
     let reloaded = rex(&["config", "reload"]).is_ok();
     Ok(format!(
-        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
+        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Pull Requests lists this branch's pull request, this repository's and yours.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
         if reloaded {
             ""
         } else {
@@ -81,12 +81,23 @@ fn config_path() -> PathBuf {
         .join("init.lua")
 }
 
+/// The managed block. It names the plugin's version by a hash of its source:
+/// the Rex app fetches its actions again only when init.lua itself changed,
+/// so a new plugin with the same loader line would keep the old palette.
 fn loader(plugin_path: &Path, bin: &Path) -> String {
     format!(
-        "{BEGIN}\n-- Managed by `leaf rex install`; `leaf rex uninstall` removes it.\ndofile({}).setup({{ bin = {{ {} }} }})\n{OPEN}idle\n{END}\n",
+        "{BEGIN}\n-- Managed by `leaf rex install`; `leaf rex uninstall` removes it.\n-- plugin: {:016x}\ndofile({}).setup({{ bin = {{ {} }} }})\n{OPEN}idle\n{END}\n",
+        fnv1a(SOURCE),
         lua_string(&plugin_path.display().to_string()),
         lua_string(&bin.display().to_string()),
     )
+}
+
+/// FNV-1a, 64 bits: stable across builds, unlike std's hasher.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// The line in the managed block that names what leaf shows, such as `document diff`.
@@ -202,6 +213,16 @@ mod tests {
         assert!(open.starts_with("rex.bind") && open.ends_with("-- after\n"));
         assert_eq!(with_open(&open, "idle"), config);
         assert_eq!(with_open("no block here\n", "diff"), "no block here\n");
+    }
+
+    #[test]
+    fn the_block_changes_when_the_plugin_does() {
+        let block = loader(Path::new("/p/init.lua"), Path::new("/bin/leaf"));
+        assert!(block.contains(&format!("-- plugin: {:016x}\n", fnv1a(SOURCE))));
+        assert_ne!(fnv1a("rex.action{a}"), fnv1a("rex.action{b}"));
+        assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
+        // Rewriting the open line keeps the version.
+        assert!(with_open(&block, "diff").contains("-- plugin: "));
     }
 
     #[test]

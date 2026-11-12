@@ -261,6 +261,25 @@ function M.setup(opts)
   }
 
   rex.action{
+    name = "leaf_pr",
+    title = "Leaf: Pull Requests",
+    description = "This branch's pull request, this repository's, and yours across GitHub,"
+      .. " in this pane. Pick one to read its summary, timeline and diff, then merge,"
+      .. " close, approve or comment.",
+    category = "Leaf",
+    keywords = "leaf pr pull request github review merge squash rebase checks timeline branch",
+    args = { target = "string?" },
+    run = function(ctx, args)
+      local target = args.target
+      if target ~= nil and target ~= "" then
+        place(ctx, "pr", "pr", target)
+      else
+        place(ctx, "pull requests", "pr")
+      end
+    end,
+  }
+
+  rex.action{
     name = "leaf_agent",
     title = "Leaf: Choose Agent…",
     description = "Pick which installed agent CLI gets questions about a selection in a Leaf"
