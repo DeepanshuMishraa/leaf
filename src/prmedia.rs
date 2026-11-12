@@ -17,6 +17,7 @@ use regex::{Captures, Regex};
 
 use crate::kitty::{self, Kitty};
 use crate::render::Figure;
+use crate::video::{self, PlayFailed, Playback};
 
 const USER_AGENT: &str = "Mozilla/5.0 (leaf reader)";
 /// An image larger than this is left as a placeholder rather than held in memory.
@@ -183,6 +184,8 @@ struct Upload {
     cols: u16,
     from: u16,
     to: u16,
+    /// The video frame shown, or 0 for a still picture.
+    frame: u64,
 }
 
 /// The description's media, and what of it the terminal holds.
@@ -199,7 +202,9 @@ pub struct Gallery {
     uploads: HashMap<Upload, kitty::Image>,
     used: HashSet<Upload>,
     placements: Vec<(kitty::Image, Rect)>,
-    /// Bumped when media arrives, so layouts sized around it are redone.
+    /// The video playing in place, and its link.
+    playing: Option<(String, Playback)>,
+    /// Bumped when media arrives or a video starts or stops, so layouts and labels are redone.
     pub generation: u64,
 }
 
@@ -217,7 +222,50 @@ impl Gallery {
             uploads: HashMap::new(),
             used: HashSet::new(),
             placements: Vec::new(),
+            playing: None,
             generation: 0,
+        }
+    }
+
+    /// Plays a video in its figure, `width` pixels across.
+    pub fn play(&mut self, href: &str, width: u32) -> Result<(), PlayFailed> {
+        let native = match self.slots.get(href) {
+            Some(Slot::Video(poster)) => poster.dimensions(),
+            _ => CARD,
+        };
+        self.stop();
+        let playback = Playback::start(href, video::decode_size(native, width))?;
+        self.playing = Some((href.to_owned(), playback));
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Stops the video playing, leaving its poster.
+    pub fn stop(&mut self) {
+        if self.playing.take().is_some() {
+            self.generation += 1;
+        }
+    }
+
+    pub fn is_playing(&self, href: &str) -> bool {
+        self.playing.as_ref().is_some_and(|(at, _)| at == href)
+    }
+
+    pub fn any_playing(&self) -> bool {
+        self.playing.is_some()
+    }
+
+    /// Takes the playing video's newest frame, and stops it when it has ended.
+    pub fn tick(&mut self) {
+        let ended = match &mut self.playing {
+            Some((_, playback)) => {
+                playback.poll();
+                playback.ended()
+            }
+            None => false,
+        };
+        if ended {
+            self.stop();
         }
     }
 
@@ -313,8 +361,15 @@ impl Gallery {
     /// is drawn, showing its rows from `scroll`.
     pub fn place(&mut self, figure: &Figure, area: Rect, scroll: usize) {
         let Some(kitty) = &mut self.kitty else { return };
-        let pixels = match self.slots.get(&figure.href) {
-            Some(Slot::Image(pixels) | Slot::Video(pixels)) => pixels,
+        // A playing video shows its newest frame over the poster.
+        let frame = self
+            .playing
+            .as_ref()
+            .filter(|(at, _)| *at == figure.href)
+            .and_then(|(_, playback)| Some((playback.current()?, playback.frame)));
+        let (pixels, frame) = match (frame, self.slots.get(&figure.href)) {
+            (Some((pixels, frame)), _) => (pixels, frame),
+            (None, Some(Slot::Image(pixels) | Slot::Video(pixels))) => (pixels, 0),
             _ => return,
         };
         let (top, bottom) = (figure.top, figure.top + figure.rows as usize);
@@ -329,6 +384,7 @@ impl Gallery {
             cols: figure.cols,
             from,
             to,
+            frame,
         };
         if !self.uploads.contains_key(&key) {
             // Only the rows on screen are sent: a placement can't clip an image's top.

@@ -33,6 +33,7 @@ mod shape;
 mod stroke;
 mod syntax;
 mod tempo;
+mod video;
 mod viewer;
 mod voicepick;
 
@@ -229,6 +230,18 @@ fn resume(
 fn main() -> ExitCode {
     memory::without_large_cache();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A leaf updated with `cargo install` brings its Rex plugin up to date. A
+    // plugin that can't be refreshed keeps working as it was, so this is quiet.
+    let installing = matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("rex" | "plugin"), Some("install" | "uninstall"))
+    );
+    if !installing {
+        let _ = plugin::refresh();
+    }
     let Some((command, rest)) = args.split_first() else {
         if std::io::stdout().is_terminal() {
             return pick_and_open(None);

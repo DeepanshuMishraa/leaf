@@ -37,6 +37,7 @@ use crate::pr::{
 };
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
+use crate::video::PlayFailed;
 
 const GREEN: Color = Color::Indexed(2);
 const RED: Color = Color::Indexed(1);
@@ -624,6 +625,7 @@ impl App {
         let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
         let mut options = crate::diff_options(&loaded.key, failure.clone());
         options.tabs = true;
+        self.gallery.stop();
         self.gallery.clear()?;
         let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
@@ -670,12 +672,19 @@ impl App {
                 self.receive(msg, terminal)?;
             }
             self.gallery.receive();
+            // A video plays only while its description is on screen.
+            if self.page.as_ref().is_none_or(|p| p.tab != Tab::Summary) {
+                self.gallery.stop();
+            }
+            self.gallery.tick();
             self.prefetch();
             self.now = pr::now();
             self.gallery.begin();
             terminal.draw(|f| self.draw(f))?;
             self.gallery.flush()?;
-            let wait = if self.animating() {
+            let wait = if self.gallery.any_playing() {
+                Duration::from_millis(30)
+            } else if self.animating() {
                 Duration::from_millis(80)
             } else {
                 Duration::from_millis(500)
@@ -725,19 +734,37 @@ impl App {
                     return Ok(());
                 }
                 let point = page.point(mouse.column, mouse.row);
-                // A click on a picture opens it: a video plays, an image shows full size.
+                // A click on a video (or its label below) plays it here, or
+                // stops it; a click on an image shows it full size in the browser.
                 let figure = page.cache.as_ref().and_then(|(_, body)| {
                     body.figures
                         .iter()
-                        .find(|f| point.0 >= f.top && point.0 < f.top + f.rows as usize)
-                        .map(|f| f.href.clone())
+                        .find(|f| point.0 >= f.top && point.0 <= f.top + f.rows as usize)
+                        .map(|f| (f.href.clone(), f.cols))
                 });
-                if let Some(href) = figure {
+                if let Some((href, cols)) = figure {
                     page.selection = None;
-                    page.toast = Some(match prmedia::open(&href) {
-                        Ok(()) => "Opened it in the browser".to_owned(),
-                        Err(e) => format!("Couldn't open {href} ({e})"),
-                    });
+                    let gallery = &mut self.gallery;
+                    page.toast = if gallery.is_playing(&href) {
+                        gallery.stop();
+                        None
+                    } else if gallery.is_video(&href) {
+                        let width = u32::from(cols) * u32::from(gallery.cell().0);
+                        match gallery.play(&href, width) {
+                            Ok(()) => None,
+                            // Without ffmpeg the browser plays it instead.
+                            Err(e @ PlayFailed::NoFfmpeg) => Some(match prmedia::open(&href) {
+                                Ok(()) => format!("{e}, so it opened in the browser"),
+                                Err(open) => format!("{e}, and the browser didn't open ({open})"),
+                            }),
+                            Err(e) => Some(e.to_string()),
+                        }
+                    } else {
+                        Some(match prmedia::open(&href) {
+                            Ok(()) => "Opened it in the browser".to_owned(),
+                            Err(e) => format!("Couldn't open {href} ({e})"),
+                        })
+                    };
                     return Ok(());
                 }
                 page.selection = Some(Selection {
@@ -931,6 +958,7 @@ impl App {
         let half = terminal.size().map(|s| s.height as usize / 2).unwrap_or(10);
         match key.code {
             // Escape lets go of a selection before it leaves.
+            KeyCode::Esc if self.gallery.any_playing() => self.gallery.stop(),
             KeyCode::Esc if page.selection.is_some() => page.selection = None,
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.page = None;
@@ -1885,7 +1913,11 @@ fn description(body: &str, width: u16, gallery: &mut Gallery) -> Body {
         if !gallery.is_video(&figure.href) {
             continue;
         }
-        let label = "▶  video · click to play";
+        let label = if gallery.is_playing(&figure.href) {
+            "■  playing · click or esc to stop"
+        } else {
+            "▶  video · click to play"
+        };
         let pad = figure.x + figure.cols.saturating_sub(label.width() as u16) / 2;
         let line = Line::from(vec![
             Span::raw(" ".repeat(pad as usize)),

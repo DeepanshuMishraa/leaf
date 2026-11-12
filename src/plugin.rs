@@ -38,6 +38,97 @@ pub fn install() -> Result<String, String> {
     ))
 }
 
+/// Brings an installed plugin up to this leaf's own, so updating leaf with
+/// `cargo install` updates the palette without `leaf rex install`. leaf runs
+/// this on every start, and Rex runs leaf (`leaf rex state`) each time it
+/// loads its config, so a new version takes over at the latest when Rex
+/// next starts. Only the leaf the plugin names does it: a development build
+/// run by hand leaves the installed plugin alone. `true` when it changed.
+pub fn refresh() -> Result<bool, String> {
+    let config = config_path();
+    let Ok(content) = fs::read_to_string(&config) else {
+        return Ok(false);
+    };
+    let Some(installed) = Installed::read(&content) else {
+        return Ok(false);
+    };
+    let this = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|e| format!("could not find this leaf binary: {e}"))?;
+    if fs::canonicalize(&installed.bin).ok().as_ref() != Some(&this) {
+        return Ok(false);
+    }
+    let current = fs::read_to_string(&installed.plugin).ok();
+    let version = format!("{PLUGIN}{:016x}", fnv1a(SOURCE));
+    if current.as_deref() == Some(SOURCE) && content.contains(&version) {
+        return Ok(false);
+    }
+    let next = with_open(
+        &with_block(&content, Some(&loader(&installed.plugin, &installed.bin))),
+        &installed.open,
+    );
+    write_if_changed(&installed.plugin, SOURCE)?;
+    write_if_changed(&config, &next)?;
+    if let Err(error) = rex(&["config", "check", &config.display().to_string()]) {
+        let _ = fs::write(&config, &content);
+        if let Some(previous) = current {
+            let _ = fs::write(&installed.plugin, previous);
+        }
+        return Err(error);
+    }
+    // Not waited for: Rex may be loading its config right now, waiting on this leaf.
+    if let Ok(bin) = crate::agent::rex_program() {
+        let _ = Command::new(bin)
+            .args(["config", "reload"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    Ok(true)
+}
+
+/// What the managed block in init.lua names: the plugin file, the leaf it
+/// runs, and what's open.
+#[derive(Debug, PartialEq, Eq)]
+struct Installed {
+    plugin: PathBuf,
+    bin: PathBuf,
+    open: String,
+}
+
+impl Installed {
+    fn read(content: &str) -> Option<Self> {
+        let start = content.find(BEGIN)?;
+        let end = start + content[start..].find(END)?;
+        let block = &content[start..end];
+        let quoted = |after: &str| -> Option<PathBuf> {
+            let rest = &block[block.find(after)? + after.len()..];
+            let rest = rest.strip_prefix('"')?;
+            let mut out = String::new();
+            let mut chars = rest.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => return Some(PathBuf::from(out)),
+                    '\\' => out.push(chars.next()?),
+                    c => out.push(c),
+                }
+            }
+            None
+        };
+        Some(Installed {
+            plugin: quoted("dofile(")?,
+            bin: quoted("bin = { ")?,
+            open: block
+                .lines()
+                .find_map(|line| line.strip_prefix(OPEN))
+                .unwrap_or("idle")
+                .trim()
+                .to_owned(),
+        })
+    }
+}
+
 pub fn uninstall() -> Result<String, String> {
     let config = config_path();
     let plugin_path = config
@@ -86,7 +177,7 @@ fn config_path() -> PathBuf {
 /// so a new plugin with the same loader line would keep the old palette.
 fn loader(plugin_path: &Path, bin: &Path) -> String {
     format!(
-        "{BEGIN}\n-- Managed by `leaf rex install`; `leaf rex uninstall` removes it.\n-- plugin: {:016x}\ndofile({}).setup({{ bin = {{ {} }} }})\n{OPEN}idle\n{END}\n",
+        "{BEGIN}\n-- Managed by `leaf rex install`; `leaf rex uninstall` removes it.\n{PLUGIN}{:016x}\ndofile({}).setup({{ bin = {{ {} }} }})\n{OPEN}idle\n{END}\n",
         fnv1a(SOURCE),
         lua_string(&plugin_path.display().to_string()),
         lua_string(&bin.display().to_string()),
@@ -102,6 +193,8 @@ fn fnv1a(text: &str) -> u64 {
 
 /// The line in the managed block that names what leaf shows, such as `document diff`.
 const OPEN: &str = "-- open: ";
+/// The line in the managed block naming the plugin's version.
+const PLUGIN: &str = "-- plugin: ";
 
 /// `content` with the managed block's open line saying `open`; unchanged
 /// when there's no managed block.
@@ -223,6 +316,28 @@ mod tests {
         assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
         // Rewriting the open line keeps the version.
         assert!(with_open(&block, "diff").contains("-- plugin: "));
+    }
+
+    #[test]
+    fn the_installed_block_names_the_plugin_the_leaf_and_what_is_open() {
+        let block = loader(Path::new("/p/leaf/init.lua"), Path::new("/bin/le\"af"));
+        let config = format!("x = 1\n{}", with_open(&block, "document diff"));
+        assert_eq!(
+            Installed::read(&config),
+            Some(Installed {
+                plugin: PathBuf::from("/p/leaf/init.lua"),
+                bin: PathBuf::from("/bin/le\"af"),
+                open: "document diff".to_owned(),
+            })
+        );
+        assert_eq!(Installed::read("no leaf here"), None);
+        // Rebuilding the block for a new plugin keeps what's open.
+        let installed = Installed::read(&config).unwrap();
+        let next = with_open(
+            &with_block(&config, Some(&loader(&installed.plugin, &installed.bin))),
+            &installed.open,
+        );
+        assert_eq!(next, config);
     }
 
     #[test]

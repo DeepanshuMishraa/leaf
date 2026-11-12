@@ -93,7 +93,7 @@ The list shows what it found last time at once and refreshes behind it, each hea
 
 A pull request opens on its title, one line of state, number, author and size, and its tabs. **Summary** shows whether it can merge, the branch, reviewers and labels when it has them, checks that are failing or running, and the description. **Timeline** shows commits, comments, reviews and line comments in order; long bot comments are cut short until `e` expands them. **Code** opens the diff in the reviewer above. The diff is fetched while the page loads and kept against the head commit, so Code opens at once and only fetches again after a push. In Code, `1`, `2` and `←` go back to Summary and Timeline (`h`/`l` scroll sideways there).
 
-Pictures in the description are drawn in place on terminals with the Kitty graphics protocol (Kitty, Ghostty, WezTerm, Rex; not inside tmux), as the reader draws its figures. Images in a table stack under their column's heading. A video shows its first frame (taken with `ffmpeg` when it's installed) under a play button; click it to play it, or click an image to see it full size. Elsewhere each picture is a one-line placeholder.
+Pictures in the description are drawn in place on terminals with the Kitty graphics protocol (Kitty, Ghostty, WezTerm, Rex; not inside tmux), as the reader draws its figures. Images in a table stack under their column's heading. A video shows its first frame under a play button. Click it to play it right there, with its sound: `ffmpeg` decodes it at the video's own pace, the frames are drawn like any picture and the sound goes to the same output as reading aloud. A click or `esc` stops it, as does leaving the Summary. Without `ffmpeg` a click opens the video in the browser instead. A click on an image shows it full size in the browser. Elsewhere each picture is a one-line placeholder.
 
 Drag over text in Summary or Timeline to select it; it's copied when you let go, and `esc` clears the selection.
 
@@ -104,6 +104,8 @@ Everything goes through the GitHub CLI, so `gh` must be installed and signed in 
 ## Rex
 
 `leaf rex install` adds Leaf to Rex's command palette. Press `cmd+shift+p` and type Leaf.
+
+Updating leaf updates the plugin too: after `cargo install leaf-reader` installs a new version, the plugin brings itself up to date the next time leaf runs. That includes when Rex loads its config, which runs leaf to ask what's open. There's no need to run `leaf rex install` again. Only the leaf the plugin was installed for does this; a development build run by hand leaves it alone.
 
 Documents and diffs open in the pane the palette was called from. leaf runs in a layer laid exactly over that pane, so nothing is typed into its shell: quitting leaf leaves the shell as it was, with no command on screen or in its history. A document already open there gives way to the new one. A pane busy with something else, such as an editor or an agent, keeps it, and leaf opens beside it.
 
