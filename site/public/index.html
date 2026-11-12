@@ -434,12 +434,12 @@
   </nav>
 
   <header class="hero">
-    <span class="ver"><b>v0.10</b> Free, open source, MIT</span>
+    <span class="ver"><b>v0.12</b> Free, open source, MIT</span>
     <h1>Read and review <span class="mark">in your terminal.</span></h1>
     <p class="sub">leaf opens PDFs, EPUBs, markdown and web articles as clean pages in your terminal's own colors, and reviews git diffs side by side. Search, highlight, draw, listen, or ask an agent without leaving the page.</p>
     <div class="cta">
       <div class="install">
-        <code><span class="p">$</span><span class="cmd">cargo install leaf-reader</span></code>
+        <code><span class="p">$</span><span class="cmd">curl -fsSL https://leaf.dipxsy.app | sh</span></code>
         <button class="copy" type="button" aria-label="Copy install command">
           <svg class="sheet" viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8.5" height="8.5"/><path d="M10.5 5V2H2.5V10.5H5"/></svg>
           <svg class="tick" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg>
@@ -447,7 +447,7 @@
       </div>
       <a class="alt" href="#tour">Take the tour ↓</a>
     </div>
-    <p class="note">Needs Rust. Installs the <code>leaf</code> command to ~/.cargo/bin.</p>
+    <p class="note">macOS 11+ and Linux with glibc 2.35+ (x86_64 or arm64; Linux needs ALSA, as desktops have). Installs <code>leaf</code> to ~/.local/bin, or updates the copy already on your PATH; <code>leaf upgrade</code> keeps it current. Elsewhere, with Rust: <code>cargo install leaf-reader</code>.</p>
     <a class="rexchip" href="#rex"><img src="rex.png" width="18" height="18" alt="">Ships as a native Rex plugin</a>
 
     <figure class="clip">
@@ -677,7 +677,7 @@
     <h2 id="end-h">Open your next book in the terminal.</h2>
     <p>Then run <code>leaf open</code> on a PDF, an EPUB, a README or a link.</p>
     <div class="install">
-      <code><span class="p">$</span><span class="cmd">cargo install leaf-reader</span></code>
+      <code><span class="p">$</span><span class="cmd">curl -fsSL https://leaf.dipxsy.app | sh</span></code>
       <button class="copy" type="button" aria-label="Copy install command">
         <svg class="sheet" viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8.5" height="8.5"/><path d="M10.5 5V2H2.5V10.5H5"/></svg>
         <svg class="tick" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg>

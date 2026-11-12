@@ -1,6 +1,12 @@
 {
   "name": "leaf-site",
   "compatibility_date": "2026-10-01",
-  "assets": { "directory": "./public" },
+  "main": "./src/worker.js",
+  // The root runs the worker first, so curl gets the install script there.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/", "/install"]
+  },
   "routes": [{ "pattern": "leaf.dipxsy.app", "custom_domain": true }]
 }

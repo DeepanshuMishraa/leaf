@@ -33,6 +33,7 @@ mod shape;
 mod stroke;
 mod syntax;
 mod tempo;
+mod upgrade;
 mod video;
 mod viewer;
 mod voicepick;
@@ -56,6 +57,8 @@ const USAGE: &str = "Usage: leaf open [file.pdf | file.epub | file.md | url]   (
        leaf voice [name]        show or set the voice that reads aloud
        leaf voices              pick a voice from every voice there is
        leaf agents              pick the installed agent questions go to
+       leaf version             print the installed version
+       leaf upgrade [--check]   install the newest release (--check: only say if there is one)
 
 Diff options:
   --staged           staged changes
@@ -297,6 +300,30 @@ fn main() -> ExitCode {
             ask_command(rest)
         }
         "rex" | "plugin" => plugin_command(rest),
+        "version" | "--version" | "-V" => {
+            println!("leaf {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        "upgrade" | "update" => {
+            let check_only = match rest {
+                [] => false,
+                [flag] if flag == "--check" => true,
+                _ => {
+                    eprintln!("Usage: leaf upgrade [--check]");
+                    return ExitCode::from(2);
+                }
+            };
+            match upgrade::run(check_only) {
+                Ok(outcome) => {
+                    println!("{outcome}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("leaf: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "voice" => voice_command(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
