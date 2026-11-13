@@ -816,32 +816,103 @@ fn deliver_rex(text: &str) -> Result<Agent, AgentFailed> {
         (Err(AgentFailed::NoAgent), Some(agent)) => return start_rex(&session, &agent, text),
         (found, _) => found?,
     };
+    write_agent(&session, &agent.pane, text)?;
+    Ok(agent)
+}
+
+/// Pastes `text` into the agent pane `pane` and submits it.
+fn write_agent(session: &str, pane: &str, text: &str) -> Result<(), AgentFailed> {
     let payload = serde_json::json!({ "data": submission(text) }).to_string();
     let output = rex_cmd(
         &[
             "block".into(),
             "call".into(),
             "-s".into(),
-            session,
+            session.into(),
             "-b".into(),
-            agent.pane.clone(),
+            pane.into(),
             "write".into(),
             "-".into(),
         ],
         Some(payload.as_bytes()),
     )
     .map_err(|cause| AgentFailed::Tmux {
-        pane: agent.pane.clone(),
+        pane: pane.into(),
         cause,
     })?;
     if output.status.success() {
-        Ok(agent)
+        Ok(())
     } else {
         Err(AgentFailed::Tmux {
-            pane: agent.pane,
+            pane: pane.into(),
             cause: stderr(&output),
         })
     }
+}
+
+/// Sends `text` to the agent in the Rex pane `pane`, the one that asked for a
+/// review, rather than whichever agent pane the lookup would find.
+pub fn deliver_to(pane: &str, text: &str) -> Result<Agent, AgentFailed> {
+    let session = rex_session().ok_or(AgentFailed::NoTmux)?;
+    write_agent(&session, pane, text)?;
+    let command = agent_from_rex_process(&session, pane).unwrap_or_else(|| "agent".into());
+    Ok(Agent {
+        pane: pane.into(),
+        command,
+    })
+}
+
+/// Opens a pane to the right of `beside` (or of this pane) running `argv` in
+/// `dir`, without taking focus from the agent, and returns its block id.
+pub fn split_beside(
+    beside: Option<&str>,
+    dir: &Path,
+    label: &str,
+    argv: &[String],
+) -> Result<String, String> {
+    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let mut args: Vec<String> = vec!["split".into(), "-s".into(), session];
+    let own = std::env::var("REX_BLOCK")
+        .ok()
+        .filter(|own| !own.is_empty());
+    if let Some(block) = beside.map(str::to_owned).or(own) {
+        args.extend(["-b".into(), block]);
+    }
+    args.extend([
+        "-c".into(),
+        dir.display().to_string(),
+        "--split=right".into(),
+        "--focus=true".into(),
+        "--label".into(),
+        label.into(),
+        "--json".into(),
+        "--".into(),
+    ]);
+    args.extend(argv.iter().cloned());
+    let printed = rex_output(&args)?;
+    serde_json::from_str::<serde_json::Value>(&printed)
+        .ok()
+        .and_then(|value| value["block_ids"][0].as_str().map(str::to_owned))
+        .ok_or_else(|| format!("rex split printed no block id: {printed}"))
+}
+
+/// Whether the Rex pane `block` is still open in this session. When Rex
+/// can't be asked, it's taken as open, so a waiter isn't cut short.
+pub fn block_open(block: &str) -> bool {
+    let Some(session) = rex_session() else {
+        return true;
+    };
+    let Ok(listed) = rex_output(&[
+        "block".into(),
+        "ls".into(),
+        "-s".into(),
+        session,
+        "--json".into(),
+        "--short=false".into(),
+    ]) else {
+        return true;
+    };
+    parse_rex_blocks(&listed).iter().any(|b| b.id == block)
 }
 
 #[cfg(test)]

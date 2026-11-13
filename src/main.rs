@@ -17,6 +17,7 @@ mod home;
 mod hue;
 mod kitty;
 mod look;
+mod margin;
 mod markdown;
 mod memory;
 mod mermaid;
@@ -25,6 +26,8 @@ mod news;
 mod pdf;
 mod picker;
 mod place;
+mod planblocks;
+mod planview;
 mod plugin;
 mod popover;
 mod pr;
@@ -35,6 +38,7 @@ mod progress;
 mod prview;
 mod remote;
 mod render;
+mod review;
 mod rextheme;
 mod scheme;
 mod shape;
@@ -62,6 +66,7 @@ use viewer::ViewerOptions;
 const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
        leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
+       leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -284,6 +289,7 @@ fn main() -> ExitCode {
             }
         },
         "agents" => agents_command(),
+        "plan" => margin::plan_command(rest),
         "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
