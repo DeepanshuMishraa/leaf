@@ -231,6 +231,26 @@ pub struct Options {
     /// Opened as a pull request's Code tab: `1`, `2` and `←` go back to its
     /// other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
+    pub layout: Layout,
+}
+
+/// How changed lines are laid out; `i` switches between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// Old code on the left, new code on the right.
+    #[default]
+    Split,
+    /// One column, removed lines above added ones, as `git diff` shows them.
+    Inline,
+}
+
+impl Layout {
+    fn toggled(self) -> Self {
+        match self {
+            Layout::Split => Layout::Inline,
+            Layout::Inline => Layout::Split,
+        }
+    }
 }
 
 impl Default for Options {
@@ -240,6 +260,7 @@ impl Default for Options {
             store: None,
             failure: Rc::new(RefCell::new(None)),
             tabs: false,
+            layout: Layout::Split,
         }
     }
 }
@@ -375,8 +396,9 @@ enum Done {
 /// Sends comment text to an agent, returning the pane it reached.
 type Deliver = Box<dyn FnMut(&str) -> Result<agent::Agent, agent::AgentFailed>>;
 
-/// One line on screen in the split view. Changed blocks are paired left-to-right;
-/// headings and notes span both sides.
+/// One line on screen. In the split layout changed blocks are paired
+/// left-to-right; inline, each line holds one changed row, or a context row on
+/// both sides. Headings and notes span the width.
 #[derive(Debug, Clone, Copy)]
 struct SplitRow {
     left: Option<usize>,
@@ -421,7 +443,7 @@ struct Split {
 }
 
 impl Split {
-    fn new(diff: &Diff) -> Self {
+    fn new(diff: &Diff, layout: Layout) -> Self {
         let rows = diff.rows();
         let mut lines = Vec::new();
         let mut line_of_row = vec![0; rows.len()];
@@ -442,6 +464,17 @@ impl Split {
                         SplitRow {
                             left: Some(at),
                             right: Some(at),
+                            band: None,
+                        },
+                        &mut line_of_row,
+                    );
+                    at += 1;
+                }
+                RowKind::Removed if layout == Layout::Inline => {
+                    push(
+                        SplitRow {
+                            left: Some(at),
+                            right: None,
                             band: None,
                         },
                         &mut line_of_row,
@@ -597,6 +630,7 @@ struct App {
     /// Where `quit` goes, for a pull request's Code tab.
     leave: Leave,
     tabs: bool,
+    layout: Layout,
     split: Split,
     /// The diff's lines on screen.
     view: Rect,
@@ -609,7 +643,7 @@ struct App {
 
 impl App {
     fn new(loaded: Loaded, options: Options) -> Self {
-        let split = Split::new(&loaded.diff);
+        let split = Split::new(&loaded.diff, options.layout);
         let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
         let (scheme, palette) = Scheme::detect();
@@ -639,6 +673,7 @@ impl App {
             quit: false,
             leave: Leave::Quit,
             tabs: options.tabs,
+            layout: options.layout,
             split,
             view: Rect::default(),
             composer_view: 0,
@@ -779,7 +814,7 @@ impl App {
                     let same_key = loaded.key == self.key;
                     self.loaded = loaded;
                     self.key = self.loaded.key.clone();
-                    self.split = Split::new(&self.loaded.diff);
+                    self.split = Split::new(&self.loaded.diff, self.layout);
                     if !same_key {
                         self.load_comments();
                     }
@@ -1228,6 +1263,7 @@ impl App {
             KeyCode::Char('y') => self.copy_payload(false),
             KeyCode::Char('Y') => self.copy_payload(true),
             KeyCode::Char('o') => self.other_side(),
+            KeyCode::Char('i') => self.toggle_layout(),
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('1') | KeyCode::Tab if self.tabs => {
                 self.leave = Leave::Summary;
@@ -1657,6 +1693,30 @@ impl App {
             self.scroll = last + 1 - height;
         }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// Switches between split and inline, keeping the cursor, selection and
+    /// focused comment on the same diff rows.
+    fn toggle_layout(&mut self) {
+        let row_of =
+            |split: &Split, line: usize| split.lines().get(line).and_then(|l| l.focus_row());
+        let cursor = row_of(&self.split, self.cursor);
+        let selection = self.selection.and_then(|line| row_of(&self.split, line));
+        let focus = self
+            .focus
+            .and_then(|(first, last)| self.split.rows_between(first, last));
+        self.layout = self.layout.toggled();
+        self.split = Split::new(&self.loaded.diff, self.layout);
+        self.cursor = cursor
+            .and_then(|row| self.split.line_for_row(row))
+            .or_else(|| self.split.first_content())
+            .unwrap_or(0);
+        self.selection = selection.and_then(|row| self.split.line_for_row(row));
+        self.focus = focus.and_then(|(first, last)| self.split.lines_for_rows(first, last));
+        match self.focus {
+            Some((first, last)) => self.follow_focus(first, last),
+            None => self.follow_cursor(),
+        }
     }
 
     fn toggle_selection(&mut self) {
@@ -2254,14 +2314,24 @@ impl App {
         let focused = self
             .focus
             .is_some_and(|(first, last)| line_index >= first && line_index <= last);
-        let left_width = width.saturating_sub(1) / 2;
-        let right_width = width.saturating_sub(1 + left_width);
         let mut spans = Vec::new();
         let side = SideState {
             current,
             highlighted: focused || selected,
         };
-        self.side_line(&mut spans, line.left, Side::Old, left_width, side);
+        if self.layout == Layout::Inline {
+            // A context row is on both sides: draw it once, with both numbers.
+            let (row, drawn) = match (line.left, line.right) {
+                (_, Some(row)) => (row, Side::New),
+                (Some(row), None) => (row, Side::Old),
+                (None, None) => return Line::default(),
+            };
+            self.side_line(&mut spans, Some(row), drawn, width, side, true);
+            return Line::from(spans);
+        }
+        let left_width = width.saturating_sub(1) / 2;
+        let right_width = width.saturating_sub(1 + left_width);
+        self.side_line(&mut spans, line.left, Side::Old, left_width, side, false);
         let rule_style = if side.highlighted {
             Style::default().fg(ACCENT).bg(self.palette.focus)
         } else if current {
@@ -2270,12 +2340,13 @@ impl App {
             Style::default().fg(DIM)
         };
         spans.push(Span::styled("│", rule_style));
-        self.side_line(&mut spans, line.right, Side::New, right_width, side);
+        self.side_line(&mut spans, line.right, Side::New, right_width, side, false);
         Line::from(spans)
     }
 
-    /// Draws one half of a split line: a change or comment marker, the line
-    /// number, then the code.
+    /// Draws one half of a split line, or a whole inline one (`both`): a
+    /// change or comment marker, the line number (inline: old and new), then
+    /// the code.
     fn side_line(
         &mut self,
         spans: &mut Vec<Span<'static>>,
@@ -2283,6 +2354,7 @@ impl App {
         side: Side,
         width: u16,
         state: SideState,
+        both: bool,
     ) {
         if width == 0 {
             return;
@@ -2324,14 +2396,17 @@ impl App {
         };
         spans.push(Span::styled(lead, lead_style));
 
-        let label = match side {
-            Side::Old => diff_row.old,
-            Side::New => diff_row.new,
+        let numbered = |label: u32| {
+            if label > 0 {
+                format!("{label:>number$} ")
+            } else {
+                " ".repeat(number + 1)
+            }
         };
-        let label = if label > 0 {
-            format!("{label:>number$} ")
-        } else {
-            " ".repeat(number + 1)
+        let label = match (both, side) {
+            (true, _) => numbered(diff_row.old) + &numbered(diff_row.new),
+            (false, Side::Old) => numbered(diff_row.old),
+            (false, Side::New) => numbered(diff_row.new),
         };
         let gutter_style = if state.current {
             Style::default()
@@ -2356,7 +2431,7 @@ impl App {
             (RowKind::Removed, Side::Old) => self.palette.removed_word,
             _ => Color::Reset,
         };
-        let gutter = number + 2;
+        let gutter = if both { 2 * number + 3 } else { number + 2 };
         let available = (width as usize).saturating_sub(gutter);
         let overlay = state.highlighted.then_some(self.palette.focus);
         let used = text_spans(
@@ -2957,6 +3032,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("m", "comments: jump, resend, delete, post"),
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
+        ("i", "split or inline layout"),
         ("h l  ← →", "scroll sideways; 0 resets"),
         ("? q", "this help, quit"),
     ];
@@ -3632,6 +3708,54 @@ diff --git a/x b/x
             text,
             "> src/main.rs L11-L12 (new side). The diff includes the lines around that range:\n\n```diff\n@@ -10,3 +10,4 @@ fn main() {\n let a = 1;\n-let b = 2;\n+let b = 3;\n+let c = 4;\n }\n```\n\nboth new\n"
         );
+    }
+
+    #[test]
+    fn i_switches_to_one_column_with_removed_lines_above_added_ones() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('j'));
+        let row = app.current_row();
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.current_row(), row, "the cursor stays on its line");
+        let screen = draw(&mut app, 100, 16);
+        let lines: Vec<&str> = screen.lines().collect();
+        let removed = lines.iter().position(|line| line.contains("let b = 2;"));
+        let added = lines.iter().position(|line| line.contains("let b = 3;"));
+        assert!(
+            removed.is_some_and(|removed| added.is_some_and(|added| removed < added)),
+            "removed above added, each on its own line:\n{screen}"
+        );
+        let context = lines
+            .iter()
+            .find(|line| line.contains("let a = 1;"))
+            .expect("the context line");
+        assert!(context.contains("10") && !context.contains('│'));
+        assert_eq!(context.matches("let a = 1;").count(), 1, "drawn once");
+
+        press(&mut app, KeyCode::Char('i'));
+        let screen = draw(&mut app, 100, 16);
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("let b = 2;") && line.contains("let b = 3;"))
+        );
+    }
+
+    #[test]
+    fn a_comment_on_an_inline_removed_line_anchors_to_the_old_side() {
+        let mut app = App::new(
+            loaded(PATCH),
+            Options {
+                layout: Layout::Inline,
+                ..Options::default()
+            },
+        );
+        app.view = Rect::new(0, 1, 120, 20);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('C'));
+        let composer = app.composer.as_ref().expect("a comment box");
+        assert_eq!(composer.anchor.side, Side::Old);
+        assert_eq!(composer.anchor.start_line, 11);
     }
 
     #[test]

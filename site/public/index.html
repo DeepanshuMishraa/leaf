@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
-  /* White paper, flat and square. Color comes from the product: the terminal it runs in,
+  /* White paper, flat, softly rounded. Color comes from the product: the terminal it runs in,
      the six highlight colors, and the diff tints. */
   :root {
     --bg: #ffffff;
@@ -37,6 +37,9 @@
 
     --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
     --ease: cubic-bezier(.2, .7, .2, 1);
+    --r: 8px;      /* panels, cards, the terminal */
+    --r-sm: 5px;   /* buttons, chips, keys */
+    --r-xs: 2px;   /* color markers */
     color-scheme: light;
   }
   body::after {
@@ -86,7 +89,7 @@
   .wrap > *, section > *, .demo > *, .hero > * { min-width: 0; max-width: 100%; }
   nav { display: flex; align-items: center; gap: 1.5rem; font-size: .8125rem; flex-wrap: wrap; }
   nav .name { font-weight: 600; margin-right: auto; display: flex; align-items: center; gap: .55rem; }
-  nav .name i { width: 10px; height: 10px; background: var(--green); }
+  nav .name i { width: 10px; height: 10px; background: var(--green); border-radius: var(--r-xs); }
   nav a:not(.name) { color: var(--muted); transition: color .25s var(--ease); }
   nav a:not(.name):hover { color: var(--ink); }
   @media (max-width: 560px) { nav .opt { display: none; } }
@@ -96,7 +99,7 @@
   .ver {
     display: inline-flex; align-items: center; gap: .6rem;
     padding: .25rem .65rem;
-    border: 1px solid var(--rule);
+    border: 1px solid var(--rule); border-radius: var(--r-sm);
     font-size: .6875rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
   }
   .ver b { font-weight: 500; color: var(--ink); }
@@ -119,15 +122,28 @@
     max-width: 100%;
     padding: .7rem .7rem .7rem 1rem;
     background: var(--ink); color: #fff;
+    border-radius: var(--r);
     font: 400 .875rem/1 var(--mono);
   }
+  /* curl or brew: one box, the command swaps. */
+  .via { display: flex; flex: none; gap: .1rem; padding-right: .85rem; border-right: 1px solid #333; }
+  .via button {
+    padding: .3rem .5rem; border: 0; border-radius: var(--r-sm);
+    background: none; color: #8a8a8a;
+    font: inherit; font-size: .75rem; cursor: pointer;
+    transition: color .25s var(--ease), background-color .25s var(--ease);
+  }
+  .via button:hover { color: #fff; }
+  .via button[aria-selected="true"] { color: #fff; background: #262626; }
+  .end .via { border-color: var(--t-rule); }
+  .end .via button[aria-selected="true"] { background: var(--t-sel); }
   .install code { white-space: nowrap; overflow-x: auto; min-width: 0; }
   .install .p { color: var(--green); user-select: none; margin-right: 1ch; }
   .copy {
     position: relative; flex: none;
     width: 1.75rem; height: 1.75rem;
     display: grid; place-items: center;
-    border: 0; background: none; color: #9a9a9a;
+    border: 0; border-radius: var(--r-sm); background: none; color: #9a9a9a;
     cursor: pointer;
     transition: color .25s var(--ease), background-color .25s var(--ease);
   }
@@ -143,7 +159,7 @@
   .clip figcaption code { color: var(--ink); }
 
   /* The terminal frame */
-  .term { width: 100%; background: var(--t-bg); color: var(--t-fg); font: 400 .8125rem/1.7 var(--mono); text-align: left; box-shadow: 0 24px 48px -28px rgba(20, 16, 40, .45); }
+  .term { width: 100%; border-radius: var(--r); overflow: hidden; background: var(--t-bg); color: var(--t-fg); font: 400 .8125rem/1.7 var(--mono); text-align: left; box-shadow: 0 24px 48px -28px rgba(20, 16, 40, .45); }
   .bar {
     display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 1rem;
     padding: .55rem .9rem;
@@ -152,7 +168,7 @@
   }
   .bar > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .dots { display: flex; gap: 6px; }
-  .dots i { width: 9px; height: 9px; }
+  .dots i { width: 9px; height: 9px; border-radius: var(--r-xs); }
   .dots i:nth-child(1) { background: var(--red); }
   .dots i:nth-child(2) { background: var(--yellow); }
   .dots i:nth-child(3) { background: var(--green); }
@@ -171,22 +187,23 @@
   .head { display: grid; gap: .65rem; max-width: 38rem; }
   .head.center { justify-self: center; text-align: center; justify-items: center; }
   .label { display: inline-flex; align-items: center; gap: .55rem; font-size: .6875rem; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
-  .label i { width: 8px; height: 8px; background: var(--c, var(--ink)); }
+  .label i { width: 8px; height: 8px; border-radius: var(--r-xs); background: var(--c, var(--ink)); }
   h2 { margin: 0; font: 500 clamp(1.4rem, 3.6vw, 1.9rem)/1.15 var(--mono); letter-spacing: -.045em; text-wrap: balance; }
   .head p { margin: 0; color: var(--muted); font-size: .875rem; line-height: 1.7; text-wrap: pretty; }
   .head p code { color: var(--ink); }
 
   /* Formats */
-  .formats {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    border-top: 1px solid var(--rule);
-    border-left: 1px solid var(--rule);
+  /* Hairline grids: the 1px gaps show the rule color behind the cells. */
+  .formats, .facts, .commands {
+    display: grid; gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule); border-radius: var(--r);
+    overflow: hidden;
   }
+  .formats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .format {
     padding: 1.2rem 1.25rem 1.3rem;
-    border-right: 1px solid var(--rule);
-    border-bottom: 1px solid var(--rule);
+    background: var(--bg);
     display: grid; gap: .4rem; align-content: start;
     min-width: 0;
     position: relative;
@@ -195,7 +212,7 @@
   .format::before { content: ""; position: absolute; left: -1px; top: -1px; width: calc(100% + 2px); height: 3px; background: var(--c); transform: scaleX(0); transform-origin: left; transition: transform .45s var(--ease); }
   .format:hover::before { transform: none; }
   .format .ext { font-size: .6875rem; color: var(--muted); display: flex; gap: .5rem; align-items: center; }
-  .format .ext i { width: 8px; height: 8px; background: var(--c); }
+  .format .ext i { width: 8px; height: 8px; border-radius: var(--r-xs); background: var(--c); }
   .format h3 { margin: 0; font: 500 .9375rem/1.4 var(--mono); }
   .format p { margin: 0; color: var(--muted); font-size: .8125rem; line-height: 1.6; text-wrap: pretty; }
   .format p code { color: var(--ink); }
@@ -208,13 +225,13 @@
   .tab {
     display: inline-flex; align-items: center; gap: .5rem;
     padding: .4rem .75rem;
-    border: 1px solid var(--rule); background: var(--bg);
+    border: 1px solid var(--rule); border-radius: var(--r-sm); background: var(--bg);
     font: inherit; color: var(--muted);
     cursor: pointer;
     position: relative; overflow: hidden;
     transition: color .25s var(--ease), border-color .25s var(--ease), background-color .25s var(--ease);
   }
-  .tab i { width: 7px; height: 7px; background: var(--c); }
+  .tab i { width: 7px; height: 7px; border-radius: var(--r-xs); background: var(--c); }
   .tab:hover { color: var(--ink); border-color: var(--faint); }
   .tab[aria-selected="true"] { color: #fff; background: var(--ink); border-color: var(--ink); }
   .tab .progress { position: absolute; left: 0; bottom: 0; height: 2px; width: 100%; background: var(--c); transform: scaleX(0); transform-origin: left; }
@@ -242,7 +259,7 @@
   .doc .alert { border-left: 2px solid var(--blue); padding-left: .9rem; }
   .doc .alert b { color: var(--blue); font-weight: 500; display: block; }
   .doc pre { margin: 0; font: inherit; font-size: .75rem; line-height: 1.55; white-space: pre; }
-  .doc .code { padding: .5rem .8rem; background: rgba(0, 0, 0, .22); margin-bottom: .8rem; }
+  .doc .code { padding: .5rem .8rem; border-radius: var(--r-sm); background: rgba(0, 0, 0, .22); margin-bottom: .8rem; }
   .doc .fig { color: var(--t-fg); }
   .doc .fig .e { color: var(--t-dim); }
 
@@ -268,7 +285,7 @@
     color: var(--t-dim); font-size: .75rem; font-variant-numeric: tabular-nums;
   }
   .foot .place { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .foot .status { flex: none; padding: 0 .45rem; border: 1px solid var(--t-rule); color: var(--t-fg); transition: opacity .3s var(--ease); }
+  .foot .status { flex: none; padding: 0 .45rem; border: 1px solid var(--t-rule); border-radius: var(--r-sm); color: var(--t-fg); transition: opacity .3s var(--ease); }
   .foot .status:empty { opacity: 0; }
   .foot .k { color: var(--t-dim); }
 
@@ -277,7 +294,7 @@
     position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%);
     width: min(24rem, calc(100% - 2rem));
     padding: .9rem 1.1rem .7rem;
-    border: 1px solid var(--t-dim);
+    border: 1px solid var(--t-dim); border-radius: var(--r);
     background: var(--t-bg);
     display: grid; gap: .6rem;
     animation: pop .25s var(--ease);
@@ -292,7 +309,7 @@
   kbd {
     display: inline-block; min-width: 1.6em;
     padding: 0 .35em;
-    border: 1px solid var(--rule); border-bottom-width: 2px;
+    border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: var(--r-sm);
     background: var(--bg);
     font: 500 .75rem/1.5 var(--mono); color: var(--ink); text-align: center;
   }
@@ -322,7 +339,7 @@
   .dbar .acc { color: var(--purple); }
   .dhunk { padding: .45rem 1rem 0; font-size: .75rem; color: var(--t-dim); }
   .dfoot .r { float: right; }
-  .dbox { position: absolute; left: .5rem; right: .5rem; bottom: 2.4rem; padding: .35rem .6rem .45rem; border-top: 1px solid var(--t-dim); background: var(--t-bg); font-size: .75rem; }
+  .dbox { position: absolute; left: .5rem; right: .5rem; bottom: 2.4rem; padding: .35rem .6rem .45rem; border-radius: var(--r-sm) var(--r-sm) 0 0; border-top: 1px solid var(--t-dim); background: var(--t-bg); font-size: .75rem; }
   .dbox .dt { position: absolute; top: -.8em; left: .6rem; padding: 0 .35rem; background: var(--t-bg); color: var(--t-dim); }
   .dbox .cur { background: var(--t-fg); color: var(--t-bg); }
   .dbar .plus { color: var(--green); }
@@ -331,40 +348,35 @@
   .dfoot .q { color: var(--yellow); }
   .dfoot .t { color: var(--t-fg); }
   .dfoot .ok { color: var(--green); }
-  .commands { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; border-top: 1px solid var(--rule); border-left: 1px solid var(--rule); font-size: .8125rem; }
-  .commands div { padding: .75rem 1rem; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); display: grid; gap: .15rem; min-width: 0; }
+  .commands { grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: .8125rem; }
+  .commands div { padding: .75rem 1rem; background: var(--bg); display: grid; gap: .15rem; min-width: 0; }
   .commands code { overflow-wrap: anywhere; }
   .commands code .p { color: var(--faint); margin-right: 1ch; }
   .commands span { color: var(--muted); font-size: .75rem; }
   @media (max-width: 640px) { .commands { grid-template-columns: minmax(0, 1fr); } }
 
   /* Features */
-  .facts {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    border-top: 1px solid var(--rule);
-    border-left: 1px solid var(--rule);
-  }
+  .facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .fact {
     padding: 1.3rem 1.35rem 1.4rem;
-    border-right: 1px solid var(--rule);
-    border-bottom: 1px solid var(--rule);
+    background: var(--bg);
     min-width: 0;
     display: grid; gap: .45rem; align-content: start;
     transition: background-color .3s var(--ease);
   }
   .fact:hover { background: #fafafa; }
   .fact h3 { margin: 0; font: 500 .8125rem/1.5 var(--mono); display: flex; gap: .6rem; align-items: baseline; }
-  .fact h3 i { flex: none; width: 8px; height: 8px; background: var(--c); transform: translateY(-1px); }
+  .fact h3 i { flex: none; width: 8px; height: 8px; border-radius: var(--r-xs); background: var(--c); transform: translateY(-1px); }
   .fact p { margin: 0; color: var(--muted); font-size: .78rem; line-height: 1.65; text-wrap: pretty; }
   .fact p code { color: var(--ink); }
-  @media (max-width: 820px) { .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 820px) { .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } .fact:last-child:nth-child(odd) { grid-column: 1 / -1; } }
+  @media (max-width: 520px) { .fact:last-child:nth-child(odd) { grid-column: auto; } }
   @media (max-width: 520px) { .facts { grid-template-columns: minmax(0, 1fr); } }
 
   /* Keys */
   .keys { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2.5rem; }
   .keys h3 { margin: 0 0 .6rem; font: 500 .75rem/1.5 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: .55rem; }
-  .keys h3 i { width: 8px; height: 8px; background: var(--c); }
+  .keys h3 i { width: 8px; height: 8px; border-radius: var(--r-xs); background: var(--c); }
   .keys dl { margin: 0; display: grid; grid-template-columns: auto 1fr; border-top: 1px solid var(--rule); }
   .keys dt, .keys dd { margin: 0; padding: .45rem 0; border-bottom: 1px solid var(--rule); font-size: .78rem; }
   .keys dt { padding-right: 1.25rem; display: flex; gap: .25rem; flex-wrap: wrap; align-content: start; }
@@ -374,7 +386,7 @@
   /* Rex */
   .rexhead { display: grid; grid-template-columns: auto 1fr; gap: 1.5rem; align-items: center; }
   .rexicon { display: block; width: 72px; height: 72px; }
-  .rexgrid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); border: 1px solid var(--rule); }
+  .rexgrid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); border: 1px solid var(--rule); border-radius: var(--r); overflow: hidden; }
   .palette { background: var(--t-bg); color: var(--t-fg); font-size: .75rem; min-width: 0; }
   .palette .pin { padding: .75rem 1rem; border-bottom: 1px solid var(--t-rule); font-size: .8125rem; }
   .palette .pin .k { color: var(--purple); margin-right: .5ch; }
@@ -390,7 +402,7 @@
   .rexnotes p { margin: 0; color: var(--muted); font-size: .8125rem; line-height: 1.7; text-wrap: pretty; }
   .rexnotes p code { color: var(--ink); }
   .who { display: flex; flex-wrap: wrap; gap: .35rem; }
-  .who span { padding: .1rem .5rem; border: 1px solid var(--rule); font-size: .75rem; }
+  .who span { padding: .1rem .5rem; border: 1px solid var(--rule); border-radius: var(--r-sm); font-size: .75rem; }
   .rexchip { display: inline-flex; align-items: center; gap: .55rem; font-size: .75rem; color: var(--muted); border-bottom: 1px solid var(--rule); padding-bottom: .1rem; transition: color .25s var(--ease), border-color .25s var(--ease); }
   .rexchip:hover { color: var(--ink); border-color: var(--ink); }
   .rexchip img { width: 18px; height: 18px; display: block; }
@@ -398,12 +410,12 @@
   @media (max-width: 480px) { .rexhead { grid-template-columns: minmax(0, 1fr); } .rexicon { width: 56px; height: 56px; } }
 
   /* Closing */
-  .end { background: var(--t-bg); color: var(--t-fg); padding: clamp(2rem, 6vw, 3.5rem) clamp(1.25rem, 5vw, 3rem); display: grid; gap: 1.25rem; justify-items: center; text-align: center; }
+  .end { background: var(--t-bg); color: var(--t-fg); border-radius: var(--r); padding: clamp(2rem, 6vw, 3.5rem) clamp(1.25rem, 5vw, 3rem); display: grid; gap: 1.25rem; justify-items: center; text-align: center; }
   .end h2 { color: var(--t-fg); }
   .end p { margin: 0; color: var(--t-dim); font-size: .8125rem; max-width: 32rem; text-wrap: balance; }
   .end p code { color: var(--t-fg); }
   .end .install { background: var(--t-bar); outline: 1px solid var(--t-rule); }
-  .end .band { margin: 0; width: 8rem; height: 3px; }
+  .end .band { margin: 0; width: 8rem; height: 3px; border-radius: var(--r-xs); overflow: hidden; }
 
   footer { display: flex; justify-content: center; flex-wrap: wrap; gap: .5rem 1.5rem; color: var(--muted); font-size: .75rem; margin-top: -2rem; }
   footer a { transition: color .25s var(--ease); }
@@ -439,6 +451,10 @@
     <p class="sub">leaf opens PDFs, EPUBs, markdown and web articles as clean pages in your terminal's own colors, and reviews git diffs side by side. Search, highlight, draw, listen, or ask an agent without leaving the page.</p>
     <div class="cta">
       <div class="install">
+        <div class="via" role="tablist" aria-label="Install with">
+          <button type="button" role="tab" aria-selected="true" data-via="curl">curl</button>
+          <button type="button" role="tab" aria-selected="false" data-via="brew">brew</button>
+        </div>
         <code><span class="p">$</span><span class="cmd">curl -fsSL https://leaf.dipxsy.app | sh</span></code>
         <button class="copy" type="button" aria-label="Copy install command">
           <svg class="sheet" viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8.5" height="8.5"/><path d="M10.5 5V2H2.5V10.5H5"/></svg>
@@ -447,7 +463,7 @@
       </div>
       <a class="alt" href="#tour">Take the tour ↓</a>
     </div>
-    <p class="note">macOS 11+ and Linux with glibc 2.35+ (x86_64 or arm64; Linux needs ALSA, as desktops have). Installs <code>leaf</code> to ~/.local/bin, or updates the copy already on your PATH; <code>leaf upgrade</code> keeps it current. Elsewhere, with Rust: <code>cargo install leaf-reader</code>.</p>
+    <p class="note">macOS 11+ and Linux with glibc 2.35+ (x86_64 or arm64; Linux needs ALSA, as desktops have). Installs <code>leaf</code> to ~/.local/bin, or updates the copy already on your PATH; <code>leaf upgrade</code> keeps it current. With Homebrew, <code>brew upgrade leaf</code> does. Elsewhere, with Rust: <code>cargo install leaf-reader</code>.</p>
     <a class="rexchip" href="#rex"><img src="rex.png" width="18" height="18" alt="">Ships as a native Rex plugin</a>
 
     <figure class="clip">
@@ -626,6 +642,7 @@
           <dt><kbd>ctrl</kbd><kbd>g</kbd></dt><dd>Post it to GitHub</dd>
           <dt><kbd>m</kbd></dt><dd>List saved comments</dd>
           <dt><kbd>y</kbd><kbd>Y</kbd></dt><dd>Copy this range, or every comment</dd>
+          <dt><kbd>i</kbd></dt><dd>Side by side or inline</dd>
           <dt><kbd>o</kbd></dt><dd>Working tree or base branch</dd>
           <dt><kbd>r</kbd></dt><dd>Reload</dd>
         </dl>
@@ -677,6 +694,10 @@
     <h2 id="end-h">Open your next book in the terminal.</h2>
     <p>Then run <code>leaf open</code> on a PDF, an EPUB, a README or a link.</p>
     <div class="install">
+      <div class="via" role="tablist" aria-label="Install with">
+        <button type="button" role="tab" aria-selected="true" data-via="curl">curl</button>
+        <button type="button" role="tab" aria-selected="false" data-via="brew">brew</button>
+      </div>
       <code><span class="p">$</span><span class="cmd">curl -fsSL https://leaf.dipxsy.app | sh</span></code>
       <button class="copy" type="button" aria-label="Copy install command">
         <svg class="sheet" viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8.5" height="8.5"/><path d="M10.5 5V2H2.5V10.5H5"/></svg>
@@ -695,6 +716,21 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // curl or brew: every install box follows the last pick.
+  const installs = {
+    curl: "curl -fsSL https://leaf.dipxsy.app | sh",
+    brew: "brew install deepanshumishraa/tap/leaf",
+  };
+  for (const pick of document.querySelectorAll(".via button")) {
+    pick.addEventListener("click", () => {
+      const via = pick.dataset.via;
+      for (const tab of document.querySelectorAll(".via button")) {
+        tab.setAttribute("aria-selected", String(tab.dataset.via === via));
+      }
+      for (const cmd of document.querySelectorAll(".install .cmd")) cmd.textContent = installs[via];
+    });
+  }
 
   // Copy buttons
   for (const btn of document.querySelectorAll(".copy")) {

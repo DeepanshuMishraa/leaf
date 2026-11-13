@@ -117,6 +117,10 @@ pub enum UpgradeFailed {
         "The downloaded leaf {version} didn't run here ({cause}), so it wasn't installed. The current leaf is unchanged."
     )]
     Broken { version: Version, cause: String },
+    #[error(
+        "This leaf was installed with Homebrew, at {0}, so Homebrew upgrades it. Nothing was changed; run: brew upgrade leaf"
+    )]
+    Homebrew(PathBuf),
     #[error("Couldn't find where this leaf is installed ({0}). Nothing was changed.")]
     NoSelf(String),
     #[error(
@@ -275,6 +279,9 @@ fn installed_path() -> Result<PathBuf, UpgradeFailed> {
     let exe = exe
         .canonicalize()
         .map_err(|e| UpgradeFailed::NoSelf(format!("{}: {e}", exe.display())))?;
+    if is_homebrew(&exe) {
+        return Err(UpgradeFailed::Homebrew(exe));
+    }
     let dir = exe
         .parent()
         .ok_or_else(|| UpgradeFailed::NoSelf(format!("{} has no folder", exe.display())))?;
@@ -287,6 +294,14 @@ fn installed_path() -> Result<PathBuf, UpgradeFailed> {
             cause: e.to_string(),
         })?;
     Ok(exe)
+}
+
+/// Whether `exe` is a Homebrew keg's, which only `brew upgrade` should replace.
+fn is_homebrew(exe: &Path) -> bool {
+    let parts: Vec<_> = exe.components().map(|part| part.as_os_str()).collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == "Cellar" && pair[1] == "leaf")
 }
 
 /// Unpacks `archive`, runs the leaf in it, and renames it over `exe`.
@@ -425,6 +440,17 @@ mod tests {
             hex(&Sha256::digest(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn a_leaf_in_homebrews_cellar_is_left_to_brew() {
+        let brewed = |path: &str| is_homebrew(Path::new(path));
+        assert!(brewed("/opt/homebrew/Cellar/leaf/0.12.1/bin/leaf"));
+        assert!(brewed(
+            "/home/linuxbrew/.linuxbrew/Cellar/leaf/0.12.1/bin/leaf"
+        ));
+        assert!(!brewed("/Users/me/.local/bin/leaf"));
+        assert!(!brewed("/Users/me/.cargo/bin/leaf"));
     }
 
     #[test]

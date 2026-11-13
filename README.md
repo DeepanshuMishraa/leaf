@@ -9,6 +9,14 @@ curl -fsSL https://leaf.dipxsy.app | sh
 
 This installs a prebuilt `leaf` for macOS (11 or later) or Linux (glibc 2.35 or later, such as Ubuntu 22.04), on x86_64 or arm64, to `~/.local/bin`. If `leaf` is already installed, from `cargo install` too, it's updated where it is. The download is checked against its published SHA-256 and run once before it replaces anything. Set `LEAF_INSTALL_DIR` to install somewhere else, or `LEAF_VERSION` for a release other than the newest. On Linux, leaf needs the ALSA sound library (`libasound2t64` or `libasound2` on Debian and Ubuntu), which desktops already have.
 
+Or with Homebrew, on macOS or Linux:
+
+```sh
+brew install deepanshumishraa/tap/leaf
+```
+
+In a Brewfile, that's `brew "deepanshumishraa/tap/leaf"`. `brew upgrade leaf` updates it; `leaf upgrade` leaves a Homebrew install to Homebrew.
+
 `leaf version` prints the version, and `leaf upgrade` installs the newest release in place, checked the same way (`leaf upgrade --check` only says whether there is one). Releases are listed at https://github.com/DeepanshuMishraa/leaf/releases.
 
 To build from source instead, use Cargo:
@@ -77,12 +85,13 @@ leaf diff --branch                 # this branch against its base
 leaf diff main...HEAD              # any revision or range
 leaf diff src/viewer.rs            # one file
 leaf diff changes.patch            # a .diff or .patch file, anywhere
+leaf diff --inline                 # one column instead of side by side
 leaf diff https://github.com/owner/repo/pull/12
 ```
 
 Local diffs need a Git repository. A patch file and a GitHub pull request, commit or comparison link open without one. `o` flips between the working tree and the base branch, and `r` reloads.
 
-Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. Added and removed lines are tinted, with the changed words picked out. The tints follow the terminal's light or dark theme and switch with it while the diff is open in Rex (or another terminal that answers the `CSI ? 996 n` color-scheme query); other terminals are matched by their background color once. `LEAF_THEME=light` or `LEAF_THEME=dark` sets it outright.
+Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. `i` switches to one column, removed lines above added ones as `git diff` shows them, with both line numbers; `leaf diff --inline` opens that way. Comments and the changed-word highlighting work the same in both. Added and removed lines are tinted, with the changed words picked out. The tints follow the terminal's light or dark theme and switch with it while the diff is open in Rex (or another terminal that answers the `CSI ? 996 n` color-scheme query); other terminals are matched by their background color once. `LEAF_THEME=light` or `LEAF_THEME=dark` sets it outright.
 
 Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `v` enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `@` (or `ctrl+enter`) asks the agent pane about the range, or the current line: type the question and press enter. `C` comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
 
@@ -152,4 +161,4 @@ cargo test
 cargo clippy
 ```
 
-To release, set `version` in `Cargo.toml` (and `package.nix`, and the `ver` badge in `site/public/index.html`), run `cargo check` so `Cargo.lock` follows, commit, then push a matching tag: `git tag v0.12.0 && git push origin v0.12.0`. The release workflow checks the tag against `Cargo.toml` and runs the tests. It then builds and runs leaf for each of the four targets, and only once all four pass publishes a GitHub release with `leaf-<target>.tar.gz`, a `.sha256` for each and `SHA256SUMS`. Last, it installs that release with the install script on macOS and Linux. Pull requests that change the source (`src`, `vendor`, `lua`, `examples`), `Cargo.toml`, `Cargo.lock`, the workflow or the install script run the same tests and builds without publishing. The site, which serves the install script, deploys with `cd site && wrangler deploy`.
+To release, set `version` in `Cargo.toml` (and `package.nix`, and the `ver` badge in `site/public/index.html`), run `cargo check` so `Cargo.lock` follows, commit, then push a matching tag: `git tag v0.12.0 && git push origin v0.12.0`. The release workflow checks the tag against `Cargo.toml` and runs the tests. It then builds and runs leaf for each of the four targets, and only once all four pass publishes a GitHub release with `leaf-<target>.tar.gz`, a `.sha256` for each and `SHA256SUMS`. Last, it installs that release with the install script on macOS and Linux. A stable release also bumps `Formula/leaf.rb` in [DeepanshuMishraa/homebrew-tap](https://github.com/DeepanshuMishraa/homebrew-tap), written by `.github/homebrew-formula.sh` and pushed with the `HOMEBREW_TAP_DEPLOY_KEY` secret (the private half of a write deploy key on the tap). Pull requests that change the source (`src`, `vendor`, `lua`, `examples`), `Cargo.toml`, `Cargo.lock`, the workflow or the install script run the same tests and builds without publishing. The site, which serves the install script, deploys with `cd site && wrangler deploy`.

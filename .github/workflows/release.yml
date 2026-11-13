@@ -8,6 +8,9 @@
 # Each target ships as leaf-<target>.tar.gz beside a .sha256 file; the names
 # carry no version, which is what `leaf upgrade` and install.sh rely on.
 #
+# A stable release also bumps Formula/leaf.rb in DeepanshuMishraa/homebrew-tap,
+# pushed with the HOMEBREW_TAP_DEPLOY_KEY secret (a write deploy key on the tap).
+#
 # Pull requests that change the source or the build, and manual runs, build every target
 # without publishing, so a broken release is caught before a tag is pushed.
 
@@ -232,6 +235,42 @@ jobs:
           else
             gh release create "$TAG" dist/* --verify-tag --title "leaf $VERSION" --generate-notes "${flags[@]}"
           fi
+
+  homebrew:
+    name: Bump the Homebrew formula
+    needs: [check, release]
+    # Pre-releases stay out of the tap, as they stay out of `releases/latest`.
+    if: ${{ !contains(needs.check.outputs.version, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write Formula/leaf.rb and push it to the tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$TAP_KEY" ]; then
+            echo "::warning::HOMEBREW_TAP_DEPLOY_KEY isn't set, so DeepanshuMishraa/homebrew-tap still has the previous leaf. The release is published; bump the tap by hand with .github/homebrew-formula.sh."
+            exit 0
+          fi
+          gh release download "v$VERSION" -p SHA256SUMS -D "$RUNNER_TEMP"
+          key="$RUNNER_TEMP/tap_key"
+          printf '%s\n' "$TAP_KEY" > "$key" && chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 git@github.com:DeepanshuMishraa/homebrew-tap.git "$RUNNER_TEMP/tap"
+          sh .github/homebrew-formula.sh "$VERSION" "$RUNNER_TEMP/SHA256SUMS" > "$RUNNER_TEMP/tap/Formula/leaf.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/leaf.rb
+          git commit -m "leaf $VERSION" || { echo "Formula already at $VERSION"; exit 0; }
+          git push
 
   verify:
     name: Install from the release (${{ matrix.os }})

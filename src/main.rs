@@ -68,9 +68,10 @@ Diff options:
   --base <ref>       this branch against <ref>
   --range <spec>     any revision or range, such as main...HEAD
   --patch <file>     a .diff or .patch file
+  --inline           one column, removed lines above added ones (i switches)
 
 Diff keys: j/k move, v visual, C comment, m comments, f files, y copy, o other
-side, r reload, ? keys, q quit
+side, i split/inline, r reload, ? keys, q quit
 
 Pull request keys: tab summary/timeline, 3 code, m merge, x close/reopen, r ready/draft,
 a approve, c comment, o browser, y copy checkout, R reload, ? keys, q back
@@ -465,8 +466,8 @@ fn open(target: &str) -> ExitCode {
 }
 
 fn diff_command(args: &[String]) -> ExitCode {
-    let request = match diff_request(args) {
-        Ok(request) => request,
+    let (request, layout) = match diff_request(args) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("leaf: {message}");
             return ExitCode::from(2);
@@ -481,7 +482,8 @@ fn diff_command(args: &[String]) -> ExitCode {
         }
     };
     let failure = Rc::new(RefCell::new(None));
-    let options = diff_options(&loaded.key, failure.clone());
+    let mut options = diff_options(&loaded.key, failure.clone());
+    options.layout = layout;
     let result = diffview::run(loaded, options).map(|_| ());
     if let Some(message) = failure.borrow().as_ref() {
         eprintln!("leaf: {message}");
@@ -777,6 +779,7 @@ fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Op
         store: None,
         failure: failure.clone(),
         tabs: false,
+        layout: diffview::Layout::Split,
     };
     match Store::open(&progress::default_path()) {
         Ok(store) => {
@@ -818,9 +821,10 @@ fn set_origin(
 }
 
 /// Parses `leaf diff` arguments into a request, discovering the repository and
-/// making paths relative to its root.
-fn diff_request(args: &[String]) -> Result<diff::Request, String> {
+/// making paths relative to its root, and the layout to open it in.
+fn diff_request(args: &[String]) -> Result<(diff::Request, diffview::Layout), String> {
     let mut origin: Option<diff::Origin> = None;
+    let mut layout = diffview::Layout::Split;
     let mut base: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut options = true;
@@ -854,6 +858,7 @@ fn diff_request(args: &[String]) -> Result<diff::Request, String> {
                 "--branch" | "-b" => {
                     set_origin(&mut origin, diff::Origin::Branch { base: None }, "--branch")?;
                 }
+                "--inline" | "-i" => layout = diffview::Layout::Inline,
                 "--base" => base = Some(value(&mut at)?),
                 "--range" | "-r" => {
                     let spec = value(&mut at)?;
@@ -980,11 +985,14 @@ fn diff_request(args: &[String]) -> Result<diff::Request, String> {
     if local && repo.is_none() {
         return Err(diff::DiffFailed::NotRepo { path: cwd }.to_string());
     }
-    Ok(diff::Request {
-        origin,
-        repo,
-        paths: files,
-    })
+    Ok((
+        diff::Request {
+            origin,
+            repo,
+            paths: files,
+        },
+        layout,
+    ))
 }
 
 #[cfg(test)]

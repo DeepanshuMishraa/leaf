@@ -139,6 +139,9 @@ main() {
       return 0
     fi
     real=$(resolve "$existing")
+    case "$real" in
+      */Cellar/leaf/*) fail "leaf at $existing was installed with Homebrew. Upgrade it with: brew upgrade leaf" ;;
+    esac
     if [ -w "$(dirname "$real")" ]; then
       dest=$real
       say "Updating ${current:-the leaf} at $existing to leaf $version"

@@ -8,6 +8,7 @@ complete -c leaf -n '__fish_seen_subcommand_from diff' -s b -l branch -d 'This b
 complete -c leaf -n '__fish_seen_subcommand_from diff' -l base -x -a '(__fish_git_branches)' -d 'Compare against a base'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -s r -l range -x -d 'Revision or revision range'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -l patch -r -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
+complete -c leaf -n '__fish_seen_subcommand_from diff' -s i -l inline -d 'One column, removed lines above added ones'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
 complete -c leaf -n __fish_use_subcommand -a pr -d 'Read and act on your pull requests'
 complete -c leaf -n __fish_use_subcommand -a ask -d 'Ask an open agent about selected text'
