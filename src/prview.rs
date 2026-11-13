@@ -21,6 +21,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
+use dither_ratatui::dither_core::Field;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -28,8 +29,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::art;
 use crate::diff;
 use crate::diffview::Leave;
+use crate::look::Look;
 use crate::popover::{self, Edit};
 use crate::pr::{
     self, Action, CheckStatus, Detail, Entry, EventKind, Group, Mergeability, PrRef, Source, State,
@@ -349,6 +352,8 @@ impl Page {
 
 struct App {
     tx: Sender<Msg>,
+    /// The theme and the UI setting, followed while the view is open.
+    look: Look,
     rx: Receiver<Msg>,
     here: Option<String>,
     branch: Option<String>,
@@ -381,6 +386,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
     let gallery = Gallery::detect();
     let (tx, rx) = mpsc::channel();
     let mut app = App {
+        look: Look::detect(),
         tx,
         rx,
         here,
@@ -716,6 +722,9 @@ impl App {
             }
             self.prefetch();
             self.now = pr::now();
+            // Following the theme reads a reply from stdin, so only with no key waiting.
+            let idle = !event::poll(Duration::ZERO)?;
+            self.look.refresh(idle);
             self.gallery.begin();
             terminal.draw(|f| self.draw(f))?;
             self.gallery.flush()?;
@@ -1144,13 +1153,14 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let now = self.now;
+        let ink = self.look.ink();
         if let Some(page) = &mut self.page {
             let refreshing = self.inflight.contains(&page.pr);
-            draw_page(f, page, &mut self.gallery, now, refreshing);
+            draw_page(f, page, &mut self.gallery, now, refreshing, ink);
             return;
         }
         if let Some(list) = &mut self.list {
-            draw_list(f, list, now);
+            draw_list(f, list, now, ink);
         }
     }
 }
@@ -1245,7 +1255,7 @@ fn verdict_glyph(verdict: Verdict) -> (&'static str, Color) {
 
 /// The list: a title, a filter, then each heading's pull requests on two
 /// lines, title above and who and when below, in one centered column.
-fn draw_list(f: &mut Frame, list: &mut List, now: i64) {
+fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     let area = f.area();
     let (x, width) = column(area);
     let w = width as usize;
@@ -1302,6 +1312,10 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64) {
         } else {
             format!("Nothing matches “{}”.", list.typed)
         };
+        if let (true, Some(ink)) = (list.loading(), ink) {
+            let field = Rect::new(area.x, top + 2, area.width, room.saturating_sub(2) as u16);
+            art::field(f.buffer_mut(), field, ink, Field::Ripple, art::clock());
+        }
         let lines: Vec<Line> = wrap(&text, w).into_iter().map(Line::from).collect();
         f.render_widget(
             Paragraph::new(lines).style(dim),
@@ -1403,6 +1417,9 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64) {
             w,
         ),
     };
+    if let Some(ink) = ink {
+        art::chrome(f.buffer_mut(), area, x, width, 4, ink);
+    }
     f.render_widget(
         Paragraph::new(footer),
         Rect::new(x, (area.y + area.height).saturating_sub(1), width, 1),
@@ -1537,7 +1554,14 @@ fn column(area: Rect) -> (u16, u16) {
     (area.x + (area.width - width) / 2, width)
 }
 
-fn draw_page(f: &mut Frame, page: &mut Page, gallery: &mut Gallery, now: i64, refreshing: bool) {
+fn draw_page(
+    f: &mut Frame,
+    page: &mut Page,
+    gallery: &mut Gallery,
+    now: i64,
+    refreshing: bool,
+    ink: Option<art::Ink>,
+) {
     let area = f.area();
     let (x, width) = column(area);
     let w = width as usize;
@@ -1558,7 +1582,24 @@ fn draw_page(f: &mut Frame, page: &mut Page, gallery: &mut Gallery, now: i64, re
             let top = area.y + area.height.saturating_sub(height) / 2;
             let indent = if matches!(page.detail, Load::Loading) {
                 let text_width = page.pr.label().width() as u16 + 11;
-                x + width.saturating_sub(text_width) / 2
+                let indent = x + width.saturating_sub(text_width) / 2;
+                // A moving field while it loads, the words on a plate over it.
+                if let Some(ink) = ink {
+                    let field =
+                        Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
+                    art::field(f.buffer_mut(), field, ink, Field::Ripple, art::clock());
+                    let plate = Rect::new(
+                        indent.saturating_sub(3),
+                        top.saturating_sub(1),
+                        text_width + 6,
+                        3,
+                    )
+                    .intersection(area);
+                    f.render_widget(Clear, plate);
+                    art::surface(f.buffer_mut(), plate, ink);
+                    art::shadow(f.buffer_mut(), plate, ink);
+                }
+                indent
             } else {
                 x
             };
@@ -1720,9 +1761,19 @@ fn draw_page(f: &mut Frame, page: &mut Page, gallery: &mut Gallery, now: i64, re
         }
     }
 
+    if let Some(ink) = ink {
+        art::chrome(
+            f.buffer_mut(),
+            area,
+            x,
+            width,
+            header_height.saturating_sub(1),
+            ink,
+        );
+    }
     footer(f, page, area, x, width);
     if let Mode::Help = page.mode {
-        draw_help(f, area);
+        draw_help(f, area, ink);
     }
 }
 
@@ -1816,7 +1867,7 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
     f.render_widget(Paragraph::new(line), Rect::new(x, y, width, 1));
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
     let keys = [
         ("←→, tab", "Summary, Timeline, Code"),
         ("1, 2, 3", "the same tabs"),
@@ -1857,6 +1908,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         })
         .collect();
     f.render_widget(Clear, rect);
+    if let Some(ink) = ink {
+        art::surface(f.buffer_mut(), rect, ink);
+        art::shadow(f.buffer_mut(), rect, ink);
+    }
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Keys ")),
         rect,

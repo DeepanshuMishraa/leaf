@@ -25,13 +25,15 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::agent;
+use crate::art;
 use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
 use crate::github;
+use crate::look::Look;
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::remote;
 use crate::render::DIM;
-use crate::rextheme;
+use crate::scheme;
 use crate::syntax;
 use crate::theme::{self, Theme};
 
@@ -47,8 +49,6 @@ const HIGHLIGHT_CACHE: usize = 64;
 const HIGHLIGHT_BYTES: usize = 128 * 1024;
 /// How many rows one wheel notch moves.
 const WHEEL_ROWS: usize = 3;
-/// How often a terminal that reports its light or dark theme is asked again.
-const SCHEME_EVERY: Duration = Duration::from_secs(1);
 
 /// Line tints: the theme's own green, red and blue mixed over its background
 /// when the theme is known, otherwise fixed shades. Exact RGB either way, not
@@ -115,110 +115,9 @@ impl Palette {
     fn of_terminal(theme: Option<Theme>, light: bool) -> Self {
         theme.map_or_else(|| Palette::new(light), Palette::from_theme)
     }
-}
 
-/// Where the palette came from, which says whether and how it's rechecked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scheme {
-    /// `LEAF_THEME`, or a terminal that won't say when its theme changes.
-    Fixed,
-    /// Rex's saved theme, read again when Rex's or macOS's settings change.
-    Rex {
-        stamp: rextheme::Stamp,
-        checked: Instant,
-    },
-    /// The terminal reports its light or dark theme (Ghostty does), so it is
-    /// asked again every `SCHEME_EVERY`, and its colors read again on a switch.
-    Followed { light: bool, checked: Instant },
-}
-
-impl Scheme {
-    /// `LEAF_THEME` first, then Rex's theme, then the terminal's colors, then
-    /// its light or dark theme or background; the dark shades when none say.
-    #[cfg(not(test))]
-    fn detect() -> (Self, Palette) {
-        use std::io::IsTerminal;
-
-        // The setting holds even when stdin isn't a terminal to ask.
-        if let Some(light) = theme_hint(std::env::var("LEAF_THEME").ok().as_deref()) {
-            return (Scheme::Fixed, Palette::new(light));
-        }
-        let stamp = rextheme::stamp();
-        if let Some(theme) = rextheme::active() {
-            let checked = Instant::now();
-            return (Scheme::Rex { stamp, checked }, Palette::from_theme(theme));
-        }
-        if !io::stdin().is_terminal() {
-            return (Scheme::Fixed, Palette::dark());
-        }
-        let colors = Theme::query();
-        if let Some(light) = crate::viewer::query_color_scheme() {
-            let checked = Instant::now();
-            return (
-                Scheme::Followed { light, checked },
-                Palette::of_terminal(colors, light),
-            );
-        }
-        let light = colors.map_or_else(
-            || crate::viewer::query_color(11).is_some_and(theme::is_light),
-            Theme::is_light,
-        );
-        (Scheme::Fixed, Palette::of_terminal(colors, light))
-    }
-
-    #[cfg(test)]
-    fn detect() -> (Self, Palette) {
-        (Scheme::Fixed, Palette::dark())
-    }
-
-    /// Checks again once `SCHEME_EVERY` has passed; the new palette when the
-    /// theme changed.
-    fn refresh(&mut self) -> Option<Palette> {
-        let checked = match self {
-            Scheme::Fixed => return None,
-            Scheme::Rex { checked, .. } | Scheme::Followed { checked, .. } => checked,
-        };
-        if checked.elapsed() < SCHEME_EVERY {
-            return None;
-        }
-        *checked = Instant::now();
-        match self {
-            Scheme::Fixed => None,
-            Scheme::Rex { stamp, .. } => {
-                let now = rextheme::stamp();
-                if now == *stamp {
-                    return None;
-                }
-                *stamp = now;
-                rextheme::active().map(Palette::from_theme)
-            }
-            Scheme::Followed { light, .. } => match crate::viewer::query_color_scheme() {
-                Some(now) if now != *light => {
-                    *light = now;
-                    Some(Palette::of_terminal(Theme::query(), now))
-                }
-                _ => None,
-            },
-        }
-    }
-
-    /// How long the event loop may sleep before the scheme is due again.
-    fn due(self) -> Option<Duration> {
-        match self {
-            Scheme::Fixed => None,
-            Scheme::Rex { checked, .. } | Scheme::Followed { checked, .. } => {
-                Some(SCHEME_EVERY.saturating_sub(checked.elapsed()))
-            }
-        }
-    }
-}
-
-/// `LEAF_THEME=light` or `dark` sets the palette outright.
-fn theme_hint(value: Option<&str>) -> Option<bool> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "light" => Some(true),
-        "dark" => Some(false),
-        _ => None,
+    fn of(colors: scheme::Colors) -> Self {
+        Palette::of_terminal(colors.theme, colors.light)
     }
 }
 
@@ -595,7 +494,7 @@ impl Split {
 struct App {
     loaded: Loaded,
     palette: Palette,
-    scheme: Scheme,
+    look: Look,
     /// When the last key, click or paste came, so the terminal is asked
     /// about its theme only once the reader has paused.
     last_input: Instant,
@@ -646,11 +545,12 @@ impl App {
         let split = Split::new(&loaded.diff, options.layout);
         let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
-        let (scheme, palette) = Scheme::detect();
+        let look = Look::detect();
+        let palette = Palette::of(look.colors());
         let mut app = App {
             loaded,
             palette,
-            scheme,
+            look,
             last_input: Instant::now(),
             cursor,
             scroll: 0,
@@ -691,12 +591,11 @@ impl App {
             // The reply is read straight from stdin, so a key typed meanwhile
             // could be taken with it: ask only while the reader is idle (no
             // key waiting, none in the last second, not writing a comment).
-            let idle = self.composer.is_none() && self.last_input.elapsed() >= SCHEME_EVERY;
-            if idle
-                && !event::poll(Duration::ZERO)?
-                && let Some(palette) = self.scheme.refresh()
-            {
-                self.palette = palette;
+            let idle = self.composer.is_none()
+                && self.last_input.elapsed() >= scheme::EVERY
+                && !event::poll(Duration::ZERO)?;
+            if self.look.refresh(idle) {
+                self.palette = Palette::of(self.look.colors());
             }
             terminal.draw(|f| self.draw(f))?;
             if let Some(text) = self.copy.take() {
@@ -2159,6 +2058,9 @@ impl App {
         } else {
             self.status_line(area.width)
         };
+        if let Some(ink) = self.look.ink() {
+            art::surface(f.buffer_mut(), area, ink);
+        }
         f.render_widget(Paragraph::new(line), area);
     }
 
@@ -2229,14 +2131,43 @@ impl App {
         }
         let end = (self.scroll + area.height as usize).min(self.split.lines().len());
         let mut lines = Vec::with_capacity(end.saturating_sub(self.scroll));
+        // File headers, by screen row and the width of their text.
+        let mut headers = Vec::new();
         for index in self.scroll..end {
             let line = self.split.lines()[index];
             lines.push(match line.band {
-                Some(row) => self.row_line(row),
+                Some(row) => {
+                    let drawn = self.row_line(row);
+                    if self.loaded.diff.rows()[row].kind == RowKind::File {
+                        headers.push((index - self.scroll, drawn.width() as u16));
+                    }
+                    drawn
+                }
                 None => self.split_content(index, area.width),
             });
         }
+        let drawn = (end - self.scroll) as u16;
         f.render_widget(Paragraph::new(lines), area);
+        // Each file opens with a tinted bar whose text trails off in dither.
+        let Some(ink) = self.look.ink() else {
+            return;
+        };
+        if drawn < area.height {
+            let rest = Rect::new(
+                area.x,
+                area.y + drawn + 1,
+                area.width,
+                area.height - drawn - 1,
+            );
+            art::end(f.buffer_mut(), rest, ink);
+        }
+        for (y, used) in headers {
+            let row = Rect::new(area.x, area.y + y as u16, area.width, 1);
+            art::surface(f.buffer_mut(), row, ink);
+            let gap = used.saturating_add(2).min(row.width);
+            let trail = Rect::new(row.x + gap, row.y, row.width - gap, 1);
+            art::trail(f.buffer_mut(), trail, ink);
+        }
     }
 
     fn row_line(&mut self, index: usize) -> Line<'static> {
@@ -2599,6 +2530,9 @@ impl App {
         let height = visible as u16 + 1;
         let rect = Rect::new(area.x + 1, area.y + area.height - height, width, height);
         f.render_widget(Clear, rect);
+        if let Some(ink) = self.look.ink() {
+            art::surface(f.buffer_mut(), rect, ink);
+        }
         let title = format!(
             " {} {} ",
             composer.anchor.file,
@@ -2654,7 +2588,7 @@ impl App {
 
     fn draw_dialog(&mut self, f: &mut Frame, area: Rect, kind: DialogKind) {
         match kind {
-            DialogKind::Help => draw_help(f, area),
+            DialogKind::Help => draw_help(f, area, self.look.ink()),
             DialogKind::Loading => {
                 let text = match &self.dialog {
                     Dialog::Loading(text) => text.clone(),
@@ -2663,6 +2597,7 @@ impl App {
                 panel(
                     f,
                     area,
+                    self.look.ink(),
                     "loading",
                     vec![Line::from(Span::styled(text, Style::default().fg(DIM)))],
                     40,
@@ -2683,7 +2618,7 @@ impl App {
                     "Esc closes · r reloads",
                     Style::default().fg(DIM),
                 )));
-                panel(f, area, "could not finish", lines, width);
+                panel(f, area, self.look.ink(), "could not finish", lines, width);
             }
             DialogKind::Comments => self.draw_comments(f, area),
             DialogKind::Files => self.draw_files(f, area),
@@ -2760,7 +2695,7 @@ impl App {
             Span::styled("↑↓ move · enter open · esc close", Style::default().fg(DIM)),
             Span::styled(format!("  {shown}"), Style::default().fg(DIM)),
         ]));
-        panel(f, area, "files", lines, width);
+        panel(f, area, self.look.ink(), "files", lines, width);
     }
 
     fn draw_comments(&self, f: &mut Frame, area: Rect) {
@@ -2800,7 +2735,7 @@ impl App {
             "enter jump · a agent · g github · d delete · y copy · esc close",
             Style::default().fg(DIM),
         )));
-        panel(f, area, "comments", lines, width);
+        panel(f, area, self.look.ink(), "comments", lines, width);
     }
 
     fn draw_confirm(&self, f: &mut Frame, area: Rect) {
@@ -2842,7 +2777,7 @@ impl App {
             Span::styled("n", Style::default().fg(REMOVED_FG)),
             Span::styled(" back to editing", Style::default().fg(DIM)),
         ]));
-        panel(f, area, "post to github", lines, width);
+        panel(f, area, self.look.ink(), "post to github", lines, width);
     }
 
     fn has_pending_highlight(&self) -> bool {
@@ -3015,7 +2950,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
     let keys = [
         ("j k  ↑ ↓", "move between code lines"),
         ("d u", "half page down or up"),
@@ -3058,10 +2993,17 @@ fn draw_help(f: &mut Frame, area: Rect) {
         " Ctrl+G posts to GitHub · Esc cancels. `leaf comments` lists them.",
         Style::default().fg(DIM),
     )));
-    panel(f, area, "keys", lines, 78);
+    panel(f, area, ink, "keys", lines, 78);
 }
 
-fn panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, width: u16) -> Rect {
+fn panel(
+    f: &mut Frame,
+    area: Rect,
+    ink: Option<art::Ink>,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> Rect {
     let width = width.saturating_add(6).min(area.width);
     let height = (lines.len() as u16).saturating_add(2).min(area.height);
     let rect = Rect {
@@ -3071,6 +3013,10 @@ fn panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, widt
         height,
     };
     f.render_widget(Clear, rect);
+    if let Some(ink) = ink {
+        art::surface(f.buffer_mut(), rect, ink);
+        art::shadow(f.buffer_mut(), rect, ink);
+    }
     let block = Block::bordered()
         .border_style(Style::default().fg(DIM))
         .title(Line::from(format!(" {title} ")).style(Style::default().fg(DIM)));
@@ -3099,11 +3045,9 @@ impl App {
         } else {
             None
         };
-        // Wakes in time to ask the terminal whether it switched light or dark.
-        match (wait, self.scheme.due()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // Wakes in time to follow the theme and the UI setting.
+        let due = self.look.due();
+        Some(wait.map_or(due, |wait| wait.min(due)))
     }
 }
 
@@ -3114,27 +3058,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_palette_follows_hints_when_the_terminal_wont_say() {
-        assert_eq!(theme_hint(Some("Light")), Some(true));
-        assert_eq!(theme_hint(Some("dark")), Some(false));
-        assert_eq!(theme_hint(Some("solarized")), None);
-        assert_eq!(theme_hint(None), None);
-        assert_eq!(Scheme::Fixed.due(), None);
-        let mut fixed = Scheme::Fixed;
-        assert_eq!(fixed.refresh(), None);
-        let mut followed = Scheme::Followed {
-            light: true,
-            checked: Instant::now(),
-        };
-        assert!(followed.due().is_some_and(|wait| wait <= SCHEME_EVERY));
-        // Not due yet, so the terminal isn't asked.
-        assert_eq!(followed.refresh(), None);
-        let mut rex = Scheme::Rex {
-            stamp: rextheme::stamp(),
-            checked: Instant::now(),
-        };
-        assert!(rex.due().is_some_and(|wait| wait <= SCHEME_EVERY));
-        assert_eq!(rex.refresh(), None);
+    fn the_palette_falls_back_to_fixed_shades_when_the_terminal_wont_say() {
         assert_eq!(Palette::of_terminal(None, true), Palette::light());
         assert_eq!(Palette::of_terminal(None, false), Palette::dark());
     }

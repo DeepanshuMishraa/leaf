@@ -214,14 +214,20 @@ fn refresh_palettes() {
     let _ = crate::plugin::note_open(&state());
 }
 
-/// What leaf shows on this machine, as the plugin reads it: `document diff`, or `idle`.
+/// What leaf shows on this machine and the look it's in, as the plugin reads
+/// it: `document diff dither`, or `idle classic`.
 pub fn state() -> String {
     let open: Vec<&str> = Readers::here().open().into_iter().map(Kind::name).collect();
-    if open.is_empty() {
+    let open = if open.is_empty() {
         "idle".to_owned()
     } else {
         open.join(" ")
-    }
+    };
+    let ui = crate::progress::Store::open(&crate::progress::default_path())
+        .ok()
+        .and_then(|store| store.load_ui().ok())
+        .unwrap_or_default();
+    format!("{open} {}", ui.as_str())
 }
 
 fn inside_rex() -> bool {

@@ -64,6 +64,39 @@ impl ImageMode {
     }
 }
 
+/// How leaf's screens are drawn: with dithered bars, panels and margins in
+/// the theme's colors, or plain, as before the dither redesign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ui {
+    #[default]
+    Dither,
+    Classic,
+}
+
+impl Ui {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ui::Dither => "dither",
+            Ui::Classic => "classic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "dither" | "on" => Some(Ui::Dither),
+            "classic" | "off" => Some(Ui::Classic),
+            _ => None,
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Ui::Dither => Ui::Classic,
+            Ui::Classic => Ui::Dither,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Open,
@@ -370,6 +403,19 @@ impl Store {
 
     pub fn save_image_mode(&self, mode: ImageMode) -> Result<(), StoreFailed> {
         self.save_setting("image_mode", mode.as_str())
+    }
+
+    /// The UI picked with `leaf ui`; dither when none was.
+    pub fn load_ui(&self) -> Result<Ui, StoreFailed> {
+        Ok(self
+            .setting("ui")?
+            .as_deref()
+            .and_then(Ui::parse)
+            .unwrap_or_default())
+    }
+
+    pub fn save_ui(&self, ui: Ui) -> Result<(), StoreFailed> {
+        self.save_setting("ui", ui.as_str())
     }
 
     /// The voice that reads aloud, by its service name.
@@ -758,6 +804,17 @@ mod tests {
         assert_eq!(Progress::of(1, 613).percent, 0);
         assert_eq!(Progress::of(15, 613).percent, 2);
         assert_eq!(Progress::of(613, 613).percent, 100);
+    }
+
+    #[test]
+    fn the_ui_is_dither_until_classic_is_picked() {
+        let store = memory();
+        assert_eq!(store.load_ui().expect("loads"), Ui::Dither);
+        store.save_ui(Ui::Classic).expect("saves");
+        assert_eq!(store.load_ui().expect("loads"), Ui::Classic);
+        assert_eq!(Ui::Classic.toggled(), Ui::Dither);
+        assert_eq!(Ui::parse("off"), Some(Ui::Classic));
+        assert_eq!(Ui::parse("nope"), None);
     }
 
     #[test]

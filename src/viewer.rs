@@ -13,6 +13,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
+use dither_ratatui::dither_core::Field;
 use image::{DynamicImage, RgbaImage};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect, Size};
@@ -26,6 +27,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::agent::{self, Agent, AgentFailed};
 use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
+use crate::art;
 use crate::article;
 use crate::doc::{Doc, ImageRef};
 use crate::edge;
@@ -33,6 +35,7 @@ use crate::find::Query;
 use crate::highlight::{self, Highlight};
 use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
+use crate::look::Look;
 use crate::mono::{self, Rgb};
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::remote::{self, Command};
@@ -360,6 +363,8 @@ pub struct App {
     image_mode: ImageMode,
     ink: Option<Rgb>,
     paper: Option<Rgb>,
+    /// The theme and the UI setting, followed while the document is open.
+    look: Look,
     highlights: Vec<Highlight>,
     /// The color new highlights and ink come in.
     hue: Hue,
@@ -502,6 +507,7 @@ impl App {
             view_height: 1,
             ink: None,
             paper: None,
+            look: Look::detect(),
             selection: None,
             dialog: Dialog::None,
             remote: HashMap::new(),
@@ -963,6 +969,10 @@ impl App {
         }
         screen.resize(self.view(), None);
         self.screen = screen;
+        let ink = self.look.ink();
+        if let Some(ink) = ink {
+            art::curtains(f.buffer_mut(), area, self.column, ink);
+        }
 
         let selection = self.selection.map(Selection::range);
         let screen = self.screen.clone();
@@ -982,6 +992,21 @@ impl App {
         self.draw_figures(f, &screen);
         self.draw_strokes(area);
 
+        // The footer sits on a bar that dissolves up into the page.
+        if let (true, Some(ink)) = (area.height >= FOOTER_ROWS, ink) {
+            let bar = Rect {
+                y: area.bottom() - 2,
+                height: 2,
+                ..area
+            };
+            art::surface(f.buffer_mut(), bar, ink);
+            let edge = Rect {
+                y: bar.y - 1,
+                height: 1,
+                ..area
+            };
+            art::dissolve(f.buffer_mut(), edge, ink, art::Bar::Below);
+        }
         let footer = self.footer();
         let footer_area = Rect {
             x: area.x,
@@ -1010,6 +1035,9 @@ impl App {
         };
         // Kitty images sit above the text, so any under a panel would hide it.
         if let Some(panel) = panel {
+            if let Some(ink) = ink {
+                art::shadow(f.buffer_mut(), panel, ink);
+            }
             self.placements.retain(|(_, rect)| !rect.intersects(panel));
         }
     }
@@ -1042,8 +1070,17 @@ impl App {
         if row < prefix {
             if prefix == 3 && row == 1 {
                 let label = format!("·  {}  ·", page + 1);
-                let x = column.x + column.width.saturating_sub(label.chars().count() as u16) / 2;
+                let label_width = label.chars().count() as u16;
+                let x = column.x + column.width.saturating_sub(label_width) / 2;
                 buf.set_string(x, y, label, Style::default().fg(DIM));
+                let row = Rect {
+                    y,
+                    height: 1,
+                    ..column
+                };
+                if let Some(ink) = self.tints() {
+                    art::rule(buf, row, label_width, ink);
+                }
             }
             return;
         }
@@ -1145,7 +1182,23 @@ impl App {
                 let to = from + (last_y - first_y + 1) as u16;
                 let pixels = self.figure_pixels(&figure.href, figure.cols);
                 pixels_used.insert((figure.href.clone(), self.image_mode));
-                let Some(pixels) = pixels else { continue };
+                let Some(pixels) = pixels else {
+                    // An image still downloading shows a moving field in its place.
+                    let arriving = matches!(
+                        Doc::image_ref(&figure.href),
+                        ImageRef::Remote(url) if matches!(self.remote.get(url), Some(Remote::Loading))
+                    );
+                    if let (true, Some(ink)) = (arriving, self.tints()) {
+                        let rect = Rect {
+                            x: self.column.x + figure.x,
+                            y: self.column.y + first_y as u16,
+                            width: figure.cols,
+                            height: (last_y - first_y + 1) as u16,
+                        };
+                        art::field(f.buffer_mut(), rect, ink, Field::Noise, art::clock());
+                    }
+                    continue;
+                };
                 let key = ProtocolKey {
                     href: figure.href.clone(),
                     mode: self.image_mode,
@@ -1255,7 +1308,19 @@ impl App {
         });
     }
 
-    fn panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line>, width: u16) -> Rect {
+    /// The dither's tints, or `None` with the classic UI.
+    fn tints(&self) -> Option<art::Ink> {
+        self.look.ink()
+    }
+
+    fn panel(
+        f: &mut Frame,
+        area: Rect,
+        ink: Option<art::Ink>,
+        title: &str,
+        lines: Vec<Line>,
+        width: u16,
+    ) -> Rect {
         let height = lines.len() as u16 + 4;
         let width = (width + 8).min(area.width);
         let rect = Rect {
@@ -1265,6 +1330,9 @@ impl App {
             height: height.min(area.height),
         };
         f.render_widget(Clear, rect);
+        if let Some(ink) = ink {
+            art::surface(f.buffer_mut(), rect, ink);
+        }
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(DIM))
@@ -1362,7 +1430,7 @@ impl App {
                 ])
             })
             .collect();
-        Self::panel(f, area, "Keys", lines, width)
+        Self::panel(f, area, self.tints(), "Keys", lines, width)
     }
 
     /// How to mark up a document: highlights, colors, the pen and the eraser.
@@ -1424,7 +1492,7 @@ impl App {
             "  saved as you go · esc close",
             dim,
         )));
-        Self::panel(f, area, "Mark up", lines, 58)
+        Self::panel(f, area, self.tints(), "Mark up", lines, 58)
     }
 
     fn draw_goto(&self, f: &mut Frame, area: Rect, digits: &str, page_count: usize) -> Rect {
@@ -1442,7 +1510,14 @@ impl App {
             Line::default(),
             Line::from(Span::styled(hint, Style::default().fg(DIM))).centered(),
         ];
-        Self::panel(f, area, "Go to page", lines, hint.chars().count() as u16)
+        Self::panel(
+            f,
+            area,
+            self.tints(),
+            "Go to page",
+            lines,
+            hint.chars().count() as u16,
+        )
     }
 
     fn draw_find(&self, f: &mut Frame, area: Rect, typed: &str) -> Rect {
@@ -1459,7 +1534,7 @@ impl App {
             Line::from(Span::styled(hint, Style::default().fg(DIM))).centered(),
         ];
         let width = (hint.chars().count() as u16).max(typed.chars().count() as u16 + 1);
-        Self::panel(f, area, "Find", lines, width)
+        Self::panel(f, area, self.tints(), "Find", lines, width)
     }
 
     fn draw_ask(&self, f: &mut Frame, area: Rect, typed: &str, passage: &str) -> Rect {
@@ -1484,7 +1559,7 @@ impl App {
         let width = (hint.chars().count() as u16)
             .max(preview.chars().count() as u16 + 2)
             .max(typed.chars().count() as u16 + 1);
-        Self::panel(f, area, "Ask", lines, width)
+        Self::panel(f, area, self.tints(), "Ask", lines, width)
     }
 
     fn draw_bookmarks(&self, f: &mut Frame, area: Rect, selected: usize) -> Rect {
@@ -1497,7 +1572,7 @@ impl App {
                 ))
                 .centered(),
             ];
-            return Self::panel(f, area, "Bookmarks", lines, 42);
+            return Self::panel(f, area, self.tints(), "Bookmarks", lines, 42);
         }
         // As many as fit, keeping the picked one in view.
         let room = (area.height as usize).saturating_sub(8).max(1);
@@ -1534,7 +1609,7 @@ impl App {
             .max(hint.chars().count() as u16);
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
-        Self::panel(f, area, "Bookmarks", lines, width)
+        Self::panel(f, area, self.tints(), "Bookmarks", lines, width)
     }
 
     /// The voice picker: a search box over every voice, or a word that
@@ -1570,7 +1645,7 @@ impl App {
                 Line::default(),
                 Line::from(Span::styled("Loading voices…", Style::default().fg(DIM))),
             ];
-            return Self::panel(f, area, "Voice", lines, 52);
+            return Self::panel(f, area, self.tints(), "Voice", lines, 52);
         };
         let ranked = aloud::rank(voices, typed);
         let picked = picked_voice(&ranked, &current, typed, selected);
@@ -1637,7 +1712,7 @@ impl App {
         let width = (name_width + about_width + 4).max(hint.chars().count()) as u16;
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM))).centered());
-        Self::panel(f, area, "Voice", lines, width)
+        Self::panel(f, area, self.tints(), "Voice", lines, width)
     }
 
     /// Typing in the voice picker searches; enter reads in the picked voice
@@ -3081,6 +3156,11 @@ impl App {
             self.receive_images();
             self.advance_search(SEARCH_SLICE);
             let narrated = self.narrate();
+            // Following the terminal's theme reads its reply from stdin, so it's
+            // asked only after a wait that no key broke.
+            if self.look.refresh(quiet && !event::poll(Duration::ZERO)?) {
+                quiet = false;
+            }
             // Between words nothing on screen changes, so there's nothing to draw.
             if narrated || !quiet {
                 terminal.draw(|f| self.draw(f))?;
@@ -3114,6 +3194,9 @@ impl App {
             } else {
                 self.loading().then_some(Duration::from_millis(100))
             };
+            // Wakes in time to follow the theme and the UI setting.
+            let due = self.look.due();
+            let wait = Some(wait.map_or(due, |wait| wait.min(due)));
             quiet = false;
             if let Some(wait) = wait
                 && !event::poll(wait)?
@@ -3459,7 +3542,8 @@ mod tests {
         };
         let mut s = Screen::new(Doc::whole("Notes", text.clone()), 120, 30, options);
         s.press(KeyCode::Char(' '));
-        let frame = s.draw();
+        // The text alone: wide screens dither their margins with half blocks.
+        let frame = s.draw().replace(['▀', '▄'], " ");
         let top = frame
             .lines()
             .find(|l| !l.trim().is_empty())

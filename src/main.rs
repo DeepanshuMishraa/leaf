@@ -1,6 +1,7 @@
 mod agent;
 mod agentpick;
 mod aloud;
+mod art;
 mod article;
 mod comment;
 mod diff;
@@ -14,6 +15,7 @@ mod github;
 mod highlight;
 mod hue;
 mod kitty;
+mod look;
 mod markdown;
 mod memory;
 mod mermaid;
@@ -30,6 +32,7 @@ mod prview;
 mod remote;
 mod render;
 mod rextheme;
+mod scheme;
 mod shape;
 mod stroke;
 mod syntax;
@@ -59,6 +62,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]  
        leaf voice [name]        show or set the voice that reads aloud
        leaf voices              pick a voice from every voice there is
        leaf agents              pick the installed agent questions go to
+       leaf ui [dither | classic | toggle]   show or switch the dithered look (classic: as before)
        leaf version             print the installed version
        leaf upgrade [--check]   install the newest release (--check: only say if there is one)
 
@@ -274,6 +278,7 @@ fn main() -> ExitCode {
             }
         },
         "agents" => agents_command(),
+        "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
                 println!("{USAGE}");
@@ -410,6 +415,58 @@ fn voices_command(reader: Option<&str>) -> ExitCode {
 }
 
 /// Shows the installed agents; the one picked gets every question from now on.
+/// `leaf ui`: says which look is on, or switches it. Open readers, diffs and
+/// pull requests pick the change up within a second, and Rex's palette is
+/// refreshed so its Dither UI action shows the new state.
+fn ui_command(args: &[String]) -> ExitCode {
+    let store = match Store::open(&progress::default_path()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let current = match store.load_ui() {
+        Ok(ui) => ui,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let next = match args {
+        [] => {
+            println!("{}", current.as_str());
+            return ExitCode::SUCCESS;
+        }
+        [word] if word == "toggle" => current.toggled(),
+        [word] => match progress::Ui::parse(word) {
+            Some(ui) => ui,
+            None => {
+                eprintln!("Usage: leaf ui [dither | classic | toggle]");
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("Usage: leaf ui [dither | classic | toggle]");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = store.save_ui(next) {
+        eprintln!("leaf: {e} The look is still {}.", current.as_str());
+        return ExitCode::from(1);
+    }
+    // Without Rex there's no palette to refresh, which is fine.
+    let _ = plugin::note_open(&remote::state());
+    println!(
+        "{}",
+        match next {
+            progress::Ui::Dither => "Dither UI on.",
+            progress::Ui::Classic => "Classic UI on. `leaf ui dither` brings the dither back.",
+        }
+    );
+    ExitCode::SUCCESS
+}
+
 fn agents_command() -> ExitCode {
     let store = match Store::open(&progress::default_path()) {
         Ok(store) => store,
@@ -634,7 +691,7 @@ fn voice_command(args: &[String]) -> ExitCode {
 fn plugin_command(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         // The plugin asks at load which actions to offer: the kinds open,
-        // such as "document diff", or "idle".
+        // such as "document diff", or "idle", then the look, "dither" or "classic".
         Some("state") => {
             println!("{}", remote::state());
             ExitCode::SUCCESS

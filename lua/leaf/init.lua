@@ -381,6 +381,32 @@ function M.setup(opts)
 
   if open.document then reading_actions() end
 
+  -- The look ------------------------------------------------------------------
+  --
+  -- Rex's palette has no checkbox, so the title says whether the dither UI
+  -- is on. `leaf ui toggle` saves the choice, every open leaf picks it up,
+  -- and leaf reloads this config so the title follows.
+
+  local dither = not open.classic
+  rex.action{
+    name = "leaf_ui",
+    title = dither and "Leaf: Dither UI ✓" or "Leaf: Dither UI (Off)",
+    description = dither
+      and "The dithered look is on: tinted bars, dithered margins and panels in your theme's colors."
+        .. " Run to switch to the classic look."
+      or "The classic look is on. Run to turn the dithered look back on.",
+    category = "Leaf",
+    keywords = "leaf dither ui look style classic old toggle appearance theme on off",
+    run = function()
+      -- Detached: switching reloads this config, which would stop a command
+      -- this action is still waiting on.
+      local _, err = rex.exec.start(argv("ui", "toggle"), { env = env, detach = true })
+      if err ~= nil then
+        error("leaf: couldn't switch the look (" .. tostring(err) .. "). It is unchanged.", 0)
+      end
+    end,
+  }
+
   for short, key in pairs(opts.keys or {}) do
     rex.bind(key, "leaf_" .. short)
   end
