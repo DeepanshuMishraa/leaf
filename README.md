@@ -40,7 +40,7 @@ leaf open README.md
 leaf open https://example.com/post
 ```
 
-For zsh completions, link `completions/_leaf` into a directory on your `$fpath`. If you don't have one, add it in `~/.zshrc` before `compinit`:
+For zsh completions, from the repository root, link `completions/_leaf` into a directory on your `$fpath`. If you don't have one, add it in `~/.zshrc` before `compinit`:
 
 ```sh
 mkdir -p ~/.zsh/completions

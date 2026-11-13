@@ -1,6 +1,6 @@
 #compdef leaf
 # Completions for leaf. Install: copy to a directory on $fpath, e.g.
-#   cp completions/_leaf ~/.zsh/completions/   (then: autoload -U compinit && compinit)
+#   cp completions/_leaf ~/.zsh/completions/   (then: fpath=(~/.zsh/completions $fpath); autoload -U compinit && compinit)
 
 _leaf_refs() {
   local -a refs
@@ -9,13 +9,13 @@ _leaf_refs() {
 }
 
 _leaf_diff() {
-  _arguments -s \
+  _arguments \
     '(-s --staged)'{-s,--staged}'[staged changes]' \
     '(-b --branch)'{-b,--branch}'[this branch against its base branch]' \
     '(-i --inline)'{-i,--inline}'[one column, removed lines above added ones]' \
     '--base=[compare against a base]:ref:_leaf_refs' \
-    '(-r --range)'{-r+,--range=}'[revision or revision range]:range:' \
-    '--patch=[diff or patch file]:patch file:_files -g "*.(diff|patch)"' \
+    '(-r --range)'{-r,--range=}'[revision or revision range]:range:' \
+    '--patch=[diff or patch file]:patch file:_files -g "(#i)*.(diff|patch)"' \
     '*:path, revision or GitHub url:_files'
 }
 
@@ -46,7 +46,7 @@ _leaf() {
 
   case $subcommand in
     open)
-      _arguments '*:document:_files -g "*.(pdf|epub|md|markdown)"'
+      _arguments '*:document:_files -g "(#i)*.(pdf|epub|md|markdown)"'
       ;;
     diff)
       _leaf_diff
@@ -56,8 +56,8 @@ _leaf() {
       ;;
     ask)
       _arguments \
-        '--title=[document name quoted in the prompt]:title:' \
-        '--question=[question to send with the selection]:question:'
+        '--title[document name quoted in the prompt]:title:' \
+        '--question[question to send with the selection]:question:'
       ;;
     rex | plugin)
       _values 'action' install uninstall
