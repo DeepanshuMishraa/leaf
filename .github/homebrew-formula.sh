@@ -1,6 +1,6 @@
 #!/bin/sh
 # Prints the Homebrew formula for a leaf release, from its SHA256SUMS.
-#   sh .github/homebrew-formula.sh 0.13.0 SHA256SUMS > Formula/leaf.rb
+#   sh .github/homebrew-formula.sh 0.14.0 SHA256SUMS > Formula/leaf.rb
 # The release workflow runs this to bump DeepanshuMishraa/homebrew-tap.
 set -eu
 
