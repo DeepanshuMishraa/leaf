@@ -4,6 +4,11 @@ After an update, leaf shows the current version's notes once, over whatever
 it opens first. Each release needs a `## <version>` section with one line
 per change, starting with `- `.
 
+## 0.15.2
+
+- A calmer home screen: a greeting, today's reading time, the search and your documents, without the heat map, meters or fills.
+- Recent documents in the folder you started in no longer repeat its path.
+
 ## 0.15.1
 
 - The dithered look is now off by default. Turn it on with `leaf ui dither`, or "Leaf: Dither UI" in Rex's palette.

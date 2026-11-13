@@ -11,7 +11,6 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use std::collections::HashMap;
 
-use crate::art::Ink;
 use crate::home;
 use crate::look::Look;
 use crate::news::News;
@@ -220,8 +219,6 @@ pub fn pick(
                     here: root,
                     entries: &entries,
                     selected: picker.selected,
-                    ink: ink.unwrap_or_else(|| Ink::of_colors(look.colors())),
-                    dither: ink.is_some(),
                 },
             );
             if let Some(news) = &mut news {
