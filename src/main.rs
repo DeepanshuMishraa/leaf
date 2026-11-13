@@ -43,6 +43,7 @@ mod review;
 mod rextheme;
 mod scheme;
 mod shape;
+mod skills;
 mod spinner;
 mod stroke;
 mod syntax;
@@ -69,6 +70,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]  
        leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
+       leaf skills install | uninstall | status   teach coding agents to use leaf
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -264,6 +266,7 @@ fn main() -> ExitCode {
     );
     if !installing {
         let _ = plugin::refresh();
+        skills::refresh();
     }
     let Some((command, rest)) = args.split_first() else {
         if std::io::stdout().is_terminal() {
@@ -293,6 +296,7 @@ fn main() -> ExitCode {
         "agents" => agents_command(),
         "plan" => margin::plan_command(rest),
         "review" => margin::review_command(rest),
+        "skills" => skills::command(rest),
         "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {

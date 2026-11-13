@@ -192,7 +192,7 @@ fn loader(plugin_path: &Path, bin: &Path) -> String {
 }
 
 /// FNV-1a, 64 bits: stable across builds, unlike std's hasher.
-fn fnv1a(text: &str) -> u64 {
+pub(crate) fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
