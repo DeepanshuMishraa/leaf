@@ -27,6 +27,8 @@ mod place;
 mod plugin;
 mod popover;
 mod pr;
+#[cfg(target_os = "macos")]
+mod prefs;
 mod prmedia;
 mod progress;
 mod prview;

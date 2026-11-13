@@ -1,22 +1,17 @@
-//! Rex's theme, read from the Mac app's saved settings. Rex paints its theme
-//! in the app, while the terminal leaf talks to answers color queries with
-//! built-in defaults, so asking the terminal can't tell which theme is on.
-//! Reading the settings also follows a theme switch while leaf is open.
+//! Rex's theme, read from the Mac app's settings. Rex paints its theme in the
+//! app, while the terminal leaf talks to answers color queries with built-in
+//! defaults, so asking the terminal can't tell which theme is on. The
+//! settings are read through cfprefsd, which has a switch the moment Rex
+//! makes it; the plist on disk catches up only seconds later.
 
 use serde_json::Value;
 
 use crate::mono::Rgb;
 use crate::theme::Theme;
 
-/// What changes when Rex's theme choice or macOS's light or dark mode does:
-/// the modification times of the two settings files they're saved in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stamp([Option<std::time::SystemTime>; 2]);
-
-/// Rex's settings, relative to the home folder.
-const SETTINGS: &str = "Library/Preferences/com.superlogical.rex.plist";
-/// macOS's global settings, which hold its light or dark mode.
-const GLOBAL: &str = "Library/Preferences/.GlobalPreferences.plist";
+/// Rex's preferences domain.
+#[cfg(target_os = "macos")]
+const DOMAIN: &str = "com.superlogical.rex";
 /// Rex's built-in themes, inside the app.
 const CATALOG: &str =
     "Contents/Resources/SuperUI_SuperDesignTokens.bundle/Contents/Resources/themes.json";
@@ -33,48 +28,36 @@ fn home() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-pub fn stamp() -> Stamp {
-    let modified = |relative: &str| {
-        let path = home()?.join(relative);
-        std::fs::metadata(path).ok()?.modified().ok()
-    };
-    Stamp([modified(SETTINGS), modified(GLOBAL)])
-}
-
 /// The theme Rex shows now. `None` outside Rex, on a host without Rex's
 /// settings (a remote pane), or when they can't be read; the caller then
 /// asks the terminal.
 #[cfg(target_os = "macos")]
 pub fn active() -> Option<Theme> {
-    use plist::Value as Plist;
+    use crate::prefs::{self, Pref};
 
     if !inside_rex() {
         return None;
     }
-    let home = home()?;
-    let settings = Plist::from_file(home.join(SETTINGS)).ok()?;
-    let settings = settings.as_dictionary()?;
-    let text = |key: &str| settings.get(key).and_then(Plist::as_string);
-    let light = match text("Workspace.appearance") {
+    prefs::sync(DOMAIN);
+    let text = |key: &str| prefs::read(DOMAIN, key).and_then(|v| v.text().map(str::to_owned));
+    let light = match text("Workspace.appearance").as_deref() {
         Some("light") => true,
         Some("dark") => false,
         // Following macOS, whose AppleInterfaceStyle exists only in dark mode.
-        _ => Plist::from_file(home.join(GLOBAL))
-            .ok()
-            .and_then(|global| {
-                let style = global.as_dictionary()?.get("AppleInterfaceStyle")?;
-                style.as_string().map(|style| style != "Dark")
-            })
-            .unwrap_or(true),
+        _ => prefs::read_global("AppleInterfaceStyle")
+            .as_ref()
+            .and_then(Pref::text)
+            .is_none_or(|style| style != "Dark"),
     };
     let id = text(if light {
         "Workspace.lightThemeID"
     } else {
         "Workspace.darkThemeID"
     })?;
-    let custom = settings
-        .get("Workspace.customThemes")
-        .and_then(Plist::as_data)
+    let id = id.as_str();
+    let custom = prefs::read(DOMAIN, "Workspace.customThemes")
+        .as_ref()
+        .and_then(Pref::data)
         .and_then(|data| serde_json::from_slice::<Value>(data).ok());
     if let Some(theme) = custom.as_ref().and_then(|themes| custom_theme(themes, id)) {
         return Some(theme);

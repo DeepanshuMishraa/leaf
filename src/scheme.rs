@@ -1,13 +1,16 @@
 //! Which theme leaf draws in, and following it as it changes: `LEAF_THEME`,
-//! then Rex's saved theme, then the terminal's own colors.
+//! then Rex's theme, then the terminal's own colors.
 
 use std::time::{Duration, Instant};
 
 use crate::rextheme;
 use crate::theme::Theme;
 
-/// How often a theme that can change is checked again.
+/// How often a terminal's theme, or the UI setting, is checked again.
 pub const EVERY: Duration = Duration::from_secs(1);
+/// How often Rex's theme is read again: a cheap call to cfprefsd, often
+/// enough that the dither follows a switch along with the rest of Rex.
+pub const REX_EVERY: Duration = Duration::from_millis(250);
 
 /// What's known of the theme: its colors when it gave them, and whether it's light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,11 +39,8 @@ impl Colors {
 pub enum Scheme {
     /// `LEAF_THEME`, or a terminal that won't say when its theme changes.
     Fixed,
-    /// Rex's saved theme, read again when Rex's or macOS's settings change.
-    Rex {
-        stamp: rextheme::Stamp,
-        checked: Instant,
-    },
+    /// Rex's theme, read again every `REX_EVERY`.
+    Rex { checked: Instant },
     /// The terminal reports its light or dark theme (Ghostty does), so it is
     /// asked again every `EVERY`, and its colors read again on a switch.
     Followed { light: bool, checked: Instant },
@@ -58,10 +58,9 @@ impl Scheme {
         if let Some(light) = theme_hint(std::env::var("LEAF_THEME").ok().as_deref()) {
             return (Scheme::Fixed, Colors { theme: None, light });
         }
-        let stamp = rextheme::stamp();
         if let Some(theme) = rextheme::active() {
             let checked = Instant::now();
-            return (Scheme::Rex { stamp, checked }, Colors::of(theme));
+            return (Scheme::Rex { checked }, Colors::of(theme));
         }
         if !std::io::stdin().is_terminal() {
             return (Scheme::Fixed, Colors::DARK);
@@ -83,26 +82,29 @@ impl Scheme {
         (Scheme::Fixed, Colors::DARK)
     }
 
-    /// Checks again once `EVERY` has passed; the new colors when the theme changed.
+    /// How long this scheme waits between checks.
+    fn every(self) -> Duration {
+        match self {
+            Scheme::Rex { .. } => REX_EVERY,
+            Scheme::Fixed | Scheme::Followed { .. } => EVERY,
+        }
+    }
+
+    /// Checks again once its wait has passed: the colors now for Rex, which
+    /// the caller compares; for a terminal, new colors only on a switch.
     pub fn refresh(&mut self) -> Option<Colors> {
+        let every = self.every();
         let checked = match self {
             Scheme::Fixed => return None,
-            Scheme::Rex { checked, .. } | Scheme::Followed { checked, .. } => checked,
+            Scheme::Rex { checked } | Scheme::Followed { checked, .. } => checked,
         };
-        if checked.elapsed() < EVERY {
+        if checked.elapsed() < every {
             return None;
         }
         *checked = Instant::now();
         match self {
             Scheme::Fixed => None,
-            Scheme::Rex { stamp, .. } => {
-                let now = rextheme::stamp();
-                if now == *stamp {
-                    return None;
-                }
-                *stamp = now;
-                rextheme::active().map(Colors::of)
-            }
+            Scheme::Rex { .. } => rextheme::active().map(Colors::of),
             Scheme::Followed { light, .. } => match crate::viewer::query_color_scheme() {
                 Some(now) if now != *light => {
                     *light = now;
@@ -117,8 +119,8 @@ impl Scheme {
     }
 
     /// Whether checking again asks the terminal, which reads its reply from
-    /// stdin and could swallow a key typed meanwhile. Rex's theme is read
-    /// from its settings file, which is safe at any moment.
+    /// stdin and could swallow a key typed meanwhile. Rex's theme comes from
+    /// cfprefsd, which is safe at any moment.
     pub fn asks_terminal(self) -> bool {
         matches!(self, Scheme::Followed { .. })
     }
@@ -127,8 +129,8 @@ impl Scheme {
     pub fn due(self) -> Option<Duration> {
         match self {
             Scheme::Fixed => None,
-            Scheme::Rex { checked, .. } | Scheme::Followed { checked, .. } => {
-                Some(EVERY.saturating_sub(checked.elapsed()))
+            Scheme::Rex { checked } | Scheme::Followed { checked, .. } => {
+                Some(self.every().saturating_sub(checked.elapsed()))
             }
         }
     }
@@ -164,10 +166,9 @@ mod tests {
         // Not due yet, so the terminal isn't asked.
         assert_eq!(followed.refresh(), None);
         let mut rex = Scheme::Rex {
-            stamp: rextheme::stamp(),
             checked: Instant::now(),
         };
-        assert!(rex.due().is_some_and(|wait| wait <= EVERY));
+        assert!(rex.due().is_some_and(|wait| wait <= REX_EVERY));
         assert_eq!(rex.refresh(), None);
     }
 }

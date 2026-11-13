@@ -765,6 +765,8 @@ impl App {
                 .gallery
                 .next_redraw()
                 .map_or(idle, |next| next.clamp(Duration::from_millis(5), idle));
+            // Wakes in time to follow the theme and the UI setting.
+            let wait = wait.min(self.look.due());
             if !event::poll(wait)? {
                 continue;
             }
