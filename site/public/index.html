@@ -94,6 +94,19 @@
   nav a:not(.name):hover { color: var(--ink); }
   @media (max-width: 560px) { nav .opt { display: none; } }
 
+  /* GitHub link: the star count rolls up, then the star fills and throws off a few copies. */
+  .gh-stars { display: inline-flex; align-items: center; gap: .45rem; }
+  .gh-logo { width: 15px; height: 15px; flex: none; }
+  .gh-count { position: relative; display: inline-flex; align-items: center; gap: .35rem; font-variant-numeric: tabular-nums; }
+  .gh-particles { position: relative; display: inline-grid; width: 14px; height: 14px; }
+  .gh-particles svg { grid-area: 1 / 1; width: 14px; height: 14px; fill: transparent; stroke: currentColor; transition: fill .3s var(--ease), color .3s var(--ease); }
+  .gh-stars.full .gh-star { fill: var(--yellow); color: #c99a12; }
+  .gh-spark { pointer-events: none; fill: var(--yellow) !important; color: #c99a12; animation: gh-spark .8s var(--ease) forwards; }
+  @keyframes gh-spark {
+    from { transform: translate(0, 0) scale(.9); opacity: 1; }
+    to { transform: translate(var(--x), var(--y)) scale(.3); opacity: 0; }
+  }
+
   /* Hero */
   .hero { display: grid; justify-items: center; gap: 1rem; text-align: center; margin-top: -1.5rem; }
   .ver {
@@ -441,7 +454,10 @@
     <a class="opt" href="#diff">Diffs</a>
     <a class="opt" href="#keys">Keys</a>
     <a class="opt" href="#rex">Rex</a>
-    <a href="https://github.com/DeepanshuMishraa/leaf">GitHub</a>
+    <a class="gh-stars" id="gh-stars" href="https://github.com/DeepanshuMishraa/leaf" aria-label="leaf on GitHub">
+      <svg class="gh-logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+      <span class="gh-count"><span class="gh-number">GitHub</span><span class="gh-particles" aria-hidden="true"><svg class="gh-star" viewBox="0 0 24 24" stroke-width="2" stroke-linejoin="round"><path d="M12 2.5l2.9 6.1 6.6.9-4.8 4.6 1.2 6.6L12 17.5l-5.9 3.2 1.2-6.6L2.5 9.5l6.6-.9z"/></svg></span></span>
+    </a>
     <a href="https://crates.io/crates/leaf-reader">crates.io</a>
   </nav>
 
@@ -716,6 +732,52 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // GitHub stars: fetch the count, roll it up from zero, then fill the star and burst.
+  {
+    const link = $("gh-stars");
+    const number = link.querySelector(".gh-number");
+    const particles = link.querySelector(".gh-particles");
+    const star = particles.querySelector(".gh-star");
+    const [, owner, repo] = new URL(link.href).pathname.split("/");
+    const fmt = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
+
+    const burst = () => {
+      if (still) return;
+      for (let i = 0; i < 6; i++) {
+        const spark = star.cloneNode(true);
+        const angle = (i / 6) * Math.PI * 2 + Math.random() * .6;
+        const dist = 14 + Math.random() * 8;
+        spark.classList.replace("gh-star", "gh-spark");
+        spark.style.setProperty("--x", `${Math.cos(angle) * dist}px`);
+        spark.style.setProperty("--y", `${Math.sin(angle) * dist}px`);
+        spark.addEventListener("animationend", () => spark.remove());
+        particles.append(spark);
+      }
+    };
+
+    const roll = (stars) => {
+      const done = () => { number.textContent = fmt.format(stars); link.classList.add("full"); burst(); };
+      if (still) return done();
+      const start = performance.now();
+      const step = (now) => {
+        const t = Math.min((now - start) / 1200, 1);
+        number.textContent = fmt.format(Math.round(stars * (1 - (1 - t) ** 3)));
+        t < 1 ? requestAnimationFrame(step) : done();
+      };
+      requestAnimationFrame(step);
+    };
+
+    fetch(`https://api.github.com/repos/${owner}/${repo}`)
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`GitHub API ${res.status}`))))
+      .then((data) => {
+        if (typeof data.stargazers_count !== "number") throw new Error("GitHub API: no stargazers_count");
+        link.setAttribute("aria-label", `leaf on GitHub, ${data.stargazers_count} stars`);
+        roll(data.stargazers_count);
+        link.addEventListener("mouseenter", burst);
+      })
+      .catch((err) => console.warn("Star count unavailable; the link still shows 'GitHub'.", err));
+  }
 
   // curl or brew: every install box follows the last pick.
   const installs = {
