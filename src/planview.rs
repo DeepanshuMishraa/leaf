@@ -1144,12 +1144,15 @@ impl App {
                     } else {
                         Style::default().fg(DIM)
                     };
-                    let hint = if self.global.is_some() {
-                        "Global note"
-                    } else {
-                        "Global note · C to write one"
-                    };
-                    buf.set_string(text_x, y, hint, style);
+                    buf.set_string(text_x, y, "Whole plan", style);
+                    if self.global.is_none() && focused {
+                        buf.set_string(
+                            text_x + 11,
+                            y,
+                            "· c adds a note on all of it",
+                            Style::default().fg(DIM),
+                        );
+                    }
                 }
                 Row::GlobalNote => {
                     let text = self.global.as_deref().unwrap_or("");
@@ -1252,79 +1255,114 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let left = if let Some(toast) = &self.toast {
-            format!(" {toast}")
-        } else if self.composer.is_some() {
-            " enter save · alt+enter new line · esc discard".to_owned()
-        } else {
-            " j/k blocks · c comment · x remove · r replace · C global · L notes · S send · ? keys"
-                .to_owned()
-        };
+        let width = area.width as usize;
         let count = self.note_count();
         let right = match count {
-            0 => "no notes ".to_owned(),
-            1 => "1 note ".to_owned(),
-            n => format!("{n} notes "),
+            0 => String::new(),
+            n => format!("{} ", plural(n, "note")),
         };
-        let room = (area.width as usize).saturating_sub(right.width() + 1);
-        let left = clip(&left, room);
-        let pad = (area.width as usize).saturating_sub(left.width() + right.width());
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(left, Style::default().fg(DIM)),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(right, Style::default().fg(DIM)),
-            ])),
-            area,
-        );
+        let room = width.saturating_sub(right.width() + 1);
+        let mut spans = match &self.toast {
+            Some(toast) => vec![Span::styled(
+                clip(&format!(" {toast}"), room),
+                Style::default().fg(DIM),
+            )],
+            None => {
+                let keys: &[(&str, &str)] = if self.composer.is_some() {
+                    &[
+                        ("enter", "save"),
+                        ("alt+enter", "new line"),
+                        ("esc", "cancel"),
+                    ]
+                } else if self.selection.is_some() {
+                    &[
+                        ("c", "comment"),
+                        ("x", "remove"),
+                        ("r", "replace"),
+                        ("esc", "clear"),
+                    ]
+                } else {
+                    &[
+                        ("c", "comment"),
+                        ("x", "remove"),
+                        ("r", "replace"),
+                        ("S", "send"),
+                        ("C", "whole plan"),
+                        ("L", "notes"),
+                        ("?", "keys"),
+                    ]
+                };
+                hints(keys, room)
+            }
+        };
+        let used: usize = spans.iter().map(|span| span.content.width()).sum();
+        spans.push(Span::raw(
+            " ".repeat(width.saturating_sub(used + right.width())),
+        ));
+        spans.push(Span::styled(right, Style::default().fg(ACCENT)));
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_verdict(&self, f: &mut Frame, area: Rect) {
-        let review = self.review();
         let count = self.note_count();
-        let notes = match count {
-            0 => "no notes".to_owned(),
-            1 => "1 note".to_owned(),
-            n => format!("{n} notes"),
+        let title = match count {
+            0 => "Send review".to_owned(),
+            n => format!("Send review · {}", plural(n, "note")),
         };
-        let approve = if review.has_notes() {
-            "  a  approve, with these notes"
+        let key = |k: &'static str| Span::styled(format!("  {k}  "), Style::default().fg(ACCENT));
+        let changes = if count == 0 {
+            Line::from(vec![
+                Span::styled("  c  ", Style::default().fg(DIM)),
+                Span::styled(
+                    "Request changes (add a note first)",
+                    Style::default().fg(DIM),
+                ),
+            ])
         } else {
-            "  a  approve"
+            Line::from(vec![key("c"), Span::raw("Request changes")])
+        };
+        let approve = if count == 0 {
+            "Approve"
+        } else {
+            "Approve, with these notes"
         };
         let lines = vec![
             Line::from(Span::styled(
-                format!("Send the review ({notes})"),
+                title,
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(approve),
-            Line::from("  n  approve with notes"),
-            Line::from("  c  request changes"),
+            Line::from(vec![key("a"), Span::raw(approve)]),
+            changes,
             Line::from(""),
             Line::from(Span::styled(
                 "  esc  keep reviewing",
                 Style::default().fg(DIM),
             )),
         ];
-        popup(f, area, lines, 40);
+        popup(f, area, lines, 42);
     }
 
     fn draw_quit(&self, f: &mut Frame, area: Rect) {
+        let key = |k: &'static str| Span::styled(format!("  {k}  "), Style::default().fg(ACCENT));
         let lines = vec![
             Line::from(Span::styled(
-                format!("{} notes aren't sent yet", self.note_count()),
+                format!("{} not sent", plural(self.note_count(), "note")),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("  S    send them"),
-            Line::from("  y    quit; they stay for next time"),
+            Line::from(vec![key("S"), Span::raw("Send the review")]),
+            Line::from(vec![
+                key("q"),
+                Span::raw("Quit; they're kept for next time"),
+            ]),
+            Line::from(""),
             Line::from(Span::styled(
                 "  esc  keep reviewing",
                 Style::default().fg(DIM),
             )),
         ];
-        popup(f, area, lines, 40);
+        popup(f, area, lines, 42);
     }
 }
 
@@ -1360,6 +1398,25 @@ fn note_summary(note: &PlanNote) -> String {
         ""
     };
     format!("{label}  {first}{more}")
+}
+
+/// Key hints, `key action` apart, as many as fit `room` columns.
+fn hints(keys: &[(&str, &str)], room: usize) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1;
+    for (key, action) in keys {
+        let width = key.width() + 1 + action.width() + 3;
+        if used + width > room {
+            break;
+        }
+        used += width;
+        spans.push(Span::styled((*key).to_owned(), Style::default().fg(ACCENT)));
+        spans.push(Span::styled(
+            format!(" {action}   "),
+            Style::default().fg(DIM),
+        ));
+    }
+    spans
 }
 
 fn plural(count: usize, word: &str) -> String {
@@ -1726,7 +1783,7 @@ create table tokens (id int);
         let mut app = app();
         let screen = draw(&mut app, 90, 30);
         assert!(screen.contains("Review plan · plan.md"), "{screen}");
-        assert!(screen.contains("Global note · C to write one"), "{screen}");
+        assert!(screen.contains("Whole plan"), "{screen}");
         for number in ["  1", "  2", "  3", "  4"] {
             assert!(
                 screen

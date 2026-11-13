@@ -2162,18 +2162,29 @@ impl App {
             ))
         } else if self.overview.is_some() {
             let unsent = self.unsent();
-            let keys = format!(
-                " enter open · c note on file · C global note · V viewed · S send{} · q quit",
-                if unsent > 0 {
-                    format!(" ({unsent})")
-                } else {
-                    String::new()
-                }
+            let right = match unsent {
+                0 => String::new(),
+                1 => "1 note ".to_owned(),
+                n => format!("{n} notes "),
+            };
+            let room = (area.width as usize).saturating_sub(cells(&right) + 1);
+            let mut spans = hints(
+                &[
+                    ("enter", "open"),
+                    ("c", "note"),
+                    ("V", "viewed"),
+                    ("S", "send"),
+                    ("C", "whole change"),
+                    ("?", "keys"),
+                ],
+                room,
             );
-            Line::from(Span::styled(
-                clip(&keys, area.width as usize),
-                Style::default().fg(DIM),
-            ))
+            let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
+            spans.push(Span::raw(" ".repeat(
+                (area.width as usize).saturating_sub(used + cells(&right)),
+            )));
+            spans.push(Span::styled(right, Style::default().fg(ACCENT)));
+            Line::from(spans)
         } else if let Some(composer) = &self.composer {
             let keys = match composer.purpose {
                 Purpose::Comment => {
@@ -2935,6 +2946,25 @@ impl App {
     }
 }
 
+/// Key hints, `key action` apart, as many as fit `room` columns.
+fn hints(keys: &[(&str, &str)], room: usize) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1;
+    for (key, action) in keys {
+        let width = cells(key) + 1 + cells(action) + 3;
+        if used + width > room {
+            break;
+        }
+        used += width;
+        spans.push(Span::styled((*key).to_owned(), Style::default().fg(ACCENT)));
+        spans.push(Span::styled(
+            format!(" {action}   "),
+            Style::default().fg(DIM),
+        ));
+    }
+    spans
+}
+
 fn totals(diff: &Diff) -> (u32, u32) {
     diff.files().iter().fold((0, 0), |(added, removed), file| {
         (added + file.added, removed + file.removed)
@@ -3517,8 +3547,12 @@ impl App {
             }
         };
         let global = match &self.notes.global {
-            Some(note) => format!("   Global  {}", note.lines().next().unwrap_or_default()),
-            None => "   Global  C writes a note on the whole change".to_owned(),
+            Some(note) => format!(
+                "   Whole change  {}",
+                note.lines().next().unwrap_or_default()
+            ),
+            None if selected == 0 => "   Whole change · c adds a note on all of it".to_owned(),
+            None => "   Whole change".to_owned(),
         };
         let global_style = if self.notes.global.is_some() {
             pick(0).fg(ACCENT)
@@ -4329,7 +4363,7 @@ diff --git a/x b/x
         let screen = draw(&mut app, 100, 12);
         assert!(screen.contains("Review · test"), "{screen}");
         assert!(screen.contains("2 files"), "{screen}");
-        assert!(screen.contains("Global  C writes a note"), "{screen}");
+        assert!(screen.contains("Whole change"), "{screen}");
         assert!(
             screen.contains("a.rs") && screen.contains("b.rs"),
             "{screen}"
