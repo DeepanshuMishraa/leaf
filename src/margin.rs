@@ -31,7 +31,7 @@ pub enum Reply {
 #[derive(Debug, thiserror::Error)]
 pub enum MarginFailed {
     #[error(
-        "leaf can't show the review here: this isn't a terminal and not a Rex pane, so there's nowhere to open it. Ask the person to run `{command}` in their terminal; the review will come back to you as a message."
+        "There's nowhere to show the review: this isn't a terminal, and not a Rex pane where it could open beside you. Ask the person to run `{command}` in their terminal; the review will come back to you as a message."
     )]
     Nowhere { command: String },
     #[error("Opening the review pane beside the agent failed ({0}). Nothing was sent.")]
@@ -126,10 +126,13 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             .display()
             .to_string();
         let (draft, save, failure) = drafts(&key);
+        // A round that can't be kept only loses the comparison with the last one.
+        let (round, previous) = record_round(&key, &source).unwrap_or((1, None));
         let plan = Plan {
             subject: request.file.clone(),
             source,
-            round: None,
+            round: Some(round),
+            previous,
             draft,
             save,
         };
@@ -396,6 +399,32 @@ fn margin_dir() -> PathBuf {
     crate::progress::default_path().with_file_name("margin")
 }
 
+/// Keeps `text` as the next round of the plan `key` when it differs from the
+/// last one, and says which round it is and what the round before said.
+fn record_round(key: &str, text: &str) -> std::io::Result<(u32, Option<String>)> {
+    let dir = margin_dir()
+        .join("rounds")
+        .join(format!("{:016x}", crate::plugin::fnv1a(key)));
+    record_round_in(&dir, text)
+}
+
+fn record_round_in(dir: &Path, text: &str) -> std::io::Result<(u32, Option<String>)> {
+    std::fs::create_dir_all(dir)?;
+    let read = |round: u32| std::fs::read_to_string(dir.join(format!("{round}.md"))).ok();
+    let last = std::fs::read_dir(dir)?
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            name.to_str()?.strip_suffix(".md")?.parse::<u32>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    if last > 0 && read(last).as_deref() == Some(text) {
+        return Ok((last, last.checked_sub(1).and_then(read)));
+    }
+    std::fs::write(dir.join(format!("{}.md", last + 1)), text)?;
+    Ok((last + 1, read(last)))
+}
+
 /// A fresh file for one round's result.
 fn result_path() -> PathBuf {
     let stamp = std::time::SystemTime::now()
@@ -609,6 +638,27 @@ mod tests {
             None
         );
         assert_eq!(parse_outcome("{\"outcome\":\"other\"}"), None);
+    }
+
+    #[test]
+    fn a_new_round_is_kept_only_when_the_plan_changed() {
+        let dir = std::env::temp_dir().join(format!("leaf-rounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(record_round_in(&dir, "one").ok(), Some((1, None)));
+        assert_eq!(record_round_in(&dir, "one").ok(), Some((1, None)));
+        assert_eq!(
+            record_round_in(&dir, "two").ok(),
+            Some((2, Some("one".into())))
+        );
+        assert_eq!(
+            record_round_in(&dir, "two").ok(),
+            Some((2, Some("one".into())))
+        );
+        assert_eq!(
+            record_round_in(&dir, "three").ok(),
+            Some((3, Some("two".into())))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

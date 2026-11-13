@@ -43,6 +43,8 @@ pub struct Plan {
     pub source: String,
     /// The plan's round, from the second submission on.
     pub round: Option<u32>,
+    /// The plan as the round before submitted it, to show what changed.
+    pub previous: Option<String>,
     /// Notes left last time and not sent, as `save` wrote them.
     pub draft: Option<String>,
     pub save: SaveDraft,
@@ -133,6 +135,11 @@ struct App {
     subject: String,
     round: Option<u32>,
     blocks: Vec<Block>,
+    /// The blocks the round before had, when there was one: a block not
+    /// among them is new or rewritten.
+    before: Option<std::collections::HashSet<String>>,
+    /// How many of the round before's blocks are gone.
+    dropped_blocks: usize,
     /// Each block laid out at `laid_width`.
     laid: Vec<Laid>,
     laid_width: u16,
@@ -167,6 +174,8 @@ impl App {
         let mut app = App {
             subject: plan.subject,
             round: plan.round,
+            before: None,
+            dropped_blocks: 0,
             blocks,
             laid: Vec::new(),
             laid_width: 0,
@@ -185,6 +194,17 @@ impl App {
             text_x: 0,
             save: plan.save,
         };
+        if let Some(previous) = plan.previous.as_deref() {
+            let before: std::collections::HashSet<String> = planblocks::blocks(previous)
+                .into_iter()
+                .map(|block| block.text)
+                .collect();
+            app.dropped_blocks = before
+                .iter()
+                .filter(|text| !app.blocks.iter().any(|block| &block.text == *text))
+                .count();
+            app.before = Some(before);
+        }
         if let Some(draft) = plan.draft.as_deref() {
             app.restore(draft);
         }
@@ -307,6 +327,35 @@ impl App {
             .iter()
             .enumerate()
             .filter(move |(_, note)| block_of(&note.target) == block)
+    }
+
+    /// Whether block `block` is new or rewritten since the round before.
+    fn changed(&self, block: usize) -> bool {
+        self.before
+            .as_ref()
+            .is_some_and(|before| !before.contains(&self.blocks[block].text))
+    }
+
+    fn changed_count(&self) -> usize {
+        (0..self.blocks.len()).filter(|b| self.changed(*b)).count()
+    }
+
+    /// `D`: the next block that changed since the round before, coming round
+    /// to the first after the last.
+    fn next_change(&mut self) {
+        if self.before.is_none() {
+            self.toast = Some("this is the plan's first round, so nothing to compare".into());
+            return;
+        }
+        let here = self.focus_index();
+        let count = self.blocks.len();
+        let found = (1..=count)
+            .map(|step| ((here + step as isize).rem_euclid(count.max(1) as isize)) as usize)
+            .find(|block| self.changed(*block));
+        match found {
+            Some(block) => self.set_focus_index(block as isize),
+            None => self.toast = Some("no block changed since the last round".into()),
+        }
     }
 
     /// Whether the whole block is marked for removal.
@@ -806,6 +855,10 @@ impl App {
                     self.persist();
                 }
             },
+            KeyCode::Char('D') => {
+                self.selection = None;
+                self.next_change()
+            }
             KeyCode::Char('L') => {
                 if self.notes.is_empty() {
                     self.toast = Some("no notes yet".into());
@@ -1051,7 +1104,16 @@ impl App {
             .map(|round| format!(" · round {round}"))
             .unwrap_or_default();
         let left = format!(" Review plan · {}{round}", self.subject);
-        let right = format!("{} blocks ", self.blocks.len());
+        let right = if self.before.is_some() {
+            let changed = self.changed_count();
+            let gone = match self.dropped_blocks {
+                0 => String::new(),
+                n => format!(" · {n} gone"),
+            };
+            format!("{changed} changed{gone} · D next change ")
+        } else {
+            format!("{} blocks ", self.blocks.len())
+        };
         let pad = (area.width as usize).saturating_sub(left.width() + right.width());
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1108,6 +1170,14 @@ impl App {
                             Style::default().fg(DIM)
                         };
                         buf.set_string(left, y, number, style);
+                        if self.changed(block) {
+                            buf.set_string(
+                                left + 3,
+                                y,
+                                "+",
+                                Style::default().fg(Hue::Green.marker()),
+                            );
+                        }
                     }
                     let crossed = self.removed(block);
                     let marks = self.passage_marks(block);
@@ -1373,6 +1443,7 @@ const KEYS: &[(&str, &str)] = &[
     ("C", "global note on the whole plan"),
     ("X", "clear the block's notes"),
     ("L", "every note: go to, edit or delete one"),
+    ("D", "next block that changed since the last round (+)"),
     ("drag", "select a passage; c, x and r then act on it"),
     ("S", "send the review with a verdict"),
     ("q", "quit"),
@@ -1460,6 +1531,7 @@ create table tokens (id int);
             subject: "plan.md".into(),
             source: PLAN.into(),
             round: None,
+            previous: None,
             draft: None,
             save: Box::new(|_| {}),
         })
@@ -1473,6 +1545,7 @@ create table tokens (id int);
             subject: "plan.md".into(),
             source: source.into(),
             round: None,
+            previous: None,
             draft,
             save: Box::new(move |json| *sink.borrow_mut() = json.map(str::to_owned)),
         });
@@ -1803,6 +1876,49 @@ create table tokens (id int);
         let first = text.find("first").unwrap_or(usize::MAX);
         let last = text.find("last").unwrap_or(0);
         assert!(first < last, "{text}");
+    }
+
+    #[test]
+    fn a_later_round_marks_what_changed_and_d_steps_through_it() {
+        let previous =
+            PLAN.replace("- Backfill it", "- Backfill everything") + "\nA gone paragraph.\n";
+        let mut app = App::new(Plan {
+            subject: "plan.md".into(),
+            source: PLAN.into(),
+            round: Some(2),
+            previous: Some(previous),
+            draft: None,
+            save: Box::new(|_| {}),
+        });
+        assert!(!app.changed(0));
+        assert!(app.changed(2));
+        assert_eq!(app.changed_count(), 1);
+        assert_eq!(app.dropped_blocks, 2);
+        let screen = draw(&mut app, 90, 30);
+        assert!(
+            screen.contains("Review plan · plan.md · round 2"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("1 changed · 2 gone · D next change"),
+            "{screen}"
+        );
+        assert!(screen.contains("  3+"), "{screen}");
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.focus, Focus::Block(2));
+        press(&mut app, KeyCode::Char('D'));
+        assert_eq!(app.focus, Focus::Block(2));
+    }
+
+    #[test]
+    fn d_on_a_first_round_says_there_is_nothing_to_compare() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('D'));
+        assert!(
+            app.toast
+                .as_deref()
+                .is_some_and(|t| t.contains("first round"))
+        );
     }
 
     #[test]

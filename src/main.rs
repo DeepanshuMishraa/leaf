@@ -15,6 +15,7 @@ mod gec;
 mod github;
 mod highlight;
 mod home;
+mod hook;
 mod hue;
 mod kitty;
 mod look;
@@ -71,6 +72,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]  
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf skills install | uninstall | status   teach coding agents to use leaf
+       leaf hook install | uninstall | status     set up every agent CLI here for plan review
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -296,7 +298,8 @@ fn main() -> ExitCode {
         "agents" => agents_command(),
         "plan" => margin::plan_command(rest),
         "review" => margin::review_command(rest),
-        "skills" => skills::command(rest),
+        "skills" | "skill" => skills::command(rest),
+        "hook" | "hooks" => hook::command(rest),
         "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
