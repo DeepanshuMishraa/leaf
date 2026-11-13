@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
@@ -30,6 +30,11 @@ const GUTTER: u16 = 6;
 const HALF_STEP: usize = 5;
 const WHEEL_STEP: usize = 3;
 const ACCENT: Color = Color::Blue;
+const SELECTION: Color = Color::Indexed(8);
+
+/// Hears the unsent notes, as JSON, each time they change; `None` once the
+/// review is sent and there's nothing left to keep.
+pub type SaveDraft = Box<dyn FnMut(Option<&str>)>;
 
 /// What is being reviewed.
 pub struct Plan {
@@ -38,6 +43,9 @@ pub struct Plan {
     pub source: String,
     /// The plan's round, from the second submission on.
     pub round: Option<u32>,
+    /// Notes left last time and not sent, as `save` wrote them.
+    pub draft: Option<String>,
+    pub save: SaveDraft,
 }
 
 /// Where the cursor is: the row for notes on the whole plan, or a block
@@ -48,10 +56,17 @@ enum Focus {
     Block(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the composer is writing. `editing` names the note being rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Writing {
-    Comment(usize),
-    Replace(usize),
+    Comment {
+        target: PlanTarget,
+        editing: Option<usize>,
+    },
+    Replace {
+        target: PlanTarget,
+        editing: Option<usize>,
+    },
     Global,
 }
 
@@ -67,6 +82,19 @@ enum Dialog {
     Help,
     Verdict,
     Quit,
+    /// Every note, with the one picked.
+    Notes {
+        selected: usize,
+    },
+}
+
+/// Text selected with the mouse inside one block: character offsets into
+/// that block's laid-out text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    block: usize,
+    start: usize,
+    end: usize,
 }
 
 /// One screen row of the plan, and what it belongs to.
@@ -103,7 +131,6 @@ fn no_images(_: &str) -> Option<(u32, u32)> {
 
 struct App {
     subject: String,
-    source: String,
     round: Option<u32>,
     blocks: Vec<Block>,
     /// Each block laid out at `laid_width`.
@@ -121,6 +148,12 @@ struct App {
     dialog: Dialog,
     toast: Option<String>,
     outcome: Option<Outcome>,
+    selection: Option<Selection>,
+    /// Where a mouse drag started: a block and an offset in its text.
+    drag: Option<(usize, usize)>,
+    /// The text column's left edge, as last drawn, for clicks.
+    text_x: u16,
+    save: SaveDraft,
 }
 
 impl App {
@@ -131,9 +164,8 @@ impl App {
         } else {
             Focus::Block(0)
         };
-        App {
+        let mut app = App {
             subject: plan.subject,
-            source: plan.source,
             round: plan.round,
             blocks,
             laid: Vec::new(),
@@ -148,7 +180,100 @@ impl App {
             dialog: Dialog::None,
             toast: None,
             outcome: None,
+            selection: None,
+            drag: None,
+            text_x: 0,
+            save: plan.save,
+        };
+        if let Some(draft) = plan.draft.as_deref() {
+            app.restore(draft);
         }
+        app
+    }
+
+    // Unsent notes, kept between runs. A note is tied to its block's text,
+    // so one whose block was rewritten since is dropped rather than misplaced.
+
+    fn draft_json(&self) -> Option<String> {
+        if self.note_count() == 0 {
+            return None;
+        }
+        let notes: Vec<serde_json::Value> = self
+            .notes
+            .iter()
+            .map(|note| {
+                let block = block_of(&note.target);
+                let quote = match &note.target {
+                    PlanTarget::Passage { quote, .. } => Some(quote.as_str()),
+                    PlanTarget::Block { .. } => None,
+                };
+                let body = match &note.edit {
+                    PlanEdit::Comment(body) | PlanEdit::Replace(body) => Some(body.as_str()),
+                    PlanEdit::Remove => None,
+                };
+                serde_json::json!({
+                    "block": self.blocks.get(block).map(|b| b.text.as_str()),
+                    "index": block,
+                    "kind": note.edit.kind(),
+                    "quote": quote,
+                    "body": body,
+                })
+            })
+            .collect();
+        Some(serde_json::json!({ "global": self.global, "notes": notes }).to_string())
+    }
+
+    fn restore(&mut self, draft: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(draft) else {
+            return;
+        };
+        self.global = value["global"]
+            .as_str()
+            .map(str::to_owned)
+            .filter(|g| !g.is_empty());
+        let mut dropped = 0;
+        for saved in value["notes"].as_array().into_iter().flatten() {
+            let text = saved["block"].as_str().unwrap_or_default();
+            let index = saved["index"].as_u64().map(|i| i as usize);
+            // The same place first, then the same text anywhere.
+            let block = index
+                .filter(|i| self.blocks.get(*i).is_some_and(|b| b.text == text))
+                .or_else(|| self.blocks.iter().position(|b| b.text == text));
+            let body = saved["body"].as_str().map(str::to_owned);
+            let edit = match (saved["kind"].as_str(), body) {
+                (Some("comment"), Some(body)) => PlanEdit::Comment(body),
+                (Some("replace"), Some(body)) => PlanEdit::Replace(body),
+                (Some("remove"), _) => PlanEdit::Remove,
+                _ => {
+                    dropped += 1;
+                    continue;
+                }
+            };
+            let Some(block) = block else {
+                dropped += 1;
+                continue;
+            };
+            let target = match saved["quote"].as_str() {
+                Some(quote) => self.passage_target(block, quote),
+                None => self.block_target(block),
+            };
+            self.notes.push(PlanNote { target, edit });
+        }
+        let kept = self.note_count();
+        self.toast = Some(match (kept, dropped) {
+            (0, 0) => return,
+            (kept, 0) => format!("{} from last time", plural(kept, "note")),
+            (kept, dropped) => format!(
+                "{} from last time; {} no longer match the plan and were dropped",
+                plural(kept, "note"),
+                dropped
+            ),
+        });
+    }
+
+    fn persist(&mut self) {
+        let json = self.draft_json();
+        (self.save)(json.as_deref());
     }
 
     fn lay_out(&mut self, width: u16) {
@@ -184,9 +309,11 @@ impl App {
             .filter(move |(_, note)| block_of(&note.target) == block)
     }
 
+    /// Whether the whole block is marked for removal.
     fn removed(&self, block: usize) -> bool {
-        self.notes_on(block)
-            .any(|(_, note)| note.edit == PlanEdit::Remove)
+        self.notes_on(block).any(|(_, note)| {
+            note.edit == PlanEdit::Remove && matches!(note.target, PlanTarget::Block { .. })
+        })
     }
 
     /// Every row of the plan, top to bottom.
@@ -284,18 +411,89 @@ impl App {
         }
     }
 
-    fn compose(&mut self, writing: Writing) {
-        let text = match writing {
-            Writing::Comment(_) => String::new(),
-            Writing::Replace(block) => self
-                .notes_on(block)
-                .find_map(|(_, note)| match &note.edit {
-                    PlanEdit::Replace(with) => Some(with.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| self.blocks[block].text.clone()),
-            Writing::Global => self.global.clone().unwrap_or_default(),
+    /// The selection, or else the block under the cursor, as a note target.
+    fn target_here(&self) -> Option<PlanTarget> {
+        if let Some(selection) = self.selection {
+            let quote = self.selected_text(selection);
+            if !quote.trim().is_empty() {
+                return Some(self.passage_target(selection.block, &quote));
+            }
+        }
+        match self.focus {
+            Focus::Block(block) => Some(self.block_target(block)),
+            Focus::Global => None,
+        }
+    }
+
+    fn compose_comment(&mut self) {
+        let Some(target) = self.target_here() else {
+            return self.compose_global();
         };
+        self.selection = None;
+        self.composer = Some(Composer {
+            writing: Writing::Comment {
+                target,
+                editing: None,
+            },
+            text: String::new(),
+        });
+    }
+
+    fn compose_replace(&mut self) {
+        let Some(target) = self.target_here() else {
+            self.toast = Some("move to a block, or select a passage, to replace it".into());
+            return;
+        };
+        self.selection = None;
+        // An earlier replacement of the same thing is edited, not doubled.
+        let editing = self
+            .notes
+            .iter()
+            .position(|note| note.target == target && matches!(note.edit, PlanEdit::Replace(_)));
+        let text = match editing.map(|at| &self.notes[at].edit) {
+            Some(PlanEdit::Replace(with)) => with.clone(),
+            _ => target_text(&target).to_owned(),
+        };
+        self.composer = Some(Composer {
+            writing: Writing::Replace { target, editing },
+            text,
+        });
+    }
+
+    fn compose_global(&mut self) {
+        self.composer = Some(Composer {
+            writing: Writing::Global,
+            text: self.global.clone().unwrap_or_default(),
+        });
+    }
+
+    /// Opens note `index` in the composer to rewrite it.
+    fn edit_note(&mut self, index: usize) {
+        let Some(note) = self.notes.get(index) else {
+            return;
+        };
+        let target = note.target.clone();
+        let (writing, text) = match &note.edit {
+            PlanEdit::Comment(body) => (
+                Writing::Comment {
+                    target,
+                    editing: Some(index),
+                },
+                body.clone(),
+            ),
+            PlanEdit::Replace(with) => (
+                Writing::Replace {
+                    target,
+                    editing: Some(index),
+                },
+                with.clone(),
+            ),
+            PlanEdit::Remove => {
+                self.toast = Some("a removal has no text to edit; x deletes it".into());
+                return;
+            }
+        };
+        self.dialog = Dialog::None;
         self.composer = Some(Composer { writing, text });
     }
 
@@ -307,6 +505,31 @@ impl App {
             lines: b.lines,
             text: b.text.clone(),
         }
+    }
+
+    /// A passage of block `block`, with the source lines it spans when found.
+    fn passage_target(&self, block: usize, quote: &str) -> PlanTarget {
+        let b = &self.blocks[block];
+        let lines = planblocks::locate(&b.text, quote)
+            .map(|(first, last)| (first + b.lines.0 - 1, last + b.lines.0 - 1));
+        PlanTarget::Passage {
+            quote: quote.trim().to_owned(),
+            block: b.index,
+            lines,
+        }
+    }
+
+    fn selected_text(&self, selection: Selection) -> String {
+        self.laid
+            .get(selection.block)
+            .map(|laid| {
+                laid.text
+                    .iter()
+                    .skip(selection.start)
+                    .take(selection.end.saturating_sub(selection.start))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn save_composer(&mut self) {
@@ -323,56 +546,115 @@ impl App {
                     "global note cleared".into()
                 });
             }
-            Writing::Comment(_) if text.is_empty() => {
-                self.toast = Some("empty comment discarded".into());
+            Writing::Comment { editing, .. } if text.is_empty() => {
+                if let Some(at) = editing {
+                    self.notes.remove(at);
+                    self.toast = Some("comment deleted".into());
+                } else {
+                    self.toast = Some("empty comment discarded".into());
+                }
             }
-            Writing::Comment(block) => {
+            Writing::Comment {
+                editing: Some(at), ..
+            } => {
+                if let Some(note) = self.notes.get_mut(at) {
+                    note.edit = PlanEdit::Comment(text);
+                }
+                self.toast = Some("comment updated".into());
+            }
+            Writing::Comment {
+                target,
+                editing: None,
+            } => {
+                self.toast = Some(format!("comment on {} saved", target_label(&target)));
                 self.notes.push(PlanNote {
-                    target: self.block_target(block),
+                    target,
                     edit: PlanEdit::Comment(text),
                 });
-                self.toast = Some(format!("comment on block {} saved", block + 1));
             }
-            Writing::Replace(block) => {
-                self.notes.retain(|note| {
-                    !(block_of(&note.target) == block
-                        && matches!(note.edit, PlanEdit::Replace(_) | PlanEdit::Remove))
-                });
-                if text.is_empty() || text == self.blocks[block].text.trim() {
+            Writing::Replace { target, editing } => {
+                if let Some(at) = editing {
+                    self.notes.remove(at);
+                }
+                if text.is_empty() || text == target_text(&target).trim() {
                     self.toast = Some("unchanged, so nothing to replace".into());
                 } else {
+                    // A replaced block isn't also removed.
+                    self.notes
+                        .retain(|note| !(note.target == target && note.edit == PlanEdit::Remove));
+                    self.toast = Some(format!("replacement for {} saved", target_label(&target)));
                     self.notes.push(PlanNote {
-                        target: self.block_target(block),
+                        target,
                         edit: PlanEdit::Replace(text),
                     });
-                    self.toast = Some(format!("replacement for block {} saved", block + 1));
                 }
             }
         }
+        self.persist();
         self.follow();
     }
 
+    /// `x`: removes the selected passage, or marks (and unmarks) the block.
+    fn remove_here(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            let quote = self.selected_text(selection);
+            if !quote.trim().is_empty() {
+                let target = self.passage_target(selection.block, &quote);
+                self.toast = Some(format!("{} marked for removal", target_label(&target)));
+                self.notes.push(PlanNote {
+                    target,
+                    edit: PlanEdit::Remove,
+                });
+                self.persist();
+                return;
+            }
+        }
+        match self.focus {
+            Focus::Block(block) => self.toggle_remove(block),
+            Focus::Global => self.toast = Some("move to a block to mark it for removal".into()),
+        }
+    }
+
+    fn delete_note(&mut self, index: usize) {
+        if index < self.notes.len() {
+            self.notes.remove(index);
+            self.toast = Some("note deleted".into());
+            self.persist();
+        }
+    }
+
+    /// Note indexes in the order the list shows them: by block, then as written.
+    fn listed(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.notes.len()).collect();
+        order.sort_by_key(|at| block_of(&self.notes[*at].target));
+        order
+    }
+
     fn toggle_remove(&mut self, block: usize) {
+        let target = self.block_target(block);
         if self.removed(block) {
             self.notes
-                .retain(|note| !(block_of(&note.target) == block && note.edit == PlanEdit::Remove));
+                .retain(|note| !(note.target == target && note.edit == PlanEdit::Remove));
             self.toast = Some(format!("block {} kept", block + 1));
         } else {
+            // A removed block isn't also replaced.
             self.notes.retain(|note| {
-                !(block_of(&note.target) == block && matches!(note.edit, PlanEdit::Replace(_)))
+                !(note.target == target && matches!(note.edit, PlanEdit::Replace(_)))
             });
             self.notes.push(PlanNote {
-                target: self.block_target(block),
+                target,
                 edit: PlanEdit::Remove,
             });
             self.toast = Some(format!("block {} marked for removal", block + 1));
         }
+        self.persist();
     }
 
     fn clear_block(&mut self, block: usize) {
         let before = self.notes.len();
         self.notes.retain(|note| block_of(&note.target) != block);
         let cleared = before - self.notes.len();
+        self.persist();
         self.toast = Some(match cleared {
             0 => "no notes on this block".into(),
             1 => "1 note cleared".into(),
@@ -403,6 +685,50 @@ impl App {
             verdict,
             text: review.render(asked),
         });
+        (self.save)(None);
+    }
+
+    fn notes_key(&mut self, key: KeyEvent, selected: usize) {
+        let listed = self.listed();
+        let picked = listed.get(selected).copied();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => self.dialog = Dialog::None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                let selected = (selected + 1).min(listed.len().saturating_sub(1));
+                self.dialog = Dialog::Notes { selected };
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.dialog = Dialog::Notes {
+                    selected: selected.saturating_sub(1),
+                };
+            }
+            KeyCode::Enter => {
+                if let Some(at) = picked {
+                    let block = block_of(&self.notes[at].target);
+                    self.dialog = Dialog::None;
+                    self.set_focus_index(block as isize);
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(at) = picked {
+                    self.edit_note(at);
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('d') => {
+                if let Some(at) = picked {
+                    self.delete_note(at);
+                    let left = self.notes.len();
+                    self.dialog = if left == 0 {
+                        Dialog::None
+                    } else {
+                        Dialog::Notes {
+                            selected: selected.min(left - 1),
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
     }
 
     fn key(&mut self, key: KeyEvent) {
@@ -435,6 +761,7 @@ impl App {
                 }
                 return;
             }
+            Dialog::Notes { selected } => return self.notes_key(key, selected),
             Dialog::None => {}
         }
         self.toast = None;
@@ -443,7 +770,15 @@ impl App {
             Focus::Block(block) => Some(block),
             Focus::Global => None,
         };
+        // Moving the cursor lets go of a selection.
+        if matches!(
+            key.code,
+            KeyCode::Char('j' | 'k' | 'J' | 'K' | 'g' | 'G') | KeyCode::Down | KeyCode::Up
+        ) {
+            self.selection = None;
+        }
         match key.code {
+            KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('c') if ctrl => self.outcome = Some(Outcome::Closed),
             KeyCode::Char('j') | KeyCode::Down => self.step(1),
             KeyCode::Char('k') | KeyCode::Up => self.step(-1),
@@ -459,26 +794,25 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.set_focus_index(-1),
             KeyCode::Char('G') | KeyCode::End => self.set_focus_index(self.blocks.len() as isize),
-            KeyCode::Char('c') | KeyCode::Enter => match block {
-                Some(block) => self.compose(Writing::Comment(block)),
-                None => self.compose(Writing::Global),
-            },
-            KeyCode::Char('C') => self.compose(Writing::Global),
-            KeyCode::Char('x') => match block {
-                Some(block) => self.toggle_remove(block),
-                None => self.toast = Some("move to a block to mark it for removal".into()),
-            },
-            KeyCode::Char('r') => match block {
-                Some(block) => self.compose(Writing::Replace(block)),
-                None => self.toast = Some("move to a block to replace it".into()),
-            },
+            KeyCode::Char('c') | KeyCode::Enter => self.compose_comment(),
+            KeyCode::Char('C') => self.compose_global(),
+            KeyCode::Char('x') => self.remove_here(),
+            KeyCode::Char('r') => self.compose_replace(),
             KeyCode::Char('X') => match block {
                 Some(block) => self.clear_block(block),
                 None => {
                     self.global = None;
                     self.toast = Some("global note cleared".into());
+                    self.persist();
                 }
             },
+            KeyCode::Char('L') => {
+                if self.notes.is_empty() {
+                    self.toast = Some("no notes yet".into());
+                } else {
+                    self.dialog = Dialog::Notes { selected: 0 };
+                }
+            }
             KeyCode::Char('S') => self.dialog = Dialog::Verdict,
             KeyCode::Char('?') => self.dialog = Dialog::Help,
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -533,18 +867,102 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_by(WHEEL_STEP as isize),
             MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_STEP as isize)),
-            MouseEventKind::Down(_) if self.composer.is_none() && self.dialog == Dialog::None => {
-                if let Some(focus) = self
-                    .shown
-                    .iter()
-                    .find(|(y, _)| *y == mouse.row)
-                    .and_then(|(_, row)| row.focus())
-                {
+            _ if self.composer.is_some() || self.dialog != Dialog::None => {}
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = None;
+                self.drag = None;
+                let Some(row) = self.row_at(mouse.row) else {
+                    return;
+                };
+                if let Some(focus) = row.focus() {
                     self.focus = focus;
+                }
+                if let Row::Text { block, row } = row {
+                    self.drag = self
+                        .offset_at(block, row, mouse.column)
+                        .map(|offset| (block, offset));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some((block, from)) = self.drag else {
+                    return;
+                };
+                // A selection stays inside the block it started in.
+                let to = match self.row_at(mouse.row) {
+                    Some(Row::Text { block: b, row }) if b == block => {
+                        self.offset_at(block, row, mouse.column)
+                    }
+                    _ => None,
+                };
+                if let Some(to) = to {
+                    let (start, end) = if to >= from {
+                        (from, to + 1)
+                    } else {
+                        (to, from + 1)
+                    };
+                    self.selection = Some(Selection { block, start, end });
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag = None;
+                if let Some(selection) = self.selection
+                    && self.selected_text(selection).trim().is_empty()
+                {
+                    self.selection = None;
+                }
+                if self.selection.is_some() {
+                    self.toast = Some("selected · c comment · x remove · r replace".into());
                 }
             }
             _ => {}
         }
+    }
+
+    fn row_at(&self, y: u16) -> Option<Row> {
+        self.shown
+            .iter()
+            .find(|(at, _)| *at == y)
+            .map(|(_, row)| *row)
+    }
+
+    /// The character of block `block`'s text drawn at screen column `x` on
+    /// its row `row`: the nearest one when `x` is past either end.
+    fn offset_at(&self, block: usize, row: usize, x: u16) -> Option<usize> {
+        let line = self.laid.get(block)?.rows.get(row)?;
+        let x = x.saturating_sub(self.text_x);
+        let mut nearest = None;
+        for seg in &line.segs {
+            let Some(start) = seg.offset else { continue };
+            let mut col = seg.x;
+            for (n, c) in seg.text.chars().enumerate() {
+                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+                if x < col + w.max(1) {
+                    return Some(nearest.filter(|_| x < seg.x).unwrap_or(start + n));
+                }
+                col += w;
+                nearest = Some(start + n);
+            }
+        }
+        nearest
+    }
+
+    /// Ranges of block `block`'s text to mark: passages with notes, in their
+    /// note's color.
+    fn passage_marks(&self, block: usize) -> Vec<(usize, usize, Color)> {
+        let Some(laid) = self.laid.get(block) else {
+            return Vec::new();
+        };
+        let text: String = laid.text.iter().collect();
+        self.notes_on(block)
+            .filter_map(|(_, note)| match &note.target {
+                PlanTarget::Passage { quote, .. } => {
+                    let at = text.find(quote.as_str())?;
+                    let start = text[..at].chars().count();
+                    Some((start, start + quote.chars().count(), hue_of(&note.edit)))
+                }
+                PlanTarget::Block { .. } => None,
+            })
+            .collect()
     }
 
     // Drawing
@@ -591,7 +1009,39 @@ impl App {
             Dialog::Help => draw_help(f, area),
             Dialog::Verdict => self.draw_verdict(f, area),
             Dialog::Quit => self.draw_quit(f, area),
+            Dialog::Notes { selected } => self.draw_notes(f, area, selected),
         }
+    }
+
+    fn draw_notes(&self, f: &mut Frame, area: Rect, selected: usize) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("Notes ({})", self.notes.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+        let width = area.width.saturating_sub(8).min(76) as usize;
+        for (row, at) in self.listed().into_iter().enumerate() {
+            let note = &self.notes[at];
+            let text = format!(
+                "{} {} · {}",
+                if row == selected { "›" } else { " " },
+                target_label(&note.target),
+                note_summary(note)
+            );
+            let mut style = Style::default().fg(hue_of(&note.edit));
+            if row == selected {
+                style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            }
+            lines.push(Line::from(Span::styled(clip(&text, width), style)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "enter go to · e edit · x delete · esc close",
+            Style::default().fg(DIM),
+        )));
+        popup(f, area, lines, width as u16 + 4);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -617,6 +1067,7 @@ impl App {
         let rows = self.rows();
         self.shown.clear();
         let text_x = left + GUTTER;
+        self.text_x = text_x;
         for (y, row) in (area.y..area.bottom()).zip(rows.iter().skip(self.scroll)) {
             self.shown.push((y, *row));
             let focused = row.focus() == Some(self.focus);
@@ -659,34 +1110,43 @@ impl App {
                         buf.set_string(left, y, number, style);
                     }
                     let crossed = self.removed(block);
+                    let marks = self.passage_marks(block);
+                    let selected = self
+                        .selection
+                        .filter(|s| s.block == block)
+                        .map(|s| (s.start, s.end));
+                    let buf = f.buffer_mut();
                     if let Some(line) = self.laid[block].rows.get(row) {
                         for seg in &line.segs {
-                            let mut style = seg.style;
-                            if crossed {
-                                style = style.add_modifier(Modifier::CROSSED_OUT).fg(DIM);
-                            }
-                            let x = text_x + seg.x;
-                            if x < text_x + width {
-                                let room = (text_x + width - x) as usize;
-                                buf.set_string(x, y, clip(&seg.text, room), style);
+                            let mut x = text_x + seg.x;
+                            for (n, c) in seg.text.chars().enumerate() {
+                                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                                if x + w as u16 > text_x + width {
+                                    break;
+                                }
+                                let mut style = seg.style;
+                                if crossed {
+                                    style = style.add_modifier(Modifier::CROSSED_OUT).fg(DIM);
+                                }
+                                if let Some(offset) = seg.offset.map(|o| o + n) {
+                                    if let Some((_, _, hue)) =
+                                        marks.iter().find(|(s, e, _)| *s <= offset && offset < *e)
+                                    {
+                                        style = style.fg(*hue).add_modifier(Modifier::UNDERLINED);
+                                    }
+                                    if selected.is_some_and(|(s, e)| s <= offset && offset < e) {
+                                        style = style.bg(SELECTION);
+                                    }
+                                }
+                                buf.set_string(x, y, c.to_string(), style);
+                                x += w as u16;
                             }
                         }
                     }
                 }
                 Row::Note { note, .. } => {
                     let note = &self.notes[note];
-                    let (label, body) = match &note.edit {
-                        PlanEdit::Comment(body) => ("comment", body.as_str()),
-                        PlanEdit::Remove => ("remove", "this block"),
-                        PlanEdit::Replace(with) => ("replace", with.as_str()),
-                    };
-                    let first = body.lines().next().unwrap_or("");
-                    let more = if body.lines().nth(1).is_some() {
-                        " …"
-                    } else {
-                        ""
-                    };
-                    let text = format!("● {label}  {first}{more}");
+                    let text = format!("● {}", note_summary(note));
                     buf.set_string(
                         text_x,
                         y,
@@ -703,9 +1163,9 @@ impl App {
         let Some(composer) = &self.composer else {
             return;
         };
-        let title = match composer.writing {
-            Writing::Comment(block) => format!(" Comment on block {} ", block + 1),
-            Writing::Replace(block) => format!(" Replace block {} ", block + 1),
+        let title = match &composer.writing {
+            Writing::Comment { target, .. } => format!(" Comment on {} ", target_label(target)),
+            Writing::Replace { target, .. } => format!(" Replace {} ", target_label(target)),
             Writing::Global => " Global note ".to_owned(),
         };
         let frame = Frame_::bordered()
@@ -727,7 +1187,8 @@ impl App {
         } else if self.composer.is_some() {
             " enter save · alt+enter new line · esc discard".to_owned()
         } else {
-            " j/k blocks · c comment · x remove · r replace · C global · S send · ? keys".to_owned()
+            " j/k blocks · c comment · x remove · r replace · C global · L notes · S send · ? keys"
+                .to_owned()
         };
         let count = self.note_count();
         let right = match count {
@@ -787,13 +1248,55 @@ impl App {
             )),
             Line::from(""),
             Line::from("  S    send them"),
-            Line::from("  y    quit and drop them"),
+            Line::from("  y    quit; they stay for next time"),
             Line::from(Span::styled(
                 "  esc  keep reviewing",
                 Style::default().fg(DIM),
             )),
         ];
         popup(f, area, lines, 40);
+    }
+}
+
+/// The text a note's target covers: the whole block, or the passage.
+fn target_text(target: &PlanTarget) -> &str {
+    match target {
+        PlanTarget::Block { text, .. } => text,
+        PlanTarget::Passage { quote, .. } => quote,
+    }
+}
+
+fn target_label(target: &PlanTarget) -> String {
+    match target {
+        PlanTarget::Block { index, .. } => format!("block {index}"),
+        PlanTarget::Passage { block, .. } => format!("a passage in block {block}"),
+    }
+}
+
+/// One line about a note: what it asks, and its text's first line.
+fn note_summary(note: &PlanNote) -> String {
+    let (label, body) = match &note.edit {
+        PlanEdit::Comment(body) => ("comment", body.as_str()),
+        PlanEdit::Remove => match &note.target {
+            PlanTarget::Block { .. } => ("remove", "this block"),
+            PlanTarget::Passage { quote, .. } => ("remove", quote.as_str()),
+        },
+        PlanEdit::Replace(with) => ("replace", with.as_str()),
+    };
+    let first = body.lines().next().unwrap_or("");
+    let more = if body.lines().nth(1).is_some() {
+        " …"
+    } else {
+        ""
+    };
+    format!("{label}  {first}{more}")
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{count} {word}s")
     }
 }
 
@@ -869,6 +1372,8 @@ const KEYS: &[(&str, &str)] = &[
     ("r", "replace the block with your text"),
     ("C", "global note on the whole plan"),
     ("X", "clear the block's notes"),
+    ("L", "every note: go to, edit or delete one"),
+    ("drag", "select a passage; c, x and r then act on it"),
     ("S", "send the review with a verdict"),
     ("q", "quit"),
 ];
@@ -935,6 +1440,8 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const PLAN: &str = "# Auth
 
@@ -953,7 +1460,159 @@ create table tokens (id int);
             subject: "plan.md".into(),
             source: PLAN.into(),
             round: None,
+            draft: None,
+            save: Box::new(|_| {}),
         })
+    }
+
+    /// An app whose saved drafts land in the returned cell.
+    fn saving(source: &str, draft: Option<String>) -> (App, Rc<RefCell<Option<String>>>) {
+        let saved = Rc::new(RefCell::new(None));
+        let sink = saved.clone();
+        let app = App::new(Plan {
+            subject: "plan.md".into(),
+            source: source.into(),
+            round: None,
+            draft,
+            save: Box::new(move |json| *sink.borrow_mut() = json.map(str::to_owned)),
+        });
+        (app, saved)
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// The screen position of the first character of `needle`.
+    fn find(screen: &str, needle: &str) -> (u16, u16) {
+        for (y, line) in screen.lines().enumerate() {
+            if let Some(at) = line.find(needle) {
+                return (line[..at].chars().count() as u16, y as u16);
+            }
+        }
+        panic!("{needle:?} isn't on screen:\n{screen}");
+    }
+
+    #[test]
+    fn a_dragged_passage_gets_its_own_note_with_its_source_line() {
+        let mut app = app();
+        let screen = draw(&mut app, 90, 30);
+        let (x, y) = find(&screen, "sessions");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), x + 7, y);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x + 7, y);
+        assert_eq!(
+            app.selection.map(|s| app.selected_text(s)),
+            Some("sessions".to_owned())
+        );
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "Which sessions?");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selection, None);
+        press(&mut app, KeyCode::Char('S'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(
+            sent(&app).contains("## 1. Block 1, line 3: comment\n> sessions\n\nWhich sessions?\n"),
+            "{}",
+            sent(&app)
+        );
+    }
+
+    #[test]
+    fn x_on_a_selection_removes_only_that_passage() {
+        let mut app = app();
+        let screen = draw(&mut app, 90, 30);
+        let (x, y) = find(&screen, "Backfill");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), x + 7, y);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x + 7, y);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.removed(2));
+        assert_eq!(app.notes.len(), 1);
+        assert!(matches!(
+            &app.notes[0].target,
+            PlanTarget::Passage { quote, block: 3, lines: Some((6, 6)) } if quote == "Backfill"
+        ));
+    }
+
+    #[test]
+    fn the_notes_list_edits_and_deletes_notes() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "first");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(app.dialog, Dialog::Notes { selected: 0 });
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(
+            app.composer.as_ref().map(|c| c.text.as_str()),
+            Some("first")
+        );
+        type_text(&mut app, " and better");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.notes[0].edit,
+            PlanEdit::Comment("first and better".into())
+        );
+        assert_eq!(app.notes.len(), 2);
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.dialog, Dialog::Notes { selected: 0 });
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn unsent_notes_are_saved_and_come_back() {
+        let (mut first, saved) = saving(PLAN, None);
+        press(&mut first, KeyCode::Char('C'));
+        type_text(&mut first, "whole plan");
+        press(&mut first, KeyCode::Enter);
+        press(&mut first, KeyCode::Char('j'));
+        press(&mut first, KeyCode::Char('c'));
+        type_text(&mut first, "on block 2");
+        press(&mut first, KeyCode::Enter);
+        let draft = saved.borrow().clone();
+        assert!(draft.is_some());
+        let (second, _) = saving(PLAN, draft);
+        assert_eq!(second.global.as_deref(), Some("whole plan"));
+        assert_eq!(second.notes, first.notes);
+        assert_eq!(second.toast.as_deref(), Some("2 notes from last time"));
+    }
+
+    #[test]
+    fn a_note_whose_block_changed_is_dropped_and_sending_clears_the_draft() {
+        let (mut first, saved) = saving(PLAN, None);
+        press(&mut first, KeyCode::Char('j'));
+        press(&mut first, KeyCode::Char('c'));
+        type_text(&mut first, "keep");
+        press(&mut first, KeyCode::Enter);
+        press(&mut first, KeyCode::Char('j'));
+        press(&mut first, KeyCode::Char('x'));
+        let draft = saved.borrow().clone();
+        let changed = PLAN.replace("- Backfill it", "- Backfill it in batches");
+        let (mut second, saved) = saving(&changed, draft);
+        assert_eq!(second.notes.len(), 1);
+        assert!(
+            second
+                .toast
+                .as_deref()
+                .is_some_and(|t| t.contains("1 no longer match")),
+            "{:?}",
+            second.toast
+        );
+        press(&mut second, KeyCode::Char('S'));
+        press(&mut second, KeyCode::Char('c'));
+        assert_eq!(*saved.borrow(), None);
     }
 
     fn press(app: &mut App, code: KeyCode) {

@@ -2,15 +2,18 @@
 //! pane beside the agent that asked), and where the review goes when it's
 //! sent (that agent, stdout, or a result file a waiting process reads).
 
+use std::cell::RefCell;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 
 use crate::agent;
 use crate::planview::{self, Plan};
+use crate::progress::Store;
 use crate::review::{Outcome, Verdict};
 
 /// Where a sent review goes.
@@ -117,12 +120,25 @@ pub fn plan_command(args: &[String]) -> ExitCode {
     };
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
     if interactive {
+        let key = std::fs::canonicalize(&request.file)
+            .unwrap_or_else(|_| PathBuf::from(&request.file))
+            .display()
+            .to_string();
+        let (draft, save, failure) = drafts(&key);
         let plan = Plan {
             subject: request.file.clone(),
             source,
             round: None,
+            draft,
+            save,
         };
-        return match planview::run(plan) {
+        let result = planview::run(plan);
+        if let Some(message) = failure.borrow().as_ref() {
+            eprintln!(
+                "leaf: unsent notes couldn't be saved ({message}). They last only while the review is open."
+            );
+        }
+        return match result {
             Ok(outcome) => finish(&outcome, &request.reply),
             Err(e) => {
                 eprintln!("leaf: {}", MarginFailed::Terminal(e));
@@ -152,6 +168,41 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The unsent notes kept for the plan `key`, a saver for them, and where a
+/// store failure is left to report once the screen is gone. Without a store,
+/// notes last only for this run.
+fn drafts(
+    key: &str,
+) -> (
+    Option<String>,
+    planview::SaveDraft,
+    Rc<RefCell<Option<String>>>,
+) {
+    let failure = Rc::new(RefCell::new(None));
+    let store = match Store::open(&crate::progress::default_path()) {
+        Ok(store) => store,
+        Err(e) => {
+            *failure.borrow_mut() = Some(e.to_string());
+            return (None, Box::new(|_| {}), failure);
+        }
+    };
+    let draft = match store.load_margin_draft(key) {
+        Ok(draft) => draft,
+        Err(e) => {
+            *failure.borrow_mut() = Some(e.to_string());
+            None
+        }
+    };
+    let key = key.to_owned();
+    let failed = failure.clone();
+    let save: planview::SaveDraft = Box::new(move |json| {
+        if let Err(e) = store.save_margin_draft(&key, json) {
+            *failed.borrow_mut() = Some(e.to_string());
+        }
+    });
+    (draft, save, failure)
 }
 
 pub fn read_plan(path: &Path) -> Result<String, MarginFailed> {

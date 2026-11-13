@@ -454,6 +454,26 @@ impl Store {
     }
 
     /// The agent CLI questions go to, such as `claude`; `None` means any agent pane.
+    /// The unsent Margin notes on the plan `key`, as the review screen saved them.
+    pub fn load_margin_draft(&self, key: &str) -> Result<Option<String>, StoreFailed> {
+        Ok(self
+            .setting(&format!("margin:{key}"))?
+            .filter(|draft| !draft.is_empty()))
+    }
+
+    /// Keeps the unsent notes on `key`, or forgets them (`None`) once sent.
+    pub fn save_margin_draft(&self, key: &str, draft: Option<&str>) -> Result<(), StoreFailed> {
+        let key = format!("margin:{key}");
+        match draft {
+            Some(draft) => self.save_setting(&key, draft),
+            None => self
+                .db
+                .execute("DELETE FROM settings WHERE key = ?", [key])
+                .map(drop)
+                .map_err(self.failed(Operation::Save)),
+        }
+    }
+
     pub fn load_agent(&self) -> Result<Option<String>, StoreFailed> {
         Ok(self.setting("agent")?.filter(|name| !name.is_empty()))
     }
@@ -1128,6 +1148,22 @@ mod tests {
         assert_eq!(store.load_agent().unwrap().as_deref(), Some("codex"));
         store.save_agent(None).unwrap();
         assert_eq!(store.load_agent().unwrap(), None);
+    }
+
+    #[test]
+    fn a_plans_unsent_notes_are_kept_until_sent() {
+        let store = memory();
+        assert_eq!(store.load_margin_draft("/p/plan.md").unwrap(), None);
+        store
+            .save_margin_draft("/p/plan.md", Some("{\"notes\":[]}"))
+            .unwrap();
+        assert_eq!(
+            store.load_margin_draft("/p/plan.md").unwrap().as_deref(),
+            Some("{\"notes\":[]}")
+        );
+        assert_eq!(store.load_margin_draft("/p/other.md").unwrap(), None);
+        store.save_margin_draft("/p/plan.md", None).unwrap();
+        assert_eq!(store.load_margin_draft("/p/plan.md").unwrap(), None);
     }
 
     #[test]
