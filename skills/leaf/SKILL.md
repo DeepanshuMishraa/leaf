@@ -11,8 +11,8 @@ leaf reads PDFs, EPUBs, Markdown files and web articles in the terminal, and rev
 
 leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `leaf open …` or `leaf diff` run by you exits at once or shows nothing. There are three ways to put something in front of the person:
 
-1. **Review commands.** `leaf plan` and `leaf review` (see the `leaf-plan` and `leaf-review` skills) open in a Rex pane beside you, and the person's review comes back to you as your next message.
-2. **Inside Rex.** You can open any leaf screen in a pane beside you. Run `rex split --split=right -- leaf open notes.md` from your pane. See the `rex` skill.
+1. **Review commands.** `leaf plan` and `leaf review` (see the `leaf-plan` and `leaf-review` skills) open in a pane beside you when you run inside Rex, tmux or Herdr, and the person's review comes back to you as your next message.
+2. **Any other screen.** Open it in a pane beside you: `tmux split-window -h 'leaf open notes.md'` in tmux, `rex split --split=right -- leaf open notes.md` in Rex.
 3. **Anywhere else.** Tell the person the exact command to run, for example `leaf diff --branch`.
 
 `leaf version` prints the installed version. `leaf --help` prints every command.

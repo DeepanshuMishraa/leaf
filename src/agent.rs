@@ -37,11 +37,11 @@ const AGENTS: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum AgentFailed {
     #[error(
-        "Not running inside Rex, so there is no agent pane to send to. The text was copied to the clipboard instead."
+        "leaf isn't running inside Rex, tmux or Herdr, so there's no agent pane to send to. The text was copied to the clipboard instead."
     )]
     NoTmux,
     #[error(
-        "No agent pane (claude, codex, opencode, gemini, grok, pi, aider…) is open in this Rex session. The text was copied to the clipboard instead. Set LEAF_AGENT_PANE to a Rex block id."
+        "No agent pane (claude, codex, opencode, grok, pi, cursor-agent…) is open here. The text was copied to the clipboard instead. Set LEAF_AGENT_PANE to the agent's pane id."
     )]
     NoAgent,
     #[error(
@@ -156,9 +156,48 @@ impl Agent {
     }
 }
 
-/// Sends `text` to the agent: a bracketed paste, then Enter outside it.
+/// Sends `text` to the agent: a bracketed paste, then Enter outside it. In
+/// Rex the agent is found as before; in tmux or Herdr, `LEAF_AGENT_PANE`
+/// names it, or else the first other pane with an agent in it.
 pub fn deliver(text: &str) -> Result<Agent, AgentFailed> {
-    deliver_rex(text)
+    let host = match crate::host::Host::detect() {
+        None | Some(crate::host::Host::Rex) => return deliver_rex(text),
+        Some(host) => host,
+    };
+    let named = std::env::var("LEAF_AGENT_PANE")
+        .ok()
+        .map(|pane| pane.trim().to_owned())
+        .filter(|pane| !pane.is_empty());
+    let (pane, command) = match named {
+        Some(pane) if host.is_open(&pane) => (pane, "agent".to_owned()),
+        Some(pane) => return Err(AgentFailed::BadPane { pane }),
+        None => host.find_agent().ok_or(AgentFailed::NoAgent)?,
+    };
+    host.type_into(&pane, text)
+        .map_err(|cause| AgentFailed::Tmux {
+            pane: pane.clone(),
+            cause,
+        })?;
+    Ok(Agent { pane, command })
+}
+
+/// Sends `text` to the agent in pane `pane` of whichever multiplexer leaf
+/// runs in: the pane that asked for a review.
+pub fn deliver_to_pane(pane: &str, text: &str) -> Result<Agent, AgentFailed> {
+    match crate::host::Host::detect() {
+        None => Err(AgentFailed::NoTmux),
+        Some(crate::host::Host::Rex) => deliver_to(pane, text),
+        Some(host) => host
+            .type_into(pane, text)
+            .map(|()| Agent {
+                pane: pane.to_owned(),
+                command: "agent".to_owned(),
+            })
+            .map_err(|cause| AgentFailed::Tmux {
+                pane: pane.to_owned(),
+                cause,
+            }),
+    }
 }
 
 fn stderr(output: &std::process::Output) -> String {
@@ -170,7 +209,7 @@ fn stderr(output: &std::process::Output) -> String {
     }
 }
 
-fn agent_name(word: &str) -> Option<&'static str> {
+pub(crate) fn agent_name(word: &str) -> Option<&'static str> {
     let name = Path::new(word).file_name()?.to_str()?.to_ascii_lowercase();
     let name = name
         .strip_suffix(".js")

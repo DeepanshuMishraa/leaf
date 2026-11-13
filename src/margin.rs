@@ -13,6 +13,7 @@ use base64::Engine;
 
 use crate::agent;
 use crate::diffreview::{Margin, SaveNotes, Sends};
+use crate::host::Host;
 use crate::planview::{self, Plan};
 use crate::progress::Store;
 use crate::review::{Outcome, Verdict};
@@ -31,7 +32,7 @@ pub enum Reply {
 #[derive(Debug, thiserror::Error)]
 pub enum MarginFailed {
     #[error(
-        "There's nowhere to show the review: this isn't a terminal, and not a Rex pane where it could open beside you. Ask the person to run `{command}` in their terminal; the review will come back to you as a message."
+        "There's nowhere to open the review: leaf opens it in a pane beside you, which needs Rex, tmux or Herdr, and this isn't running in any of them. Ask the person to run `{command}` in their terminal, or to start you inside tmux, Herdr or Rex."
     )]
     Nowhere { command: String },
     #[error("Opening the review pane beside the agent failed ({0}). Nothing was sent.")]
@@ -52,6 +53,8 @@ pub enum MarginFailed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlanRequest {
     file: String,
+    /// What the review calls the plan, in place of its path.
+    title: Option<String>,
     reply: Reply,
     /// Block until the review is sent and print it, instead of returning at once.
     wait: bool,
@@ -68,6 +71,7 @@ the review is sent and prints it instead.";
 
 fn parse_plan(args: &[String]) -> Result<PlanRequest, String> {
     let mut file = None;
+    let mut title = None;
     let mut reply = Reply::Agent(None);
     let mut wait = false;
     let mut args = args.iter();
@@ -83,6 +87,10 @@ fn parse_plan(args: &[String]) -> Result<PlanRequest, String> {
                 let path = args.next().ok_or("--result needs a file path")?;
                 reply = Reply::Result(PathBuf::from(path));
             }
+            "--title" => {
+                let text = args.next().ok_or("--title needs the plan's name")?;
+                title = Some(text.clone());
+            }
             other if other.starts_with('-') => {
                 return Err(format!(
                     "unknown option {other}. Run `leaf plan --help` for usage."
@@ -96,7 +104,12 @@ fn parse_plan(args: &[String]) -> Result<PlanRequest, String> {
         }
     }
     let file = file.ok_or("name the plan to review: leaf plan <plan.md>")?;
-    Ok(PlanRequest { file, reply, wait })
+    Ok(PlanRequest {
+        file,
+        title,
+        reply,
+        wait,
+    })
 }
 
 /// `leaf plan`.
@@ -129,7 +142,10 @@ pub fn plan_command(args: &[String]) -> ExitCode {
         // A round that can't be kept only loses the comparison with the last one.
         let (round, previous) = record_round(&key, &source).unwrap_or((1, None));
         let plan = Plan {
-            subject: request.file.clone(),
+            subject: request
+                .title
+                .clone()
+                .unwrap_or_else(|| shown_path(&request.file)),
             source,
             round: Some(round),
             previous,
@@ -151,11 +167,12 @@ pub fn plan_command(args: &[String]) -> ExitCode {
         };
     }
     let command = format!("leaf plan {}", request.file);
-    match beside(
-        &["plan".to_owned(), request.file.clone()],
-        request.wait,
-        &command,
-    ) {
+    let mut forwarded = vec!["plan".to_owned()];
+    if let Some(title) = &request.title {
+        forwarded.extend(["--title".to_owned(), title.clone()]);
+    }
+    forwarded.push(request.file.clone());
+    match beside(&forwarded, request.wait, &command) {
         Ok(Opened::Returned) => {
             println!(
                 "Opened {} for review in a pane beside you. The review arrives as your next message: end your turn now and don't poll for it.",
@@ -342,6 +359,27 @@ pub fn diff_margin(key: &str, failure: Rc<RefCell<Option<String>>>) -> Margin {
     }
 }
 
+/// A plan's path as the person would write it: from this folder when it's
+/// under it, else from the home folder.
+fn shown_path(file: &str) -> String {
+    let path = Path::new(file);
+    if path.is_relative() {
+        return file.to_owned();
+    }
+    if let Some(rest) = std::env::current_dir()
+        .ok()
+        .and_then(|dir| path.strip_prefix(dir).ok().map(Path::to_path_buf))
+    {
+        return rest.display().to_string();
+    }
+    match std::env::var_os("HOME")
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => file.to_owned(),
+    }
+}
+
 pub fn read_plan(path: &Path) -> Result<String, MarginFailed> {
     let source = std::fs::read_to_string(path).map_err(|cause| MarginFailed::Read {
         path: path.display().to_string(),
@@ -370,10 +408,8 @@ pub fn beside(args: &[String], wait: bool, command: &str) -> Result<Opened, Marg
     let nowhere = || MarginFailed::Nowhere {
         command: command.to_owned(),
     };
-    let Some(_session) = agent::rex_session_id() else {
-        return Err(nowhere());
-    };
-    let asking = std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty());
+    let host = Host::detect().ok_or_else(nowhere)?;
+    let asking = host.own_pane();
     let exe = std::env::current_exe()
         .map(|exe| exe.display().to_string())
         .unwrap_or_else(|_| "leaf".into());
@@ -387,16 +423,22 @@ pub fn beside(args: &[String], wait: bool, command: &str) -> Result<Opened, Marg
     }
     argv.extend(rest.iter().cloned());
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let pane = agent::split_beside(asking.as_deref(), &dir, "review", &argv)
+    let pane = host
+        .split_beside(asking.as_deref(), &dir, "review", &argv)
         .map_err(MarginFailed::Split)?;
     match result {
         None => Ok(Opened::Returned),
-        Some(path) => Ok(Opened::Waited(wait_for(&path, &pane))),
+        Some(path) => Ok(Opened::Waited(wait_for(&host, &path, &pane))),
     }
 }
 
 fn margin_dir() -> PathBuf {
     crate::progress::default_path().with_file_name("margin")
+}
+
+/// Where Margin keeps plans it's handed, rounds and results.
+pub fn data_dir() -> PathBuf {
+    margin_dir()
 }
 
 /// Keeps `text` as the next round of the plan `key` when it differs from the
@@ -441,7 +483,7 @@ const PANE_CHECK: Duration = Duration::from_secs(2);
 
 /// Waits for the review pane's result. A pane closed without one counts as
 /// closed without a verdict.
-pub fn wait_for(path: &Path, pane: &str) -> Outcome {
+pub fn wait_for(host: &Host, path: &Path, pane: &str) -> Outcome {
     let mut checked = Instant::now();
     loop {
         if let Some(outcome) = read_result(path) {
@@ -450,7 +492,7 @@ pub fn wait_for(path: &Path, pane: &str) -> Outcome {
         }
         if checked.elapsed() >= PANE_CHECK {
             checked = Instant::now();
-            if !agent::block_open(pane) {
+            if !host.is_open(pane) {
                 // One last look: the pane may have written it as it closed.
                 let outcome = read_result(path).unwrap_or(Outcome::Closed);
                 let _ = std::fs::remove_file(path);
@@ -550,7 +592,7 @@ pub fn finish(outcome: &Outcome, reply: &Reply) -> ExitCode {
                 return ExitCode::SUCCESS;
             };
             let delivered = match pane {
-                Some(pane) => agent::deliver_to(pane, text),
+                Some(pane) => agent::deliver_to_pane(pane, text),
                 None => agent::deliver(text),
             };
             match delivered {
@@ -590,6 +632,7 @@ mod tests {
             parse_plan(&args(&["plan.md"])),
             Ok(PlanRequest {
                 file: "plan.md".into(),
+                title: None,
                 reply: Reply::Agent(None),
                 wait: false
             })

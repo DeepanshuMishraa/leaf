@@ -16,6 +16,7 @@ mod github;
 mod highlight;
 mod home;
 mod hook;
+mod host;
 mod hue;
 mod kitty;
 mod look;
@@ -265,7 +266,7 @@ fn main() -> ExitCode {
             args.get(1).map(String::as_str)
         ),
         (Some("rex" | "plugin"), Some("install" | "uninstall"))
-    );
+    ) || args.first().is_some_and(|arg| arg == "hook");
     if !installing {
         let _ = plugin::refresh();
         skills::refresh();

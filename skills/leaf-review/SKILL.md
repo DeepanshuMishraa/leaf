@@ -16,10 +16,12 @@ description: Hand your code changes to the person for review in leaf. They go fi
    leaf review https://github.com/owner/repo/pull/12
    ```
 
-   Inside Rex this opens the review beside your pane and returns at once.
+   In Rex, tmux or Herdr this opens the review beside your pane and returns at once.
 3. **End your turn.** Don't wait, sleep, poll or read the pane. The review arrives as your next message.
 
-If leaf says there's nowhere to open it (not in Rex), tell the person to run the same command in their terminal. `leaf review --wait …` blocks and prints the review to stdout instead.
+If you have a `leaf_review_changes` tool (Pi), call it instead: it returns the review.
+
+If leaf says there's nowhere to open it (you're not in Rex, tmux or Herdr), tell the person to run the same command in their terminal. `leaf review --wait …` blocks and prints the review to stdout instead.
 
 ## The review you get back
 

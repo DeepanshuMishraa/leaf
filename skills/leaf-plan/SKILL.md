@@ -12,10 +12,12 @@ description: Hand a written plan, spec or design to the person for review in lea
    leaf plan docs/plans/<topic>.md
    ```
 
-   Inside Rex this opens the review beside your pane and returns at once with `Opened … for review`.
+   In Rex, tmux or Herdr this opens the review beside your pane and returns at once with `Opened … for review`.
 3. **End your turn.** Don't wait, sleep, poll or read the pane. The review arrives as your next message.
 
-If leaf says there's nowhere to open it (not in Rex), tell the person to run `leaf plan docs/plans/<topic>.md` in their terminal. The review comes back to you the same way.
+If leaf says there's nowhere to open it (you're not in Rex, tmux or Herdr), tell the person to run `leaf plan docs/plans/<topic>.md` in their terminal and paste you the review, or to restart you inside tmux or Herdr.
+
+If you have a `leaf_review_plan` tool (Pi), call it with the file instead: it returns the review.
 
 If you have to block until the answer, as in a script, run `leaf plan --wait <file>`. It prints the review to stdout when the person sends it.
 

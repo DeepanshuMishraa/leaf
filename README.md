@@ -137,7 +137,19 @@ leaf hook install     # set up every agent CLI here (asks first; --dry-run shows
 leaf skills install   # or only the skills: leaf, leaf-plan and leaf-review
 ```
 
-`leaf hook install` finds the agent CLIs on this machine (Claude Code, Codex, Gemini CLI, OpenCode, Copilot CLI, Pi, Cursor Agent, Amp, Droid, Grok), shows what it will change, and asks once. Claude Code gets a plan-mode hook. When it leaves plan mode, the plan opens for review beside it. Approving lets it go ahead, and requesting changes sends your review back and keeps it planning. Every agent gets the skills, which teach it to run `leaf plan` and `leaf review` itself and to act on the review. Settings files are merged, never replaced, and the first change keeps a `.leaf-backup` beside the file. `leaf hook status` shows what's set up, and `leaf hook uninstall` takes out only what leaf added.
+`leaf hook install` finds the coding agents on this machine, shows what it will change, and asks once. Each agent gets the skills, and a hook where it has one. With the hook, a plan opens in leaf at the moment the agent would ask you to approve it. Request changes and the agent revises; approve and it goes ahead.
+
+| Agent | How it hands you a plan |
+|---|---|
+| Claude Code | `PermissionRequest` hook on `ExitPlanMode` |
+| Grok Build | `PreToolUse` hook on `exit_plan_mode` (Grok then asks you to confirm once more) |
+| Codex | `Stop` hook on plan mode's `<proposed_plan>`. Trust it once in Codex's `/hooks`. |
+| Antigravity | `Stop` hook that finds a new `implementation_plan.md` |
+| Cursor | `preToolUse` hook on its plan tool |
+| Pi | an extension with `leaf_review_plan` and `leaf_review_changes` tools |
+| OpenCode | the skills, since it has no plan hook; it runs `leaf plan` itself |
+
+Config files are merged, never replaced, and the first change to a JSON file keeps a `.leaf-backup` beside it. `leaf hook status` shows what's set up, and `leaf hook uninstall` takes out only what leaf added.
 
 ### Plans
 
@@ -165,7 +177,7 @@ Notes you haven't sent are kept and come back next time. A note on a block that 
 
 A person can run `leaf plan` or `leaf review` in a terminal. The review goes to the agent pane leaf finds, as questions do, or to stdout with `--print`.
 
-An agent can run them too. It has no terminal, so inside Rex leaf opens the review in a pane beside the agent and returns at once. The review goes back to that agent's pane when you send it. `--wait` blocks instead and prints the review. Outside Rex, leaf tells the agent to ask you to run the command.
+An agent can run them too, and hooks do. The agent has no terminal, so leaf opens the review in a pane beside it. That needs one of Rex, tmux or Herdr: start your agent inside one of them. leaf returns at once, and the review goes back into the agent's pane when you send it. `--wait` (what hooks use) blocks instead and prints the review. Outside all three, leaf tells the agent to ask you to run the command, and a hook steps aside so the agent asks you as it normally would.
 
 ## Rex
 

@@ -6,21 +6,27 @@ People can start a review too. `leaf plan` and `leaf review` work the same wheth
 
 ## Status
 
-Built on `feat/review-loop`:
-
-- **Done:** steps 1 to 7, 9 and 10 in the delivery order below.
-- **Step 8 (more agent hooks):** not started. Every agent other than Claude Code gets the skills only, until its hook format is checked against its docs.
+Built on `feat/review-loop` for 0.16.0. Every step in the delivery order is done.
 
 Where the build differs from the design below:
 
-- **Plan review has its own screen** (`planview.rs`) instead of a mode bolted onto the reader. It lays each block out with the reader's renderer (`render::layout`), so the Markdown looks the same, and keeps the reader's 4,600 lines untouched.
-- **Some diff keys moved.** The global note is `M`, because `G` already means last line. The file note is `F`, so `f` alone opens the file picker. The overview is `tab`, or `O` in a pull request's Code tab, where `tab` switches tabs.
-- **Plan rounds show which blocks changed** (`+` in the gutter, `D` to step through them) instead of opening a separate diff. Rounds are kept per plan under `~/.local/share/leaf/margin/rounds/`.
-- **Unsent notes are stored in the settings table** (`margin:<plan path>` and `margin:diff:<diff key>`) as JSON instead of in new tables. Result files sit in `~/.local/share/leaf/margin/`.
-- **Approve with notes in the Claude Code hook** answers `allow`, and the notes are pasted into the agent's pane as its next message, because `allow` can't carry a message.
-- **Skills** install to `~/.claude/skills` and `~/.agents/skills`. `leaf skill` works as well as `leaf skills`.
+- **Plan review has its own screen** (`planview.rs`) instead of a mode bolted onto the reader. It lays each block out with the reader's renderer, so the Markdown looks the same.
+- **Some diff keys moved.** The note on the whole change is `M`, because `G` already means last line. The file note is `F`, so `f` alone opens the file picker. The overview is `tab`, or `O` in a pull request's Code tab.
+- **Plan rounds show which blocks changed** (`+` in the gutter, `D` to step through them) instead of opening a separate diff.
+- **Unsent notes are stored in the settings table** as JSON instead of in new tables.
+- **Agents need Rex, tmux or Herdr** to ask for a review (`host.rs`). A person reviewing by hand needs none.
+- **Each agent hands over its plan the way it can** (`hook.rs`):
+  - Claude Code: `PermissionRequest` on `ExitPlanMode`.
+  - Grok Build: `PreToolUse` on `exit_plan_mode`.
+  - Codex: `Stop` on `<proposed_plan>`.
+  - Antigravity: `Stop` on a new `implementation_plan.md`.
+  - Cursor: `preToolUse` on its plan tool.
+  - Pi: an extension with two tools.
+  - OpenCode: skills only, since none of its documented hooks fires when a plan is presented.
 
-Not verified by hand yet: the pane-beside flow inside a live Rex session, and the Claude Code hook in a real plan-mode session. Unit tests cover the parts around them: the result files, the hook's input and answers, and the settings merge.
+Verified live: plan review and the Claude Code hook in Rex, tmux and Herdr, both the waiting path and the path that types the review back. Pi loads the extension and registers both tools, and Grok loads its hook.
+
+Not verified live: a real plan-mode session in Codex, Cursor or Antigravity, since that needs a model run. Their hook formats come from each tool's docs. Cursor's CLI has been reported to fire only some hook events, so its plan hook may only fire in the editor.
 
 ## Goals
 
