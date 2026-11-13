@@ -104,7 +104,8 @@ impl Resource {
                 })
             }
             "compare" => {
-                let range = parts.next()?.trim_end_matches(".diff");
+                let range = parts.collect::<Vec<_>>().join("/");
+                let range = range.trim_end_matches(".diff");
                 let (base, head) = range.split_once("...")?;
                 let (base, head) = (clean(base)?, clean(head)?);
                 Some(Resource::Compare {
@@ -690,6 +691,33 @@ mod tests {
                 repo: "r".into(),
                 base: "main".into(),
                 head: "feat".into()
+            })
+        );
+        assert_eq!(
+            Resource::parse_url("https://github.com/o/r/compare/main...feat/pr-viewer"),
+            Some(Resource::Compare {
+                owner: "o".into(),
+                repo: "r".into(),
+                base: "main".into(),
+                head: "feat/pr-viewer".into()
+            })
+        );
+        assert_eq!(
+            Resource::parse_url("https://github.com/o/r/compare/release/1.0...fix/x?expand=1"),
+            Some(Resource::Compare {
+                owner: "o".into(),
+                repo: "r".into(),
+                base: "release/1.0".into(),
+                head: "fix/x".into()
+            })
+        );
+        assert_eq!(
+            Resource::parse_url("https://github.com/o/r/compare/main...feat/x.diff"),
+            Some(Resource::Compare {
+                owner: "o".into(),
+                repo: "r".into(),
+                base: "main".into(),
+                head: "feat/x".into()
             })
         );
         assert_eq!(Resource::parse_url("https://github.com/o/r/issues/1"), None);
