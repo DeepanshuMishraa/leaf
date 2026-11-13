@@ -427,9 +427,10 @@ fn with_engine<T>(f: impl FnOnce(&mut Highlighter) -> Result<T, String>) -> Resu
     }
 }
 
-/// Compiles the lexers ahead of the first code block. Compiling takes about
-/// a tenth of a second, so it runs beside document loading instead of
-/// stalling the first frame. A failure is kept and comes back as plain code.
+/// Compiles the lexers ahead of the first code block. Compiling is spread
+/// across cores (about a tenth of a second on one), and runs beside document
+/// loading so it stalls the first frame as little as it can. A failure is
+/// kept and comes back as plain code.
 pub fn warm() -> Result<(), String> {
     with_engine(|_| Ok(()))
 }
@@ -1068,5 +1069,17 @@ mod tests {
         assert_eq!(comment[0], Kind::Comment, "{comment:?}");
         let cafe = "let café = 1\n";
         assert_eq!(kinds(cafe, Some("js")).len(), cafe.chars().count());
+    }
+
+    #[test]
+    fn code_laid_out_while_the_highlighter_starts_elsewhere_waits_and_is_colored() {
+        // As at launch: warming on its own thread (compiling across threads of
+        // its own) while the first page asks for colors.
+        let warming = std::thread::spawn(warm);
+        let code = "fn main() {}\n";
+        let painted = kinds(code, Some("rust"));
+        assert!(warming.join().expect("warming finishes").is_ok());
+        assert_eq!(painted.len(), code.chars().count(), "{painted:?}");
+        assert_eq!(painted[0], Kind::Keyword, "{painted:?}");
     }
 }
