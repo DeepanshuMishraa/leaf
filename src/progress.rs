@@ -65,11 +65,12 @@ impl ImageMode {
 }
 
 /// How leaf's screens are drawn: with dithered bars, panels and margins in
-/// the theme's colors, or plain, as before the dither redesign.
+/// the theme's colors, or plain, as before the dither redesign. Plain until
+/// the dither is turned on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Ui {
-    #[default]
     Dither,
+    #[default]
     Classic,
 }
 
@@ -409,7 +410,7 @@ impl Store {
         self.save_setting("image_mode", mode.as_str())
     }
 
-    /// The UI picked with `leaf ui`; dither when none was.
+    /// The UI picked with `leaf ui`; classic when none was.
     pub fn load_ui(&self) -> Result<Ui, StoreFailed> {
         Ok(self
             .setting("ui")?
@@ -420,6 +421,27 @@ impl Store {
 
     pub fn save_ui(&self, ui: Ui) -> Result<(), StoreFailed> {
         self.save_setting("ui", ui.as_str())
+    }
+
+    /// The leaf version whose "What's new" was last shown.
+    pub fn load_seen_version(&self) -> Result<Option<String>, StoreFailed> {
+        self.setting("seen_version")
+    }
+
+    pub fn save_seen_version(&self, version: &str) -> Result<(), StoreFailed> {
+        self.save_setting("seen_version", version)
+    }
+
+    /// Whether anything was ever read or reviewed with this store: a fresh
+    /// install has no update to catch up on.
+    pub fn used_before(&self) -> Result<bool, StoreFailed> {
+        self.db
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM progress) OR EXISTS (SELECT 1 FROM scroll) OR EXISTS (SELECT 1 FROM usage)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(self.failed(Operation::Read))
     }
 
     /// The voice that reads aloud, by its service name.
@@ -838,11 +860,11 @@ mod tests {
     }
 
     #[test]
-    fn the_ui_is_dither_until_classic_is_picked() {
+    fn the_ui_is_classic_until_dither_is_picked() {
         let store = memory();
-        assert_eq!(store.load_ui().expect("loads"), Ui::Dither);
-        store.save_ui(Ui::Classic).expect("saves");
         assert_eq!(store.load_ui().expect("loads"), Ui::Classic);
+        store.save_ui(Ui::Dither).expect("saves");
+        assert_eq!(store.load_ui().expect("loads"), Ui::Dither);
         assert_eq!(Ui::Classic.toggled(), Ui::Dither);
         assert_eq!(Ui::parse("off"), Some(Ui::Classic));
         assert_eq!(Ui::parse("nope"), None);

@@ -37,6 +37,7 @@ use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
 use crate::look::Look;
 use crate::mono::{self, Rgb};
+use crate::news::News;
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::remote::{self, Command};
 use crate::render::{self, DIM, Laid};
@@ -366,6 +367,8 @@ pub struct App {
     paper: Option<Rgb>,
     /// The theme and the UI setting, followed while the document is open.
     look: Look,
+    /// This version's notes, up once after an update until OK.
+    news: Option<News>,
     /// Time spent reading, for the home screen's heat map.
     clock: usage::Clock,
     highlights: Vec<Highlight>,
@@ -511,6 +514,7 @@ impl App {
             ink: None,
             paper: None,
             look: Look::detect(),
+            news: News::unseen(),
             clock: usage::Clock::start(),
             selection: None,
             dialog: Dialog::None,
@@ -1037,12 +1041,16 @@ impl App {
             Dialog::Bookmarks { selected } => Some(self.draw_bookmarks(f, area, selected)),
             Dialog::Voices { typed, selected } => Some(self.draw_voices(f, area, &typed, selected)),
         };
+        let news = self.news.as_mut().map(|news| news.draw(f, ink));
         // Kitty images sit above the text, so any under a panel would hide it.
         if let Some(panel) = panel {
             if let Some(ink) = ink {
                 art::shadow(f.buffer_mut(), panel, ink);
             }
             self.placements.retain(|(_, rect)| !rect.intersects(panel));
+        }
+        if let Some(news) = news {
+            self.placements.retain(|(_, rect)| !rect.intersects(news));
         }
     }
 
@@ -2451,6 +2459,9 @@ impl App {
         if let Some(line) = self.rex_command.take() {
             return self.rex_key(&key, line);
         }
+        if News::key(&mut self.news, key) {
+            return;
+        }
         match self.dialog.clone() {
             Dialog::Goto { digits, page_count } => return self.goto_key(&key, digits, page_count),
             Dialog::Find { typed } => return self.find_key(&key, typed),
@@ -2641,7 +2652,7 @@ impl App {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
-        if self.dialog != Dialog::None {
+        if News::mouse(&mut self.news, mouse) || self.dialog != Dialog::None {
             return;
         }
         let (x, y) = (mouse.column, mouse.row);

@@ -30,6 +30,7 @@ use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
 use crate::github;
 use crate::look::Look;
+use crate::news::News;
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::remote;
 use crate::render::DIM;
@@ -498,6 +499,8 @@ struct App {
     /// Time spent here, for the home screen's heat map.
     clock: usage::Clock,
     look: Look,
+    /// This version's notes, up once after an update until OK.
+    news: Option<News>,
     /// When the last key, click or paste came, so the terminal is asked
     /// about its theme only once the reader has paused.
     last_input: Instant,
@@ -554,6 +557,7 @@ impl App {
             loaded,
             palette,
             look,
+            news: News::unseen(),
             clock: usage::Clock::start(),
             last_input: Instant::now(),
             cursor,
@@ -1119,6 +1123,9 @@ impl App {
             }
             return;
         }
+        if News::key(&mut self.news, key) {
+            return;
+        }
         if self.dialog_kind().is_some() {
             self.dialog_key(key);
             return;
@@ -1301,7 +1308,10 @@ impl App {
     }
 
     fn mouse(&mut self, mouse: MouseEvent) {
-        if self.dialog_kind().is_some() || self.composer.is_some() {
+        if News::mouse(&mut self.news, mouse)
+            || self.dialog_kind().is_some()
+            || self.composer.is_some()
+        {
             return;
         }
         let (top, height, scroll) = (self.view.y, self.view.height, self.scroll);
@@ -2032,6 +2042,10 @@ impl App {
         self.draw_composer(f, body);
         if let Some(kind) = self.dialog_kind() {
             self.draw_dialog(f, area, kind);
+        }
+        let ink = self.look.ink();
+        if let Some(news) = &mut self.news {
+            news.draw(f, ink);
         }
     }
 

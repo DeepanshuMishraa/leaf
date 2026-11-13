@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::art::Ink;
 use crate::home;
 use crate::look::Look;
+use crate::news::News;
 use crate::popover::{self, Edit};
 
 const READABLE: [&str; 4] = ["pdf", "epub", "md", "markdown"];
@@ -203,6 +204,7 @@ pub fn pick(
     // Asked once the terminal is raw.
     let mut look = Look::detect();
     let name = home::first_name();
+    let mut news = News::unseen();
     let result = (|| loop {
         let entries = picker.entries();
         let rows: usize = entries.iter().map(|(_, list)| list.len()).sum();
@@ -221,7 +223,10 @@ pub fn pick(
                     ink: ink.unwrap_or_else(|| Ink::of_colors(look.colors())),
                     dither: ink.is_some(),
                 },
-            )
+            );
+            if let Some(news) = &mut news {
+                news.draw(f, ink);
+            }
         })?;
         // Wakes to follow the theme and the UI setting.
         if !event::poll(look.due())? {
@@ -229,6 +234,7 @@ pub fn pick(
             continue;
         }
         let key = match event::read()? {
+            Event::Key(key) if News::key(&mut news, key) => continue,
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => continue,
         };

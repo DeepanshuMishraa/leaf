@@ -33,6 +33,7 @@ use crate::art;
 use crate::diff;
 use crate::diffview::Leave;
 use crate::look::Look;
+use crate::news::News;
 use crate::popover::{self, Edit};
 use crate::pr::{
     self, Action, CheckStatus, Detail, Entry, EventKind, Group, Mergeability, PrRef, Source, State,
@@ -377,6 +378,8 @@ struct App {
     tx: Sender<Msg>,
     /// The theme and the UI setting, followed while the view is open.
     look: Look,
+    /// This version's notes, up once after an update until OK.
+    news: Option<News>,
     /// Time spent here, for the home screen's heat map.
     clock: usage::Clock,
     rx: Receiver<Msg>,
@@ -412,6 +415,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
     let (tx, rx) = mpsc::channel();
     let mut app = App {
         look: Look::detect(),
+        news: News::unseen(),
         clock: usage::Clock::start(),
         tx,
         rx,
@@ -772,6 +776,8 @@ impl App {
             }
             self.clock.touch();
             match event::read()? {
+                Event::Key(key) if News::key(&mut self.news, key) => {}
+                Event::Mouse(mouse) if News::mouse(&mut self.news, mouse) => {}
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if !self.key(key, terminal)? {
                         return Ok(());
@@ -1194,10 +1200,13 @@ impl App {
         if let Some(page) = &mut self.page {
             let refreshing = self.inflight.contains(&page.pr);
             draw_page(f, page, &mut self.gallery, now, refreshing, ink);
-            return;
-        }
-        if let Some(list) = &mut self.list {
+        } else if let Some(list) = &mut self.list {
             draw_list(f, list, now, ink);
+        }
+        if let Some(news) = &mut self.news {
+            let panel = news.draw(f, ink);
+            // Kitty images sit above the text, so any under the dialog would hide it.
+            self.gallery.uncover(panel);
         }
     }
 }

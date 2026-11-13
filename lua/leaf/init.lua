@@ -383,14 +383,15 @@ function M.setup(opts)
   -- is on. `leaf ui toggle` saves the choice, every open leaf picks it up,
   -- and leaf reloads this config so the title follows.
 
-  local dither = not open.classic
+  -- Off unless leaf says it's on: the classic look is the default.
+  local dither = open.dither == true
   rex.action{
     name = "leaf_ui",
     title = dither and "Leaf: Dither UI ✓" or "Leaf: Dither UI (Off)",
     description = dither
       and "The dithered look is on: tinted bars, dithered margins and panels in your theme's colors."
         .. " Run to switch to the classic look."
-      or "The classic look is on. Run to turn the dithered look back on.",
+      or "The classic look is on. Run to turn on the dithered look.",
     category = "Leaf",
     keywords = "leaf dither ui look style classic old toggle appearance theme on off",
     run = function()

@@ -9,10 +9,13 @@
 //! leaves the installed leaf as it was.
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
+
+use crate::spinner;
 
 const REPO: &str = "DeepanshuMishraa/leaf";
 const USER_AGENT: &str = concat!("leaf/", env!("CARGO_PKG_VERSION"));
@@ -176,7 +179,7 @@ impl fmt::Display for Outcome {
 pub fn run(check_only: bool) -> Result<Outcome, UpgradeFailed> {
     let target = TARGET.ok_or(UpgradeFailed::UnsupportedPlatform)?;
     let current = Version::current().ok_or(UpgradeFailed::PreRelease(env!("CARGO_PKG_VERSION")))?;
-    let newest = latest()?;
+    let newest = spinner::step("Checking for a new release", |_| latest())?;
     if newest <= current {
         return Ok(Outcome::Current {
             installed: current,
@@ -193,19 +196,35 @@ pub fn run(check_only: bool) -> Result<Outcome, UpgradeFailed> {
     let exe = installed_path()?;
     let base =
         format!("https://github.com/{REPO}/releases/download/v{newest}/leaf-{target}.tar.gz");
-    let archive = download(&base)?;
-    let expected = checksum_of(&String::from_utf8_lossy(&download(&format!(
-        "{base}.sha256"
-    ))?))
-    .ok_or_else(|| UpgradeFailed::Download {
-        url: format!("{base}.sha256"),
-        cause: "it holds no SHA-256 checksum".to_owned(),
+    let archive = spinner::step(&format!("Downloading leaf {newest}"), |spinner| {
+        download(&base, |got, total| {
+            spinner.detail(match total {
+                Some(total) => format!(
+                    "({} of {})",
+                    spinner::megabytes(got),
+                    spinner::megabytes(total)
+                ),
+                None => format!("({})", spinner::megabytes(got)),
+            })
+        })
     })?;
-    let actual = hex(&Sha256::digest(&archive));
-    if actual != expected {
-        return Err(UpgradeFailed::Checksum { expected, actual });
-    }
-    install(&archive, &exe, newest)?;
+    spinner::step("Verifying the download", |_| {
+        let sums = download(&format!("{base}.sha256"), |_, _| {})?;
+        let expected = checksum_of(&String::from_utf8_lossy(&sums)).ok_or_else(|| {
+            UpgradeFailed::Download {
+                url: format!("{base}.sha256"),
+                cause: "it holds no SHA-256 checksum".to_owned(),
+            }
+        })?;
+        let actual = hex(&Sha256::digest(&archive));
+        if actual != expected {
+            return Err(UpgradeFailed::Checksum { expected, actual });
+        }
+        Ok(())
+    })?;
+    spinner::step(&format!("Installing to {}", exe.display()), |_| {
+        install(&archive, &exe, newest)
+    })?;
     Ok(Outcome::Upgraded {
         from: current,
         to: newest,
@@ -246,20 +265,30 @@ fn tag_version(location: &str) -> Option<Version> {
     Version::parse(tag.split(['?', '#']).next()?)
 }
 
-fn download(url: &str) -> Result<Vec<u8>, UpgradeFailed> {
+/// Downloads `url`, telling `progress` the bytes so far and the size, when
+/// the server says it.
+fn download(url: &str, progress: impl Fn(u64, Option<u64>)) -> Result<Vec<u8>, UpgradeFailed> {
     let failed = |cause: String| UpgradeFailed::Download {
         url: url.to_owned(),
         cause,
     };
-    ureq::get(url)
+    let body = ureq::get(url)
         .header("user-agent", USER_AGENT)
         .call()
         .map_err(|e| failed(e.to_string()))?
-        .into_body()
-        .with_config()
-        .limit(MAX_ARCHIVE)
-        .read_to_vec()
-        .map_err(|e| failed(e.to_string()))
+        .into_body();
+    let total = body.content_length();
+    let mut reader = body.into_with_config().limit(MAX_ARCHIVE).reader();
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(MAX_ARCHIVE) as usize);
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).map_err(|e| failed(e.to_string()))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        progress(bytes.len() as u64, total);
+    }
 }
 
 /// The checksum in a `sha256sum`-style line: `<64 hex digits>  <file>`.

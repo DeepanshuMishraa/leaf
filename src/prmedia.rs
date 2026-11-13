@@ -750,6 +750,11 @@ impl Gallery {
         kitty.flush(&mut io::stdout(), &self.placements)
     }
 
+    /// Leaves out this frame's images that `panel` would overlap.
+    pub fn uncover(&mut self, panel: Rect) {
+        self.placements.retain(|(_, rect)| !rect.intersects(panel));
+    }
+
     /// Takes every image off the screen, as before handing the terminal over.
     pub fn clear(&mut self) -> io::Result<()> {
         self.placements.clear();

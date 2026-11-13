@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::spinner;
+
 const BEGIN: &str = "-- >>> leaf >>>";
 const END: &str = "-- <<< leaf <<<";
 const SOURCE: &str = include_str!("../lua/leaf/init.lua");
@@ -21,13 +23,18 @@ pub fn install() -> Result<String, String> {
         .join("init.lua");
     let previous = fs::read_to_string(&config).unwrap_or_default();
     let next = with_block(&previous, Some(&loader(&plugin_path, &bin)));
-    write_if_changed(&plugin_path, SOURCE)?;
-    write_if_changed(&config, &next)?;
-    if let Err(error) = rex(&["config", "check", &config.display().to_string()]) {
+    spinner::step("Writing the plugin into Rex's config", |_| {
+        write_if_changed(&plugin_path, SOURCE)?;
+        write_if_changed(&config, &next)
+    })?;
+    let checked = spinner::step("Checking Rex's config", |_| {
+        rex(&["config", "check", &config.display().to_string()])
+    });
+    if let Err(error) = checked {
         let _ = fs::write(&config, previous);
         return Err(error);
     }
-    let reloaded = rex(&["config", "reload"]).is_ok();
+    let reloaded = spinner::step("Reloading Rex", |_| rex(&["config", "reload"])).is_ok();
     Ok(format!(
         "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Pull Requests lists this branch's pull request, this repository's and yours.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
         if reloaded {

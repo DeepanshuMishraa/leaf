@@ -21,6 +21,7 @@ mod markdown;
 mod memory;
 mod mermaid;
 mod mono;
+mod news;
 mod pdf;
 mod picker;
 mod place;
@@ -37,6 +38,7 @@ mod render;
 mod rextheme;
 mod scheme;
 mod shape;
+mod spinner;
 mod stroke;
 mod syntax;
 mod tempo;
@@ -476,7 +478,7 @@ fn ui_command(args: &[String]) -> ExitCode {
         "{}",
         match next {
             progress::Ui::Dither => "Dither UI on.",
-            progress::Ui::Classic => "Classic UI on. `leaf ui dither` brings the dither back.",
+            progress::Ui::Classic => "Classic UI on. `leaf ui dither` turns the dither on.",
         }
     );
     ExitCode::SUCCESS

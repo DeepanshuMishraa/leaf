@@ -96,11 +96,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dither_draws_until_classic_is_picked() {
+    fn classic_draws_until_dither_is_picked() {
         let mut look = Look::detect();
+        assert!(look.ink().is_none());
+        look.ui = Ui::Dither;
         assert!(look.ink().is_some());
         look.ui = Ui::Classic;
-        assert!(look.ink().is_none());
         assert!(look.due() <= scheme::EVERY);
         assert!(!look.refresh(true), "nothing changed");
     }
