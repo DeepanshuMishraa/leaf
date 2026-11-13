@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 
 use crate::agent;
+use crate::diffreview::{Margin, SaveNotes, Sends};
 use crate::planview::{self, Plan};
 use crate::progress::Store;
 use crate::review::{Outcome, Verdict};
@@ -203,6 +204,139 @@ fn drafts(
         }
     });
     (draft, save, failure)
+}
+
+const REVIEW_USAGE: &str = "Usage: leaf review [--wait | --print] [--reply-to <rex block>] [diff options] [path | revision | GitHub url]
+
+Reviews changes file by file: an overview of every changed file, notes on
+lines (C), on a file (F) and on the whole change (M), then S sends them as one
+review with a verdict. Takes the same sources as leaf diff (--staged, --branch,
+--base <ref>, a range, a patch file or a GitHub link).
+
+Run by an agent (no terminal) inside Rex, it opens beside the agent and returns
+at once; the review arrives as the agent's next message. --wait blocks until
+the review is sent and prints it instead.";
+
+/// Takes Margin's own options out of `args`, leaving the rest for the diff.
+fn split_review(args: &[String]) -> Result<(Reply, bool, Vec<String>), String> {
+    let mut reply = Reply::Agent(None);
+    let mut wait = false;
+    let mut rest = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--wait" => wait = true,
+            "--print" => reply = Reply::Print,
+            "--reply-to" => {
+                let block = args.next().ok_or("--reply-to needs a Rex block id")?;
+                reply = Reply::Agent(Some(block.clone()));
+            }
+            "--result" => {
+                let path = args.next().ok_or("--result needs a file path")?;
+                reply = Reply::Result(PathBuf::from(path));
+            }
+            _ => rest.push(arg.clone()),
+        }
+    }
+    Ok((reply, wait, rest))
+}
+
+/// `leaf review`.
+pub fn review_command(args: &[String]) -> ExitCode {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("{REVIEW_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let (reply, wait, rest) = match split_review(args) {
+        Ok(split) => split,
+        Err(message) => {
+            eprintln!("leaf: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let (request, layout) = match crate::diff_request(&rest) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("leaf: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    if !interactive {
+        let mut forwarded = vec!["review".to_owned()];
+        forwarded.extend(rest.iter().cloned());
+        let command = format!("leaf {}", forwarded.join(" "));
+        return match beside(&forwarded, wait, &command) {
+            Ok(Opened::Returned) => {
+                println!(
+                    "Opened the changes for review in a pane beside you. The review arrives as your next message: end your turn now and don't poll for it."
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(Opened::Waited(outcome)) => {
+                print_outcome(&outcome);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("leaf: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    std::thread::spawn(crate::syntax::warm);
+    let loaded = match request.load() {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if loaded.diff.files().is_empty() {
+        eprintln!(
+            "leaf: there are no changes to review in {}. Name another source, such as --staged or --branch.",
+            loaded.label
+        );
+        return ExitCode::from(1);
+    }
+    let failure = Rc::new(RefCell::new(None));
+    let mut options = crate::diff_options(&loaded.key, failure.clone());
+    options.layout = layout;
+    let result = crate::diffview::review(loaded, options);
+    if let Some(message) = failure.borrow().as_ref() {
+        eprintln!("leaf: {message}");
+    }
+    match result {
+        Ok(outcome) => finish(&outcome, &reply),
+        Err(e) => {
+            eprintln!("leaf: {}", MarginFailed::Terminal(e));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// File and global notes for the diff `key`, kept like a plan's notes. A store
+/// failure is left in `failure`, which the diff screen reports on leaving.
+pub fn diff_margin(key: &str, failure: Rc<RefCell<Option<String>>>) -> Margin {
+    let (draft, save, failed) = drafts(&format!("diff:{key}"));
+    if let Some(message) = failed.borrow().clone() {
+        *failure.borrow_mut() = Some(message);
+    }
+    // Later save failures surface the same way.
+    let save: SaveNotes = {
+        let mut inner = save;
+        Box::new(move |json| {
+            inner(json);
+            if let Some(message) = failed.borrow().clone() {
+                *failure.borrow_mut() = Some(message);
+            }
+        })
+    };
+    Margin {
+        draft,
+        save,
+        sends: Sends::Agent,
+        overview_first: false,
+    }
 }
 
 pub fn read_plan(path: &Path) -> Result<String, MarginFailed> {

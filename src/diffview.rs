@@ -28,12 +28,14 @@ use crate::agent;
 use crate::art;
 use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
+use crate::diffreview::{self, FileNotes, Margin, SaveNotes, Sends};
 use crate::github;
 use crate::look::Look;
 use crate::news::News;
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::remote;
 use crate::render::DIM;
+use crate::review::{Outcome, Verdict};
 use crate::scheme;
 use crate::syntax;
 use crate::theme::{self, Theme};
@@ -133,6 +135,8 @@ pub struct Options {
     /// other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
     pub layout: Layout,
+    /// File and global notes, and where `S` sends the review.
+    pub margin: Margin,
 }
 
 /// How changed lines are laid out; `i` switches between them.
@@ -162,6 +166,7 @@ impl Default for Options {
             failure: Rc::new(RefCell::new(None)),
             tabs: false,
             layout: Layout::Split,
+            margin: Margin::default(),
         }
     }
 }
@@ -183,6 +188,7 @@ enum DialogKind {
     Error,
     Confirm,
     Loading,
+    Verdict,
 }
 
 struct Confirm {
@@ -208,6 +214,8 @@ enum Dialog {
     Error(String),
     Confirm(Confirm),
     Loading(String),
+    /// Picking the verdict the review goes out with.
+    Verdict,
 }
 
 impl Dialog {
@@ -220,6 +228,7 @@ impl Dialog {
             Dialog::Error(_) => DialogKind::Error,
             Dialog::Confirm(_) => DialogKind::Confirm,
             Dialog::Loading(_) => DialogKind::Loading,
+            Dialog::Verdict => DialogKind::Verdict,
         }
     }
 }
@@ -544,6 +553,31 @@ struct App {
     highlight: HashMap<(u32, u32), Rc<Vec<Vec<syntax::Kind>>>>,
     new_highlights: u8,
     deliver: Deliver,
+    /// File and global notes and viewed marks.
+    notes: FileNotes,
+    save_notes: SaveNotes,
+    sends: Sends,
+    /// The overview of every file, with the row picked: 0 is the global
+    /// note, then one row per file. `None` while reading a file.
+    overview: Option<usize>,
+    note_editor: Option<NoteEditor>,
+    /// How the review ended, for `leaf review`.
+    outcome: Option<Outcome>,
+    /// Set by a first `q` with notes unsent, so a second one quits.
+    quit_armed: bool,
+}
+
+/// A file or global note being written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoteTarget {
+    File(String),
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteEditor {
+    target: NoteTarget,
+    text: String,
 }
 
 impl App {
@@ -588,7 +622,22 @@ impl App {
             highlight: HashMap::new(),
             new_highlights: HIGHLIGHT_BUDGET,
             deliver: Box::new(agent::deliver),
+            notes: options
+                .margin
+                .draft
+                .as_deref()
+                .map(FileNotes::from_json)
+                .unwrap_or_default(),
+            save_notes: options.margin.save,
+            sends: options.margin.sends,
+            overview: None,
+            note_editor: None,
+            outcome: None,
+            quit_armed: false,
         };
+        if options.margin.overview_first && !app.loaded.diff.files().is_empty() {
+            app.overview = Some(1);
+        }
         app.rebuild_marks();
         app
     }
@@ -857,6 +906,18 @@ impl App {
 
 /// Opens the reviewer on a loaded patch, and says how it was left.
 pub fn run(loaded: Loaded, options: Options) -> io::Result<Leave> {
+    open(loaded, options).map(|app| app.leave)
+}
+
+/// Opens the reviewer for a Margin round: on the overview of every file, with
+/// `S` closing it and handing the review back.
+pub fn review(loaded: Loaded, mut options: Options) -> io::Result<Outcome> {
+    options.margin.sends = Sends::Return;
+    options.margin.overview_first = true;
+    open(loaded, options).map(|app| app.outcome.unwrap_or(Outcome::Closed))
+}
+
+fn open(loaded: Loaded, options: Options) -> io::Result<App> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
@@ -876,7 +937,7 @@ pub fn run(loaded: Loaded, options: Options) -> io::Result<Leave> {
     remote::withdraw(remote::Kind::Diff);
     let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    result.map(|()| app.leave)
+    result.map(|()| app)
 }
 
 /// The text sent to an agent or posted as a comment: the file and line range,
@@ -1130,12 +1191,29 @@ impl App {
             self.dialog_key(key);
             return;
         }
+        if self.note_editor.is_some() {
+            self.editor_key(key);
+            return;
+        }
         if self.composer.is_some() {
             self.composer_key(key);
             return;
         }
+        if self.overview.is_some() {
+            self.overview_key(key);
+            return;
+        }
+        if !matches!(key.code, KeyCode::Char('q')) {
+            self.quit_armed = false;
+        }
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.ask_quit(),
+            KeyCode::Char('F') => self.edit_file_note(None),
+            KeyCode::Char('M') => self.edit_global_note(),
+            KeyCode::Char('V') => self.toggle_viewed(None),
+            KeyCode::Char('S') => self.open_verdict(),
+            KeyCode::Char('O') => self.show_overview(),
+            KeyCode::Tab if !self.tabs => self.show_overview(),
             KeyCode::Esc => {
                 // Escape drops whatever is highlighted before it quits.
                 if self.visual {
@@ -1163,7 +1241,7 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.go_edge(true),
             KeyCode::Char(']') | KeyCode::Char('n') => self.next_file(true),
             KeyCode::Char('[') | KeyCode::Char('N') => self.next_file(false),
-            KeyCode::Char('F') | KeyCode::Char('f') => self.show_files(),
+            KeyCode::Char('f') => self.show_files(),
             KeyCode::Char('v') => self.toggle_selection(),
             KeyCode::Char('C') => self.compose(Purpose::Comment),
             KeyCode::Char('@') => self.compose(Purpose::Ask),
@@ -1218,6 +1296,7 @@ impl App {
             Some(DialogKind::Files) => self.files_key(key),
             Some(DialogKind::Confirm) => self.confirm_key(key),
             Some(DialogKind::Loading) => {}
+            Some(DialogKind::Verdict) => self.verdict_key(key),
             Some(DialogKind::Help | DialogKind::Error) | None => {
                 if matches!(
                     key.code,
@@ -1450,6 +1529,13 @@ impl App {
             return;
         }
         let current = self.current_file().unwrap_or(0);
+        // Reviewing, the files come round through the overview.
+        let last = diff.files().len() - 1;
+        if self.sends == Sends::Return
+            && ((forward && current == last) || (!forward && current == 0))
+        {
+            return self.show_overview();
+        }
         let index = if forward {
             (current + 1) % diff.files().len()
         } else {
@@ -2029,7 +2115,12 @@ impl App {
         let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         self.view = body;
         self.follow_cursor();
-        self.draw_rows(f, body);
+        if let Some(selected) = self.overview {
+            self.draw_overview(f, body, selected);
+        } else {
+            self.draw_rows(f, body);
+        }
+        self.draw_note_editor(f, body);
         self.draw_footer(
             f,
             Rect::new(
@@ -2061,6 +2152,28 @@ impl App {
             };
             let text = clip(&toast.text, area.width.saturating_sub(2) as usize);
             Line::from(Span::styled(format!(" {text}"), style))
+        } else if self.note_editor.is_some() {
+            Line::from(Span::styled(
+                clip(
+                    " enter save · alt+enter new line · empty clears it · esc discard",
+                    area.width as usize,
+                ),
+                Style::default().fg(DIM),
+            ))
+        } else if self.overview.is_some() {
+            let unsent = self.unsent();
+            let keys = format!(
+                " enter open · c note on file · C global note · V viewed · S send{} · q quit",
+                if unsent > 0 {
+                    format!(" ({unsent})")
+                } else {
+                    String::new()
+                }
+            );
+            Line::from(Span::styled(
+                clip(&keys, area.width as usize),
+                Style::default().fg(DIM),
+            ))
         } else if let Some(composer) = &self.composer {
             let keys = match composer.purpose {
                 Purpose::Comment => {
@@ -2118,10 +2231,18 @@ impl App {
             left.push_str(&format!("  {mode}{lines} {unit} · C comment"));
         }
         let (added, removed) = totals(diff);
-        let stats = if self.tabs {
-            format!("1 summary · 2 timeline   +{added} −{removed} ")
+        let unsent = self.unsent();
+        let review = if unsent > 0 {
+            format!("{unsent} unsent · S send   ")
+        } else if self.sends == Sends::Return {
+            "tab files · S send   ".to_owned()
         } else {
-            format!("+{added} −{removed} ")
+            String::new()
+        };
+        let stats = if self.tabs {
+            format!("{review}1 summary · 2 timeline   +{added} −{removed} ")
+        } else {
+            format!("{review}+{added} −{removed} ")
         };
         let left_width = (width as usize).saturating_sub(cells(&stats) + 1);
         let left = clip(&left, left_width);
@@ -2642,6 +2763,7 @@ impl App {
             DialogKind::Comments => self.draw_comments(f, area),
             DialogKind::Files => self.draw_files(f, area),
             DialogKind::Confirm => self.draw_confirm(f, area),
+            DialogKind::Verdict => self.draw_verdict(f, area),
         }
     }
 
@@ -2984,6 +3106,14 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
             "ask the agent about the line or selection (⇧⌘A in Rex)",
         ),
         ("m", "comments: jump, resend, delete, post"),
+        (
+            "tab O",
+            "overview of every file, with notes and viewed marks",
+        ),
+        ("F", "note on this whole file"),
+        ("M", "global note on the whole change"),
+        ("V", "mark this file viewed (again: not viewed)"),
+        ("S", "send drafts and notes as one review, with a verdict"),
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
         ("i", "split or inline layout"),
@@ -3067,6 +3197,468 @@ impl App {
         // Wakes in time to follow the theme and the UI setting.
         let due = self.look.due();
         Some(wait.map_or(due, |wait| wait.min(due)))
+    }
+}
+
+// Margin: the overview of every file, file and global notes, viewed marks,
+// and the one review `S` sends.
+
+impl App {
+    /// How many notes the review would send now.
+    fn unsent(&self) -> usize {
+        self.notes.count()
+            + self
+                .comments
+                .iter()
+                .filter(|saved| saved.comment.state == State::Draft)
+                .count()
+    }
+
+    fn persist_notes(&mut self) {
+        let json = self.notes.to_json();
+        (self.save_notes)(json.as_deref());
+    }
+
+    /// `q` reviewing with notes unsent asks for a second `q`, so they aren't
+    /// left behind by accident. They're kept either way.
+    fn ask_quit(&mut self) {
+        let unsent = self.unsent();
+        if self.sends == Sends::Return && unsent > 0 && !self.quit_armed {
+            self.quit_armed = true;
+            let notes = if unsent == 1 { "1 note" } else { "notes" };
+            self.toast(format!(
+                "{notes} not sent yet: S sends the review, q again quits and keeps them"
+            ));
+        } else {
+            self.quit = true;
+        }
+    }
+
+    fn show_overview(&mut self) {
+        if self.loaded.diff.files().is_empty() {
+            self.toast("This diff has no files");
+            return;
+        }
+        let row = self.current_file().map_or(1, |file| file + 1);
+        self.overview = Some(row);
+    }
+
+    fn overview_rows(&self) -> usize {
+        self.loaded.diff.files().len() + 1
+    }
+
+    /// The file the overview row picks, or `None` on the global row.
+    fn overview_file(&self) -> Option<usize> {
+        self.overview.and_then(|row| row.checked_sub(1))
+    }
+
+    fn overview_key(&mut self, key: KeyEvent) {
+        let Some(selected) = self.overview else {
+            return;
+        };
+        let last = self.overview_rows() - 1;
+        if !matches!(key.code, KeyCode::Char('q')) {
+            self.quit_armed = false;
+        }
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char('j') | KeyCode::Down => self.overview = Some((selected + 1).min(last)),
+            KeyCode::Char('k') | KeyCode::Up => self.overview = Some(selected.saturating_sub(1)),
+            KeyCode::Char('g') | KeyCode::Home => self.overview = Some(0),
+            KeyCode::Char('G') | KeyCode::End => self.overview = Some(last),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => match self.overview_file() {
+                Some(file) => {
+                    self.overview = None;
+                    self.jump_file(file);
+                }
+                None => self.edit_global_note(),
+            },
+            KeyCode::Char('c') => match self.overview_file() {
+                Some(file) => self.edit_file_note(Some(file)),
+                None => self.edit_global_note(),
+            },
+            KeyCode::Char('C') | KeyCode::Char('M') => self.edit_global_note(),
+            KeyCode::Char('V') => {
+                if let Some(file) = self.overview_file() {
+                    self.toggle_viewed(Some(file));
+                }
+            }
+            KeyCode::Char('x') => match self.overview_file() {
+                Some(file) => {
+                    let path = self.loaded.diff.files()[file].path().to_owned();
+                    if self.notes.files.remove(&path).is_some() {
+                        self.persist_notes();
+                        self.toast("File note deleted");
+                    }
+                }
+                None => {
+                    if self.notes.global.take().is_some() {
+                        self.persist_notes();
+                        self.toast("Global note deleted");
+                    }
+                }
+            },
+            KeyCode::Char('S') => self.open_verdict(),
+            KeyCode::Char('m') => self.show_comments(),
+            KeyCode::Char('?') => self.dialog = Dialog::Help,
+            KeyCode::Tab | KeyCode::Char('O') | KeyCode::Esc => {
+                if self.sends == Sends::Return && key.code == KeyCode::Esc {
+                    self.ask_quit();
+                } else {
+                    self.overview = None;
+                }
+            }
+            KeyCode::Char('q') => self.ask_quit(),
+            _ => {}
+        }
+    }
+
+    /// Writes the note on file `file`, or the file under the cursor.
+    fn edit_file_note(&mut self, file: Option<usize>) {
+        let Some(file) = file.or_else(|| self.current_file()) else {
+            self.toast("Move to a file first");
+            return;
+        };
+        let Some(path) = self.loaded.diff.file(file).map(|f| f.path().to_owned()) else {
+            return;
+        };
+        let text = self.notes.files.get(&path).cloned().unwrap_or_default();
+        self.note_editor = Some(NoteEditor {
+            target: NoteTarget::File(path),
+            text,
+        });
+    }
+
+    fn edit_global_note(&mut self) {
+        self.note_editor = Some(NoteEditor {
+            target: NoteTarget::Global,
+            text: self.notes.global.clone().unwrap_or_default(),
+        });
+    }
+
+    fn editor_key(&mut self, key: KeyEvent) {
+        let Some(editor) = self.note_editor.as_mut() else {
+            return;
+        };
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.note_editor = None;
+                self.toast("Note discarded");
+            }
+            KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
+                editor.text.push('\n')
+            }
+            KeyCode::Enter => {
+                let Some(editor) = self.note_editor.take() else {
+                    return;
+                };
+                let message = match &editor.target {
+                    NoteTarget::Global => {
+                        self.notes.set_global(&editor.text);
+                        if self.notes.global.is_some() {
+                            "Global note saved"
+                        } else {
+                            "Global note cleared"
+                        }
+                    }
+                    NoteTarget::File(path) => {
+                        self.notes.set_file(path, &editor.text);
+                        if self.notes.files.contains_key(path) {
+                            "File note saved"
+                        } else {
+                            "File note cleared"
+                        }
+                    }
+                };
+                self.persist_notes();
+                self.toast(message);
+            }
+            KeyCode::Backspace if alt || ctrl => {
+                let kept = editor.text.trim_end().len();
+                let word = editor.text[..kept]
+                    .rfind(char::is_whitespace)
+                    .map_or(0, |at| at + 1);
+                editor.text.truncate(word);
+            }
+            KeyCode::Backspace => {
+                editor.text.pop();
+            }
+            KeyCode::Char('u') if ctrl => editor.text.clear(),
+            KeyCode::Char(c) if !ctrl => editor.text.push(c),
+            _ => {}
+        }
+    }
+
+    fn toggle_viewed(&mut self, file: Option<usize>) {
+        let Some(file) = file.or_else(|| self.current_file()) else {
+            return;
+        };
+        let viewed = self.notes.toggle_viewed(&self.loaded.diff, file);
+        self.persist_notes();
+        let count = self.loaded.diff.files().len();
+        let seen = (0..count)
+            .filter(|f| self.notes.is_viewed(&self.loaded.diff, *f))
+            .count();
+        self.toast(if viewed {
+            format!("Viewed · {seen} of {count} files")
+        } else {
+            format!("Not viewed · {seen} of {count} files")
+        });
+    }
+
+    fn open_verdict(&mut self) {
+        self.dialog = Dialog::Verdict;
+    }
+
+    fn verdict_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('a') => self.send_review(Verdict::Approve),
+            KeyCode::Char('n') => self.send_review(Verdict::ApproveWithNotes),
+            KeyCode::Char('c') | KeyCode::Char('r') => self.send_review(Verdict::RequestChanges),
+            KeyCode::Esc | KeyCode::Char('q') => self.dialog = Dialog::None,
+            _ => {}
+        }
+    }
+
+    fn review_subject(&self) -> String {
+        self.loaded.label.clone()
+    }
+
+    fn send_review(&mut self, asked: Verdict) {
+        self.dialog = Dialog::None;
+        let review = diffreview::build(
+            &self.loaded.diff,
+            &self.review_subject(),
+            &self.notes,
+            &self.comments,
+        );
+        if asked == Verdict::RequestChanges && !review.has_notes() {
+            self.fail("Add a note first (C on lines, F on a file, M for the whole change), so the agent knows what to change.");
+            return;
+        }
+        let verdict = review.verdict(asked);
+        let text = review.render(asked);
+        match self.sends {
+            Sends::Return => {
+                self.outcome = Some(Outcome::Sent { verdict, text });
+                self.mark_sent();
+                self.quit = true;
+            }
+            Sends::Agent => match (self.deliver)(&text) {
+                Ok(agent) => {
+                    self.mark_sent();
+                    self.toast(format!(
+                        "Review ({}) sent to {}",
+                        verdict.label(),
+                        agent.describe()
+                    ));
+                }
+                Err(e) => {
+                    self.copy = Some(text);
+                    self.fail(e.to_string());
+                }
+            },
+        }
+    }
+
+    /// The draft comments and the notes went out with the review.
+    fn mark_sent(&mut self) {
+        let drafts: Vec<usize> = self
+            .comments
+            .iter()
+            .enumerate()
+            .filter(|(_, saved)| saved.comment.state == State::Draft)
+            .map(|(index, _)| index)
+            .collect();
+        for index in drafts {
+            self.set_state(index, State::Agent);
+        }
+        self.notes.sent();
+        self.persist_notes();
+    }
+
+    fn draft_comments_in(&self, path: &str) -> usize {
+        self.comments
+            .iter()
+            .filter(|saved| {
+                saved.comment.state == State::Draft && saved.comment.anchor.file == path
+            })
+            .count()
+    }
+
+    fn draw_overview(&mut self, f: &mut Frame, area: Rect, selected: usize) {
+        if area.height == 0 {
+            return;
+        }
+        let diff = &self.loaded.diff;
+        let files = diff.files();
+        let (added, removed) = totals(diff);
+        let width = area.width as usize;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let title = format!(" Review · {}", self.review_subject());
+        let stats = format!("{} files  +{added} −{removed} ", files.len());
+        let pad = width.saturating_sub(cells(&title) + cells(&stats));
+        lines.push(Line::from(vec![
+            Span::styled(
+                clip(&title, width.saturating_sub(cells(&stats))),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(stats, Style::default().fg(DIM)),
+        ]));
+        lines.push(Line::from(""));
+        let pick = |row: usize| {
+            if row == selected {
+                Style::default().bg(self.palette.focus)
+            } else {
+                Style::default()
+            }
+        };
+        let global = match &self.notes.global {
+            Some(note) => format!("   Global  {}", note.lines().next().unwrap_or_default()),
+            None => "   Global  C writes a note on the whole change".to_owned(),
+        };
+        let global_style = if self.notes.global.is_some() {
+            pick(0).fg(ACCENT)
+        } else {
+            pick(0).fg(DIM)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{:<width$}", clip(&global, width)),
+            global_style,
+        )));
+        lines.push(Line::from(""));
+        let path_width = files
+            .iter()
+            .map(|file| cells(&file.display()) + 1)
+            .max()
+            .unwrap_or(0)
+            .min(width.saturating_sub(34).max(12));
+        // Rows for files, scrolled to keep the picked one on screen.
+        let room = (area.height as usize).saturating_sub(lines.len());
+        let first = selected
+            .saturating_sub(1)
+            .saturating_sub(room.saturating_sub(1))
+            .min(files.len().saturating_sub(room));
+        for (index, file) in files.iter().enumerate().skip(first).take(room) {
+            let row = index + 1;
+            let viewed = self.notes.is_viewed(diff, index);
+            let has_note = self.notes.files.contains_key(file.path());
+            let comments = self.draft_comments_in(file.path());
+            let notes = comments + usize::from(has_note);
+            let (status, color) = file_status(file);
+            let mark = match (viewed, notes > 0) {
+                (_, true) => "●",
+                (true, false) => "✓",
+                (false, false) => " ",
+            };
+            let notes_label = match notes {
+                0 => String::new(),
+                1 => "1 note".to_owned(),
+                n => format!("{n} notes"),
+            };
+            let style = pick(row);
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {mark} "),
+                    style.fg(if notes > 0 { ACCENT } else { DIM }),
+                ),
+                Span::styled(format!("{status} "), style.fg(color)),
+                Span::styled(
+                    format!("{:<path_width$}", clip(&file.display(), path_width)),
+                    if viewed { style.fg(DIM) } else { style },
+                ),
+                Span::styled(
+                    format!("  {:>6}", format!("+{}", file.added)),
+                    style.fg(ADDED_FG),
+                ),
+                Span::styled(
+                    format!(" {:>6}", format!("−{}", file.removed)),
+                    style.fg(REMOVED_FG),
+                ),
+                Span::styled(format!("  {notes_label:<9}"), style.fg(ACCENT)),
+            ];
+            let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
+            spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
+            lines.push(Line::from(spans));
+        }
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn draw_note_editor(&self, f: &mut Frame, area: Rect) {
+        let Some(editor) = &self.note_editor else {
+            return;
+        };
+        let title = match &editor.target {
+            NoteTarget::Global => " Global note on the whole change ".to_owned(),
+            NoteTarget::File(path) => format!(" Note on {path} "),
+        };
+        let inner_width = area.width.saturating_sub(4).max(1) as usize;
+        let text = format!("{}▏", editor.text);
+        let lines = wrap_text(&text, inner_width);
+        let height = (lines.len() as u16 + 2)
+            .clamp(3, area.height / 2 + 1)
+            .min(area.height);
+        let rect = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(height),
+            width: area.width,
+            height,
+        };
+        f.render_widget(Clear, rect);
+        let block = Block::bordered()
+            .border_style(Style::default().fg(ACCENT))
+            .title(Line::from(title).style(Style::default().fg(ACCENT)));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let skip = lines.len().saturating_sub(inner.height as usize);
+        let shown: Vec<Line> = lines.into_iter().skip(skip).map(Line::from).collect();
+        f.render_widget(Paragraph::new(shown), inner);
+    }
+
+    fn draw_verdict(&self, f: &mut Frame, area: Rect) {
+        let unsent = self.unsent();
+        let notes = match unsent {
+            0 => "no notes".to_owned(),
+            1 => "1 note".to_owned(),
+            n => format!("{n} notes"),
+        };
+        let to = match self.sends {
+            Sends::Return => "the agent that asked",
+            Sends::Agent => "the agent pane",
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("Send {notes} to {to}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" a ", Style::default().fg(ACCENT)),
+                Span::raw(if unsent > 0 {
+                    "approve, with these notes"
+                } else {
+                    "approve"
+                }),
+            ]),
+            Line::from(vec![
+                Span::styled(" n ", Style::default().fg(ACCENT)),
+                Span::raw("approve with notes"),
+            ]),
+            Line::from(vec![
+                Span::styled(" c ", Style::default().fg(ACCENT)),
+                Span::raw("request changes"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "esc keeps reviewing",
+                Style::default().fg(DIM),
+            )),
+        ];
+        panel(f, area, self.look.ink(), "send review", lines, 40);
     }
 }
 
@@ -3708,5 +4300,182 @@ diff --git a/x b/x
         let mut app = App::new(loaded(""), Options::default());
         let screen = draw(&mut app, 80, 10);
         assert!(screen.contains("nothing changed"));
+    }
+
+    fn reviewing(patch: &str) -> App {
+        let options = Options {
+            margin: Margin {
+                sends: Sends::Return,
+                overview_first: true,
+                ..Margin::default()
+            },
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(patch), options);
+        app.view = Rect::new(0, 1, 120, 20);
+        app
+    }
+
+    fn outcome_text(app: &App) -> String {
+        match &app.outcome {
+            Some(Outcome::Sent { text, .. }) => text.clone(),
+            other => panic!("expected a sent review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_review_opens_on_an_overview_of_every_file() {
+        let mut app = reviewing(TWO_FILES);
+        let screen = draw(&mut app, 100, 12);
+        assert!(screen.contains("Review · test"), "{screen}");
+        assert!(screen.contains("2 files"), "{screen}");
+        assert!(screen.contains("Global  C writes a note"), "{screen}");
+        assert!(
+            screen.contains("a.rs") && screen.contains("b.rs"),
+            "{screen}"
+        );
+        assert_eq!(app.overview, Some(1));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.overview, None);
+        assert_eq!(app.current_file(), Some(1));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.overview, Some(2));
+    }
+
+    #[test]
+    fn the_last_file_goes_on_to_the_overview_when_reviewing() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.current_file(), Some(1));
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.overview.is_some());
+    }
+
+    #[test]
+    fn line_file_and_global_notes_go_out_as_one_review() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "split it up");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "rename the file");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "why two?");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.comments.len(), 1);
+        assert_eq!(app.unsent(), 3);
+        press(&mut app, KeyCode::Char('S'));
+        assert!(matches!(app.dialog, Dialog::Verdict));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.quit);
+        let text = outcome_text(&app);
+        assert!(
+            text.starts_with("# Review of test: changes requested"),
+            "{text}"
+        );
+        assert!(text.contains("Global: split it up"), "{text}");
+        assert!(
+            text.contains("## b.rs\n\n### 1. Whole file\n\nrename the file"),
+            "{text}"
+        );
+        assert!(text.contains("+two"), "{text}");
+        assert!(text.contains("why two?"), "{text}");
+        assert_eq!(app.comments[0].comment.state, State::Agent);
+        assert_eq!(app.notes.count(), 0);
+    }
+
+    #[test]
+    fn in_a_plain_diff_s_delivers_the_review_to_the_agent_pane() {
+        let sent = Rc::new(RefCell::new(None));
+        let mut app = app();
+        let captured = sent.clone();
+        app.deliver = Box::new(move |text| {
+            *captured.borrow_mut() = Some(text.to_owned());
+            Ok(agent::Agent {
+                pane: "%3".to_owned(),
+                command: "claude".to_owned(),
+            })
+        });
+        press(&mut app, KeyCode::Char('F'));
+        type_text(&mut app, "looks fine");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('S'));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(!app.quit);
+        let text = sent.borrow().clone().unwrap_or_default();
+        assert!(
+            text.starts_with("# Review of test: approved with notes"),
+            "{text}"
+        );
+        assert!(
+            text.contains("## src/main.rs\n\n### 1. Whole file\n\nlooks fine"),
+            "{text}"
+        );
+        assert_eq!(app.notes.count(), 0);
+    }
+
+    #[test]
+    fn requesting_changes_without_notes_is_refused() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('S'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(!app.quit);
+        assert_eq!(app.outcome, None);
+    }
+
+    #[test]
+    fn viewed_files_are_ticked_in_the_overview() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('V'));
+        assert!(app.notes.is_viewed(&app.loaded.diff, 0));
+        let screen = draw(&mut app, 100, 12);
+        assert!(screen.contains(" ✓ M a.rs"), "{screen}");
+    }
+
+    #[test]
+    fn quitting_a_review_with_unsent_notes_takes_a_second_q() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "hm");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+        assert_eq!(app.outcome, None);
+    }
+
+    #[test]
+    fn notes_are_saved_as_they_change_and_come_back() {
+        let saved = Rc::new(RefCell::new(None));
+        let sink = saved.clone();
+        let options = Options {
+            margin: Margin {
+                save: Box::new(move |json| *sink.borrow_mut() = json.map(str::to_owned)),
+                ..Margin::default()
+            },
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(PATCH), options);
+        press(&mut app, KeyCode::Char('M'));
+        type_text(&mut app, "kept");
+        press(&mut app, KeyCode::Enter);
+        let draft = saved.borrow().clone();
+        let again = App::new(
+            loaded(PATCH),
+            Options {
+                margin: Margin {
+                    draft,
+                    ..Margin::default()
+                },
+                ..Options::default()
+            },
+        );
+        assert_eq!(again.notes.global.as_deref(), Some("kept"));
     }
 }

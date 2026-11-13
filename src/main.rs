@@ -5,6 +5,7 @@ mod art;
 mod article;
 mod comment;
 mod diff;
+mod diffreview;
 mod diffview;
 mod doc;
 mod edge;
@@ -67,6 +68,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]  
        leaf diff [options] [path | revision | GitHub url]
        leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
+       leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -290,6 +292,7 @@ fn main() -> ExitCode {
         },
         "agents" => agents_command(),
         "plan" => margin::plan_command(rest),
+        "review" => margin::review_command(rest),
         "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -862,6 +865,7 @@ fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Op
         failure: failure.clone(),
         tabs: false,
         layout: diffview::Layout::Split,
+        margin: margin::diff_margin(key, failure.clone()),
     };
     match Store::open(&progress::default_path()) {
         Ok(store) => {
