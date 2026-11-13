@@ -11,8 +11,8 @@
 # A stable release also bumps Formula/leaf.rb in DeepanshuMishraa/homebrew-tap,
 # pushed with the HOMEBREW_TAP_DEPLOY_KEY secret (a write deploy key on the tap).
 #
-# Pull requests that change the source or the build, and manual runs, build every target
-# without publishing, so a broken release is caught before a tag is pushed.
+# It runs only for a pushed v tag or a published release, never for branches or
+# pull requests.
 
 name: Release
 
@@ -20,26 +20,16 @@ on:
   push:
     # Any v tag; the check job holds it to Cargo.toml's exact version.
     tags: ["v*"]
-  pull_request:
-    # Everything the binary or the install path is built from.
-    paths:
-      - .github/workflows/release.yml
-      - Cargo.toml
-      - Cargo.lock
-      - src/**
-      - vendor/**
-      - lua/**
-      - examples/**
-      - site/public/install.sh
-  workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
 
 concurrency:
   group: release-${{ github.ref }}
-  # A tag's release run is never cut off halfway; a newer push to a pull request is.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A tag's release run is never cut off halfway; a second run for the same tag waits.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always

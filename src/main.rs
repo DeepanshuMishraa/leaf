@@ -50,7 +50,7 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf open [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
+const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
        leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
        leaf comments [--json]
@@ -332,6 +332,8 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
+        // Anything else names a document: `leaf README.md` is `leaf open README.md`.
+        target if rest.is_empty() && !target.starts_with('-') => open(target),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
