@@ -137,6 +137,10 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage (
+  day TEXT PRIMARY KEY,
+  seconds INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS highlights (
   key TEXT NOT NULL,
   page INTEGER NOT NULL,
@@ -434,6 +438,33 @@ impl Store {
 
     pub fn save_agent(&self, agent: Option<&str>) -> Result<(), StoreFailed> {
         self.save_setting("agent", agent.unwrap_or(""))
+    }
+
+    /// Adds `seconds` of use to `day` (`YYYY-MM-DD`, local).
+    pub fn add_usage(&self, day: &str, seconds: u64) -> Result<(), StoreFailed> {
+        self.db
+            .execute(
+                "INSERT INTO usage (day, seconds) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET seconds = seconds + excluded.seconds",
+                params![day, seconds as i64],
+            )
+            .map(drop)
+            .map_err(self.failed(Operation::Save))
+    }
+
+    /// Seconds of use on each day from `since` (`YYYY-MM-DD`) on.
+    pub fn usage_since(&self, since: &str) -> Result<Vec<(String, u64)>, StoreFailed> {
+        let mut statement = self
+            .db
+            .prepare("SELECT day, seconds FROM usage WHERE day >= ? ORDER BY day")
+            .map_err(self.failed(Operation::Read))?;
+        let rows = statement
+            .query_map([since], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(self.failed(Operation::Read))?;
+        rows.map(|row| row.map(|(day, seconds)| (day, seconds.max(0) as u64)))
+            .collect::<Result<_, _>>()
+            .map_err(self.failed(Operation::Read))
     }
 
     /// How fast reading aloud goes.

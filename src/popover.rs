@@ -30,10 +30,6 @@ pub struct Section {
     pub rows: Vec<Row>,
 }
 
-pub fn count(sections: &[Section]) -> usize {
-    sections.iter().map(|s| s.rows.len()).sum()
-}
-
 /// What a key did to the search field and the picked row.
 pub enum Edit {
     /// The text changed; the first row is picked again.

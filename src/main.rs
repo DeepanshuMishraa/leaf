@@ -13,6 +13,7 @@ mod font;
 mod gec;
 mod github;
 mod highlight;
+mod home;
 mod hue;
 mod kitty;
 mod look;
@@ -39,6 +40,7 @@ mod syntax;
 mod tempo;
 mod theme;
 mod upgrade;
+mod usage;
 mod video;
 mod viewer;
 mod voicepick;
@@ -351,13 +353,24 @@ fn main() -> ExitCode {
 /// here, or (from Rex's popover) in a new pane beside `beside`.
 fn pick_and_open(beside: Option<&str>) -> ExitCode {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let recent = Store::open(&progress::default_path())
-        .and_then(|store| store.recent(30))
+    let store = Store::open(&progress::default_path());
+    let recent = store
+        .as_ref()
+        .map_err(|e| e.to_string())
+        .and_then(|store| store.recent(30).map_err(|e| e.to_string()))
         .unwrap_or_else(|e| {
-            eprintln!("leaf: {e} The picker still lists files here.");
+            eprintln!("leaf: {e} The home screen still lists files here.");
             Vec::new()
         });
-    let target = match picker::pick(&root, recent) {
+    // A year of days, for the heat map; without it the map is just empty.
+    let usage = store
+        .as_ref()
+        .ok()
+        .and_then(|store| store.usage_since(&usage::Date::days_ago(371).key()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let target = match picker::pick(&root, recent, usage) {
         Ok(Some(target)) => target,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {

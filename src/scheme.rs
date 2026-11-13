@@ -116,6 +116,13 @@ impl Scheme {
         }
     }
 
+    /// Whether checking again asks the terminal, which reads its reply from
+    /// stdin and could swallow a key typed meanwhile. Rex's theme is read
+    /// from its settings file, which is safe at any moment.
+    pub fn asks_terminal(self) -> bool {
+        matches!(self, Scheme::Followed { .. })
+    }
+
     /// How long an event loop may sleep before the scheme is due again.
     pub fn due(self) -> Option<Duration> {
         match self {

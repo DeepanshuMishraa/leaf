@@ -3,7 +3,7 @@
 //! the background; where a bar meets the page it dissolves into it through
 //! one row of half-block pixels. Dither only goes in rows that hold no text.
 
-use dither_ratatui::dither_core::{Field, Matrix, PixelGrid, Rgba};
+use dither_ratatui::dither_core::{Field, Matrix, PixelGrid, Rgba, Tone};
 use dither_ratatui::raster::{fill_bg, paint, pixel_size};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -15,10 +15,46 @@ use crate::theme::{self, Theme};
 /// Backgrounds assumed when only light or dark is known.
 const DARK_PAPER: Rgb = [24, 24, 27];
 const LIGHT_PAPER: Rgb = [250, 250, 250];
-/// How far a bar's tint moves from the background toward the theme's blue.
-const SURFACE_TINT: f32 = 0.12;
-/// How far rules, shadows and fields move toward it.
-const MARK_TINT: f32 = 0.42;
+/// How far a bar's tint moves from the background toward the theme's accent.
+const SURFACE_TINT: f32 = 0.1;
+/// Where on a tone's ramp (0 near-black, 1 pale) pixels sit. Each mirrors
+/// the other around the background: pastels that fade into white on a
+/// light theme, deep jewel tones that fade into black on a dark one.
+const DARK_LEVEL: f32 = 0.38;
+const LIGHT_LEVEL: f32 = 0.5;
+/// Degrees the second tone turns from the first when the theme's magenta
+/// is a grey or too close to its accent to tell apart.
+const ACCENT_TURN: f32 = 50.0;
+/// Closest the two tones' hues may be, in degrees.
+const MIN_SPREAD: f32 = 25.0;
+/// The hue taken when the theme's accent is a grey.
+const DEFAULT_HUE: f32 = 250.0;
+
+/// The OKLCH hue of an sRGB color in degrees, or `None` for a grey.
+fn hue([r, g, b]: Rgb) -> Option<f32> {
+    let linear = |c: u8| {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (linear(r), linear(g), linear(b));
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    let a = 1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s;
+    let b = 0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s;
+    let chroma = (a * a + b * b).sqrt();
+    (chroma > 0.02).then(|| b.atan2(a).to_degrees().rem_euclid(360.0))
+}
+/// How far apart two hues are around the circle, in degrees.
+fn circular_gap(a: f32, b: f32) -> f32 {
+    let d = (a - b).rem_euclid(360.0);
+    d.min(360.0 - d)
+}
+
 /// Widest a rule beside a page number reaches on each side.
 const RULE_REACH: u16 = 16;
 
@@ -27,26 +63,35 @@ const RULE_REACH: u16 = 16;
 pub struct Ink {
     /// Bars and panels.
     pub surface: Rgba,
-    /// Rules, shadows and fields: stronger, still quiet.
+    /// Dithered pixels: the theme's accent, in dither-kit's ramp for its hue.
     pub mark: Rgba,
-    /// A second tone that gradients dither toward: the theme's violet,
-    /// halfway from its blue to its red.
+    /// A second tone that gradients dither toward: the theme's magenta.
     pub accent: Rgba,
     background: Rgba,
 }
 
 impl Ink {
-    /// Tints mixed from the theme's background toward its blue.
+    /// Bars tinted from the theme's background toward its accent; pixels in
+    /// dither-kit's perceptual ramps for the hues of its accent and its
+    /// magenta, so each theme dithers in its own colors and a muted one
+    /// still gets clear color.
     pub fn of(theme: Theme) -> Self {
         let rgba = |[r, g, b]: Rgb| Rgba::rgb(r, g, b);
+        let first = hue(theme.accent)
+            .or_else(|| hue(theme.blue))
+            .unwrap_or(DEFAULT_HUE);
+        let second = hue(theme.magenta)
+            .filter(|&other| circular_gap(first, other) >= MIN_SPREAD)
+            .unwrap_or(first + ACCENT_TURN);
+        let level = if theme.is_light() {
+            LIGHT_LEVEL
+        } else {
+            DARK_LEVEL
+        };
         Ink {
-            surface: rgba(theme::mix(theme.background, theme.blue, SURFACE_TINT)),
-            mark: rgba(theme::mix(theme.background, theme.blue, MARK_TINT)),
-            accent: rgba(theme::mix(
-                theme.background,
-                theme::mix(theme.blue, theme.red, 0.5),
-                MARK_TINT,
-            )),
+            surface: rgba(theme::mix(theme.background, theme.accent, SURFACE_TINT)),
+            mark: Tone::Hue(first).shade(level),
+            accent: Tone::Hue(second).shade(level - 0.03),
             background: rgba(theme.background),
         }
     }
@@ -63,6 +108,8 @@ impl Ink {
             red: toward,
             green: toward,
             blue: toward,
+            accent: toward,
+            magenta: toward,
         })
     }
 
@@ -345,6 +392,97 @@ pub fn field(buf: &mut Buffer, area: Rect, ink: Ink, field: Field, time: f32) {
     paint(&grid, area, buf, ink.background);
 }
 
+/// Levels a heat map day shows, from an empty day to a full one.
+pub const HEAT_LEVELS: u8 = 4;
+/// Pixels a heat map day takes each way, and the gap after it.
+const DAY_PX: usize = 2;
+const DAY_STEP: usize = 3;
+/// Rows a heat map of seven days down takes.
+pub const HEAT_GRID_ROWS: u16 = (7 * DAY_STEP).div_ceil(2) as u16;
+
+/// Paints one heat map day: a two-by-two square at `(x, y)` in `grid`,
+/// `level` of its four pixels lit in the tone by ordered dither and the
+/// rest faint, so an empty day still reads as a square on the calendar.
+fn day(grid: &mut PixelGrid, x: usize, y: usize, level: u8, ink: Ink) {
+    let share = f32::from(level.min(HEAT_LEVELS)) / f32::from(HEAT_LEVELS);
+    let faint = ink.mark.mix(ink.background, EMPTY_FADE);
+    for dy in 0..DAY_PX {
+        for dx in 0..DAY_PX {
+            let (px, py) = ((x + dx) as i32, (y + dy) as i32);
+            let color = if Matrix::Bayer2.on(dx as i32, dy as i32, share) {
+                ink.lit(px, py, 0.0, 0.45 + 0.55 * share)
+            } else {
+                faint
+            };
+            grid.set(px, py, color);
+        }
+    }
+}
+
+/// A heat map: one column of seven days (Monday first) per week, a
+/// gap pixel between days each way. `None` is a day not to draw, after today.
+pub fn heat_grid(buf: &mut Buffer, at: (u16, u16), weeks: &[[Option<u8>; 7]], ink: Ink) {
+    let area = Rect::new(at.0, at.1, (weeks.len() * DAY_STEP) as u16, HEAT_GRID_ROWS)
+        .intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let (w, h) = pixel_size(area);
+    let mut grid = PixelGrid::new(w, h);
+    for (week, days) in weeks.iter().enumerate() {
+        for (row, level) in days.iter().enumerate() {
+            if let Some(level) = level {
+                day(&mut grid, week * DAY_STEP, row * DAY_STEP, *level, ink);
+            }
+        }
+    }
+    paint(&grid, area, buf, ink.background);
+}
+
+/// One day's square on its own, two cells across one row, for a legend.
+pub fn heat(buf: &mut Buffer, cell: Rect, level: u8, ink: Ink) {
+    let cell = Rect {
+        width: DAY_PX as u16,
+        height: 1,
+        ..cell
+    }
+    .intersection(buf.area);
+    if cell.is_empty() {
+        return;
+    }
+    let (w, h) = pixel_size(cell);
+    let mut grid = PixelGrid::new(w, h);
+    day(&mut grid, 0, 0, level, ink);
+    paint(&grid, cell, buf, ink.background);
+}
+
+/// How far an empty day, or a meter's track, sinks toward the background.
+const EMPTY_FADE: f32 = 0.8;
+
+/// A thin meter of `value` (0..1) along the bottom of the one-row `row`:
+/// the read part in the tone, brightening toward its leading edge, the rest
+/// a faint dotted track.
+pub fn progress(buf: &mut Buffer, row: Rect, value: f32, ink: Ink) {
+    let row = Rect { height: 1, ..row }.intersection(buf.area);
+    if row.is_empty() {
+        return;
+    }
+    let (w, h) = pixel_size(row);
+    let filled = (value.clamp(0.0, 1.0) * w as f32).round() as usize;
+    let mut grid = PixelGrid::new(w, h);
+    let y = h - 1;
+    for x in 0..w {
+        let (gx, gy) = (row.x as i32 + x as i32, row.y as i32 * 2 + y as i32);
+        if x < filled {
+            let level = 0.5 + 0.5 * (x + 1) as f32 / filled as f32;
+            grid.set(x as i32, y as i32, ink.lit(gx, gy, 0.0, level));
+        } else if x % 2 == 0 {
+            grid.set(x as i32, y as i32, ink.mark.mix(ink.background, EMPTY_FADE));
+        }
+    }
+    paint(&grid, row, buf, ink.background);
+}
+
 /// Seconds since the process started, the clock moving fields share.
 pub fn clock() -> f32 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -379,10 +517,12 @@ mod tests {
             red: [200, 0, 0],
             green: [0, 200, 0],
             blue: [0, 0, 250],
+            accent: [0, 0, 250],
+            magenta: [200, 0, 200],
         });
         assert!(
             dark.surface.b > dark.surface.r,
-            "leans toward the theme's blue"
+            "leans toward the theme's accent"
         );
         assert!(
             dark.mark.b > dark.surface.b,
@@ -499,5 +639,51 @@ mod tests {
         end(&mut buf, area, INK);
         assert!(lit(&buf, Rect::new(0, 0, 80, END_ROWS)) > 0);
         assert_eq!(lit(&buf, Rect::new(0, END_ROWS, 80, 20 - END_ROWS)), 0);
+    }
+
+    #[test]
+    fn hues_come_from_the_theme_and_greys_have_none() {
+        let blue = hue([9, 105, 218]).expect("a blue has a hue");
+        assert!((230.0..275.0).contains(&blue), "{blue}");
+        let red = hue([217, 106, 77]).expect("a red has a hue");
+        assert!(red < 60.0 || red > 340.0, "{red}");
+        assert_eq!(hue([128, 128, 128]), None);
+    }
+
+    #[test]
+    fn each_theme_dithers_in_its_own_accent() {
+        // Rex's charcoal-atelier: a terracotta cursor over muted ANSI colors.
+        let charcoal = Theme {
+            background: [22, 22, 22],
+            red: [217, 106, 77],
+            green: [154, 171, 132],
+            blue: [138, 160, 180],
+            accent: [224, 93, 58],
+            magenta: [177, 147, 168],
+        };
+        let ink = Ink::of(charcoal);
+        let spread = |c: Rgba| c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b);
+        assert!(spread(ink.mark) > 40, "clear color: {:?}", ink.mark);
+        assert!(
+            ink.mark.r > ink.mark.b,
+            "warm, like its cursor: {:?}",
+            ink.mark
+        );
+        // merino-light: a blue cursor and a violet magenta.
+        let merino = Theme {
+            background: [255, 255, 255],
+            red: [207, 34, 46],
+            green: [17, 99, 41],
+            blue: [9, 105, 218],
+            accent: [9, 105, 218],
+            magenta: [130, 80, 223],
+        };
+        let ink = Ink::of(merino);
+        assert!(
+            ink.mark.b > ink.mark.r,
+            "blue, like its cursor: {:?}",
+            ink.mark
+        );
+        assert_ne!(ink.mark, ink.accent, "two tones");
     }
 }

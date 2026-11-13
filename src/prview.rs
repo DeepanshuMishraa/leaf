@@ -40,6 +40,7 @@ use crate::pr::{
 };
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
+use crate::usage;
 use crate::video::PlayFailed;
 
 const GREEN: Color = Color::Indexed(2);
@@ -296,6 +297,10 @@ struct Page {
     cache: Option<((u16, Tab, bool, u64), Body)>,
     /// Where the body was drawn last, for the mouse.
     body_area: Rect,
+    /// The pinned header's lines and where they were drawn: selectable
+    /// too, as the lines before the body's.
+    header: Vec<Line<'static>>,
+    header_area: Rect,
     tab_hits: Vec<(Rect, TabHit)>,
     /// Where the header shows the pull request's number; a click copies it.
     number_hit: Option<Rect>,
@@ -317,6 +322,8 @@ impl Page {
             dragging: false,
             cache: None,
             body_area: Rect::default(),
+            header: Vec::new(),
+            header_area: Rect::default(),
             tab_hits: Vec::new(),
             number_hit: None,
         }
@@ -337,16 +344,32 @@ impl Page {
         }
     }
 
-    /// The body point under a screen cell, clamped into the body.
+    /// The point under a screen cell in the page's lines: the header's,
+    /// then the body's, which start after them. Clamped into the body below it.
     fn point(&self, column: u16, row: u16) -> Point {
-        point_in(self.body_area, self.scroll, column, row)
+        let header = self.header_area;
+        if row < self.body_area.y && row >= header.y && !header.is_empty() {
+            return point_in(header, 0, column, row);
+        }
+        let (line, col) = point_in(self.body_area, self.scroll, column, row);
+        (self.header.len() + line, col)
+    }
+
+    /// The body line a page point is on, or `None` in the header.
+    fn body_line(&self, point: Point) -> Option<usize> {
+        point.0.checked_sub(self.header.len())
     }
 
     fn selected_text(&self) -> String {
-        let (Some(selection), Some((_, body))) = (self.selection, &self.cache) else {
+        let Some(selection) = self.selection else {
             return String::new();
         };
-        selection.text(&body.lines)
+        let body = self
+            .cache
+            .as_ref()
+            .map_or(&[][..], |(_, body)| &body.lines[..]);
+        let lines: Vec<Line<'static>> = self.header.iter().chain(body).cloned().collect();
+        selection.text(&lines)
     }
 }
 
@@ -354,6 +377,8 @@ struct App {
     tx: Sender<Msg>,
     /// The theme and the UI setting, followed while the view is open.
     look: Look,
+    /// Time spent here, for the home screen's heat map.
+    clock: usage::Clock,
     rx: Receiver<Msg>,
     here: Option<String>,
     branch: Option<String>,
@@ -387,6 +412,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
     let (tx, rx) = mpsc::channel();
     let mut app = App {
         look: Look::detect(),
+        clock: usage::Clock::start(),
         tx,
         rx,
         here,
@@ -742,6 +768,7 @@ impl App {
             if !event::poll(wait)? {
                 continue;
             }
+            self.clock.touch();
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if !self.key(key, terminal)? {
@@ -785,17 +812,18 @@ impl App {
                     page.toast = Some(format!("Copied {label}"));
                     return Ok(());
                 }
-                if !inside(page.body_area) {
+                if !inside(page.body_area) && !inside(page.header_area) {
                     page.selection = None;
                     return Ok(());
                 }
                 let point = page.point(mouse.column, mouse.row);
+                let line = page.body_line(point);
                 // A click on a video (or its label below) plays it here, or
                 // stops it; a click on an image shows it full size in the browser.
-                let figure = page.cache.as_ref().and_then(|(_, body)| {
+                let figure = page.cache.as_ref().zip(line).and_then(|((_, body), line)| {
                     body.figures
                         .iter()
-                        .find(|f| point.0 >= f.top && point.0 <= f.top + f.rows as usize)
+                        .find(|f| line >= f.top && line <= f.top + f.rows as usize)
                         .map(|f| (f.href.clone(), f.cols))
                 });
                 if let Some((href, cols)) = figure {
@@ -830,14 +858,21 @@ impl App {
                 page.dragging = true;
             }
             MouseEventKind::Drag(MouseButton::Left) if page.dragging => {
-                // Dragging past the body's edge scrolls it.
+                // Dragging past the body's edge scrolls it; once it's at the top,
+                // a drag upward goes on into the header.
                 let area = page.body_area;
-                if mouse.row < area.y {
+                let from_body = page
+                    .selection
+                    .is_some_and(|s| page.body_line(s.anchor).is_some());
+                let scrolling_up = mouse.row < area.y && from_body && page.scroll > 0;
+                if scrolling_up {
                     page.scroll = page.scroll.saturating_sub(1);
                 } else if mouse.row >= area.y + area.height {
                     page.scroll += 1;
                 }
-                let point = page.point(mouse.column, mouse.row);
+                // While the body still scrolls, the drag holds at its top row.
+                let row = if scrolling_up { area.y } else { mouse.row };
+                let point = page.point(mouse.column, row);
                 if let Some(selection) = &mut page.selection {
                     selection.head = point;
                 }
@@ -1571,6 +1606,8 @@ fn draw_page(
     let detail = match &page.detail {
         Load::Ready(detail) => detail,
         Load::Loading | Load::Failed(_) => {
+            page.header.clear();
+            page.header_area = Rect::default();
             let lines: Vec<Line> = match &page.detail {
                 Load::Failed(e) => wrap(e, w).into_iter().map(Line::from).collect(),
                 _ => vec![Line::from(vec![
@@ -1687,10 +1724,19 @@ fn draw_page(
     header.push(Line::default());
 
     let header_height = header.len() as u16;
-    f.render_widget(
-        Paragraph::new(header),
-        Rect::new(x, area.y, width, header_height.min(area.height)),
-    );
+    page.header_area = Rect::new(x, area.y, width, header_height.min(area.height));
+    let shown: Vec<Line> = header
+        .iter()
+        .enumerate()
+        .map(
+            |(index, line)| match page.selection.and_then(|s| s.columns(index)) {
+                Some((from, to)) => highlight(line, from, to),
+                None => line.clone(),
+            },
+        )
+        .collect();
+    f.render_widget(Paragraph::new(shown), page.header_area);
+    page.header = header;
 
     // The body scrolls between the header and the footer.
     let footer_height = footer_height(page, width);
@@ -1721,12 +1767,15 @@ fn draw_page(
         .enumerate()
         .skip(page.scroll)
         .take(body_height as usize)
-        .map(
-            |(index, line)| match page.selection.and_then(|s| s.columns(index)) {
+        .map(|(index, line)| {
+            match page
+                .selection
+                .and_then(|s| s.columns(page.header.len() + index))
+            {
                 Some((from, to)) => highlight(line, from, to),
                 None => line.clone(),
-            },
-        )
+            }
+        })
         .collect();
     f.render_widget(Paragraph::new(visible), page.body_area);
 
@@ -2495,6 +2544,47 @@ mod tests {
             lit.spans
                 .iter()
                 .any(|s| s.content == "world" && s.style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test]
+    fn the_header_is_selectable_and_a_drag_runs_on_into_the_body() {
+        let mut page = Page::new(
+            PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            Load::Loading,
+        );
+        page.header = vec![
+            Line::default(),
+            Line::from("fix: Find curly quotes"),
+            Line::from("● Open   o/r#1 · marcos"),
+        ];
+        page.header_area = Rect::new(4, 0, 60, 3);
+        page.body_area = Rect::new(4, 4, 60, 10);
+        page.cache = Some((
+            (60, Tab::Summary, false, 0),
+            Body {
+                lines: vec![
+                    Line::from("Status  Ready to merge"),
+                    Line::from("Branch  fix/find"),
+                ],
+                figures: Vec::new(),
+            },
+        ));
+        // A cell on the title row is a header point; one in the body comes after the header's lines.
+        assert_eq!(page.point(9, 1), (1, 5));
+        assert_eq!(page.point(12, 5), (4, 8));
+        assert_eq!(page.body_line((4, 8)), Some(1));
+        assert_eq!(page.body_line((1, 5)), None);
+        page.selection = Some(Selection {
+            anchor: page.point(9, 1),
+            head: page.point(9, 4),
+        });
+        assert_eq!(
+            page.selected_text(),
+            "Find curly quotes\n● Open   o/r#1 · marcos\nStatus"
         );
     }
 

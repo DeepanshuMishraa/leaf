@@ -10,6 +10,10 @@ pub struct Theme {
     pub red: Rgb,
     pub green: Rgb,
     pub blue: Rgb,
+    /// The theme's own accent: its cursor color, or its blue when it gives none.
+    pub accent: Rgb,
+    /// ANSI 5, or the blue when the theme gives none.
+    pub magenta: Rgb,
 }
 
 impl Theme {
@@ -18,11 +22,15 @@ impl Theme {
     #[cfg(not(test))]
     pub fn query() -> Option<Self> {
         use crate::viewer::{query_color, query_palette};
+        let blue = query_palette(4)?;
         Some(Theme {
             background: query_color(11)?,
             red: query_palette(1)?,
             green: query_palette(2)?,
-            blue: query_palette(4)?,
+            blue,
+            // Not every terminal answers for its cursor (OSC 12).
+            accent: query_color(12).unwrap_or(blue),
+            magenta: query_palette(5).unwrap_or(blue),
         })
     }
 

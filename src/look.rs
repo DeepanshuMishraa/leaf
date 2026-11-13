@@ -48,13 +48,16 @@ impl Look {
         }
     }
 
-    /// Reads the UI setting again once `scheme::EVERY` has passed, and the
-    /// theme too when `idle`: following a terminal's theme reads its reply
-    /// from stdin, which would swallow a key typed meanwhile. True when
-    /// either changed, so the screen is drawn again.
+    /// Reads the UI setting and the theme again once `scheme::EVERY` has
+    /// passed. A terminal's theme is asked for only when `idle`: its reply
+    /// comes on stdin, which would swallow a key typed meanwhile; Rex's is
+    /// read from a file, so it's followed even while the mouse moves. True
+    /// when either changed, so the screen is drawn again.
     pub fn refresh(&mut self, idle: bool) -> bool {
         let mut changed = false;
-        if idle && let Some(colors) = self.scheme.refresh() {
+        if (idle || !self.scheme.asks_terminal())
+            && let Some(colors) = self.scheme.refresh()
+        {
             changed |= colors != self.colors;
             self.colors = colors;
         }

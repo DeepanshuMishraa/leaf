@@ -36,6 +36,7 @@ use crate::render::DIM;
 use crate::scheme;
 use crate::syntax;
 use crate::theme::{self, Theme};
+use crate::usage;
 
 const ACCENT: Color = Color::Indexed(12);
 const ADDED_FG: Color = Color::Indexed(2);
@@ -494,6 +495,8 @@ impl Split {
 struct App {
     loaded: Loaded,
     palette: Palette,
+    /// Time spent here, for the home screen's heat map.
+    clock: usage::Clock,
     look: Look,
     /// When the last key, click or paste came, so the terminal is asked
     /// about its theme only once the reader has paused.
@@ -551,6 +554,7 @@ impl App {
             loaded,
             palette,
             look,
+            clock: usage::Clock::start(),
             last_input: Instant::now(),
             cursor,
             scroll: 0,
@@ -617,6 +621,7 @@ impl App {
                 let event = event::read()?;
                 if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
                     self.last_input = Instant::now();
+                    self.clock.touch();
                 }
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
@@ -3070,6 +3075,8 @@ mod tests {
             red: [0xd9, 0x6a, 0x4d],
             green: [0x9a, 0xab, 0x84],
             blue: [0x8a, 0xa0, 0xb4],
+            accent: [0xe0, 0x5d, 0x3a],
+            magenta: [0xb1, 0x93, 0xa8],
         };
         let palette = Palette::of_terminal(Some(theme), true);
         assert_eq!(palette, Palette::from_theme(theme));

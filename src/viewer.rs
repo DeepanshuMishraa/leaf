@@ -41,6 +41,7 @@ use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::remote::{self, Command};
 use crate::render::{self, DIM, Laid};
 use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
+use crate::usage;
 
 /// Widest the text column gets; a book-like measure is easiest to read.
 const MAX_TEXT_WIDTH: u16 = 76;
@@ -365,6 +366,8 @@ pub struct App {
     paper: Option<Rgb>,
     /// The theme and the UI setting, followed while the document is open.
     look: Look,
+    /// Time spent reading, for the home screen's heat map.
+    clock: usage::Clock,
     highlights: Vec<Highlight>,
     /// The color new highlights and ink come in.
     hue: Hue,
@@ -508,6 +511,7 @@ impl App {
             ink: None,
             paper: None,
             look: Look::detect(),
+            clock: usage::Clock::start(),
             selection: None,
             dialog: Dialog::None,
             remote: HashMap::new(),
@@ -3156,6 +3160,10 @@ impl App {
             self.receive_images();
             self.advance_search(SEARCH_SLICE);
             let narrated = self.narrate();
+            // Listening counts as reading.
+            if narrated {
+                self.clock.touch();
+            }
             // Following the terminal's theme reads its reply from stdin, so it's
             // asked only after a wait that no key broke.
             if self.look.refresh(quiet && !event::poll(Duration::ZERO)?) {
@@ -3206,6 +3214,7 @@ impl App {
             }
             // Handle everything already waiting before drawing again.
             loop {
+                self.clock.touch();
                 match event::read()? {
                     Event::Key(key) => self.key(key),
                     Event::Mouse(mouse) => self.mouse(mouse),

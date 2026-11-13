@@ -6,13 +6,19 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use crate::popover::{self, Edit, Row, Section};
+use std::collections::HashMap;
+
+use crate::art::Ink;
+use crate::home;
+use crate::look::Look;
+use crate::popover::{self, Edit};
 
 const READABLE: [&str; 4] = ["pdf", "epub", "md", "markdown"];
+/// Most recent documents listed.
+const RECENT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
@@ -26,57 +32,18 @@ pub enum Entry {
     Link(String),
 }
 
-impl Entry {
-    fn row(&self, here: &Path) -> Row {
-        let name = |path: &Path| {
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string())
-        };
-        match self {
-            Entry::Folder(path) => Row {
-                icon: "📁",
-                label: name(path),
-                detail: String::new(),
-                checked: false,
-            },
-            Entry::Document(path) => Row {
-                icon: "📄",
-                label: name(path),
-                detail: String::new(),
-                checked: false,
-            },
-            Entry::Recent { target, percent } => Row {
-                icon: if is_link(target) { "🌐" } else { "📄" },
-                label: Path::new(target)
-                    .strip_prefix(here)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| tilde(target)),
-                detail: format!("{percent}%"),
-                checked: false,
-            },
-            Entry::Link(url) => Row {
-                icon: "🌐",
-                label: format!("Read {url}"),
-                detail: String::new(),
-                checked: false,
-            },
-        }
-    }
-}
-
 fn readable(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| READABLE.iter().any(|r| e.eq_ignore_ascii_case(r)))
 }
 
-fn is_link(text: &str) -> bool {
+pub fn is_link(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-fn tilde(path: &str) -> String {
+pub fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&home) => {
             format!("~{}", &path[home.len()..])
@@ -168,33 +135,35 @@ impl Picker {
         }
         let (dir, filter) = split(&self.typed);
         let mut out = Vec::new();
-        if self.typed == self.start && !self.recent.is_empty() {
-            out.push((
-                "Recent".to_owned(),
-                self.recent
-                    .iter()
-                    .filter(|(key, _)| is_link(key) || Path::new(key).is_file())
-                    .take(5)
-                    .map(|(target, percent)| Entry::Recent {
+        // Recent documents while the field is in the folder it started in,
+        // narrowed by what's typed after it.
+        if let Some(typed) = self
+            .typed
+            .strip_prefix(&self.start)
+            .filter(|typed| !typed.contains('/'))
+        {
+            let mut recent: Vec<(u8, Entry)> = self
+                .recent
+                .iter()
+                .filter(|(key, _)| is_link(key) || Path::new(key).is_file())
+                .filter_map(|(target, percent)| {
+                    let name = target.rsplit('/').next().unwrap_or(target);
+                    let rank = score(name, typed)?;
+                    let entry = Entry::Recent {
                         target: target.clone(),
                         percent: *percent,
-                    })
-                    .collect(),
-            ));
+                    };
+                    Some((rank, entry))
+                })
+                .collect();
+            recent.sort_by_key(|(rank, _)| *rank);
+            let recent: Vec<Entry> = recent.into_iter().map(|(_, e)| e).take(RECENT).collect();
+            if !recent.is_empty() {
+                out.push(("Recent".to_owned(), recent));
+            }
         }
-        out.push(("Go to".to_owned(), children(&dir, &filter)));
+        out.push(("In this folder".to_owned(), children(&dir, &filter)));
         out
-    }
-
-    fn sections(&self, entries: &[(String, Vec<Entry>)]) -> Vec<Section> {
-        let (here, _) = split(&self.start);
-        entries
-            .iter()
-            .map(|(title, list)| Section {
-                title: title.clone(),
-                rows: list.iter().map(|e| e.row(&here)).collect(),
-            })
-            .collect()
     }
 
     /// Enter: a document to read, or `None` after going into a folder.
@@ -216,8 +185,12 @@ impl Picker {
     }
 }
 
-/// Shows the picker until a document is chosen, or `None` when it's closed.
-pub fn pick(root: &Path, recent: Vec<(String, usize)>) -> io::Result<Option<String>> {
+/// Shows the home screen until a document is chosen, or `None` when it's closed.
+pub fn pick(
+    root: &Path,
+    recent: Vec<(String, usize)>,
+    usage: HashMap<String, u64>,
+) -> io::Result<Option<String>> {
     let start = format!("{}/", root.display().to_string().trim_end_matches('/'));
     let mut picker = Picker {
         typed: start.clone(),
@@ -226,35 +199,39 @@ pub fn pick(root: &Path, recent: Vec<(String, usize)>) -> io::Result<Option<Stri
         recent,
     };
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::SetTitle("Open"));
+    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::SetTitle("leaf"));
+    // Asked once the terminal is raw.
+    let mut look = Look::detect();
+    let name = home::first_name();
     let result = (|| loop {
         let entries = picker.entries();
-        let sections = picker.sections(&entries);
-        let rows = popover::count(&sections);
+        let rows: usize = entries.iter().map(|(_, list)| list.len()).sum();
         picker.selected = picker.selected.min(rows.saturating_sub(1));
+        let ink = look.ink();
         terminal.draw(|f| {
-            popover::draw(
+            home::draw(
                 f,
-                &popover::View {
-                    chip: "Open",
+                &home::View {
+                    name: &name,
+                    usage: &usage,
                     typed: &picker.typed,
-                    placeholder: "A path, or an https:// link…",
-                    sections: &sections,
+                    here: root,
+                    entries: &entries,
                     selected: picker.selected,
-                    empty: "No folders or documents here. Type a path or a link.",
-                    footer: "enter open · tab go into · esc close",
+                    ink: ink.unwrap_or_else(|| Ink::of_colors(look.colors())),
+                    dither: ink.is_some(),
                 },
             )
         })?;
-        if !event::poll(Duration::from_secs(60))? {
+        // Wakes to follow the theme and the UI setting.
+        if !event::poll(look.due())? {
+            look.refresh(true);
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            _ => continue,
         };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
         let picked = entries
             .iter()
             .flat_map(|(_, list)| list)

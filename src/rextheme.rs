@@ -115,11 +115,18 @@ fn catalog_theme(entry: &Value, id: &str) -> Option<Theme> {
     }
     let source = entry.get("source")?;
     let ansi = |index: usize| hex(source.get("ansi")?.get(index)?.as_str()?);
+    let blue = ansi(4)?;
     Some(Theme {
         background: hex(source.get("background")?.as_str()?)?,
         red: ansi(1)?,
         green: ansi(2)?,
-        blue: ansi(4)?,
+        blue,
+        accent: source
+            .get("cursor")
+            .and_then(Value::as_str)
+            .and_then(hex)
+            .unwrap_or(blue),
+        magenta: ansi(5).unwrap_or(blue),
     })
 }
 
@@ -138,11 +145,14 @@ fn custom_theme(themes: &Value, id: &str) -> Option<Theme> {
             .and_then(|overrides| overrides.get(index.to_string()));
         stored(overridden.or_else(|| palette.get("ansi")?.get(index))?)
     };
+    let blue = ansi(4)?;
     Some(Theme {
         background: stored(palette.get("background")?)?,
         red: ansi(1)?,
         green: ansi(2)?,
-        blue: ansi(4)?,
+        blue,
+        accent: palette.get("cursor").and_then(stored).unwrap_or(blue),
+        magenta: ansi(5).unwrap_or(blue),
     })
 }
 
@@ -216,6 +226,8 @@ mod tests {
                 red: [0xd9, 0x6a, 0x4d],
                 green: [0x9a, 0xab, 0x84],
                 blue: [0x8a, 0xa0, 0xb4],
+                accent: [0x8a, 0xa0, 0xb4],
+                magenta: [0x8a, 0xa0, 0xb4],
             })
         );
     }
@@ -238,6 +250,8 @@ mod tests {
                 red: [51, 51, 51],
                 green: [0, 255, 0],
                 blue: [204, 204, 204],
+                accent: [204, 204, 204],
+                magenta: [204, 204, 204],
             })
         );
     }

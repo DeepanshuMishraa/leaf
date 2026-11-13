@@ -204,20 +204,16 @@ function M.setup(opts)
   rex.action{
     name = "leaf_open",
     title = "Leaf: Open Document…",
-    description = "Browse this folder for a PDF, EPUB or markdown file, or pick one read lately,"
-      .. " and read it in this pane.",
+    description = "Open leaf's home in this pane: today's reading, a heat map of the days you read,"
+      .. " and a search over recent documents and this folder's PDFs, EPUBs and markdown files.",
     category = "Leaf",
     keywords = "leaf pdf markdown epub read document article book file picker",
     args = { target = "string?" },
     run = function(ctx, args)
       local target = args.target or ""
-      local dir = cwd(ctx)
+      -- Nothing named: leaf's home screen, in this pane (beside it when busy).
       if target == "" then
-        if ctx.block_id == nil then
-          open_pane(ctx, "leaf", pane_command(ctx, "open"), dir)
-        else
-          popover(ctx, "Open", pane_command(ctx, "open", "--beside", ctx.block_id), dir)
-        end
+        place(ctx, "leaf", "open")
         return
       end
       place(ctx, target:match("([^/]+)$") or "leaf", "open", target)
