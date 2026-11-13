@@ -128,6 +128,45 @@ Keys: `←/→`, `tab` (`shift+tab` back), `1`, `2`, `3` switch tabs (a click on
 
 Everything goes through the GitHub CLI, so `gh` must be installed and signed in (`gh auth login`).
 
+## Margin: review your agent's plans and changes
+
+Margin is how you and a coding agent pass work back and forth in leaf. The agent hands over a plan or a set of changes, you leave notes, and they go back as one review with a verdict. The agent gets it as its next message, in the conversation it's already having.
+
+```sh
+leaf hook install     # set up every agent CLI here (asks first; --dry-run shows the changes)
+leaf skills install   # or only the skills: leaf, leaf-plan and leaf-review
+```
+
+`leaf hook install` finds the agent CLIs on this machine (Claude Code, Codex, Gemini CLI, OpenCode, Copilot CLI, Pi, Cursor Agent, Amp, Droid, Grok), shows what it will change, and asks once. Claude Code gets a plan-mode hook. When it leaves plan mode, the plan opens for review beside it. Approving lets it go ahead, and requesting changes sends your review back and keeps it planning. Every agent gets the skills, which teach it to run `leaf plan` and `leaf review` itself and to act on the review. Settings files are merged, never replaced, and the first change keeps a `.leaf-backup` beside the file. `leaf hook status` shows what's set up, and `leaf hook uninstall` takes out only what leaf added.
+
+### Plans
+
+`leaf plan plan.md` splits a Markdown plan into numbered blocks: each heading with the paragraphs under it, each list item, code block, table and quote. Move between blocks with `j/k` (`J/K` jump to blocks with notes), then:
+
+- `c` comments on the block
+- `x` marks it for removal (press it again to keep the block)
+- `r` replaces it with your text, starting from the block's own
+
+Drag over text to do the same to just that passage. `C` writes a global note on the whole plan, `L` lists every note to jump to, edit or delete, and `X` clears a block's notes. `S` sends the review: `a` approve, `n` approve with notes, `c` request changes.
+
+Notes you haven't sent are kept and come back next time. A note on a block that has since been rewritten is dropped, and leaf tells you. Each new version of a plan is a round. From the second round on, blocks that changed are marked `+`, the header counts the changed and removed blocks, and `D` steps through what changed.
+
+### Changes
+
+`leaf review` takes the same sources as `leaf diff` (`--staged`, `--branch`, a range, a patch or a GitHub link). It opens on an overview of every changed file, with its size, its notes and whether you've viewed it. `enter` opens a file, and `tab` comes back to the overview. Past the last file, `]` comes back too. Notes go on three levels:
+
+- lines: `C` on the cursor line or a `v` selection
+- a whole file: `F`, or `c` in the overview
+- the whole change: `M`, or `C` in the overview
+
+`V` marks a file viewed. The mark clears if the file changes. `S` sends the draft line comments and the notes as one review, grouped by file in diff order, with each line comment's hunk. Plain `leaf diff` has the overview, the notes and `S` as well, and sends the review straight to the agent pane.
+
+### Who opens it
+
+A person can run `leaf plan` or `leaf review` in a terminal. The review goes to the agent pane leaf finds, as questions do, or to stdout with `--print`.
+
+An agent can run them too. It has no terminal, so inside Rex leaf opens the review in a pane beside the agent and returns at once. The review goes back to that agent's pane when you send it. `--wait` blocks instead and prints the review. Outside Rex, leaf tells the agent to ask you to run the command.
+
 ## Rex
 
 `leaf rex install` adds Leaf to Rex's command palette. Press `cmd+shift+p` and type Leaf.

@@ -257,6 +257,37 @@ function M.setup(opts)
   }
 
   rex.action{
+    name = "leaf_review_plan",
+    title = "Leaf: Review Plan…",
+    description = "Review a Markdown plan block by block: comment on, remove or replace blocks,"
+      .. " add a global note, and send one review with a verdict to the agent pane.",
+    category = "Leaf",
+    keywords = "leaf plan review margin spec design agent approve request changes",
+    args = { target = "string" },
+    run = function(ctx, args)
+      place(ctx, args.target:match("([^/]+)$") or "plan", "plan", args.target)
+    end,
+  }
+
+  rex.action{
+    name = "leaf_review_changes",
+    title = "Leaf: Review Changes",
+    description = "Review the working tree file by file, starting from an overview of every file:"
+      .. " notes on lines, files and the whole change go to the agent pane as one review.",
+    category = "Leaf",
+    keywords = "leaf review margin changes files agent approve request changes overview",
+    args = { target = "string?" },
+    run = function(ctx, args)
+      local target = args.target
+      if target ~= nil and target ~= "" then
+        place(ctx, "review", "review", target)
+      else
+        place(ctx, "review", "review")
+      end
+    end,
+  }
+
+  rex.action{
     name = "leaf_pr",
     title = "Leaf: Pull Requests",
     description = "This branch's pull request, this repository's, and yours across GitHub,"
