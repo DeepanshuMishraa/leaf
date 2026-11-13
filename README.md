@@ -40,6 +40,14 @@ leaf open README.md
 leaf open https://example.com/post
 ```
 
+For zsh completions, from the repository root, link `completions/_leaf` into a directory on your `$fpath`. If you don't have one, add it in `~/.zshrc` before `compinit`:
+
+```sh
+mkdir -p ~/.zsh/completions
+ln -s "$PWD/completions/_leaf" ~/.zsh/completions/
+fpath=(~/.zsh/completions $fpath)   # in ~/.zshrc, before compinit
+```
+
 Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `ctrl+d`/`u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `?` all keys, `q` quit.
 
 Press `f` to find text: type a word or phrase and press enter. leaf turns to the next page that has it and marks every match in orange. `n` and `N` go to the next and previous match, wrapping round the book, and `esc` clears the search. Case doesn't matter, typed quotes and hyphens find curly quotes and Unicode hyphens (`don't` finds `don’t`), and a phrase is found across line breaks.
