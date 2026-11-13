@@ -13,6 +13,9 @@ pub struct Query {
 /// Curly quotes and Unicode hyphens fold to what a keyboard types: PDFs and
 /// articles set "don’t" and "state‐of‐the‐art", and readers search for "don't".
 fn fold(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
     match c {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{02BC}' | '\u{2032}' => '\'',
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' => '"',
