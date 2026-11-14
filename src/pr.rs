@@ -124,6 +124,66 @@ pub struct Entry {
     pub author: String,
     pub updated: String,
     pub draft: bool,
+    /// How and when it ended; `None` while it's open.
+    pub ended: Option<Ended>,
+}
+
+impl Entry {
+    /// When the list orders it by: when it ended, else when it last changed.
+    pub fn when(&self) -> &str {
+        self.ended.as_ref().map_or(&self.updated, |e| &e.at)
+    }
+}
+
+/// How a merged pull request or closed issue in the list ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ended {
+    pub how: Ending,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    Merged,
+    Completed,
+    NotPlanned,
+}
+
+impl Ending {
+    /// The verb for the row's line: "merged 3d ago".
+    pub fn verb(self) -> &'static str {
+        match self {
+            Ending::Merged => "merged",
+            Ending::Completed => "closed",
+            Ending::NotPlanned => "closed as not planned",
+        }
+    }
+}
+
+/// Which rows a list tab shows: those still open, or those done with
+/// (merged pull requests, closed issues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Status {
+    Open,
+    Done,
+}
+
+impl Status {
+    /// The switch's label for `kind`: Open, then Merged or Closed.
+    pub fn label(self, kind: Kind) -> &'static str {
+        match (self, kind) {
+            (Status::Open, _) => "Open",
+            (Status::Done, Kind::Pull) => "Merged",
+            (Status::Done, Kind::Issue) => "Closed",
+        }
+    }
+
+    pub fn other(self) -> Status {
+        match self {
+            Status::Open => Status::Done,
+            Status::Done => Status::Open,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -577,27 +637,38 @@ impl Source {
         }
     }
 
-    fn query(&self) -> Result<String, PrFailed> {
-        let filter = match self {
-            Source::Branch { repo, branch } => format!("repo:{repo} head:{branch}"),
-            Source::Repo(repo) => format!("repo:{repo}"),
-            Source::Authored(_) => "author:@me".to_owned(),
-            Source::Reviewing => "review-requested:@me".to_owned(),
-            Source::Owned(_) => format!("user:{}", viewer()?),
+    fn query(&self, status: Status) -> Result<String, PrFailed> {
+        let filter = match (self, status) {
+            (Source::Branch { repo, branch }, _) => format!("repo:{repo} head:{branch}"),
+            (Source::Repo(repo), _) => format!("repo:{repo}"),
+            (Source::Authored(_), _) => "author:@me".to_owned(),
+            // A request leaves once it's answered, so done ones are those you reviewed.
+            (Source::Reviewing, Status::Open) => "review-requested:@me".to_owned(),
+            (Source::Reviewing, Status::Done) => "reviewed-by:@me".to_owned(),
+            (Source::Owned(_), _) => format!("user:{}", viewer()?),
+        };
+        let state = match (status, self.kind()) {
+            (Status::Open, _) => "is:open",
+            (Status::Done, Kind::Pull) => "is:merged",
+            (Status::Done, Kind::Issue) => "is:closed",
         };
         Ok(format!(
-            "{} is:open archived:false {filter} sort:updated-desc",
+            "{} {state} archived:false {filter} sort:updated-desc",
             self.kind().qualifier()
         ))
     }
 
-    fn cache_key(&self) -> String {
-        match self {
+    fn cache_key(&self, status: Status) -> String {
+        let key = match self {
             Source::Branch { repo, branch } => format!("list-branch-{repo}-{branch}"),
             Source::Repo(repo) => format!("list-repo-{repo}"),
             Source::Authored(kind) => format!("list-authored-{}", kind.key()),
             Source::Reviewing => "list-reviewing".to_owned(),
             Source::Owned(kind) => format!("list-owned-{}", kind.key()),
+        };
+        match status {
+            Status::Open => key,
+            Status::Done => format!("{key}-done"),
         }
     }
 }
@@ -688,15 +759,16 @@ pub fn cached_viewer() -> Option<String> {
 }
 
 /// One GraphQL search: much faster than `gh search prs`, which goes through REST.
-const SEARCH: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest { number title isDraft updatedAt author { login } repository { nameWithOwner } } ... on Issue { number title updatedAt author { login } repository { nameWithOwner } } } } }";
+const SEARCH: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest { number title isDraft updatedAt mergedAt author { login } repository { nameWithOwner } } ... on Issue { number title updatedAt closedAt stateReason author { login } repository { nameWithOwner } } } } }";
 
-/// The open pull requests or issues one search finds, newest first. The answer is
-/// cached, so the list shows at once next time while it's asked again.
-pub fn search(source: &Source) -> Result<Vec<Entry>, PrFailed> {
+/// The pull requests or issues one search finds, newest first: open ones, or
+/// merged and closed ones. The answer is cached, so the list shows at once
+/// next time while it's asked again.
+pub fn search(source: &Source, status: Status) -> Result<Vec<Entry>, PrFailed> {
     if !*GH {
         return Err(PrFailed::NoGh);
     }
-    let query = source.query()?;
+    let query = source.query(status)?;
     let json = gh_json(&[
         "api",
         "graphql",
@@ -709,13 +781,13 @@ pub fn search(source: &Source) -> Result<Vec<Entry>, PrFailed> {
         .pointer("/data/search/nodes")
         .cloned()
         .unwrap_or(Value::Null);
-    store(&source.cache_key(), &nodes.to_string());
+    store(&source.cache_key(status), &nodes.to_string());
     Ok(parse_search(&nodes))
 }
 
 /// What `search` found last time, if it has run before.
-pub fn cached_search(source: &Source) -> Option<Vec<Entry>> {
-    let nodes: Value = serde_json::from_str(&load(&source.cache_key())?).ok()?;
+pub fn cached_search(source: &Source, status: Status) -> Option<Vec<Entry>> {
+    let nodes: Value = serde_json::from_str(&load(&source.cache_key(status))?).ok()?;
     Some(parse_search(&nodes))
 }
 
@@ -735,9 +807,10 @@ pub fn merge(lists: impl IntoIterator<Item = Vec<Entry>>) -> Vec<Entry> {
     let mut out: Vec<Entry> = by_ref.into_values().collect();
     // Rows updated at the same second keep a fixed order, so the picked row
     // doesn't jump between redraws.
+    // Done rows go by when they ended, open ones by when they last changed.
     out.sort_by(|a, b| {
-        seconds(&b.updated)
-            .cmp(&seconds(&a.updated))
+        seconds(b.when())
+            .cmp(&seconds(a.when()))
             .then_with(|| a.pr.repo.cmp(&b.pr.repo))
             .then_with(|| b.pr.number.cmp(&a.pr.number))
     });
@@ -785,7 +858,30 @@ fn entry(item: &Value, repo: String) -> Entry {
             .get("isDraft")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        ended: ended(item),
     }
+}
+
+/// A merged pull request's or closed issue's ending, read from the search
+/// answer; `None` for an open one, or an answer cached before leaf asked.
+fn ended(item: &Value) -> Option<Ended> {
+    let at = |key| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .filter(|at| !at.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(at) = at("mergedAt") {
+        return Some(Ended {
+            how: Ending::Merged,
+            at,
+        });
+    }
+    let how = match item.get("stateReason").and_then(Value::as_str) {
+        Some("NOT_PLANNED") => Ending::NotPlanned,
+        _ => Ending::Completed,
+    };
+    at("closedAt").map(|at| Ended { how, at })
 }
 
 fn parse_search(json: &Value) -> Vec<Entry> {
@@ -1403,7 +1499,7 @@ mod tests {
             Source::Authored(Kind::Pull)
         );
         assert_eq!(
-            Source::Authored(Kind::Issue).query().unwrap(),
+            Source::Authored(Kind::Issue).query(Status::Open).unwrap(),
             "is:issue is:open archived:false author:@me sort:updated-desc"
         );
         assert_eq!(
@@ -1411,10 +1507,54 @@ mod tests {
                 repo: "o/r".into(),
                 branch: "fix/q".into()
             }
-            .query()
+            .query(Status::Open)
             .unwrap(),
             "is:pr is:open archived:false repo:o/r head:fix/q sort:updated-desc"
         );
+    }
+
+    #[test]
+    fn done_searches_ask_for_merged_and_closed_rows() {
+        assert_eq!(
+            Source::Authored(Kind::Pull).query(Status::Done).unwrap(),
+            "is:pr is:merged archived:false author:@me sort:updated-desc"
+        );
+        assert_eq!(
+            Source::Authored(Kind::Issue).query(Status::Done).unwrap(),
+            "is:issue is:closed archived:false author:@me sort:updated-desc"
+        );
+        assert_eq!(
+            Source::Reviewing.query(Status::Done).unwrap(),
+            "is:pr is:merged archived:false reviewed-by:@me sort:updated-desc"
+        );
+        assert_ne!(
+            Source::Reviewing.cache_key(Status::Open),
+            Source::Reviewing.cache_key(Status::Done)
+        );
+    }
+
+    #[test]
+    fn done_rows_carry_how_and_when_they_ended_and_sort_by_it() {
+        let nodes = serde_json::json!([
+            {"number": 1, "title": "a", "updatedAt": "2026-11-10T00:00:00Z",
+             "mergedAt": "2026-11-01T00:00:00Z", "author": {"login": "me"},
+             "repository": {"nameWithOwner": "o/r"}},
+            {"number": 2, "title": "b", "updatedAt": "2026-11-02T00:00:00Z",
+             "closedAt": "2026-11-02T00:00:00Z", "stateReason": "NOT_PLANNED",
+             "author": {"login": "me"}, "repository": {"nameWithOwner": "o/r"}},
+            {"number": 3, "title": "c", "updatedAt": "2026-11-03T00:00:00Z",
+             "author": {"login": "me"}, "repository": {"nameWithOwner": "o/r"}}
+        ]);
+        let rows = parse_search(&nodes);
+        assert_eq!(rows[0].ended.as_ref().map(|e| e.how), Some(Ending::Merged));
+        assert_eq!(
+            rows[1].ended.as_ref().map(|e| e.how),
+            Some(Ending::NotPlanned)
+        );
+        assert_eq!(rows[2].ended, None);
+        // #1 changed last but merged first, so it goes last.
+        let order: Vec<u64> = merge([rows]).iter().map(|e| e.pr.number).collect();
+        assert_eq!(order, [3, 2, 1]);
     }
 
     #[test]
@@ -1578,6 +1718,7 @@ mod tests {
             author: String::new(),
             updated: updated.into(),
             draft: false,
+            ended: None,
         };
         let merged = merge([
             vec![e(1, "2026-01-01T00:00:00Z"), e(2, "2026-02-01T00:00:00Z")],
@@ -1598,6 +1739,7 @@ mod tests {
             author: String::new(),
             updated: updated.into(),
             draft: false,
+            ended: None,
         };
         let merged = merge([
             vec![e("old", "2026-01-01T00:00:00Z")],
@@ -1619,6 +1761,7 @@ mod tests {
             author: String::new(),
             updated: "2026-01-01T00:00:00Z".into(),
             draft: false,
+            ended: None,
         };
         let rows = |lists: Vec<Vec<Entry>>| -> Vec<(String, u64)> {
             merge(lists)
@@ -1643,6 +1786,7 @@ mod tests {
             author: author.into(),
             updated: String::new(),
             draft: false,
+            ended: None,
         };
         assert_eq!(Relation::of(&e("Me/leaf", "me"), "me"), Relation::Yours);
         assert_eq!(Relation::of(&e("o/r", "me"), "me"), Relation::Outgoing);

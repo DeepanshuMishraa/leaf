@@ -39,8 +39,8 @@ use crate::look::Look;
 use crate::news::News;
 use crate::popover::{self, Edit};
 use crate::pr::{
-    self, Action, CheckStatus, CloseReason, Detail, Entry, EventKind, Kind, Mergeability, PrRef,
-    Relation, Source, State, Verdict,
+    self, Action, CheckStatus, CloseReason, Detail, Ended, Ending, Entry, EventKind, Kind,
+    Mergeability, PrRef, Relation, Source, State, Status, Verdict,
 };
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
@@ -164,6 +164,8 @@ enum Mode {
 }
 
 enum Fetch {
+    /// Not asked yet this run: the done searches wait until they're shown.
+    Idle,
     Loading,
     Done,
     Failed(String),
@@ -172,18 +174,28 @@ enum Fetch {
 /// One search behind the list: what it found last, and whether it's asking again.
 struct Slot {
     source: Source,
+    status: Status,
     entries: Option<Vec<Entry>>,
     fetch: Fetch,
+}
+
+/// What a click in the list's tab row asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListHit {
+    Kind(Kind),
+    Status(Status),
 }
 
 struct List {
     /// The tab shown.
     kind: Kind,
+    /// Open rows, or merged and closed ones.
+    status: Status,
     slots: Vec<Slot>,
     /// Your login, once known; until then rows aren't colored.
     me: Option<String>,
-    /// Where each tab's label was drawn, for clicks.
-    tab_hits: Vec<(Rect, Kind)>,
+    /// Where each tab's and switch's label was drawn, for clicks.
+    tab_hits: Vec<(Rect, ListHit)>,
     typed: String,
     selected: usize,
     /// The selected pull request and when it was picked, to fetch it once it rests there.
@@ -204,12 +216,15 @@ struct List {
 }
 
 impl List {
-    /// The searches behind a tab.
+    /// The searches behind a tab, for the shown status.
     fn slots_of(&self, kind: Kind) -> impl Iterator<Item = &Slot> {
-        self.slots.iter().filter(move |s| s.source.kind() == kind)
+        let status = self.status;
+        self.slots
+            .iter()
+            .filter(move |s| s.source.kind() == kind && s.status == status)
     }
 
-    /// Everything a tab found, each once, newest first.
+    /// Everything a tab found for the shown status, each once, newest first.
     fn all(&self, kind: Kind) -> Vec<Entry> {
         pr::merge(self.slots_of(kind).filter_map(|s| s.entries.clone()))
     }
@@ -245,10 +260,23 @@ impl List {
     fn show(&mut self, kind: Kind) {
         if self.kind != kind {
             self.kind = kind;
-            self.selected = 0;
-            self.resting = None;
-            self.pressed = None;
+            self.reset_pick();
         }
+    }
+
+    /// Switches between open rows and done ones, keeping the tab.
+    fn show_status(&mut self, status: Status) {
+        if self.status != status {
+            self.status = status;
+            self.reset_pick();
+        }
+    }
+
+    fn reset_pick(&mut self) {
+        self.selected = 0;
+        self.resting = None;
+        self.pressed = None;
+        self.selection = None;
     }
 
     fn loading(&self) -> bool {
@@ -593,7 +621,8 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
 }
 
 impl App {
-    /// Shows the list from the last run's answers and asks every search again, all at once.
+    /// Shows the list from the last run's answers and asks the open searches
+    /// again, all at once.
     fn open_list(&mut self) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -601,20 +630,23 @@ impl App {
                 let _ = tx.send(Msg::Me(me));
             }
         });
-        let slots = pr::sources(self.here.as_deref(), self.branch.as_deref())
+        // Every search twice over: open rows asked now, done ones shown from
+        // last time and asked only once they're looked at.
+        let sources = pr::sources(self.here.as_deref(), self.branch.as_deref());
+        let slots: Vec<Slot> = [Status::Open, Status::Done]
             .into_iter()
-            .enumerate()
-            .map(|(index, source)| {
-                self.search(index, &source);
-                Slot {
-                    entries: pr::cached_search(&source),
-                    source,
-                    fetch: Fetch::Loading,
-                }
+            .flat_map(|status| {
+                sources.iter().map(move |source| Slot {
+                    entries: pr::cached_search(source, status),
+                    source: source.clone(),
+                    status,
+                    fetch: Fetch::Idle,
+                })
             })
             .collect();
         self.list = Some(List {
             kind: Kind::Pull,
+            status: Status::Open,
             slots,
             me: pr::cached_viewer(),
             tab_hits: Vec::new(),
@@ -629,19 +661,51 @@ impl App {
             selection: None,
             dragging: false,
         });
+        self.ask_shown();
+    }
+
+    /// Asks the searches behind the shown status that haven't been asked
+    /// this run, for both tabs, so flipping tabs finds them ready.
+    fn ask_shown(&mut self) {
+        let Some(list) = &mut self.list else {
+            return;
+        };
+        let status = list.status;
+        let asks: Vec<(usize, Source)> = list
+            .slots
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, s)| s.status == status && matches!(s.fetch, Fetch::Idle))
+            .map(|(index, slot)| {
+                slot.fetch = Fetch::Loading;
+                (index, slot.source.clone())
+            })
+            .collect();
+        for (index, source) in asks {
+            self.search(index, &source, status);
+        }
+    }
+
+    /// `tab` on the list: open rows or done ones.
+    fn flip_status(&mut self) {
+        if let Some(list) = &mut self.list {
+            list.show_status(list.status.other());
+        }
+        self.ask_shown();
     }
 
     /// Asks search `index` again; the answer arrives as `Msg::Searched`.
-    fn search(&self, index: usize, source: &Source) {
+    fn search(&self, index: usize, source: &Source, status: Status) {
         let (tx, asked) = (self.tx.clone(), source.clone());
         std::thread::spawn(move || {
-            let result = pr::search(&asked).map_err(|e| e.to_string());
+            let result = pr::search(&asked, status).map_err(|e| e.to_string());
             let _ = tx.send(Msg::Searched(index, result));
         });
     }
 
-    /// `R` on the list: asks every search again now, keeping the rows shown
-    /// until the answers arrive, and lets rows be read ahead afresh.
+    /// `R` on the list: asks again now every search asked this run and those
+    /// behind what's shown, keeping the rows shown until the answers arrive,
+    /// and lets rows be read ahead afresh.
     fn reload_list(&mut self) {
         let Some(list) = &mut self.list else {
             return;
@@ -650,14 +714,21 @@ impl App {
             list.note = Some("Already reloading".to_owned());
             return;
         }
-        let sources: Vec<Source> = list.slots.iter().map(|s| s.source.clone()).collect();
-        for slot in &mut list.slots {
-            slot.fetch = Fetch::Loading;
-        }
+        let shown = list.status;
+        let asks: Vec<(usize, Source, Status)> = list
+            .slots
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, s)| s.status == shown || !matches!(s.fetch, Fetch::Idle))
+            .map(|(index, slot)| {
+                slot.fetch = Fetch::Loading;
+                (index, slot.source.clone(), slot.status)
+            })
+            .collect();
         // The tab row's spinner shows it's asking.
         self.prefetched.clear();
-        for (index, source) in sources.iter().enumerate() {
-            self.search(index, source);
+        for (index, source, status) in asks {
+            self.search(index, &source, status);
         }
     }
 
@@ -1116,12 +1187,18 @@ impl App {
         let last = list.count().saturating_sub(1);
         let point = point_in(list.shown_area, 0, mouse.column, mouse.row);
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
-            && let Some(&(_, kind)) = list.tab_hits.iter().find(|(rect, _)| {
+            && let Some(&(_, hit)) = list.tab_hits.iter().find(|(rect, _)| {
                 mouse.row == rect.y && (rect.x..rect.x + rect.width).contains(&mouse.column)
             })
         {
             list.selection = None;
-            list.show(kind);
+            match hit {
+                ListHit::Kind(kind) => list.show(kind),
+                ListHit::Status(status) => {
+                    list.show_status(status);
+                    self.ask_shown();
+                }
+            }
             return;
         }
         match mouse.kind {
@@ -1202,12 +1279,17 @@ impl App {
         list.note = None;
         list.selection = None;
         match key.code {
-            // Two tabs, so any of these flips between them.
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+            // Two tabs, so either arrow flips between them.
+            KeyCode::Left | KeyCode::Right => {
                 list.show(match list.kind {
                     Kind::Pull => Kind::Issue,
                     Kind::Issue => Kind::Pull,
                 });
+                return Ok(true);
+            }
+            // Tab flips open rows and done ones: merged or closed.
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.flip_status();
                 return Ok(true);
             }
             // Asks every search again now rather than waiting. `R` only while
@@ -1619,7 +1701,8 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         let label = kind.title();
         let count = list.all(kind).len();
         let width = label.width() as u16;
-        list.tab_hits.push((Rect::new(at, row, width, 1), kind));
+        list.tab_hits
+            .push((Rect::new(at, row, width, 1), ListHit::Kind(kind)));
         tabs.push(Span::styled(label, if on { bold } else { dim }));
         let count = if count > 0 {
             format!(" {count}")
@@ -1633,44 +1716,110 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     if list.loading() {
         tabs.push(Span::styled(spinner().to_string(), dim));
     }
-    // What each color means, for the colors on screen.
-    let mut legend = Vec::new();
-    if list.me.is_some() {
-        for relation in Relation::ALL {
-            if entries.iter().any(|e| list.relation(e) == relation) {
-                if !legend.is_empty() {
-                    legend.push(Span::raw("   "));
+    // The switch between open rows and done ones, at the right: the shown
+    // one bright and underlined, the other quiet; tab or a click flips it.
+    let mut switch = Vec::new();
+    let mut labels = Vec::new();
+    for status in [Status::Open, Status::Done] {
+        let label = status.label(list.kind);
+        let on = status == list.status;
+        let style = if on {
+            bold.add_modifier(Modifier::UNDERLINED).fg(match status {
+                Status::Open => GREEN,
+                Status::Done => PURPLE,
+            })
+        } else {
+            dim
+        };
+        if !switch.is_empty() {
+            switch.push(Span::styled("  ·  ", dim));
+        }
+        labels.push((
+            switch.iter().map(|s| s.content.width()).sum::<usize>(),
+            label,
+            status,
+        ));
+        switch.push(Span::styled(label, style));
+    }
+    let switch_width: usize = switch.iter().map(|s| s.content.width()).sum();
+    let switch_x = x + width.saturating_sub(switch_width as u16);
+    for (offset, label, status) in labels {
+        list.tab_hits.push((
+            Rect::new(switch_x + offset as u16, row, label.width() as u16, 1),
+            ListHit::Status(status),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(spread(tabs, switch, w)),
+        Rect::new(x, row, width, 1),
+    );
+
+    // Beside the filter: what the colors mean for open rows; for done ones,
+    // a sparkline of the last twelve weeks.
+    let mut aside = Vec::new();
+    match list.status {
+        Status::Open if list.me.is_some() => {
+            for relation in Relation::ALL {
+                if entries.iter().any(|e| list.relation(e) == relation) {
+                    if !aside.is_empty() {
+                        aside.push(Span::raw("   "));
+                    }
+                    aside.push(Span::styled(
+                        "● ",
+                        Style::default().fg(relation_color(relation)),
+                    ));
+                    aside.push(Span::styled(relation.label(), dim));
                 }
-                legend.push(Span::styled(
-                    "● ",
-                    Style::default().fg(relation_color(relation)),
+            }
+        }
+        Status::Open => {}
+        Status::Done => {
+            let weeks = weekly(&list.all(list.kind), now, SPARK_WEEKS);
+            let most = weeks.iter().copied().max().unwrap_or(0);
+            if most > 0 {
+                for count in &weeks {
+                    let (bar, style) = match count {
+                        0 => ("▁", dim),
+                        n => (
+                            SPARK[(n * (SPARK.len() - 1)).div_ceil(most)],
+                            Style::default().fg(PURPLE),
+                        ),
+                    };
+                    aside.push(Span::styled(bar, style));
+                }
+                let sum: usize = weeks.iter().sum();
+                let verb = match list.kind {
+                    Kind::Pull => "merged",
+                    Kind::Issue => "closed",
+                };
+                aside.push(Span::styled(
+                    format!("  {sum} {verb} in {SPARK_WEEKS} weeks"),
+                    dim,
                 ));
-                legend.push(Span::styled(relation.label(), dim));
             }
         }
     }
-    let used: usize = tabs.iter().chain(&legend).map(|s| s.content.width()).sum();
-    if used >= w {
-        legend.clear();
-    }
-    f.render_widget(
-        Paragraph::new(spread(tabs, legend, w)),
-        Rect::new(x, row, width, 1),
-    );
     let field = if list.typed.is_empty() {
-        Line::from(vec![
+        vec![
             Span::styled("/  ", dim),
             Span::styled("▏", bold),
             Span::styled("Filter by title, repository, number or author", dim),
-        ])
+        ]
     } else {
-        Line::from(vec![
+        vec![
             Span::styled("/  ", dim),
             Span::raw(list.typed.clone()),
             Span::styled("▏", bold),
-        ])
+        ]
     };
-    f.render_widget(Paragraph::new(field), Rect::new(x, area.y + 3, width, 1));
+    let used: usize = field.iter().chain(&aside).map(|s| s.content.width()).sum();
+    if used + 2 >= w {
+        aside.clear();
+    }
+    f.render_widget(
+        Paragraph::new(spread(field, aside, w)),
+        Rect::new(x, area.y + 3, width, 1),
+    );
 
     let top = area.y + 5;
     let bottom = (area.y + area.height).saturating_sub(2);
@@ -1680,12 +1829,13 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         list.shown.clear();
         list.selection = None;
         let what = list.kind.title().to_lowercase();
+        let state = list.status.label(list.kind).to_lowercase();
         let text = if list.loading() {
-            format!("{}  Loading your {what}", spinner())
+            format!("{}  Loading your {state} {what}", spinner())
         } else if let Some(e) = list.failure().filter(|_| list.typed.is_empty()) {
             e
         } else if list.typed.is_empty() {
-            format!("No open {what} concern you.")
+            format!("No {state} {what} concern you.")
         } else {
             format!("Nothing matches “{}”.", list.typed)
         };
@@ -1701,11 +1851,32 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     } else {
         // Every line of the list, and the row index each belongs to.
         let mut lines: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+        let mut group = None;
         for (index, entry) in entries.iter().enumerate() {
+            // Done rows fall under when they ended: Today, Yesterday, …
+            if let Some(ended) = entry.ended.as_ref().filter(|_| list.status == Status::Done) {
+                let here = age_group(&ended.at, now);
+                if group != Some(here) {
+                    if group.is_some() {
+                        lines.push((Line::default(), None));
+                    }
+                    group = Some(here);
+                    let count = entries
+                        .iter()
+                        .filter(|e| e.ended.as_ref().map(|e| age_group(&e.at, now)) == Some(here))
+                        .count();
+                    lines.push((group_heading(here, count, w), None));
+                }
+            }
             let picked = index == list.selected;
             let bar = if picked { "▌ " } else { "  " };
-            let glyph = if entry.draft { "○" } else { "●" };
-            let color = relation_color(list.relation(entry));
+            let (glyph, color) = match (&entry.ended, list.status) {
+                (Some(ended), Status::Done) => ending_glyph(ended.how),
+                _ => (
+                    if entry.draft { "○" } else { "●" },
+                    relation_color(list.relation(entry)),
+                ),
+            };
             let name = entry.pr.repo.rsplit('/').next().unwrap_or(&entry.pr.repo);
             lines.push((
                 spread(
@@ -1722,19 +1893,36 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
                 ),
                 Some(index),
             ));
-            let mut about = format!("{} · {}", entry.author, pr::ago(&entry.updated, now));
-            if entry.draft {
-                about.push_str(" · draft");
-            }
-            lines.push((
-                Line::from(vec![Span::raw("     "), Span::styled(about, dim)]),
-                Some(index),
-            ));
+            let about = match (&entry.ended, list.status) {
+                // The author in their relation's color, so whose it was
+                // still reads without the open list's dot.
+                (Some(Ended { how, at }), Status::Done) => vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        entry.author.clone(),
+                        Style::default().fg(relation_color(list.relation(entry))),
+                    ),
+                    Span::styled(format!(" · {} {}", how.verb(), pr::ago(at, now)), dim),
+                ],
+                _ => {
+                    let mut about = format!("{} · {}", entry.author, pr::ago(&entry.updated, now));
+                    if entry.draft {
+                        about.push_str(" · draft");
+                    }
+                    vec![Span::raw("     "), Span::styled(about, dim)]
+                }
+            };
+            lines.push((Line::from(about), Some(index)));
         }
         // Scroll so the picked row stays in view.
         let first_of = |wanted: usize| lines.iter().position(|(_, i)| *i == Some(wanted));
         let at = first_of(list.selected).unwrap_or(0);
-        let skip = (at + 2).saturating_sub(room).min(at);
+        // A group's heading stays in view above its first row.
+        let from = match at.checked_sub(1).map(|above| &lines[above]) {
+            Some((_, None)) => at - 1,
+            _ => at,
+        };
+        let skip = (at + 2).saturating_sub(room).min(from);
         list.hits.clear();
         let mut shown = Vec::new();
         for (y, (line, owner)) in lines.into_iter().skip(skip).take(room).enumerate() {
@@ -1762,6 +1950,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         f.render_widget(Paragraph::new(drawn), list.shown_area);
     }
 
+    let flip = list.status.other().label(list.kind).to_lowercase();
     let footer = match (list.failure(), &list.note) {
         (_, Some(note)) => Line::from(Span::styled(clip(note, w), dim)),
         (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
@@ -1769,7 +1958,8 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
             &[
                 ("↑↓", "move"),
                 ("enter", "open"),
-                ("tab", "switch"),
+                ("tab", &flip),
+                ("←→", "pulls · issues"),
                 ("type", "filter"),
                 ("^y", "copy #"),
                 ("R", "reload"),
@@ -1785,6 +1975,94 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         Paragraph::new(footer),
         Rect::new(x, (area.y + area.height).saturating_sub(1), width, 1),
     );
+}
+
+/// How many weeks the done list's sparkline covers, and its bars.
+const SPARK_WEEKS: usize = 12;
+const SPARK: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// How many rows ended in each of the last `weeks` weeks, oldest first;
+/// the last is the seven days up to `now`.
+fn weekly(entries: &[Entry], now: i64, weeks: usize) -> Vec<usize> {
+    const WEEK: i64 = 7 * 86_400;
+    let mut counts = vec![0; weeks];
+    for at in entries
+        .iter()
+        .filter_map(|e| e.ended.as_ref().and_then(|e| pr::seconds(&e.at)))
+    {
+        let ago = (now - at).max(0) / WEEK;
+        if let Some(slot) = usize::try_from(ago)
+            .ok()
+            .and_then(|ago| weeks.checked_sub(ago + 1))
+        {
+            counts[slot] += 1;
+        }
+    }
+    counts
+}
+
+/// The done list's groups, by how long ago a row ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgeGroup {
+    Today,
+    Yesterday,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+    Older,
+}
+
+impl AgeGroup {
+    fn label(self) -> &'static str {
+        match self {
+            AgeGroup::Today => "Today",
+            AgeGroup::Yesterday => "Yesterday",
+            AgeGroup::ThisWeek => "This week",
+            AgeGroup::ThisMonth => "This month",
+            AgeGroup::ThisYear => "This year",
+            AgeGroup::Older => "Older",
+        }
+    }
+}
+
+/// Which group a time falls in, counting whole days (UTC) back from `now`.
+fn age_group(iso: &str, now: i64) -> AgeGroup {
+    let Some(then) = pr::seconds(iso) else {
+        return AgeGroup::Older;
+    };
+    match now.div_euclid(86_400) - then.div_euclid(86_400) {
+        ..=0 => AgeGroup::Today,
+        1 => AgeGroup::Yesterday,
+        2..=6 => AgeGroup::ThisWeek,
+        7..=30 => AgeGroup::ThisMonth,
+        31..=364 => AgeGroup::ThisYear,
+        _ => AgeGroup::Older,
+    }
+}
+
+/// A group's heading: its name, a quiet rule, and how many rows it holds.
+fn group_heading(group: AgeGroup, count: usize, width: usize) -> Line<'static> {
+    let label = group.label();
+    let count = count.to_string();
+    let rule = width.saturating_sub(label.width() + count.width() + 4);
+    Line::from(vec![
+        Span::styled(
+            format!("  {label} "),
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("─".repeat(rule), Style::default().fg(DIM)),
+        Span::styled(format!(" {count}"), Style::default().fg(DIM)),
+    ])
+}
+
+/// How a done row ended, as its glyph and color: merged and completed in
+/// purple, as GitHub shows them; not planned quiet.
+fn ending_glyph(how: Ending) -> (&'static str, Color) {
+    match how {
+        Ending::Merged => ("◆", PURPLE),
+        Ending::Completed => ("✓", PURPLE),
+        Ending::NotPlanned => ("⊘", DIM),
+    }
 }
 
 /// Key hints, as many as fit: the key, then what it does, quieter.
@@ -3089,26 +3367,58 @@ mod tests {
             author: "me".into(),
             updated: format!("2026-11-12T04:0{number}:00Z"),
             draft: false,
+            ended: None,
         };
-        let mut list = List {
+        let mut list = list_of(vec![
+            Slot {
+                source: Source::Authored(Kind::Pull),
+                status: Status::Open,
+                entries: Some(vec![entry(1, "fix quotes"), entry(2, "add pr")]),
+                fetch: Fetch::Done,
+            },
+            Slot {
+                source: Source::Reviewing,
+                status: Status::Open,
+                entries: Some(vec![entry(2, "add pr")]),
+                fetch: Fetch::Loading,
+            },
+            Slot {
+                source: Source::Authored(Kind::Issue),
+                status: Status::Open,
+                entries: Some(vec![entry(3, "crash on open")]),
+                fetch: Fetch::Done,
+            },
+            Slot {
+                source: Source::Authored(Kind::Issue),
+                status: Status::Done,
+                entries: Some(vec![entry(4, "old crash"), entry(5, "older crash")]),
+                fetch: Fetch::Idle,
+            },
+        ]);
+        assert_eq!(list.count(), 2);
+        // Newest first, across searches.
+        assert_eq!(list.picked().map(|pr| pr.number), Some(2));
+        assert!(list.loading());
+        list.typed = "quotes".into();
+        assert_eq!(list.picked().map(|pr| pr.number), Some(1));
+        list.typed.clear();
+        list.show(Kind::Issue);
+        assert_eq!(list.count(), 1);
+        assert!(!list.loading());
+        assert_eq!(list.picked().map(|pr| pr.number), Some(3));
+        // The done switch shows the other searches, and the tab stays.
+        list.selected = 0;
+        list.show_status(Status::Done);
+        assert_eq!(list.kind, Kind::Issue);
+        assert_eq!(list.count(), 2);
+        assert_eq!(list.picked().map(|pr| pr.number), Some(5));
+    }
+
+    fn list_of(slots: Vec<Slot>) -> List {
+        List {
             kind: Kind::Pull,
-            slots: vec![
-                Slot {
-                    source: Source::Authored(Kind::Pull),
-                    entries: Some(vec![entry(1, "fix quotes"), entry(2, "add pr")]),
-                    fetch: Fetch::Done,
-                },
-                Slot {
-                    source: Source::Reviewing,
-                    entries: Some(vec![entry(2, "add pr")]),
-                    fetch: Fetch::Loading,
-                },
-                Slot {
-                    source: Source::Authored(Kind::Issue),
-                    entries: Some(vec![entry(3, "crash on open")]),
-                    fetch: Fetch::Done,
-                },
-            ],
+            status: Status::Open,
+            slots,
             me: Some("me".into()),
             tab_hits: Vec::new(),
             typed: String::new(),
@@ -3121,18 +3431,100 @@ mod tests {
             shown_area: Rect::default(),
             selection: None,
             dragging: false,
+        }
+    }
+
+    #[test]
+    fn done_rows_are_grouped_by_when_they_ended_with_a_sparkline() {
+        let now = pr::seconds("2026-11-14T12:00:00Z").unwrap();
+        let done = |number, title: &str, how, at: &str| Entry {
+            pr: PrRef {
+                repo: "o/leaf".into(),
+                number,
+            },
+            title: title.into(),
+            author: "me".into(),
+            updated: at.into(),
+            draft: false,
+            ended: Some(Ended { how, at: at.into() }),
         };
-        assert_eq!(list.count(), 2);
-        // Newest first, across searches.
-        assert_eq!(list.picked().map(|pr| pr.number), Some(2));
-        assert!(list.loading());
-        list.typed = "quotes".into();
-        assert_eq!(list.picked().map(|pr| pr.number), Some(1));
-        list.typed.clear();
-        list.show(Kind::Issue);
-        assert_eq!(list.count(), 1);
-        assert!(!list.loading());
-        assert_eq!(list.picked().map(|pr| pr.number), Some(3));
+        let mut list = list_of(vec![Slot {
+            source: Source::Authored(Kind::Pull),
+            status: Status::Done,
+            entries: Some(vec![
+                done(1, "ship it", Ending::Merged, "2026-11-14T09:00:00Z"),
+                done(2, "fix quotes", Ending::Merged, "2026-11-13T09:00:00Z"),
+                done(3, "old work", Ending::Merged, "2026-08-01T09:00:00Z"),
+            ]),
+            fetch: Fetch::Done,
+        }]);
+        list.status = Status::Done;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+            .expect("test terminal");
+        terminal
+            .draw(|f| draw_list(f, &mut list, now, None))
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let screen: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let text = screen.join("\n");
+        assert!(text.contains("Open  ·  Merged"), "{text}");
+        assert!(text.contains("2 merged in 12 weeks"), "{text}");
+        let at = |needle: &str| screen.iter().position(|l| l.contains(needle));
+        assert!(at("Today") < at("ship it"), "{text}");
+        assert!(at("ship it") < at("Yesterday"), "{text}");
+        assert!(at("Yesterday") < at("fix quotes"), "{text}");
+        assert!(at("This year") < at("old work"), "{text}");
+        assert!(text.contains("◆  ship it"), "{text}");
+        assert!(text.contains("me · merged"), "{text}");
+        assert!(text.contains("tab open"), "{text}");
+        // The switch can be clicked.
+        assert!(
+            list.tab_hits
+                .iter()
+                .any(|(_, hit)| *hit == ListHit::Status(Status::Open))
+        );
+    }
+
+    #[test]
+    fn rows_fall_into_age_groups_and_weeks() {
+        let now = pr::seconds("2026-11-14T12:00:00Z").unwrap();
+        assert_eq!(age_group("2026-11-14T00:01:00Z", now), AgeGroup::Today);
+        assert_eq!(age_group("2026-11-13T23:59:00Z", now), AgeGroup::Yesterday);
+        assert_eq!(age_group("2026-11-09T12:00:00Z", now), AgeGroup::ThisWeek);
+        assert_eq!(age_group("2026-10-20T12:00:00Z", now), AgeGroup::ThisMonth);
+        assert_eq!(age_group("2026-01-20T12:00:00Z", now), AgeGroup::ThisYear);
+        assert_eq!(age_group("2024-01-20T12:00:00Z", now), AgeGroup::Older);
+        let ended = |at: &str| Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            title: String::new(),
+            author: String::new(),
+            updated: at.into(),
+            draft: false,
+            ended: Some(Ended {
+                how: Ending::Completed,
+                at: at.into(),
+            }),
+        };
+        let weeks = weekly(
+            &[
+                ended("2026-11-14T00:00:00Z"),
+                ended("2026-11-10T00:00:00Z"),
+                ended("2026-11-01T00:00:00Z"),
+                ended("2025-01-01T00:00:00Z"),
+            ],
+            now,
+            3,
+        );
+        assert_eq!(weeks, [0, 1, 2]);
     }
 
     #[test]
