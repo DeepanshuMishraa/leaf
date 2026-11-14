@@ -525,7 +525,11 @@ fn open(target: &str) -> ExitCode {
         }
     };
     let failure = Rc::new(RefCell::new(None));
-    let options = resume(target, doc.page_count, &failure);
+    let mut options = resume(target, doc.page_count, &failure);
+    let lower = target.to_ascii_lowercase();
+    if !is_url(target) && (lower.ends_with(".md") || lower.ends_with(".markdown")) {
+        options.watch = Some(PathBuf::from(target));
+    }
     let result = viewer::run(doc, options);
     if let Some(message) = failure.borrow().as_ref() {
         eprintln!("leaf: {message}");
