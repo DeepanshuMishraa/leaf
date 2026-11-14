@@ -36,7 +36,7 @@ pub fn install() -> Result<String, String> {
     }
     let reloaded = spinner::step("Reloading Rex", |_| rex(&["config", "reload"])).is_ok();
     Ok(format!(
-        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Pull Requests lists this branch's pull request, this repository's and yours.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
+        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Pull Requests & Issues lists the pull requests and issues that concern you, newest first.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
         if reloaded {
             ""
         } else {
@@ -192,9 +192,20 @@ fn loader(plugin_path: &Path, bin: &Path) -> String {
 }
 
 /// FNV-1a, 64 bits: stable across builds, unlike std's hasher.
-fn fnv1a(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+pub(crate) fn fnv1a(text: &str) -> u64 {
+    fnv1a_bytes(text.as_bytes())
+}
+
+/// FNV-1a over bytes: stable across builds and Rust releases, unlike
+/// `DefaultHasher`, so it's safe for values that are saved.
+pub(crate) fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    fnv1a_continue(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+/// FNV-1a carried on from `hash` over more bytes.
+pub(crate) fn fnv1a_continue(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 

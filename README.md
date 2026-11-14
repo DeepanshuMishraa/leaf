@@ -101,32 +101,90 @@ Local diffs need a Git repository. A patch file and a GitHub pull request, commi
 
 Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. `i` switches to one column, removed lines above added ones as `git diff` shows them, with both line numbers; `leaf diff --inline` opens that way. Comments and the changed-word highlighting work the same in both. Added and removed lines are tinted, with the changed words picked out. The tints follow the terminal's light or dark theme and switch with it while the diff is open in Rex (or another terminal that answers the `CSI ? 996 n` color-scheme query); other terminals are matched by their background color once. `LEAF_THEME=light` or `LEAF_THEME=dark` sets it outright.
 
-Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `v` enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `@` (or `ctrl+enter`) asks the agent pane about the range, or the current line: type the question and press enter. `C` comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
+Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `V` (or `v`) enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `@` (or `ctrl+enter`) asks the agent pane about the range, or the current line: type the question and press enter. `c` (or `C`) comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
 
 The message names the file, the side, and the line range, and includes the hunk around that range, then the comment. It is sent, not left sitting in the agent's input. An agent pane is found from `LEAF_AGENT_PANE`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini`, `grok`, `pi` or another known agent. With no Rex session or no agent, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
-## Pull requests
+## Pull requests and issues
 
-`leaf pr` lists the open pull requests that concern you: this branch's first, then this repository's, yours across GitHub, the ones waiting on your review, and the rest in repositories you own. Type to filter by title, repository, number or author, and press `enter` to open one. Name one to open it directly:
+`leaf pr` lists the pull requests and issues that concern you, in two tabs; `←/→` switches. **Pull requests** holds yours across GitHub, the ones in repositories you own, the ones waiting on your review, and this repository's. **Issues** holds the ones you opened and the ones opened in repositories you own. Each tab is one list, newest first, and each row's dot says whose it is: green is yours in your own repository, blue is yours in someone else's, yellow is someone else's in yours, and grey is the rest. The legend beside the filter names the colors on screen.
+
+`tab` flips each tab between **Open** and **Merged** (pull requests) or **Closed** (issues); the switch at the top right shows which, and a click flips it too. The done lists are grouped by when each one ended (Today, Yesterday, This week, This month, This year, Older), newest first. A purple `◆` is merged, a purple `✓` closed as completed, a grey `⊘` closed as not planned, and the author's name keeps its color. A sparkline beside the filter counts how many were merged or closed in each of the last twelve weeks. Done lists show what was found last time and are asked again the first time you open them in a run.
+
+Type to filter by title, repository, number or author. `enter` opens either one here in leaf. Name a pull request to open it directly:
 
 ```sh
-leaf pr                                  # pick from your open pull requests
+leaf pr                                  # pick from your open pull requests and issues
 leaf pr 12                               # #12 in this repository
 leaf pr owner/repo#12                    # any repository
 leaf pr https://github.com/owner/repo/pull/12
 ```
 
-The list shows what it found last time at once and refreshes behind it, each heading as its answer arrives. Each pull request takes two lines, its title over who opened it and when; `↑/↓` or the wheel move, a click picks a row and a second click opens it when you let go (a drag doesn't open it), and `ctrl+y` copies the picked pull request's number. The pull request under the cursor is read ahead, so `enter` opens it without waiting, and one read before opens at once while it's read again. Answers, diffs and pictures are cached in `$XDG_CACHE_HOME/leaf/pr` (default `~/.cache/leaf/pr`).
+The list shows what it found last time at once and refreshes behind it as each answer arrives. Each row takes two lines, its title over who opened it and when; `↑/↓` or the wheel move, a click picks a row and a second click opens it when you let go (a drag doesn't open it), and `ctrl+y` copies the picked row's number, pull request or issue. `R` (or `ctrl+r` while filtering) asks every search again now instead of waiting. The item under the cursor is read ahead, so `enter` opens it without waiting, and one read before opens at once while it's read again. Answers, diffs and pictures are cached in `$XDG_CACHE_HOME/leaf/pr` (default `~/.cache/leaf/pr`).
 
-A pull request opens on its title, one line of state, number, author and size, and its tabs. **Summary** shows whether it can merge, the branch, reviewers and labels when it has them, checks that are failing or running, and the description. **Timeline** shows commits, comments, reviews and line comments in order; long bot comments are cut short until `e` expands them. **Code** opens the diff in the reviewer above. The diff is fetched while the page loads and kept against the head commit, so Code opens at once and only fetches again after a push. In Code, `1`, `2` and `←` go back to Summary and Timeline, as do `tab` and `shift+tab` (`h`/`l` scroll sideways there).
+A pull request opens on its title, one line of state, number, author and size, and its tabs. **Summary** shows whether it can merge, the branch, reviewers and labels when it has them, checks that are failing or running, and the description. **Timeline** shows commits, comments, reviews and line comments in order; long bot comments are cut short until `e` expands them. **Comments** holds only the comments and reviews, each in full: `j`/`k` pick one, `enter` replies quoting it, and `c` comments on the pull request. **Code** opens the diff in the reviewer above. The diff is fetched while the page loads and kept against the head commit, so Code opens at once and only fetches again after a push. In Code, `1`, `2`, `3` and `←` go back to Summary, Timeline and Comments, as do `tab` and `shift+tab` (`h`/`l` scroll sideways there).
+
+An issue opens on the same page, with **Summary** (its state, assignees, labels and description) **Timeline** (its history) and **Comments** (each comment in full, `j`/`k` to pick one); it has no Code tab. `c` comments, and `]`/`[` picks a comment for `enter` to reply to, quoting it. `x` closes an open issue as completed or not planned, or reopens a closed one, and `o` opens it on GitHub.
 
 Pictures in the description are drawn in place on terminals with the Kitty graphics protocol (Kitty, Ghostty, WezTerm, Rex; not inside tmux), as the reader draws its figures. Images in a table stack under their column's heading. SVG images are drawn too, and an animated GIF plays on its own, looping (a GIF too large for the memory set aside for GIFs shows its first frame). A video shows its first frame under a play button. Click it to play it right there, with its sound; a ring turns over the frame until the video has loaded: `ffmpeg` decodes it at the video's own pace, the frames are drawn like any picture and the sound goes to the same output as reading aloud. A click or `esc` stops it, as does leaving the Summary. Without `ffmpeg` a click opens the video in the browser instead. A click on an image shows it full size in the browser. Elsewhere each picture is a one-line placeholder.
 
 Drag over text in Summary or Timeline to select it; it's copied when you let go, and `esc` clears the selection.
 
-Keys: `←/→`, `tab` (`shift+tab` back), `1`, `2`, `3` switch tabs (a click on a tab too), `j/k`, `ctrl+d/u`, `space/b`, `g/G` scroll. `m` merges: pick squash (`s`), merge commit (`m`) or rebase (`r`), then confirm. `x` closes, or reopens a closed one, `r` marks a draft ready or converts it back, `a` approves, `c` comments (`enter` posts, `alt+enter` adds a line). `o` opens it on GitHub, `y` copies `gh pr checkout N`, `Y` the link, `n` the number (or click the number in the header), `R` reloads, `?` lists the keys, `q` goes back to the list. The footer lists the main keys. Merging and closing ask first.
+Keys: `←/→`, `tab` (`shift+tab` back), `1` to `4` switch tabs (a click on a tab too), `j/k`, `ctrl+d/u`, `space/b`, `g/G` scroll. `m` merges: pick squash (`s`), merge commit (`m`) or rebase (`r`), then confirm. `x` closes, or reopens a closed one, `r` marks a draft ready or converts it back, `a` approves, `c` comments (`enter` posts, `alt+enter` adds a line). `]`/`[` picks a comment and `enter` replies to it, quoting it. `o` opens it on GitHub, `y` copies `gh pr checkout N`, `Y` the link, `n` the number (or click the number in the header), `R` reloads, `?` lists the keys, `q` goes back to the list. The footer lists the main keys. Merging and closing ask first.
 
 Everything goes through the GitHub CLI, so `gh` must be installed and signed in (`gh auth login`).
+
+## Margin: review your agent's plans and changes
+
+Margin is how you and a coding agent pass work back and forth in leaf. The agent hands over a plan or a set of changes, you leave notes, and they go back as one review with a verdict. The agent gets it as its next message, in the conversation it's already having.
+
+```sh
+leaf hook install     # set up every agent CLI here (asks first; --dry-run shows the changes)
+leaf skills install   # or only the skills: leaf, leaf-plan and leaf-review
+```
+
+`leaf hook install` finds the coding agents on this machine, shows what it will change, and asks once. Each agent gets the skills, and a hook where it has one. With the hook, a plan opens in leaf at the moment the agent would ask you to approve it. Request changes and the agent revises; approve and it goes ahead.
+
+| Agent | How it hands you a plan |
+|---|---|
+| Claude Code | `PermissionRequest` hook on `ExitPlanMode` |
+| Grok Build | `PreToolUse` hook on `exit_plan_mode` (Grok then asks you to confirm once more) |
+| Codex | `Stop` hook on plan mode's `<proposed_plan>`. Trust it once in Codex's `/hooks`. |
+| Antigravity | `Stop` hook that finds a new `implementation_plan.md` |
+| Cursor | `preToolUse` hook on its plan tool |
+| Pi | an extension with `leaf_review_plan` and `leaf_review_changes` tools |
+| OpenCode | the skills, since it has no plan hook; it runs `leaf plan` itself |
+
+Config files are merged, never replaced, and the first change to a JSON file keeps a `.leaf-backup` beside it. `leaf hook status` shows what's set up, and `leaf hook uninstall` takes out only what leaf added.
+
+### Plans
+
+`leaf plan plan.md` splits a Markdown plan into numbered blocks: each heading with everything under it, up to the next heading. Text before the first heading, or after a `---` rule, is a block of its own. `j/k` move line by line, `]`/`[` jump between blocks and `J/K` jump to blocks with notes. Then:
+
+- `c` comments on the cursor's line. `V` starts a selection, `j/k` extend it inside the block, and `c` comments on the selected lines.
+- `B` comments on the whole block.
+- `x` removes the selection, or marks the whole block for removal (press it again to keep the block).
+- `r` replaces the selection or the block with your text, starting from its own.
+
+Dragging over text selects a passage the same way. `C` writes a global note on the whole plan, `L` lists every note to jump to, edit or delete, and `X` clears a block's notes. `S` sends the review: `a` approve, `n` approve with notes, `c` request changes.
+
+Notes you haven't sent are kept and come back next time. A note on a block that has since been rewritten is dropped, and leaf tells you. Each new version of a plan is a round. From the second round on, blocks that changed are marked `+`, the header counts the changed and removed blocks, and `D` steps through what changed.
+
+### Changes
+
+`leaf review` takes the same sources as `leaf diff` (`--staged`, `--branch`, a range, a patch or a GitHub link). It opens on an overview of every changed file, with its size, its notes and whether you've viewed it. `enter` opens a file, and `tab` comes back to the overview. Past the last file, `]` comes back too. Notes go on three levels:
+
+- lines: `c` on the cursor line, or press `V` to select lines with `j/k`, then `c`
+- a whole file: `F`, or `c` in the overview
+- the whole change: `M`, or `C` in the overview
+
+`w` marks a file viewed. The mark clears if the file changes. `S` sends the draft line comments and the notes as one review, grouped by file in diff order, with each line comment's hunk. Plain `leaf diff` has the overview, the notes and `S` as well, and sends the review straight to the agent pane.
+
+### Who opens it
+
+A person can run `leaf plan` or `leaf review` in a terminal. The review goes to the agent pane leaf finds, as questions do, or to stdout with `--print`.
+
+An agent can run them too, and hooks do. The agent has no terminal, so leaf opens the review in a pane beside it. That needs one of Rex, tmux or Herdr: start your agent inside one of them. leaf returns at once, and the review goes back into the agent's pane when you send it. `--wait` (what hooks use) blocks instead and prints the review. Outside all three, leaf tells the agent to ask you to run the command, and a hook steps aside so the agent asks you as it normally would.
 
 ## Rex
 
@@ -140,7 +198,7 @@ Always there:
 
 - **Open Document…** floats a picker over the window, like Rex's Go to Directory. The field holds a path, starting at the pane's folder; type to narrow that folder's folders and documents, `tab` or `enter` on a folder goes into it, and `enter` on a document reads it. Documents read lately come first, with how far in. A typed `https://` link opens as it is. `leaf open` with no file, or plain `leaf`, shows the same picker in place.
 - **Review Diff**, **Review Staged Changes** and **Review This Branch** open the diff reviewer.
-- **Pull Requests** opens `leaf pr` in the pane; pass `target` (a number, `owner/repo#N` or a link) to open one directly.
+- **Pull Requests & Issues** opens `leaf pr` in the pane; pass `target` (a number, `owner/repo#N` or a link) to open one directly.
 - **Choose Agent…** floats a list of the agent CLIs installed here (claude, codex, opencode, gemini, grok, pi…), with the one picked now ticked. Questions then go to the pane already running that agent, so its conversation goes on; with none open, leaf starts it in a new pane beside, already asked, and later questions go there. **Any agent pane** sends to whichever agent pane is open: the focused one, else one in the same tab. `leaf agents` shows the same list in place.
 
 While a document or a diff is open:

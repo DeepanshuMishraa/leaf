@@ -1,6 +1,9 @@
-//! `leaf pr`: the open pull requests that concern you, and one read in full.
+//! `leaf pr`: the open pull requests and issues that concern you, and a pull
+//! request read in full.
 //!
-//! The list shows the last run's answers at once and refreshes behind them;
+//! The list has two tabs, Pull requests and Issues, each one list newest
+//! first, its rows colored by whose they are and where. It shows the last
+//! run's answers at once and refreshes behind them;
 //! the row under the cursor is read ahead, so opening it is instant. A pull
 //! request has a Summary (status, branch, reviewers, checks that need you,
 //! the description with its images and videos) and a Timeline (commits,
@@ -36,8 +39,8 @@ use crate::look::Look;
 use crate::news::News;
 use crate::popover::{self, Edit};
 use crate::pr::{
-    self, Action, CheckStatus, Detail, Entry, EventKind, Group, Mergeability, PrRef, Source, State,
-    Verdict,
+    self, Action, CheckStatus, CloseReason, Detail, Ended, Ending, Entry, EventKind, Kind,
+    Mergeability, PrRef, Relation, Source, State, Status, Verdict,
 };
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
@@ -48,6 +51,7 @@ const GREEN: Color = Color::Indexed(2);
 const RED: Color = Color::Indexed(1);
 const YELLOW: Color = Color::Indexed(3);
 const PURPLE: Color = Color::Indexed(5);
+const BLUE: Color = Color::Indexed(4);
 /// Width of the label column in the summary.
 const LABEL: usize = 11;
 /// The widest the page gets; past this, lines are too long to read comfortably.
@@ -60,7 +64,21 @@ const WHEEL_ROWS: usize = 3;
 const FRESH: Duration = Duration::from_secs(30);
 /// How long the list's selection rests before that pull request is fetched.
 const SETTLE: Duration = Duration::from_millis(150);
+/// Beside a picked comment's time, when there's room.
+const REPLY_HINT: &str = "enter replies";
+/// The list's note while an `R` is still being answered.
+const RELOADING: &str = "Already reloading";
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// The keys an issue's footer offers, in the order they're dropped to fit.
+const ISSUE_KEYS: [(&str, &str); 7] = [
+    ("←→", "tabs"),
+    ("c", "comment"),
+    ("]", "reply"),
+    ("x", "close"),
+    ("o", "browser"),
+    ("?", "keys"),
+    ("q", "back"),
+];
 /// The keys the page's footer offers, in the order they're dropped to fit.
 const KEYS: [(&str, &str); 8] = [
     ("←→", "tabs"),
@@ -93,8 +111,10 @@ enum Load<T> {
 
 enum Msg {
     Searched(usize, Result<Vec<Entry>, String>),
+    /// Your GitHub login, which colors the list's rows.
+    Me(String),
     Viewed(PrRef, Box<Result<Detail, String>>),
-    Acted(PrRef, Result<String, String>),
+    Acted(PrRef, Kind, Result<String, String>),
     /// The patch fetched for a head commit.
     Patched(PrRef, String, Result<String, String>),
 }
@@ -103,6 +123,23 @@ enum Msg {
 enum Tab {
     Summary,
     Timeline,
+    /// Only the comments and reviews, each in full, to pick and reply to.
+    Comments,
+}
+
+impl Tab {
+    /// The page's own tabs in order; a pull request's Code tab follows them.
+    const ALL: [Tab; 3] = [Tab::Summary, Tab::Timeline, Tab::Comments];
+}
+
+/// Where moving one tab on or back from the shown one lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Tab(Tab),
+    /// A pull request's diff, which opens in the reviewer.
+    Code,
+    /// Past the first or last tab, with no wrapping asked for.
+    Stay,
 }
 
 /// What a click in the tab row asks for.
@@ -110,6 +147,7 @@ enum Tab {
 enum TabHit {
     Summary,
     Timeline,
+    Comments,
     Code,
 }
 
@@ -117,29 +155,51 @@ enum Mode {
     Normal,
     /// Picking how to merge.
     Merge,
+    /// Picking why an issue is closed.
+    Close,
     Confirm(Action),
     Compose {
         text: Vec<char>,
         cursor: usize,
+        /// Whose comment this replies to, quoted at the top of `text`.
+        reply: Option<String>,
     },
     Help,
 }
 
 enum Fetch {
+    /// Not asked yet this run: the done searches wait until they're shown.
+    Idle,
     Loading,
     Done,
     Failed(String),
 }
 
-/// One heading of the list: what it found last, and whether it's asking again.
+/// One search behind the list: what it found last, and whether it's asking again.
 struct Slot {
     source: Source,
+    status: Status,
     entries: Option<Vec<Entry>>,
     fetch: Fetch,
 }
 
+/// What a click in the list's tab row asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListHit {
+    Kind(Kind),
+    Status(Status),
+}
+
 struct List {
+    /// The tab shown.
+    kind: Kind,
+    /// Open rows, or merged and closed ones.
+    status: Status,
     slots: Vec<Slot>,
+    /// Your login, once known; until then rows aren't colored.
+    me: Option<String>,
+    /// Where each tab's and switch's label was drawn, for clicks.
+    tab_hits: Vec<(Rect, ListHit)>,
     typed: String,
     selected: usize,
     /// The selected pull request and when it was picked, to fetch it once it rests there.
@@ -150,7 +210,7 @@ struct List {
     /// release unless the mouse was dragged or the list changed under it.
     pressed: Option<PrRef>,
     /// What ctrl+y or a drag copied, shown in the footer until the next key.
-    copied: Option<String>,
+    note: Option<String>,
     /// The rows' lines as drawn last, and where, so a drag can select their text.
     shown: Vec<Line<'static>>,
     shown_area: Rect,
@@ -160,55 +220,76 @@ struct List {
 }
 
 impl List {
-    fn entries(&self) -> Vec<(String, Vec<Entry>)> {
-        let groups = pr::dedupe(
-            self.slots
-                .iter()
-                .filter_map(|slot| {
-                    Some(Group {
-                        title: slot.source.title(),
-                        entries: slot.entries.clone()?,
-                    })
-                })
-                .collect(),
-        );
+    /// The searches behind a tab, for the shown status.
+    fn slots_of(&self, kind: Kind) -> impl Iterator<Item = &Slot> {
+        let status = self.status;
+        self.slots
+            .iter()
+            .filter(move |s| s.source.kind() == kind && s.status == status)
+    }
+
+    /// Everything a tab found for the shown status, each once, newest first.
+    fn all(&self, kind: Kind) -> Vec<Entry> {
+        pr::merge(self.slots_of(kind).filter_map(|s| s.entries.clone()))
+    }
+
+    /// The shown tab's rows that match the filter.
+    fn entries(&self) -> Vec<Entry> {
         let filter = self.typed.to_lowercase();
-        groups
+        self.all(self.kind)
             .into_iter()
-            .map(|group| {
-                let entries = group
-                    .entries
-                    .into_iter()
-                    .filter(|e| {
-                        filter.is_empty()
-                            || e.title.to_lowercase().contains(&filter)
-                            || e.pr.label().to_lowercase().contains(&filter)
-                            || e.author.to_lowercase().contains(&filter)
-                    })
-                    .collect();
-                (group.title, entries)
+            .filter(|e| {
+                filter.is_empty()
+                    || e.title.to_lowercase().contains(&filter)
+                    || e.pr.label().to_lowercase().contains(&filter)
+                    || e.author.to_lowercase().contains(&filter)
             })
             .collect()
     }
 
     fn picked(&self) -> Option<PrRef> {
-        self.entries()
-            .into_iter()
-            .flat_map(|(_, list)| list)
-            .nth(self.selected)
-            .map(|e| e.pr)
+        self.entries().into_iter().nth(self.selected).map(|e| e.pr)
     }
 
     fn count(&self) -> usize {
-        self.entries().iter().map(|(_, e)| e.len()).sum()
+        self.entries().len()
+    }
+
+    fn relation(&self, entry: &Entry) -> Relation {
+        self.me
+            .as_deref()
+            .map_or(Relation::Other, |me| Relation::of(entry, me))
+    }
+
+    fn show(&mut self, kind: Kind) {
+        if self.kind != kind {
+            self.kind = kind;
+            self.reset_pick();
+        }
+    }
+
+    /// Switches between open rows and done ones, keeping the tab.
+    fn show_status(&mut self, status: Status) {
+        if self.status != status {
+            self.status = status;
+            self.reset_pick();
+        }
+    }
+
+    fn reset_pick(&mut self) {
+        self.selected = 0;
+        self.resting = None;
+        self.pressed = None;
+        self.selection = None;
     }
 
     fn loading(&self) -> bool {
-        self.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading))
+        self.slots_of(self.kind)
+            .any(|s| matches!(s.fetch, Fetch::Loading))
     }
 
     fn failure(&self) -> Option<String> {
-        self.slots.iter().find_map(|s| match &s.fetch {
+        self.slots_of(self.kind).find_map(|s| match &s.fetch {
             Fetch::Failed(e) => Some(e.clone()),
             _ => None,
         })
@@ -281,8 +362,15 @@ struct Body {
 
 struct Page {
     pr: PrRef,
+    kind: Kind,
     detail: Load<Detail>,
     tab: Tab,
+    /// The timeline event picked to reply to, by its index.
+    focus: Option<usize>,
+    /// The timeline's first line of each event, as laid out last.
+    starts: Vec<usize>,
+    /// Scroll the picked event into view on the next draw.
+    reveal: bool,
     scroll: usize,
     mode: Mode,
     /// What the footer says until the next key.
@@ -308,11 +396,15 @@ struct Page {
 }
 
 impl Page {
-    fn new(pr: PrRef, detail: Load<Detail>) -> Self {
+    fn new(pr: PrRef, kind: Kind, detail: Load<Detail>) -> Self {
         Page {
             pr,
+            kind,
             detail,
             tab: Tab::Summary,
+            focus: None,
+            starts: Vec::new(),
+            reveal: false,
             scroll: 0,
             mode: Mode::Normal,
             toast: None,
@@ -335,7 +427,97 @@ impl Page {
             self.tab = tab;
             self.scroll = 0;
             self.selection = None;
+            self.cache = None;
         }
+        // Comments opens on a comment picked, so enter replies at once.
+        // With none to pick, the tab says so itself, so no toast.
+        if tab == Tab::Comments && self.focus.is_none() {
+            let toast = self.toast.take();
+            self.pick(1);
+            self.toast = toast;
+        }
+    }
+
+    /// The tab `step` places on (1) or back (-1) from the shown one. A pull
+    /// request's Code tab comes after Comments; `wrap` goes round past the
+    /// ends, as tab and shift-tab do.
+    fn step(&self, step: isize, wrap: bool) -> Step {
+        let at = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0) as isize;
+        let tabs = Tab::ALL.len() as isize;
+        // Code is one more place, after the last tab, for a pull request.
+        let places = tabs + isize::from(self.kind == Kind::Pull);
+        let next = at + step;
+        let next = if wrap {
+            next.rem_euclid(places)
+        } else if (0..places).contains(&next) {
+            next
+        } else {
+            return Step::Stay;
+        };
+        match Tab::ALL.get(next as usize) {
+            Some(tab) => Step::Tab(*tab),
+            None => Step::Code,
+        }
+    }
+
+    /// The link to this pull request or issue.
+    fn url(&self) -> String {
+        match self.kind {
+            Kind::Pull => self.pr.url(),
+            Kind::Issue => self.pr.issue_url(),
+        }
+    }
+
+    /// Picks the next (`step` 1) or previous (-1) comment on the timeline to reply to.
+    fn pick(&mut self, step: isize) {
+        let Load::Ready(detail) = &self.detail else {
+            return;
+        };
+        let replyable: Vec<usize> = detail
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| quoted(e).is_some())
+            .map(|(i, _)| i)
+            .collect();
+        let next = match (self.focus, step > 0) {
+            (None, true) => replyable.first(),
+            (None, false) => replyable.last(),
+            (Some(at), true) => replyable.iter().find(|i| **i > at).or(replyable.last()),
+            (Some(at), false) => replyable
+                .iter()
+                .rev()
+                .find(|i| **i < at)
+                .or(replyable.first()),
+        };
+        if let Some(&next) = next {
+            if self.tab != Tab::Comments {
+                self.show(Tab::Timeline);
+            }
+            self.focus = Some(next);
+            self.reveal = true;
+            self.cache = None;
+        } else {
+            self.toast = Some("No comments to reply to yet".to_owned());
+        }
+    }
+
+    /// The composer, holding the picked comment quoted.
+    fn reply(&mut self) {
+        let Load::Ready(detail) = &self.detail else {
+            return;
+        };
+        let Some(event) = self.focus.and_then(|i| detail.timeline.get(i)) else {
+            self.toast = Some("Press ] or [ to pick a comment first".to_owned());
+            return;
+        };
+        let Some(quote) = quoted(event) else { return };
+        let text: Vec<char> = quote.chars().collect();
+        self.mode = Mode::Compose {
+            cursor: text.len(),
+            text,
+            reply: Some(event.actor.clone()),
+        };
     }
 
     fn head(&self) -> String {
@@ -433,7 +615,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
     };
     match start {
         Start::List => app.open_list(),
-        Start::Pr(pr) => app.open_page(pr),
+        Start::Pr(pr) => app.open_page(pr, Kind::Pull),
     }
     let result = setup.and_then(|_| app.event_loop(&mut terminal));
     let _ = app.gallery.clear();
@@ -443,41 +625,119 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
 }
 
 impl App {
-    /// Shows the list from the last run's answers and asks every heading again, all at once.
+    /// Shows the list from the last run's answers and asks the open searches
+    /// again, all at once.
     fn open_list(&mut self) {
-        let slots = pr::sources(self.here.as_deref(), self.branch.as_deref())
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(me) = pr::viewer() {
+                let _ = tx.send(Msg::Me(me));
+            }
+        });
+        // Every search twice over: open rows asked now, done ones shown from
+        // last time and asked only once they're looked at.
+        let sources = pr::sources(self.here.as_deref(), self.branch.as_deref());
+        let slots: Vec<Slot> = [Status::Open, Status::Done]
             .into_iter()
-            .enumerate()
-            .map(|(index, source)| {
-                let (tx, asked) = (self.tx.clone(), source.clone());
-                std::thread::spawn(move || {
-                    let result = pr::search(&asked).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::Searched(index, result));
-                });
-                Slot {
-                    entries: pr::cached_search(&source),
-                    source,
-                    fetch: Fetch::Loading,
-                }
+            .flat_map(|status| {
+                sources.iter().map(move |source| Slot {
+                    entries: pr::cached_search(source, status),
+                    source: source.clone(),
+                    status,
+                    fetch: Fetch::Idle,
+                })
             })
             .collect();
         self.list = Some(List {
+            kind: Kind::Pull,
+            status: Status::Open,
             slots,
+            me: pr::cached_viewer(),
+            tab_hits: Vec::new(),
             typed: String::new(),
             selected: 0,
             resting: None,
             hits: Vec::new(),
             pressed: None,
-            copied: None,
+            note: None,
             shown: Vec::new(),
             shown_area: Rect::default(),
             selection: None,
             dragging: false,
         });
+        self.ask_shown();
+    }
+
+    /// Asks the searches behind the shown status that haven't been asked
+    /// this run, for both tabs, so flipping tabs finds them ready.
+    fn ask_shown(&mut self) {
+        let Some(list) = &mut self.list else {
+            return;
+        };
+        let status = list.status;
+        let asks: Vec<(usize, Source)> = list
+            .slots
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, s)| s.status == status && matches!(s.fetch, Fetch::Idle))
+            .map(|(index, slot)| {
+                slot.fetch = Fetch::Loading;
+                (index, slot.source.clone())
+            })
+            .collect();
+        for (index, source) in asks {
+            self.search(index, &source, status);
+        }
+    }
+
+    /// `tab` on the list: open rows or done ones.
+    fn flip_status(&mut self) {
+        if let Some(list) = &mut self.list {
+            list.show_status(list.status.other());
+        }
+        self.ask_shown();
+    }
+
+    /// Asks search `index` again; the answer arrives as `Msg::Searched`.
+    fn search(&self, index: usize, source: &Source, status: Status) {
+        let (tx, asked) = (self.tx.clone(), source.clone());
+        std::thread::spawn(move || {
+            let result = pr::search(&asked, status).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Searched(index, result));
+        });
+    }
+
+    /// `R` on the list: asks again now every search asked this run and those
+    /// behind what's shown, keeping the rows shown until the answers arrive,
+    /// and lets rows be read ahead afresh.
+    fn reload_list(&mut self) {
+        let Some(list) = &mut self.list else {
+            return;
+        };
+        if list.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading)) {
+            list.note = Some(RELOADING.to_owned());
+            return;
+        }
+        let shown = list.status;
+        let asks: Vec<(usize, Source, Status)> = list
+            .slots
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, s)| s.status == shown || !matches!(s.fetch, Fetch::Idle))
+            .map(|(index, slot)| {
+                slot.fetch = Fetch::Loading;
+                (index, slot.source.clone(), slot.status)
+            })
+            .collect();
+        // The tab row's spinner shows it's asking.
+        self.prefetched.clear();
+        for (index, source, status) in asks {
+            self.search(index, &source, status);
+        }
     }
 
     /// Opens a pull request on what's known of it, and reads it again unless that's fresh.
-    fn open_page(&mut self, pr: PrRef) {
+    fn open_page(&mut self, pr: PrRef, kind: Kind) {
         let known = self
             .details
             .get(&pr)
@@ -489,20 +749,22 @@ impl App {
                 }
                 detail
             })
-            .or_else(|| pr::cached_view(&pr));
+            .or_else(|| pr::cached_view(&pr, kind));
         let detail = match known {
             Some(detail) => {
-                let head = detail.head_sha.clone();
-                self.want_patch(&pr, &head);
+                if kind == Kind::Pull {
+                    let head = detail.head_sha.clone();
+                    self.want_patch(&pr, &head);
+                }
                 Load::Ready(detail)
             }
             None => Load::Loading,
         };
-        self.page = Some(Page::new(pr.clone(), detail));
-        self.fetch(pr, false);
+        self.page = Some(Page::new(pr.clone(), kind, detail));
+        self.fetch(pr, kind, false);
     }
 
-    fn fetch(&mut self, pr: PrRef, force: bool) {
+    fn fetch(&mut self, pr: PrRef, kind: Kind, force: bool) {
         let fresh = self
             .details
             .get(&pr)
@@ -513,7 +775,7 @@ impl App {
         self.inflight.insert(pr.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = pr::view(&pr).map_err(|e| e.to_string());
+            let result = pr::view(&pr, kind).map_err(|e| e.to_string());
             let _ = tx.send(Msg::Viewed(pr, Box::new(result)));
         });
     }
@@ -548,6 +810,7 @@ impl App {
             return;
         }
         let Some(list) = &mut self.list else { return };
+        let kind = list.kind;
         let Some(picked) = list.picked() else { return };
         match &list.resting {
             Some((pr, at)) if *pr == picked => {
@@ -555,7 +818,7 @@ impl App {
                     && !self.details.contains_key(&picked)
                     && self.prefetched.insert(picked.clone())
                 {
-                    self.fetch(picked, false);
+                    self.fetch(picked, kind, false);
                 }
             }
             _ => list.resting = Some((picked, Instant::now())),
@@ -568,16 +831,17 @@ impl App {
         page.busy = Some(match &action {
             Action::Merge(method) => format!("{}…", method.label()),
             Action::Close => "Closing…".to_owned(),
+            Action::CloseAs(reason) => format!("Closing as {}…", reason.label()),
             Action::Reopen => "Reopening…".to_owned(),
             Action::Ready => "Marking ready…".to_owned(),
             Action::Draft => "Converting to draft…".to_owned(),
             Action::Approve => "Approving…".to_owned(),
             Action::Comment(_) => "Posting comment…".to_owned(),
         });
-        let (tx, pr) = (self.tx.clone(), page.pr.clone());
+        let (tx, pr, kind) = (self.tx.clone(), page.pr.clone(), page.kind);
         std::thread::spawn(move || {
-            let result = pr::perform(&pr, &action).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Acted(pr, result));
+            let result = pr::perform(&pr, kind, &action).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Acted(pr, kind, result));
         });
     }
 
@@ -586,6 +850,10 @@ impl App {
         let Some(page) = &mut self.page else {
             return Ok(());
         };
+        // An issue has no diff, so there is nothing to open.
+        if page.kind == Kind::Issue {
+            return Ok(());
+        }
         let (pr, head) = (page.pr.clone(), page.head());
         self.want_patch(&pr, &head);
         match self.patches.get(&pr) {
@@ -614,13 +882,28 @@ impl App {
                         Err(e) => slot.fetch = Fetch::Failed(e),
                     }
                 }
+                // "Already reloading" is about the searches now answered, so
+                // the keys come back once the last one is.
+                if let Some(list) = self
+                    .list
+                    .as_mut()
+                    .filter(|l| !l.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading)))
+                    && list.note.as_deref() == Some(RELOADING)
+                {
+                    list.note = None;
+                }
+            }
+            Msg::Me(me) => {
+                if let Some(list) = &mut self.list {
+                    list.me = Some(me);
+                }
             }
             Msg::Viewed(pr, result) => {
                 self.inflight.remove(&pr);
                 let shown = self.page.as_ref().is_some_and(|p| p.pr == pr);
                 match *result {
                     Ok(detail) => {
-                        if shown {
+                        if shown && detail.kind == Kind::Pull {
                             // The diff is fetched while the page is read, so Code opens at once.
                             let head = detail.head_sha.clone();
                             self.want_patch(&pr, &head);
@@ -643,7 +926,7 @@ impl App {
                     }
                 }
             }
-            Msg::Acted(pr, result) => {
+            Msg::Acted(pr, kind, result) => {
                 if let Some(page) = self.page.as_mut().filter(|p| p.pr == pr) {
                     page.busy = None;
                     page.toast = Some(match result {
@@ -651,7 +934,7 @@ impl App {
                         Err(e) => e,
                     });
                 }
-                self.fetch(pr, true);
+                self.fetch(pr, kind, true);
             }
             Msg::Patched(pr, head, result) => {
                 self.patching.remove(&pr);
@@ -707,6 +990,7 @@ impl App {
             match &result {
                 Ok(Leave::Summary) => page.show(Tab::Summary),
                 Ok(Leave::Timeline) => page.show(Tab::Timeline),
+                Ok(Leave::Comments) => page.show(Tab::Comments),
                 Ok(Leave::Quit) | Err(_) => {}
             }
             page.toast = match (result, failure.borrow().as_ref()) {
@@ -810,6 +1094,7 @@ impl App {
                     match hit {
                         TabHit::Summary => page.show(Tab::Summary),
                         TabHit::Timeline => page.show(Tab::Timeline),
+                        TabHit::Comments => page.show(Tab::Comments),
                         TabHit::Code => return self.open_code(terminal),
                     }
                     return Ok(());
@@ -904,10 +1189,32 @@ impl App {
         Ok(())
     }
 
+    /// Opens a row's pull request or issue.
+    fn choose(&mut self, pr: PrRef) {
+        let Some(list) = &self.list else { return };
+        let kind = list.kind;
+        self.open_page(pr, kind);
+    }
+
     fn list_mouse(&mut self, mouse: MouseEvent) {
         let Some(list) = &mut self.list else { return };
         let last = list.count().saturating_sub(1);
         let point = point_in(list.shown_area, 0, mouse.column, mouse.row);
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && let Some(&(_, hit)) = list.tab_hits.iter().find(|(rect, _)| {
+                mouse.row == rect.y && (rect.x..rect.x + rect.width).contains(&mouse.column)
+            })
+        {
+            list.selection = None;
+            match hit {
+                ListHit::Kind(kind) => list.show(kind),
+                ListHit::Status(status) => {
+                    list.show_status(status);
+                    self.ask_shown();
+                }
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => {
                 list.selection = None;
@@ -955,7 +1262,7 @@ impl App {
                             let text = s.text(&list.shown);
                             if !text.is_empty() {
                                 copy(&text);
-                                list.copied =
+                                list.note =
                                     Some(format!("Copied {} characters", text.chars().count()));
                             }
                         }
@@ -966,7 +1273,7 @@ impl App {
                 if let Some(pr) = list.pressed.take()
                     && list.picked().as_ref() == Some(&pr)
                 {
-                    self.open_page(pr);
+                    self.choose(pr);
                 }
             }
             _ => {}
@@ -983,15 +1290,39 @@ impl App {
         };
         let rows = list.count();
         let picked = list.picked();
-        list.copied = None;
+        list.note = None;
         list.selection = None;
         match key.code {
+            // Two tabs, so either arrow flips between them.
+            KeyCode::Left | KeyCode::Right => {
+                list.show(match list.kind {
+                    Kind::Pull => Kind::Issue,
+                    Kind::Issue => Kind::Pull,
+                });
+                return Ok(true);
+            }
+            // Tab flips open rows and done ones: merged or closed.
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.flip_status();
+                return Ok(true);
+            }
+            // Asks every search again now rather than waiting. `R` only while
+            // nothing's typed, so a filter can still hold an R (it ignores
+            // case, so `r` starts one); ctrl+r works either way.
+            KeyCode::Char('R') if list.typed.is_empty() => {
+                self.reload_list();
+                return Ok(true);
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reload_list();
+                return Ok(true);
+            }
             // Letters filter the list, so copying the number takes ctrl.
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(pr) = &picked {
                     let number = format!("#{}", pr.number);
                     copy(&number);
-                    list.copied = Some(format!("Copied {number}"));
+                    list.note = Some(format!("Copied {number}"));
                 }
                 return Ok(true);
             }
@@ -1019,7 +1350,7 @@ impl App {
             Edit::Quit => return Ok(false),
             Edit::Choose => {
                 if let Some(pr) = picked {
-                    self.open_page(pr);
+                    self.choose(pr);
                 }
             }
             Edit::Complete | Edit::Typed | Edit::Moved | Edit::Nothing => {}
@@ -1061,6 +1392,18 @@ impl App {
                 };
                 return Ok(true);
             }
+            Mode::Close => {
+                let picked = match key.code {
+                    KeyCode::Char(c) => CloseReason::ALL.into_iter().find(|r| r.key() == c),
+                    KeyCode::Enter => Some(CloseReason::Completed),
+                    _ => None,
+                };
+                match picked {
+                    Some(reason) => self.act(Action::CloseAs(reason)),
+                    None => page.mode = Mode::Normal,
+                }
+                return Ok(true);
+            }
             Mode::Confirm(action) => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char('y')) {
                     let action = action.clone();
@@ -1070,7 +1413,7 @@ impl App {
                 }
                 return Ok(true);
             }
-            Mode::Compose { text, cursor } => {
+            Mode::Compose { text, cursor, .. } => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Esc => page.mode = Mode::Normal,
@@ -1112,12 +1455,19 @@ impl App {
             // Escape lets go of a selection before it leaves.
             KeyCode::Esc if self.gallery.any_playing() => self.gallery.stop(),
             KeyCode::Esc if page.selection.is_some() => page.selection = None,
+            KeyCode::Esc if page.focus.is_some() => {
+                page.focus = None;
+                page.cache = None;
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.page = None;
                 if self.list.is_none() {
                     return Ok(false);
                 }
             }
+            // On Comments, j and k move between comments rather than lines.
+            KeyCode::Char('j') | KeyCode::Down if page.tab == Tab::Comments => page.pick(1),
+            KeyCode::Char('k') | KeyCode::Up if page.tab == Tab::Comments => page.pick(-1),
             KeyCode::Char('j') | KeyCode::Down => page.scroll += 1,
             KeyCode::Char('k') | KeyCode::Up => page.scroll = page.scroll.saturating_sub(1),
             KeyCode::Char('d') if ctrl => page.scroll += half,
@@ -1128,39 +1478,56 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
-            // Tab cycles Summary → Timeline → Code; shift-tab goes the other way.
-            KeyCode::Tab if page.tab == Tab::Summary => page.show(Tab::Timeline),
-            KeyCode::BackTab if page.tab == Tab::Timeline => page.show(Tab::Summary),
-            KeyCode::Tab | KeyCode::BackTab => self.open_code(terminal)?,
+            KeyCode::Char(']') => page.pick(1),
+            KeyCode::Char('[') => page.pick(-1),
+            KeyCode::Enter if page.busy.is_none() && page.focus.is_some() => page.reply(),
+            // Tab cycles Summary → Timeline → Comments (→ Code) and round;
+            // shift-tab goes the other way. The arrows stop at the ends.
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h' | 'l') => {
+                let forward =
+                    matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Char('l'));
+                let wrap = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+                match page.step(if forward { 1 } else { -1 }, wrap) {
+                    Step::Tab(tab) => page.show(tab),
+                    Step::Code => self.open_code(terminal)?,
+                    Step::Stay => {}
+                }
+            }
             KeyCode::Char('1') => page.show(Tab::Summary),
             KeyCode::Char('2') => page.show(Tab::Timeline),
-            KeyCode::Left | KeyCode::Char('h') => page.show(Tab::Summary),
-            KeyCode::Right | KeyCode::Char('l') if page.tab == Tab::Summary => {
-                page.show(Tab::Timeline)
-            }
-            KeyCode::Right | KeyCode::Char('l' | '3') => self.open_code(terminal)?,
+            KeyCode::Char('3') => page.show(Tab::Comments),
+            KeyCode::Char('4') if page.kind == Kind::Pull => self.open_code(terminal)?,
             KeyCode::Char('e') => {
                 page.expanded = !page.expanded;
                 page.cache = None;
             }
             KeyCode::Char('?') => page.mode = Mode::Help,
             KeyCode::Char('R') => {
-                let pr = page.pr.clone();
-                self.fetch(pr, true);
+                let (pr, kind) = (page.pr.clone(), page.kind);
+                self.fetch(pr, kind, true);
             }
             KeyCode::Char('o') => {
-                page.toast = Some(match pr::open_in_browser(&page.pr) {
+                let opened = match page.kind {
+                    Kind::Pull => pr::open_in_browser(&page.pr),
+                    Kind::Issue => pr::open_issue(&page.pr),
+                };
+                page.toast = Some(match opened {
                     Ok(()) => format!("Opened {} in the browser", page.pr.label()),
                     Err(e) => e.to_string(),
                 });
             }
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') if page.kind == Kind::Pull => {
                 copy(&page.pr.checkout());
                 page.toast = Some(format!("Copied {}", page.pr.checkout()));
             }
-            KeyCode::Char('Y') => {
-                copy(&page.pr.url());
-                page.toast = Some(format!("Copied {}", page.pr.url()));
+            KeyCode::Char('y' | 'Y') => {
+                let url = page.url();
+                copy(&url);
+                page.toast = Some(format!("Copied {url}"));
             }
             KeyCode::Char('n') => {
                 let number = format!("#{}", page.pr.number);
@@ -1171,6 +1538,7 @@ impl App {
                 page.mode = Mode::Compose {
                     text: Vec::new(),
                     cursor: 0,
+                    reply: None,
                 };
             }
             KeyCode::Char(c @ ('m' | 'x' | 'r' | 'a')) => {
@@ -1184,6 +1552,7 @@ impl App {
                 };
                 match available(detail, c) {
                     Ok(Next::Merge) => page.mode = Mode::Merge,
+                    Ok(Next::Close) => page.mode = Mode::Close,
                     Ok(Next::Confirm(action)) => page.mode = Mode::Confirm(action),
                     Ok(Next::Now(action)) => self.act(action),
                     Err(why) => page.toast = Some(why),
@@ -1214,12 +1583,14 @@ impl App {
 /// What a key leads to on a pull request in this state.
 enum Next {
     Merge,
+    /// Pick why the issue is closed.
+    Close,
     Confirm(Action),
     Now(Action),
 }
 
 fn available(detail: &Detail, key: char) -> Result<Next, String> {
-    let open = matches!(detail.state, State::Open | State::Draft);
+    let open = detail.state.is_open();
     let state = || {
         format!(
             "#{} is {}",
@@ -1227,6 +1598,16 @@ fn available(detail: &Detail, key: char) -> Result<Next, String> {
             detail.state.label().to_lowercase()
         )
     };
+    if detail.kind == Kind::Issue {
+        return match key {
+            'x' if open => Ok(Next::Close),
+            'x' => Ok(Next::Confirm(Action::Reopen)),
+            'm' | 'r' | 'a' => {
+                Err("Only pull requests can be merged, drafted or approved".to_owned())
+            }
+            _ => Err(String::new()),
+        };
+    }
     match key {
         'm' => {
             if !open {
@@ -1251,13 +1632,15 @@ fn available(detail: &Detail, key: char) -> Result<Next, String> {
         }
         'x' => match detail.state {
             State::Merged => Err(state()),
-            State::Closed => Ok(Next::Confirm(Action::Reopen)),
+            State::Closed | State::Completed | State::NotPlanned => {
+                Ok(Next::Confirm(Action::Reopen))
+            }
             State::Open | State::Draft => Ok(Next::Confirm(Action::Close)),
         },
         'r' => match detail.state {
             State::Draft => Ok(Next::Now(Action::Ready)),
             State::Open => Ok(Next::Confirm(Action::Draft)),
-            State::Merged | State::Closed => Err(state()),
+            State::Merged | State::Closed | State::Completed | State::NotPlanned => Err(state()),
         },
         'a' if open => Ok(Next::Confirm(Action::Approve)),
         'a' => Err(state()),
@@ -1275,8 +1658,9 @@ fn state_color(state: State) -> Color {
     match state {
         State::Open => GREEN,
         State::Draft => DIM,
-        State::Merged => PURPLE,
+        State::Merged | State::Completed => PURPLE,
         State::Closed => RED,
+        State::NotPlanned => DIM,
     }
 }
 
@@ -1299,8 +1683,18 @@ fn verdict_glyph(verdict: Verdict) -> (&'static str, Color) {
     }
 }
 
-/// The list: a title, a filter, then each heading's pull requests on two
-/// lines, title above and who and when below, in one centered column.
+fn relation_color(relation: Relation) -> Color {
+    match relation {
+        Relation::Yours => GREEN,
+        Relation::Outgoing => BLUE,
+        Relation::Incoming => YELLOW,
+        Relation::Other => DIM,
+    }
+}
+
+/// The list: the tabs and a legend, a filter, then the shown tab's rows
+/// newest first on two lines, title above and who and when below, in one
+/// centered column.
 fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     let area = f.area();
     let (x, width) = column(area);
@@ -1308,39 +1702,138 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let entries = list.entries();
-    let total: usize = entries.iter().map(|(_, e)| e.len()).sum();
+    let total = entries.len();
     list.selected = list.selected.min(total.saturating_sub(1));
 
-    // The title row, and how many there are or that they're being asked for.
-    let status = if list.loading() {
-        format!("{}  updating", spinner())
-    } else if total > 0 {
-        format!("{total} open")
-    } else {
-        String::new()
-    };
+    // The tabs, each with how many it has, and a spinner while asking again.
+    let row = area.y + 1;
+    let mut tabs = Vec::new();
+    list.tab_hits.clear();
+    let mut at = x;
+    for kind in [Kind::Pull, Kind::Issue] {
+        let on = kind == list.kind;
+        let label = kind.title();
+        let count = list.all(kind).len();
+        let width = label.width() as u16;
+        list.tab_hits
+            .push((Rect::new(at, row, width, 1), ListHit::Kind(kind)));
+        tabs.push(Span::styled(label, if on { bold } else { dim }));
+        let count = if count > 0 {
+            format!(" {count}")
+        } else {
+            String::new()
+        };
+        at += width + count.width() as u16 + 4;
+        tabs.push(Span::styled(count, dim));
+        tabs.push(Span::raw("    "));
+    }
+    if list.loading() {
+        tabs.push(Span::styled(spinner().to_string(), dim));
+    }
+    // The switch between open rows and done ones, at the right: the shown
+    // one bright and underlined, the other quiet; tab or a click flips it.
+    let mut switch = Vec::new();
+    let mut labels = Vec::new();
+    for status in [Status::Open, Status::Done] {
+        let label = status.label(list.kind);
+        let on = status == list.status;
+        let style = if on {
+            bold.add_modifier(Modifier::UNDERLINED).fg(match status {
+                Status::Open => GREEN,
+                Status::Done => PURPLE,
+            })
+        } else {
+            dim
+        };
+        if !switch.is_empty() {
+            switch.push(Span::styled("  ·  ", dim));
+        }
+        labels.push((
+            switch.iter().map(|s| s.content.width()).sum::<usize>(),
+            label,
+            status,
+        ));
+        switch.push(Span::styled(label, style));
+    }
+    let switch_width: usize = switch.iter().map(|s| s.content.width()).sum();
+    let switch_x = x + width.saturating_sub(switch_width as u16);
+    for (offset, label, status) in labels {
+        list.tab_hits.push((
+            Rect::new(switch_x + offset as u16, row, label.width() as u16, 1),
+            ListHit::Status(status),
+        ));
+    }
     f.render_widget(
-        Paragraph::new(spread(
-            vec![Span::styled("Pull requests", bold)],
-            vec![Span::styled(status, dim)],
-            w,
-        )),
-        Rect::new(x, area.y + 1, width, 1),
+        Paragraph::new(spread(tabs, switch, w)),
+        Rect::new(x, row, width, 1),
     );
+
+    // Beside the filter: what the colors mean for open rows; for done ones,
+    // a sparkline of the last twelve weeks.
+    let mut aside = Vec::new();
+    match list.status {
+        Status::Open if list.me.is_some() => {
+            for relation in Relation::ALL {
+                if entries.iter().any(|e| list.relation(e) == relation) {
+                    if !aside.is_empty() {
+                        aside.push(Span::raw("   "));
+                    }
+                    aside.push(Span::styled(
+                        "● ",
+                        Style::default().fg(relation_color(relation)),
+                    ));
+                    aside.push(Span::styled(relation.label(), dim));
+                }
+            }
+        }
+        Status::Open => {}
+        Status::Done => {
+            let weeks = weekly(&list.all(list.kind), now, SPARK_WEEKS);
+            let most = weeks.iter().copied().max().unwrap_or(0);
+            if most > 0 {
+                for count in &weeks {
+                    let (bar, style) = match count {
+                        0 => ("▁", dim),
+                        n => (
+                            SPARK[(n * (SPARK.len() - 1)).div_ceil(most)],
+                            Style::default().fg(PURPLE),
+                        ),
+                    };
+                    aside.push(Span::styled(bar, style));
+                }
+                let sum: usize = weeks.iter().sum();
+                let verb = match list.kind {
+                    Kind::Pull => "merged",
+                    Kind::Issue => "closed",
+                };
+                aside.push(Span::styled(
+                    format!("  {sum} {verb} in {SPARK_WEEKS} weeks"),
+                    dim,
+                ));
+            }
+        }
+    }
     let field = if list.typed.is_empty() {
-        Line::from(vec![
+        vec![
             Span::styled("/  ", dim),
             Span::styled("▏", bold),
             Span::styled("Filter by title, repository, number or author", dim),
-        ])
+        ]
     } else {
-        Line::from(vec![
+        vec![
             Span::styled("/  ", dim),
             Span::raw(list.typed.clone()),
             Span::styled("▏", bold),
-        ])
+        ]
     };
-    f.render_widget(Paragraph::new(field), Rect::new(x, area.y + 3, width, 1));
+    let used: usize = field.iter().chain(&aside).map(|s| s.content.width()).sum();
+    if used + 2 >= w {
+        aside.clear();
+    }
+    f.render_widget(
+        Paragraph::new(spread(field, aside, w)),
+        Rect::new(x, area.y + 3, width, 1),
+    );
 
     let top = area.y + 5;
     let bottom = (area.y + area.height).saturating_sub(2);
@@ -1349,12 +1842,14 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     if total == 0 {
         list.shown.clear();
         list.selection = None;
+        let what = list.kind.title().to_lowercase();
+        let state = list.status.label(list.kind).to_lowercase();
         let text = if list.loading() {
-            format!("{}  Loading your pull requests", spinner())
+            format!("{}  Loading your {state} {what}", spinner())
         } else if let Some(e) = list.failure().filter(|_| list.typed.is_empty()) {
             e
         } else if list.typed.is_empty() {
-            "No open pull requests concern you.".to_owned()
+            format!("No {state} {what} concern you.")
         } else {
             format!("Nothing matches “{}”.", list.typed)
         };
@@ -1370,58 +1865,78 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     } else {
         // Every line of the list, and the row index each belongs to.
         let mut lines: Vec<(Line<'static>, Option<usize>)> = Vec::new();
-        let mut index = 0;
-        for (title, group) in entries.iter().filter(|(_, e)| !e.is_empty()) {
-            if !lines.is_empty() {
-                lines.push((Line::default(), None));
-            }
-            lines.push((
-                Line::from(vec![
-                    Span::styled(title.to_uppercase(), dim.add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {}", group.len()), dim),
-                ]),
-                None,
-            ));
-            lines.push((Line::default(), None));
-            for entry in group {
-                let picked = index == list.selected;
-                let bar = if picked { "▌ " } else { "  " };
-                let (glyph, color) = if entry.draft {
-                    ("○", DIM)
-                } else {
-                    ("●", GREEN)
-                };
-                let name = entry.pr.repo.rsplit('/').next().unwrap_or(&entry.pr.repo);
-                lines.push((
-                    spread(
-                        vec![
-                            Span::styled(bar, bold),
-                            Span::styled(format!("{glyph}  "), Style::default().fg(color)),
-                            Span::styled(
-                                entry.title.clone(),
-                                if picked { bold } else { Style::default() },
-                            ),
-                        ],
-                        vec![Span::styled(format!("{name} #{}", entry.pr.number), dim)],
-                        w,
-                    ),
-                    Some(index),
-                ));
-                let mut about = format!("{} · {}", entry.author, pr::ago(&entry.updated, now));
-                if entry.draft {
-                    about.push_str(" · draft");
+        let mut group = None;
+        for (index, entry) in entries.iter().enumerate() {
+            // Done rows fall under when they ended: Today, Yesterday, …
+            if let Some(ended) = entry.ended.as_ref().filter(|_| list.status == Status::Done) {
+                let here = age_group(&ended.at, now);
+                if group != Some(here) {
+                    if group.is_some() {
+                        lines.push((Line::default(), None));
+                    }
+                    group = Some(here);
+                    let count = entries
+                        .iter()
+                        .filter(|e| e.ended.as_ref().map(|e| age_group(&e.at, now)) == Some(here))
+                        .count();
+                    lines.push((group_heading(here, count, w), None));
                 }
-                lines.push((
-                    Line::from(vec![Span::raw("     "), Span::styled(about, dim)]),
-                    Some(index),
-                ));
-                index += 1;
             }
+            let picked = index == list.selected;
+            let bar = if picked { "▌ " } else { "  " };
+            let (glyph, color) = match (&entry.ended, list.status) {
+                (Some(ended), Status::Done) => ending_glyph(ended.how),
+                _ => (
+                    if entry.draft { "○" } else { "●" },
+                    relation_color(list.relation(entry)),
+                ),
+            };
+            let name = entry.pr.repo.rsplit('/').next().unwrap_or(&entry.pr.repo);
+            lines.push((
+                spread(
+                    vec![
+                        Span::styled(bar, bold),
+                        Span::styled(format!("{glyph}  "), Style::default().fg(color)),
+                        Span::styled(
+                            entry.title.clone(),
+                            if picked { bold } else { Style::default() },
+                        ),
+                    ],
+                    vec![Span::styled(format!("{name} #{}", entry.pr.number), dim)],
+                    w,
+                ),
+                Some(index),
+            ));
+            let about = match (&entry.ended, list.status) {
+                // The author in their relation's color, so whose it was
+                // still reads without the open list's dot.
+                (Some(Ended { how, at }), Status::Done) => vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        entry.author.clone(),
+                        Style::default().fg(relation_color(list.relation(entry))),
+                    ),
+                    Span::styled(format!(" · {} {}", how.verb(), pr::ago(at, now)), dim),
+                ],
+                _ => {
+                    let mut about = format!("{} · {}", entry.author, pr::ago(&entry.updated, now));
+                    if entry.draft {
+                        about.push_str(" · draft");
+                    }
+                    vec![Span::raw("     "), Span::styled(about, dim)]
+                }
+            };
+            lines.push((Line::from(about), Some(index)));
         }
-        // Scroll so the picked row and its heading stay in view.
+        // Scroll so the picked row stays in view.
         let first_of = |wanted: usize| lines.iter().position(|(_, i)| *i == Some(wanted));
         let at = first_of(list.selected).unwrap_or(0);
-        let skip = (at + 2).saturating_sub(room).min(at.saturating_sub(2));
+        // A group's heading stays in view above its first row.
+        let from = match at.checked_sub(1).map(|above| &lines[above]) {
+            Some((_, None)) => at - 1,
+            _ => at,
+        };
+        let skip = (at + 2).saturating_sub(room).min(from);
         list.hits.clear();
         let mut shown = Vec::new();
         for (y, (line, owner)) in lines.into_iter().skip(skip).take(room).enumerate() {
@@ -1449,15 +1964,19 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         f.render_widget(Paragraph::new(drawn), list.shown_area);
     }
 
-    let footer = match (list.failure(), &list.copied) {
-        (_, Some(copied)) => Line::from(Span::styled(clip(copied, w), dim)),
+    let flip = list.status.other().label(list.kind).to_lowercase();
+    let footer = match (list.failure(), &list.note) {
+        (_, Some(note)) => Line::from(Span::styled(clip(note, w), dim)),
         (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
         _ => keys_line(
             &[
                 ("↑↓", "move"),
                 ("enter", "open"),
+                ("tab", &flip),
+                ("←→", "pulls · issues"),
                 ("type", "filter"),
                 ("^y", "copy #"),
+                ("R", "reload"),
                 ("esc", "quit"),
             ],
             w,
@@ -1470,6 +1989,94 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         Paragraph::new(footer),
         Rect::new(x, (area.y + area.height).saturating_sub(1), width, 1),
     );
+}
+
+/// How many weeks the done list's sparkline covers, and its bars.
+const SPARK_WEEKS: usize = 12;
+const SPARK: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// How many rows ended in each of the last `weeks` weeks, oldest first;
+/// the last is the seven days up to `now`.
+fn weekly(entries: &[Entry], now: i64, weeks: usize) -> Vec<usize> {
+    const WEEK: i64 = 7 * 86_400;
+    let mut counts = vec![0; weeks];
+    for at in entries
+        .iter()
+        .filter_map(|e| e.ended.as_ref().and_then(|e| pr::seconds(&e.at)))
+    {
+        let ago = (now - at).max(0) / WEEK;
+        if let Some(slot) = usize::try_from(ago)
+            .ok()
+            .and_then(|ago| weeks.checked_sub(ago + 1))
+        {
+            counts[slot] += 1;
+        }
+    }
+    counts
+}
+
+/// The done list's groups, by how long ago a row ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgeGroup {
+    Today,
+    Yesterday,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+    Older,
+}
+
+impl AgeGroup {
+    fn label(self) -> &'static str {
+        match self {
+            AgeGroup::Today => "Today",
+            AgeGroup::Yesterday => "Yesterday",
+            AgeGroup::ThisWeek => "This week",
+            AgeGroup::ThisMonth => "This month",
+            AgeGroup::ThisYear => "This year",
+            AgeGroup::Older => "Older",
+        }
+    }
+}
+
+/// Which group a time falls in, counting whole days (UTC) back from `now`.
+fn age_group(iso: &str, now: i64) -> AgeGroup {
+    let Some(then) = pr::seconds(iso) else {
+        return AgeGroup::Older;
+    };
+    match now.div_euclid(86_400) - then.div_euclid(86_400) {
+        ..=0 => AgeGroup::Today,
+        1 => AgeGroup::Yesterday,
+        2..=6 => AgeGroup::ThisWeek,
+        7..=30 => AgeGroup::ThisMonth,
+        31..=364 => AgeGroup::ThisYear,
+        _ => AgeGroup::Older,
+    }
+}
+
+/// A group's heading: its name, a quiet rule, and how many rows it holds.
+fn group_heading(group: AgeGroup, count: usize, width: usize) -> Line<'static> {
+    let label = group.label();
+    let count = count.to_string();
+    let rule = width.saturating_sub(label.width() + count.width() + 4);
+    Line::from(vec![
+        Span::styled(
+            format!("  {label} "),
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("─".repeat(rule), Style::default().fg(DIM)),
+        Span::styled(format!(" {count}"), Style::default().fg(DIM)),
+    ])
+}
+
+/// How a done row ended, as its glyph and color: merged and completed in
+/// purple, as GitHub shows them; not planned quiet.
+fn ending_glyph(how: Ending) -> (&'static str, Color) {
+    match how {
+        Ending::Merged => ("◆", PURPLE),
+        Ending::Completed => ("✓", PURPLE),
+        Ending::NotPlanned => ("⊘", DIM),
+    }
 }
 
 /// Key hints, as many as fit: the key, then what it does, quieter.
@@ -1691,25 +2298,55 @@ fn draw_page(
         label_width,
         1,
     ));
-    header.push(spread(
-        meta,
-        vec![
+    let size = match detail.kind {
+        Kind::Pull => vec![
             Span::styled(format!("+{}", detail.additions), Style::default().fg(GREEN)),
             Span::raw(" "),
             Span::styled(format!("−{}", detail.deletions), Style::default().fg(RED)),
         ],
-        w,
-    ));
+        Kind::Issue => {
+            let comments = detail
+                .timeline
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::Comment { .. }))
+                .count();
+            match comments {
+                0 => Vec::new(),
+                1 => vec![Span::styled("1 comment", dim)],
+                n => vec![Span::styled(format!("{n} comments"), dim)],
+            }
+        }
+    };
+    header.push(spread(meta, size, w));
     header.push(Line::default());
     let tabs_row = area.y + header.len() as u16;
     let mut tabs = Vec::new();
     page.tab_hits.clear();
     let mut at = x;
-    for (label, hit, on) in [
+    let comment_count = detail
+        .timeline
+        .iter()
+        .filter(|e| quoted(e).is_some())
+        .count();
+    let comments_label = match comment_count {
+        0 => "Comments".to_owned(),
+        n => format!("Comments {n}"),
+    };
+    let tab_labels = [
         ("Summary", TabHit::Summary, page.tab == Tab::Summary),
         ("Timeline", TabHit::Timeline, page.tab == Tab::Timeline),
+        (
+            comments_label.as_str(),
+            TabHit::Comments,
+            page.tab == Tab::Comments,
+        ),
         ("Code", TabHit::Code, false),
-    ] {
+    ];
+    let shown_tabs = match page.kind {
+        Kind::Pull => &tab_labels[..],
+        Kind::Issue => &tab_labels[..3],
+    };
+    for &(label, hit, on) in shown_tabs {
         let text = if hit == TabHit::Code && page.code {
             format!("{} Code", spinner())
         } else {
@@ -1760,16 +2397,34 @@ fn draw_page(
     if page.cache.as_ref().is_none_or(|(k, _)| *k != key) {
         let body = match page.tab {
             Tab::Summary => summary(detail, w, gallery),
-            Tab::Timeline => Body {
-                lines: timeline(detail, w, now, page.expanded),
-                figures: Vec::new(),
-            },
+            Tab::Timeline => {
+                let (lines, starts) = timeline(detail, w, now, page.expanded, page.focus);
+                page.starts = starts;
+                Body {
+                    lines,
+                    figures: Vec::new(),
+                }
+            }
+            Tab::Comments => {
+                let (lines, starts) = comments(detail, w, now, page.focus);
+                page.starts = starts;
+                Body {
+                    lines,
+                    figures: Vec::new(),
+                }
+            }
         };
         page.cache = Some((key, body));
     }
     let Some((_, body)) = page.cache.as_ref() else {
         return;
     };
+    // The picked comment comes into view a line below the top.
+    if std::mem::take(&mut page.reveal)
+        && let Some(start) = page.focus.and_then(|i| page.starts.get(i))
+    {
+        page.scroll = start.saturating_sub(1);
+    }
     let last = body.lines.len().saturating_sub(body_height as usize);
     page.scroll = page.scroll.min(last);
     let visible: Vec<Line> = body
@@ -1833,7 +2488,7 @@ fn draw_page(
     }
     footer(f, page, area, x, width);
     if let Mode::Help = page.mode {
-        draw_help(f, area, ink);
+        draw_help(f, area, page.kind, ink);
     }
 }
 
@@ -1860,13 +2515,21 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
         _ => String::new(),
     };
     let line = match &page.mode {
-        Mode::Compose { text, cursor } => {
+        Mode::Compose {
+            text,
+            cursor,
+            reply,
+        } => {
             let height = footer_height(page, width);
             let top = y + 1 - height;
+            let title = match reply {
+                Some(who) => format!("Reply to {who} on #{}", page.pr.number),
+                None => format!("Comment on #{}", page.pr.number),
+            };
             let mut lines = vec![
                 Line::default(),
                 Line::from(vec![
-                    Span::styled(format!("Comment on #{}", page.pr.number), accent),
+                    Span::styled(title, accent),
                     Span::styled("   enter send · alt+enter new line · esc cancel", dim),
                 ]),
             ];
@@ -1894,12 +2557,27 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
             spans.push(Span::styled("esc cancel", dim));
             Line::from(spans)
         }
+        Mode::Close => {
+            let mut spans = vec![Span::styled(
+                format!("Close #{} as   ", page.pr.number),
+                accent,
+            )];
+            for reason in CloseReason::ALL {
+                spans.push(Span::styled(format!("{} ", reason.key()), accent));
+                spans.push(Span::styled(format!("{}   ", reason.label()), dim));
+            }
+            spans.push(Span::styled("esc cancel", dim));
+            Line::from(spans)
+        }
         Mode::Confirm(action) => {
             let question = match action {
                 Action::Merge(method) => {
                     format!("{} #{} into {base}?", method.label(), page.pr.number)
                 }
                 Action::Close => format!("Close #{}?", page.pr.number),
+                Action::CloseAs(reason) => {
+                    format!("Close #{} as {}?", page.pr.number, reason.label())
+                }
                 Action::Reopen => format!("Reopen #{}?", page.pr.number),
                 Action::Draft => format!("Convert #{} to a draft?", page.pr.number),
                 Action::Approve => format!("Approve #{}?", page.pr.number),
@@ -1921,32 +2599,71 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 format!("{} Loading the diff…", spinner()),
                 dim,
             )),
-            _ => keys_line(&KEYS, width as usize),
+            _ if page.tab == Tab::Comments => keys_line(
+                &[
+                    ("j/k", "pick"),
+                    ("enter", "reply"),
+                    ("c", "comment"),
+                    ("←→", "tabs"),
+                    ("q", "back"),
+                ],
+                width as usize,
+            ),
+            _ if page.focus.is_some() => keys_line(
+                &[("enter", "reply"), ("[ ]", "pick"), ("esc", "done")],
+                width as usize,
+            ),
+            _ => match page.kind {
+                Kind::Pull => keys_line(&KEYS, width as usize),
+                Kind::Issue => keys_line(&ISSUE_KEYS, width as usize),
+            },
         },
     };
     f.render_widget(Paragraph::new(line), Rect::new(x, y, width, 1));
 }
 
-fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
-    let keys = [
-        ("←→, tab", "Summary, Timeline, Code"),
-        ("1, 2, 3", "the same tabs"),
-        ("j/k, ctrl+d/u", "scroll a line, half a screen"),
-        ("space/b, g/G", "a screen, top and bottom"),
-        ("drag", "select text; it's copied"),
-        ("click", "a picture opens it, a video plays"),
-        ("e", "expand or cut short long comments"),
-        ("m", "merge: squash, merge commit or rebase"),
-        ("x", "close, or reopen a closed one"),
-        ("r", "mark ready, or convert to draft"),
-        ("a", "approve"),
-        ("c", "comment"),
-        ("o", "open on GitHub"),
-        ("y, Y, n", "copy the checkout command, link, number"),
-        ("click #", "the number in the header copies it"),
-        ("R", "reload"),
-        ("q, esc", "back to the list, or quit"),
-    ];
+fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
+    let keys: &[(&str, &str)] = match kind {
+        Kind::Pull => &[
+            ("←→, tab", "Summary, Timeline, Comments, Code"),
+            ("1, 2, 3, 4", "the same tabs"),
+            ("j/k, ctrl+d/u", "scroll a line, half a screen"),
+            ("space/b, g/G", "a screen, top and bottom"),
+            ("drag", "select text; it's copied"),
+            ("click", "a picture opens it, a video plays"),
+            ("e", "expand or cut short long comments"),
+            ("m", "merge: squash, merge commit or rebase"),
+            ("x", "close, or reopen a closed one"),
+            ("r", "mark ready, or convert to draft"),
+            ("a", "approve"),
+            ("c", "comment"),
+            ("] [, enter", "pick a comment, reply quoting it"),
+            ("j/k on Comments", "pick the next or previous comment"),
+            ("o", "open on GitHub"),
+            ("y, Y, n", "copy the checkout command, link, number"),
+            ("click #", "the number in the header copies it"),
+            ("R", "reload"),
+            ("q, esc", "back to the list, or quit"),
+        ],
+        Kind::Issue => &[
+            ("←→, tab", "Summary, Timeline, Comments"),
+            ("1, 2, 3", "the same tabs"),
+            ("j/k, ctrl+d/u", "scroll a line, half a screen"),
+            ("space/b, g/G", "a screen, top and bottom"),
+            ("drag", "select text; it's copied"),
+            ("click", "a picture opens it, a video plays"),
+            ("e", "expand or cut short long comments"),
+            ("x", "close as done or not planned, reopen"),
+            ("c", "comment"),
+            ("] [, enter", "pick a comment, reply quoting it"),
+            ("j/k on Comments", "pick the next or previous comment"),
+            ("o", "open on GitHub"),
+            ("y, n", "copy the link, number"),
+            ("click #", "the number in the header copies it"),
+            ("R", "reload"),
+            ("q, esc", "back to the list, or quit"),
+        ],
+    };
     let width = 54.min(area.width.saturating_sub(4));
     let height = (keys.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
@@ -2027,9 +2744,38 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
     let dim = Style::default().fg(DIM);
     let mut lines = Vec::new();
 
+    if detail.kind == Kind::Issue {
+        let (status, color) = match detail.state {
+            State::Completed => ("Closed as completed", PURPLE),
+            State::NotPlanned => ("Closed as not planned", DIM),
+            _ => ("Open", GREEN),
+        };
+        lines.push(field(
+            "Status",
+            vec![Span::styled(status, Style::default().fg(color))],
+        ));
+        lines.push(field(
+            "Assignees",
+            vec![if detail.assignees.is_empty() {
+                Span::styled("No one", dim)
+            } else {
+                Span::raw(detail.assignees.join("  "))
+            }],
+        ));
+        if !detail.labels.is_empty() {
+            lines.push(field(
+                "Labels",
+                vec![Span::styled(detail.labels.join("  "), dim)],
+            ));
+        }
+        return with_description(lines, detail, width, gallery);
+    }
+
     let (status, color) = match (detail.state, detail.mergeability) {
         (State::Merged, _) => ("Merged".to_owned(), PURPLE),
-        (State::Closed, _) => ("Closed without merging".to_owned(), RED),
+        (State::Closed | State::Completed | State::NotPlanned, _) => {
+            ("Closed without merging".to_owned(), RED)
+        }
         (State::Draft, _) => ("Draft".to_owned(), DIM),
         (_, Mergeability::Ready) => ("Ready to merge".to_owned(), GREEN),
         (_, Mergeability::Conflicts) => (format!("Conflicts with {}", detail.base), RED),
@@ -2091,6 +2837,16 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
         }
     }
 
+    with_description(lines, detail, width, gallery)
+}
+
+/// The summary's fields, then two blank lines and the description.
+fn with_description(
+    mut lines: Vec<Line<'static>>,
+    detail: &Detail,
+    width: usize,
+    gallery: &mut Gallery,
+) -> Body {
     lines.push(Line::default());
     lines.push(Line::default());
     let offset = lines.len();
@@ -2203,12 +2959,96 @@ fn rows(rows: &[render::Row], indent: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line<'static>> {
+/// A comment quoted to start a reply, or `None` for an event with nothing to quote.
+fn quoted(event: &pr::Event) -> Option<String> {
+    let body = match &event.kind {
+        EventKind::Comment { body }
+        | EventKind::Review { body, .. }
+        | EventKind::Inline { body, .. } => pr::visible(body),
+        _ => return None,
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let mut quote: String = body.lines().map(|line| format!("> {line}\n")).collect();
+    quote.push('\n');
+    Some(quote)
+}
+
+/// Which events a list of them holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Events {
+    All,
+    /// Only those with a comment to quote, each in full.
+    Comments,
+}
+
+/// The timeline's lines, and the first line of each event. The `focus`
+/// event, picked to reply to, has its rail drawn bright instead of dim.
+fn timeline(
+    detail: &Detail,
+    width: usize,
+    now: i64,
+    expanded: bool,
+    focus: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    events(detail, width, now, expanded, focus, Events::All)
+}
+
+/// The Comments tab: every comment and review with something to say, in
+/// full. `starts` is still by timeline index, as `focus` is.
+fn comments(
+    detail: &Detail,
+    width: usize,
+    now: i64,
+    focus: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let (lines, starts) = events(detail, width, now, true, focus, Events::Comments);
+    if !lines.is_empty() {
+        return (lines, starts);
+    }
+    let subject = match detail.kind {
+        Kind::Pull => "pull request",
+        Kind::Issue => "issue",
+    };
+    let empty = vec![Line::from(Span::styled(
+        format!("No comments on this {subject} yet. c writes the first one."),
+        Style::default().fg(DIM),
+    ))];
+    (empty, starts)
+}
+
+fn events(
+    detail: &Detail,
+    width: usize,
+    now: i64,
+    expanded: bool,
+    focus: Option<usize>,
+    which: Events,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = Vec::new();
+    let mut starts = Vec::new();
     let indent = 4u16;
-    for event in &detail.timeline {
+    let subject = match detail.kind {
+        Kind::Pull => "pull request",
+        Kind::Issue => "issue",
+    };
+    let closed = match detail.state {
+        State::Completed => "Closed as completed",
+        State::NotPlanned => "Closed as not planned",
+        _ => "Closed",
+    };
+    let closed_color = state_color(detail.state);
+    for (index, event) in detail.timeline.iter().enumerate() {
+        starts.push(lines.len());
+        if which == Events::Comments && quoted(event).is_none() {
+            continue;
+        }
+        let picked = focus == Some(index);
+        let accent = Style::default().fg(BLUE).add_modifier(Modifier::BOLD);
+        let rail = if picked { accent } else { dim };
         let when = Span::styled(pr::ago(&event.at, now), dim);
         let actor = Span::styled(event.actor.clone(), bold);
         let (glyph, color, what, body): (&str, Color, Vec<Span<'static>>, Option<String>) =
@@ -2216,7 +3056,7 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
                 EventKind::Opened => (
                     "●",
                     GREEN,
-                    vec![actor, Span::styled(" opened this pull request", dim)],
+                    vec![actor, Span::styled(format!(" opened this {subject}"), dim)],
                     None,
                 ),
                 EventKind::Commit { sha, headline } => (
@@ -2265,26 +3105,51 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
                 ),
                 EventKind::Closed => (
                     "●",
-                    RED,
+                    closed_color,
                     vec![Span::styled(
-                        "Closed",
-                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                        closed,
+                        Style::default()
+                            .fg(closed_color)
+                            .add_modifier(Modifier::BOLD),
                     )],
                     None,
                 ),
             };
-        let mut left = vec![Span::styled(
-            format!("{glyph}  "),
-            Style::default().fg(color),
-        )];
-        left.extend(what);
-        lines.push(spread(left, vec![when], width));
+        // The picked comment stands out: a pointer for its glyph, a thick
+        // blue rail down its body, and a reminder of what enter does, but
+        // only when that fits without cutting the header's own words.
+        let (left, right) = if picked {
+            let mut left = vec![Span::styled("▶  ", accent)];
+            left.extend(what);
+            let hint = [Span::styled(REPLY_HINT, accent), Span::styled(" · ", dim)];
+            let needed: usize = left
+                .iter()
+                .chain(&hint)
+                .chain(std::iter::once(&when))
+                .map(|s| s.content.width())
+                .sum();
+            let right = if needed < width {
+                hint.into_iter().chain(std::iter::once(when)).collect()
+            } else {
+                vec![when]
+            };
+            (left, right)
+        } else {
+            let mut left = vec![Span::styled(
+                format!("{glyph}  "),
+                Style::default().fg(color),
+            )];
+            left.extend(what);
+            (left, vec![when])
+        };
+        lines.push(spread(left, right, width));
         if let Some(body) = body.map(|b| pr::visible(&b)).filter(|b| !b.is_empty()) {
             let rendered = markdown(&body, (width as u16).saturating_sub(indent), indent);
             let total = rendered.len();
             let shown = if expanded { total } else { total.min(EXCERPT) };
             lines.extend(rendered.into_iter().take(shown).map(|mut line| {
-                line.spans.insert(0, Span::styled("│", dim));
+                line.spans
+                    .insert(0, Span::styled(if picked { "┃" } else { "│" }, rail));
                 line.spans[1] = Span::styled(
                     line.spans[1].content.chars().skip(1).collect::<String>(),
                     line.spans[1].style,
@@ -2301,7 +3166,7 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
         lines.push(Line::from(Span::styled("│", dim)));
     }
     lines.pop();
-    lines
+    (lines, starts)
 }
 
 /// Swaps markdown and HTML images for `▣ alt` so they don't leave blank space.
@@ -2356,6 +3221,8 @@ mod tests {
                 repo: "o/r".into(),
                 number: 7,
             },
+            kind: Kind::Pull,
+            assignees: Vec::new(),
             title: "fix: Find curly quotes and Unicode hyphens from typed ones".into(),
             body: "Searching `don't` skips **every** `don’t`.\n\n![Before](https://x/a.png)".into(),
             state,
@@ -2412,6 +3279,95 @@ mod tests {
     }
 
     #[test]
+    fn the_comments_tab_holds_only_comments_in_full() {
+        let now = pr::seconds("2026-11-12T04:30:00Z").unwrap();
+        let mut d = detail(State::Open);
+        d.timeline.push(pr::Event {
+            at: "2026-11-12T04:00:00Z".into(),
+            actor: "ana".into(),
+            kind: EventKind::Commit {
+                sha: "abc1234".into(),
+                headline: "fix it".into(),
+            },
+        });
+        let (lines, starts) = comments(&d, 60, now, None);
+        let shown = texts(&lines);
+        assert!(shown[0].starts_with("◆  bot commented"), "{shown:?}");
+        // Picked, it's pointed at, its rail is thick, and enter is named.
+        let (picked, _) = comments(&d, 60, now, Some(1));
+        let picked = texts(&picked);
+        assert!(picked[0].starts_with("▶  bot commented"), "{picked:?}");
+        assert!(picked[0].contains("enter replies"), "{picked:?}");
+        assert!(picked[1].starts_with('┃'), "{picked:?}");
+        // Too narrow for the hint, the header keeps its own words whole.
+        let (narrow, _) = comments(&d, 24, now, Some(1));
+        let narrow = texts(&narrow);
+        assert!(narrow[0].starts_with("▶  bot commented"), "{narrow:?}");
+        assert!(!narrow[0].contains("enter"), "{narrow:?}");
+        assert!(shown.iter().any(|l| l.contains("line 30")));
+        assert!(
+            !shown
+                .iter()
+                .any(|l| l.contains("opened") || l.contains("abc1234"))
+        );
+        assert_eq!(starts.len(), d.timeline.len());
+        assert_eq!(starts[1], 0);
+
+        d.timeline.truncate(1);
+        let (lines, _) = comments(&d, 60, now, None);
+        assert!(texts(&lines)[0].starts_with("No comments on this pull request yet"));
+    }
+
+    #[test]
+    fn tabs_step_through_comments_to_code_for_a_pull_request_only() {
+        let pr = PrRef {
+            repo: "o/r".into(),
+            number: 1,
+        };
+        let mut page = Page::new(pr.clone(), Kind::Pull, Load::Ready(detail(State::Open)));
+        assert_eq!(page.step(1, false), Step::Tab(Tab::Timeline));
+        assert_eq!(page.step(-1, false), Step::Stay);
+        assert_eq!(page.step(-1, true), Step::Code);
+        page.show(Tab::Comments);
+        // Opening Comments picks the first comment, ready to reply to.
+        assert_eq!(page.focus, Some(1));
+        assert_eq!(page.step(1, false), Step::Code);
+
+        let mut issue = Page::new(pr, Kind::Issue, Load::Ready(detail(State::Open)));
+        issue.show(Tab::Comments);
+        assert_eq!(issue.step(1, false), Step::Stay);
+        assert_eq!(issue.step(1, true), Step::Tab(Tab::Summary));
+        issue.pick(1);
+        assert_eq!(issue.tab, Tab::Comments, "picking stays on Comments");
+    }
+
+    #[test]
+    fn replying_quotes_only_the_picked_comment() {
+        let mut d = detail(State::Open);
+        d.timeline.push(pr::Event {
+            at: "2026-11-12T04:00:00Z".into(),
+            actor: "ana".into(),
+            kind: EventKind::Comment {
+                body: "Second thought".into(),
+            },
+        });
+        let pr = PrRef {
+            repo: "o/r".into(),
+            number: 1,
+        };
+        let mut page = Page::new(pr, Kind::Pull, Load::Ready(d));
+        page.show(Tab::Comments);
+        page.pick(1);
+        assert_eq!(page.focus, Some(2));
+        page.reply();
+        let Mode::Compose { text, reply, .. } = &page.mode else {
+            panic!("expected the composer");
+        };
+        assert_eq!(text.iter().collect::<String>(), "> Second thought\n\n");
+        assert_eq!(reply.as_deref(), Some("ana"));
+    }
+
+    #[test]
     fn the_summary_shows_only_what_has_something_to_say() {
         let body = summary(&detail(State::Open), 80, &mut Gallery::plain());
         let text = texts(&body.lines).join("\n");
@@ -2444,10 +3400,10 @@ mod tests {
     #[test]
     fn long_timeline_comments_are_cut_short_until_expanded() {
         let now = pr::seconds("2026-11-12T04:30:00Z").unwrap();
-        let short = texts(&timeline(&detail(State::Open), 60, now, false));
+        let short = texts(&timeline(&detail(State::Open), 60, now, false, None).0);
         assert!(short[0].starts_with("●  marcos opened this pull request"));
         assert!(short.iter().any(|l| l.contains("more lines · e expands")));
-        let long = texts(&timeline(&detail(State::Open), 60, now, true));
+        let long = texts(&timeline(&detail(State::Open), 60, now, true, None).0);
         assert!(long.iter().any(|l| l.contains("line 30")));
         assert!(!long.iter().any(|l| l.contains("more lines")));
     }
@@ -2477,7 +3433,7 @@ mod tests {
     }
 
     #[test]
-    fn the_list_shows_each_pull_request_once_and_filters() {
+    fn the_list_shows_each_row_once_per_tab_and_filters() {
         let entry = |number, title: &str| Entry {
             pr: PrRef {
                 repo: "o/r".into(),
@@ -2485,42 +3441,166 @@ mod tests {
             },
             title: title.into(),
             author: "me".into(),
-            updated: "2026-11-12T04:00:00Z".into(),
+            updated: format!("2026-11-12T04:0{number}:00Z"),
             draft: false,
+            ended: None,
         };
-        let mut list = List {
-            slots: vec![
-                Slot {
-                    source: Source::Yours,
-                    entries: Some(vec![entry(1, "fix quotes"), entry(2, "add pr")]),
-                    fetch: Fetch::Done,
-                },
-                Slot {
-                    source: Source::Reviewing,
-                    entries: Some(vec![entry(2, "add pr")]),
-                    fetch: Fetch::Loading,
-                },
-                Slot {
-                    source: Source::Owned,
-                    entries: None,
-                    fetch: Fetch::Loading,
-                },
-            ],
+        let mut list = list_of(vec![
+            Slot {
+                source: Source::Authored(Kind::Pull),
+                status: Status::Open,
+                entries: Some(vec![entry(1, "fix quotes"), entry(2, "add pr")]),
+                fetch: Fetch::Done,
+            },
+            Slot {
+                source: Source::Reviewing,
+                status: Status::Open,
+                entries: Some(vec![entry(2, "add pr")]),
+                fetch: Fetch::Loading,
+            },
+            Slot {
+                source: Source::Authored(Kind::Issue),
+                status: Status::Open,
+                entries: Some(vec![entry(3, "crash on open")]),
+                fetch: Fetch::Done,
+            },
+            Slot {
+                source: Source::Authored(Kind::Issue),
+                status: Status::Done,
+                entries: Some(vec![entry(4, "old crash"), entry(5, "older crash")]),
+                fetch: Fetch::Idle,
+            },
+        ]);
+        assert_eq!(list.count(), 2);
+        // Newest first, across searches.
+        assert_eq!(list.picked().map(|pr| pr.number), Some(2));
+        assert!(list.loading());
+        list.typed = "quotes".into();
+        assert_eq!(list.picked().map(|pr| pr.number), Some(1));
+        list.typed.clear();
+        list.show(Kind::Issue);
+        assert_eq!(list.count(), 1);
+        assert!(!list.loading());
+        assert_eq!(list.picked().map(|pr| pr.number), Some(3));
+        // The done switch shows the other searches, and the tab stays.
+        list.selected = 0;
+        list.show_status(Status::Done);
+        assert_eq!(list.kind, Kind::Issue);
+        assert_eq!(list.count(), 2);
+        assert_eq!(list.picked().map(|pr| pr.number), Some(5));
+    }
+
+    fn list_of(slots: Vec<Slot>) -> List {
+        List {
+            kind: Kind::Pull,
+            status: Status::Open,
+            slots,
+            me: Some("me".into()),
+            tab_hits: Vec::new(),
             typed: String::new(),
             selected: 0,
             resting: None,
             hits: Vec::new(),
             pressed: None,
-            copied: None,
+            note: None,
             shown: Vec::new(),
             shown_area: Rect::default(),
             selection: None,
             dragging: false,
+        }
+    }
+
+    #[test]
+    fn done_rows_are_grouped_by_when_they_ended_with_a_sparkline() {
+        let now = pr::seconds("2026-11-14T12:00:00Z").unwrap();
+        let done = |number, title: &str, how, at: &str| Entry {
+            pr: PrRef {
+                repo: "o/leaf".into(),
+                number,
+            },
+            title: title.into(),
+            author: "me".into(),
+            updated: at.into(),
+            draft: false,
+            ended: Some(Ended { how, at: at.into() }),
         };
-        assert_eq!(list.count(), 2);
-        assert!(list.loading());
-        list.typed = "quotes".into();
-        assert_eq!(list.picked().map(|pr| pr.number), Some(1));
+        let mut list = list_of(vec![Slot {
+            source: Source::Authored(Kind::Pull),
+            status: Status::Done,
+            entries: Some(vec![
+                done(1, "ship it", Ending::Merged, "2026-11-14T09:00:00Z"),
+                done(2, "fix quotes", Ending::Merged, "2026-11-13T09:00:00Z"),
+                done(3, "old work", Ending::Merged, "2026-08-01T09:00:00Z"),
+            ]),
+            fetch: Fetch::Done,
+        }]);
+        list.status = Status::Done;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+            .expect("test terminal");
+        terminal
+            .draw(|f| draw_list(f, &mut list, now, None))
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let screen: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let text = screen.join("\n");
+        assert!(text.contains("Open  ·  Merged"), "{text}");
+        assert!(text.contains("2 merged in 12 weeks"), "{text}");
+        let at = |needle: &str| screen.iter().position(|l| l.contains(needle));
+        assert!(at("Today") < at("ship it"), "{text}");
+        assert!(at("ship it") < at("Yesterday"), "{text}");
+        assert!(at("Yesterday") < at("fix quotes"), "{text}");
+        assert!(at("This year") < at("old work"), "{text}");
+        assert!(text.contains("◆  ship it"), "{text}");
+        assert!(text.contains("me · merged"), "{text}");
+        assert!(text.contains("tab open"), "{text}");
+        // The switch can be clicked.
+        assert!(
+            list.tab_hits
+                .iter()
+                .any(|(_, hit)| *hit == ListHit::Status(Status::Open))
+        );
+    }
+
+    #[test]
+    fn rows_fall_into_age_groups_and_weeks() {
+        let now = pr::seconds("2026-11-14T12:00:00Z").unwrap();
+        assert_eq!(age_group("2026-11-14T00:01:00Z", now), AgeGroup::Today);
+        assert_eq!(age_group("2026-11-13T23:59:00Z", now), AgeGroup::Yesterday);
+        assert_eq!(age_group("2026-11-09T12:00:00Z", now), AgeGroup::ThisWeek);
+        assert_eq!(age_group("2026-10-20T12:00:00Z", now), AgeGroup::ThisMonth);
+        assert_eq!(age_group("2026-01-20T12:00:00Z", now), AgeGroup::ThisYear);
+        assert_eq!(age_group("2024-01-20T12:00:00Z", now), AgeGroup::Older);
+        let ended = |at: &str| Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            title: String::new(),
+            author: String::new(),
+            updated: at.into(),
+            draft: false,
+            ended: Some(Ended {
+                how: Ending::Completed,
+                at: at.into(),
+            }),
+        };
+        let weeks = weekly(
+            &[
+                ended("2026-11-14T00:00:00Z"),
+                ended("2026-11-10T00:00:00Z"),
+                ended("2026-11-01T00:00:00Z"),
+                ended("2025-01-01T00:00:00Z"),
+            ],
+            now,
+            3,
+        );
+        assert_eq!(weeks, [0, 1, 2]);
     }
 
     #[test]
@@ -2530,6 +3610,7 @@ mod tests {
                 repo: "o/r".into(),
                 number: 1,
             },
+            Kind::Pull,
             Load::Loading,
         );
         page.cache = Some((
@@ -2565,6 +3646,7 @@ mod tests {
                 repo: "o/r".into(),
                 number: 1,
             },
+            Kind::Pull,
             Load::Loading,
         );
         page.header = vec![

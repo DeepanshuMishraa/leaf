@@ -37,11 +37,11 @@ const AGENTS: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum AgentFailed {
     #[error(
-        "Not running inside Rex, so there is no agent pane to send to. The text was copied to the clipboard instead."
+        "leaf isn't running inside Rex, tmux or Herdr, so there's no agent pane to send to. The text was copied to the clipboard instead."
     )]
     NoTmux,
     #[error(
-        "No agent pane (claude, codex, opencode, gemini, grok, pi, aider…) is open in this Rex session. The text was copied to the clipboard instead. Set LEAF_AGENT_PANE to a Rex block id."
+        "No agent pane (claude, codex, opencode, grok, pi, cursor-agent…) is open here. The text was copied to the clipboard instead. Set LEAF_AGENT_PANE to the agent's pane id."
     )]
     NoAgent,
     #[error(
@@ -156,9 +156,48 @@ impl Agent {
     }
 }
 
-/// Sends `text` to the agent: a bracketed paste, then Enter outside it.
+/// Sends `text` to the agent: a bracketed paste, then Enter outside it. In
+/// Rex the agent is found as before; in tmux or Herdr, `LEAF_AGENT_PANE`
+/// names it, or else the first other pane with an agent in it.
 pub fn deliver(text: &str) -> Result<Agent, AgentFailed> {
-    deliver_rex(text)
+    let host = match crate::host::Host::detect() {
+        None | Some(crate::host::Host::Rex) => return deliver_rex(text),
+        Some(host) => host,
+    };
+    let named = std::env::var("LEAF_AGENT_PANE")
+        .ok()
+        .map(|pane| pane.trim().to_owned())
+        .filter(|pane| !pane.is_empty());
+    let (pane, command) = match named {
+        Some(pane) if host.is_open(&pane) => (pane, "agent".to_owned()),
+        Some(pane) => return Err(AgentFailed::BadPane { pane }),
+        None => host.find_agent().ok_or(AgentFailed::NoAgent)?,
+    };
+    host.type_into(&pane, text)
+        .map_err(|cause| AgentFailed::Tmux {
+            pane: pane.clone(),
+            cause,
+        })?;
+    Ok(Agent { pane, command })
+}
+
+/// Sends `text` to the agent in pane `pane` of whichever multiplexer leaf
+/// runs in: the pane that asked for a review.
+pub fn deliver_to_pane(pane: &str, text: &str) -> Result<Agent, AgentFailed> {
+    match crate::host::Host::detect() {
+        None => Err(AgentFailed::NoTmux),
+        Some(crate::host::Host::Rex) => deliver_to(pane, text),
+        Some(host) => host
+            .type_into(pane, text)
+            .map(|()| Agent {
+                pane: pane.to_owned(),
+                command: "agent".to_owned(),
+            })
+            .map_err(|cause| AgentFailed::Tmux {
+                pane: pane.to_owned(),
+                cause,
+            }),
+    }
 }
 
 fn stderr(output: &std::process::Output) -> String {
@@ -170,7 +209,7 @@ fn stderr(output: &std::process::Output) -> String {
     }
 }
 
-fn agent_name(word: &str) -> Option<&'static str> {
+pub(crate) fn agent_name(word: &str) -> Option<&'static str> {
     let name = Path::new(word).file_name()?.to_str()?.to_ascii_lowercase();
     let name = name
         .strip_suffix(".js")
@@ -816,32 +855,103 @@ fn deliver_rex(text: &str) -> Result<Agent, AgentFailed> {
         (Err(AgentFailed::NoAgent), Some(agent)) => return start_rex(&session, &agent, text),
         (found, _) => found?,
     };
+    write_agent(&session, &agent.pane, text)?;
+    Ok(agent)
+}
+
+/// Pastes `text` into the agent pane `pane` and submits it.
+fn write_agent(session: &str, pane: &str, text: &str) -> Result<(), AgentFailed> {
     let payload = serde_json::json!({ "data": submission(text) }).to_string();
     let output = rex_cmd(
         &[
             "block".into(),
             "call".into(),
             "-s".into(),
-            session,
+            session.into(),
             "-b".into(),
-            agent.pane.clone(),
+            pane.into(),
             "write".into(),
             "-".into(),
         ],
         Some(payload.as_bytes()),
     )
     .map_err(|cause| AgentFailed::Tmux {
-        pane: agent.pane.clone(),
+        pane: pane.into(),
         cause,
     })?;
     if output.status.success() {
-        Ok(agent)
+        Ok(())
     } else {
         Err(AgentFailed::Tmux {
-            pane: agent.pane,
+            pane: pane.into(),
             cause: stderr(&output),
         })
     }
+}
+
+/// Sends `text` to the agent in the Rex pane `pane`, the one that asked for a
+/// review, rather than whichever agent pane the lookup would find.
+pub fn deliver_to(pane: &str, text: &str) -> Result<Agent, AgentFailed> {
+    let session = rex_session().ok_or(AgentFailed::NoTmux)?;
+    write_agent(&session, pane, text)?;
+    let command = agent_from_rex_process(&session, pane).unwrap_or_else(|| "agent".into());
+    Ok(Agent {
+        pane: pane.into(),
+        command,
+    })
+}
+
+/// Opens a pane to the right of `beside` (or of this pane) running `argv` in
+/// `dir`, focusing it, and returns its block id.
+pub fn split_beside(
+    beside: Option<&str>,
+    dir: &Path,
+    label: &str,
+    argv: &[String],
+) -> Result<String, String> {
+    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let mut args: Vec<String> = vec!["split".into(), "-s".into(), session];
+    let own = std::env::var("REX_BLOCK")
+        .ok()
+        .filter(|own| !own.is_empty());
+    if let Some(block) = beside.map(str::to_owned).or(own) {
+        args.extend(["-b".into(), block]);
+    }
+    args.extend([
+        "-c".into(),
+        dir.display().to_string(),
+        "--split=right".into(),
+        "--focus=true".into(),
+        "--label".into(),
+        label.into(),
+        "--json".into(),
+        "--".into(),
+    ]);
+    args.extend(argv.iter().cloned());
+    let printed = rex_output(&args)?;
+    serde_json::from_str::<serde_json::Value>(&printed)
+        .ok()
+        .and_then(|value| value["block_ids"][0].as_str().map(str::to_owned))
+        .ok_or_else(|| format!("rex split printed no block id: {printed}"))
+}
+
+/// Whether the Rex pane `block` is still open in this session. When Rex
+/// can't be asked, it's taken as open, so a waiter isn't cut short.
+pub fn block_open(block: &str) -> bool {
+    let Some(session) = rex_session() else {
+        return true;
+    };
+    let Ok(listed) = rex_output(&[
+        "block".into(),
+        "ls".into(),
+        "-s".into(),
+        session,
+        "--json".into(),
+        "--short=false".into(),
+    ]) else {
+        return true;
+    };
+    parse_rex_blocks(&listed).iter().any(|b| b.id == block)
 }
 
 #[cfg(test)]

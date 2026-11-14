@@ -98,6 +98,10 @@ impl PrRef {
         format!("https://github.com/{}/pull/{}", self.repo, self.number)
     }
 
+    pub fn issue_url(&self) -> String {
+        format!("https://github.com/{}/issues/{}", self.repo, self.number)
+    }
+
     pub fn resource(&self) -> Resource {
         let (owner, repo) = self.repo.split_once('/').unwrap_or(("", &self.repo));
         Resource::Pull {
@@ -120,21 +124,81 @@ pub struct Entry {
     pub author: String,
     pub updated: String,
     pub draft: bool,
+    /// How and when it ended; `None` while it's open.
+    pub ended: Option<Ended>,
 }
 
-/// Pull requests listed under one heading.
-#[derive(Debug, Clone)]
-pub struct Group {
-    pub title: String,
-    pub entries: Vec<Entry>,
+impl Entry {
+    /// When the list orders it by: when it ended, else when it last changed.
+    pub fn when(&self) -> &str {
+        self.ended.as_ref().map_or(&self.updated, |e| &e.at)
+    }
+}
+
+/// How a merged pull request or closed issue in the list ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ended {
+    pub how: Ending,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    Merged,
+    Completed,
+    NotPlanned,
+}
+
+impl Ending {
+    /// The verb for the row's line: "merged 3d ago".
+    pub fn verb(self) -> &'static str {
+        match self {
+            Ending::Merged => "merged",
+            Ending::Completed => "closed",
+            Ending::NotPlanned => "closed as not planned",
+        }
+    }
+}
+
+/// Which rows a list tab shows: those still open, or those done with
+/// (merged pull requests, closed issues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Status {
+    Open,
+    Done,
+}
+
+impl Status {
+    /// The switch's label for `kind`: Open, then Merged or Closed.
+    pub fn label(self, kind: Kind) -> &'static str {
+        match (self, kind) {
+            (Status::Open, _) => "Open",
+            (Status::Done, Kind::Pull) => "Merged",
+            (Status::Done, Kind::Issue) => "Closed",
+        }
+    }
+
+    pub fn other(self) -> Status {
+        match self {
+            Status::Open => Status::Done,
+            Status::Done => Status::Open,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Open,
+    /// A pull request only.
     Draft,
+    /// A pull request only.
     Merged,
+    /// A pull request closed without merging.
     Closed,
+    /// An issue closed as done.
+    Completed,
+    /// An issue closed as not planned.
+    NotPlanned,
 }
 
 impl State {
@@ -143,7 +207,36 @@ impl State {
             State::Open => "Open",
             State::Draft => "Draft",
             State::Merged => "Merged",
-            State::Closed => "Closed",
+            State::Closed | State::Completed | State::NotPlanned => "Closed",
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        matches!(self, State::Open | State::Draft)
+    }
+}
+
+/// Why an issue is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    Completed,
+    NotPlanned,
+}
+
+impl CloseReason {
+    pub const ALL: [CloseReason; 2] = [CloseReason::Completed, CloseReason::NotPlanned];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CloseReason::Completed => "completed",
+            CloseReason::NotPlanned => "not planned",
+        }
+    }
+
+    pub fn key(self) -> char {
+        match self {
+            CloseReason::Completed => 'c',
+            CloseReason::NotPlanned => 'n',
         }
     }
 }
@@ -320,10 +413,14 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-/// A pull request read in full.
+/// A pull request or issue read in full. An issue leaves the branch, size,
+/// reviewer, check and merge fields empty.
 #[derive(Debug, Clone)]
 pub struct Detail {
     pub pr: PrRef,
+    pub kind: Kind,
+    /// Who an issue is assigned to.
+    pub assignees: Vec<String>,
     pub title: String,
     pub body: String,
     pub state: State,
@@ -349,11 +446,13 @@ pub struct Detail {
     pub timeline: Vec<Event>,
 }
 
-/// Something done to a pull request.
+/// Something done to a pull request or an issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Merge(MergeMethod),
     Close,
+    /// Closes an issue, saying why.
+    CloseAs(CloseReason),
     Reopen,
     Ready,
     Draft,
@@ -362,19 +461,27 @@ pub enum Action {
 }
 
 impl Action {
-    fn args(&self, pr: &PrRef) -> Vec<String> {
+    fn args(&self, pr: &PrRef, kind: Kind) -> Vec<String> {
         let number = pr.number.to_string();
         let (verb, extra): (&str, Vec<String>) = match self {
             Action::Merge(method) => ("merge", vec![method.flag().to_owned()]),
             Action::Close => ("close", Vec::new()),
+            Action::CloseAs(reason) => (
+                "close",
+                vec!["--reason".to_owned(), reason.label().to_owned()],
+            ),
             Action::Reopen => ("reopen", Vec::new()),
             Action::Ready => ("ready", Vec::new()),
             Action::Draft => ("ready", vec!["--undo".to_owned()]),
             Action::Approve => ("review", vec!["--approve".to_owned()]),
             Action::Comment(body) => ("comment", vec!["--body".to_owned(), body.clone()]),
         };
+        let noun = match kind {
+            Kind::Pull => "pr",
+            Kind::Issue => "issue",
+        };
         let mut args = vec![
-            "pr".to_owned(),
+            noun.to_owned(),
             verb.to_owned(),
             number,
             "-R".to_owned(),
@@ -390,6 +497,7 @@ impl Action {
         match self {
             Action::Merge(method) => format!("{label} merged ({})", method.label().to_lowercase()),
             Action::Close => format!("{label} closed"),
+            Action::CloseAs(reason) => format!("{label} closed as {}", reason.label()),
             Action::Reopen => format!("{label} reopened"),
             Action::Ready => format!("{label} is ready for review"),
             Action::Draft => format!("{label} is a draft again"),
@@ -481,52 +589,94 @@ fn github_repo(url: &str) -> Option<String> {
     }
 }
 
-/// Where one heading of the list gets its pull requests.
+/// What the list shows: pull requests or issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Pull,
+    Issue,
+}
+
+impl Kind {
+    pub fn title(self) -> &'static str {
+        match self {
+            Kind::Pull => "Pull requests",
+            Kind::Issue => "Issues",
+        }
+    }
+
+    fn qualifier(self) -> &'static str {
+        match self {
+            Kind::Pull => "is:pr",
+            Kind::Issue => "is:issue",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Kind::Pull => "pr",
+            Kind::Issue => "issue",
+        }
+    }
+}
+
+/// One search the list is made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Branch { repo: String, branch: String },
     Repo(String),
-    Yours,
+    Authored(Kind),
     Reviewing,
-    Owned,
+    Owned(Kind),
 }
 
 impl Source {
-    pub fn title(&self) -> String {
+    pub fn kind(&self) -> Kind {
         match self {
-            Source::Branch { .. } => "This branch".to_owned(),
-            Source::Repo(repo) => repo.clone(),
-            Source::Yours => "Yours".to_owned(),
-            Source::Reviewing => "Review requested".to_owned(),
-            Source::Owned => "In your repositories".to_owned(),
+            Source::Branch { .. } | Source::Repo(_) | Source::Reviewing => Kind::Pull,
+            Source::Authored(kind) | Source::Owned(kind) => *kind,
         }
     }
 
-    fn query(&self) -> Result<String, PrFailed> {
-        let filter = match self {
-            Source::Branch { repo, branch } => format!("repo:{repo} head:{branch}"),
-            Source::Repo(repo) => format!("repo:{repo}"),
-            Source::Yours => "author:@me".to_owned(),
-            Source::Reviewing => "review-requested:@me".to_owned(),
-            Source::Owned => format!("user:{}", viewer()?),
+    fn query(&self, status: Status) -> Result<String, PrFailed> {
+        let filter = match (self, status) {
+            (Source::Branch { repo, branch }, _) => format!("repo:{repo} head:{branch}"),
+            (Source::Repo(repo), _) => format!("repo:{repo}"),
+            (Source::Authored(_), _) => "author:@me".to_owned(),
+            // A request leaves once it's answered, so done ones are those you reviewed.
+            (Source::Reviewing, Status::Open) => "review-requested:@me".to_owned(),
+            (Source::Reviewing, Status::Done) => "reviewed-by:@me".to_owned(),
+            (Source::Owned(_), _) => format!("user:{}", viewer()?),
         };
-        Ok(format!("is:pr is:open archived:false {filter}"))
+        let state = match (status, self.kind()) {
+            (Status::Open, _) => "is:open",
+            (Status::Done, Kind::Pull) => "is:merged",
+            (Status::Done, Kind::Issue) => "is:closed",
+        };
+        Ok(format!(
+            "{} {state} archived:false {filter} sort:updated-desc",
+            self.kind().qualifier()
+        ))
     }
 
-    fn cache_key(&self) -> String {
-        match self {
+    fn cache_key(&self, status: Status) -> String {
+        let key = match self {
             Source::Branch { repo, branch } => format!("list-branch-{repo}-{branch}"),
             Source::Repo(repo) => format!("list-repo-{repo}"),
-            Source::Yours => "list-yours".to_owned(),
+            Source::Authored(kind) => format!("list-authored-{}", kind.key()),
             Source::Reviewing => "list-reviewing".to_owned(),
-            Source::Owned => "list-owned".to_owned(),
+            Source::Owned(kind) => format!("list-owned-{}", kind.key()),
+        };
+        match status {
+            Status::Open => key,
+            Status::Done => format!("{key}-done"),
         }
     }
 }
 
-/// The list's headings, in order: this branch's pull request, this
-/// repository's, yours, those waiting on your review, then the rest in
-/// repositories you own. A default branch has no pull request of its own.
+/// The searches behind each tab. Pull requests: this branch's (a default
+/// branch has none of its own), this repository's, yours, those waiting on
+/// your review, and those in repositories you own. Issues: yours, and those in
+/// repositories you own.
 pub fn sources(here: Option<&str>, branch: Option<&str>) -> Vec<Source> {
     let mut out = Vec::new();
     if let Some(repo) = here {
@@ -538,65 +688,185 @@ pub fn sources(here: Option<&str>, branch: Option<&str>) -> Vec<Source> {
         }
         out.push(Source::Repo(repo.to_owned()));
     }
-    out.extend([Source::Yours, Source::Reviewing, Source::Owned]);
+    out.extend([
+        Source::Authored(Kind::Pull),
+        Source::Reviewing,
+        Source::Owned(Kind::Pull),
+        Source::Authored(Kind::Issue),
+        Source::Owned(Kind::Issue),
+    ]);
     out
 }
 
-/// Your GitHub login: from gh's own config, which needs no request, or else asked.
-fn viewer() -> Result<String, PrFailed> {
-    if let Ok(login) = gh(&["config", "get", "user", "-h", "github.com"])
-        && !login.is_empty()
-    {
-        return Ok(login);
+/// How a row concerns you, which picks its color in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Relation {
+    /// Yours, in your own repository.
+    Yours,
+    /// Yours, in someone else's repository.
+    Outgoing,
+    /// Someone else's, in your repository.
+    Incoming,
+    /// Someone else's, elsewhere: this repository's, or waiting on your review.
+    Other,
+}
+
+impl Relation {
+    pub const ALL: [Relation; 4] = [
+        Relation::Yours,
+        Relation::Outgoing,
+        Relation::Incoming,
+        Relation::Other,
+    ];
+
+    pub fn of(entry: &Entry, me: &str) -> Self {
+        let owner = entry.pr.repo.split('/').next().unwrap_or_default();
+        match (
+            entry.author.eq_ignore_ascii_case(me),
+            owner.eq_ignore_ascii_case(me),
+        ) {
+            (true, true) => Relation::Yours,
+            (true, false) => Relation::Outgoing,
+            (false, true) => Relation::Incoming,
+            (false, false) => Relation::Other,
+        }
     }
-    gh(&["api", "user", "-q", ".login"])
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Relation::Yours => "yours",
+            Relation::Outgoing => "to others",
+            Relation::Incoming => "from others",
+            Relation::Other => "other",
+        }
+    }
+}
+
+/// Your GitHub login: from gh's own config, which needs no request, or else
+/// asked. Kept, so the list can color its rows at once next time.
+pub fn viewer() -> Result<String, PrFailed> {
+    let login = match gh(&["config", "get", "user", "-h", "github.com"]) {
+        Ok(login) if !login.is_empty() => login,
+        _ => gh(&["api", "user", "-q", ".login"])?,
+    };
+    store("viewer", &login);
+    Ok(login)
+}
+
+/// The login `viewer` found last time.
+pub fn cached_viewer() -> Option<String> {
+    load("viewer").filter(|login| !login.is_empty())
 }
 
 /// One GraphQL search: much faster than `gh search prs`, which goes through REST.
-const SEARCH: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest { number title isDraft updatedAt author { login } repository { nameWithOwner } } } } }";
+const SEARCH: &str = "query($q: String!, $after: String) { search(query: $q, type: ISSUE, first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { number title isDraft updatedAt mergedAt author { login } repository { nameWithOwner } } ... on Issue { number title updatedAt closedAt stateReason author { login } repository { nameWithOwner } } } } }";
 
-/// The open pull requests one heading lists, newest first. The answer is
-/// cached, so the list shows at once next time while it's asked again.
-pub fn search(source: &Source) -> Result<Vec<Entry>, PrFailed> {
+/// How many pages of 100 a done search reads. Open searches read one.
+const DONE_PAGES: usize = 3;
+
+/// The pull requests or issues one search finds, newest first: open ones, or
+/// merged and closed ones. The answer is cached, so the list shows at once
+/// next time while it's asked again.
+pub fn search(source: &Source, status: Status) -> Result<Vec<Entry>, PrFailed> {
     if !*GH {
         return Err(PrFailed::NoGh);
     }
-    let query = source.query()?;
-    let json = gh_json(&[
-        "api",
-        "graphql",
-        "-f",
-        &format!("query={SEARCH}"),
-        "-f",
-        &format!("q={query}"),
-    ])?;
-    let nodes = json
-        .pointer("/data/search/nodes")
-        .cloned()
-        .unwrap_or(Value::Null);
-    store(&source.cache_key(), &nodes.to_string());
+    let query = source.query(status)?;
+    let pages = match status {
+        Status::Open => 1,
+        Status::Done => DONE_PAGES,
+    };
+    let mut nodes = Vec::new();
+    let mut after: Option<String> = None;
+    let mut more = false;
+    for _ in 0..pages {
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={SEARCH}"),
+            "-f".to_owned(),
+            format!("q={query}"),
+        ];
+        if let Some(cursor) = &after {
+            args.extend(["-f".to_owned(), format!("after={cursor}")]);
+        }
+        let json = gh_json(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let search = json.pointer("/data/search").cloned().unwrap_or(Value::Null);
+        nodes.extend(array(&search, "nodes").iter().cloned());
+        more = search
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        after = search
+            .pointer("/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if !more || after.is_none() {
+            break;
+        }
+    }
+    let nodes = match status {
+        Status::Done if more => complete_since(nodes),
+        _ => nodes,
+    };
+    let nodes = Value::Array(nodes);
+    store(&source.cache_key(status), &nodes.to_string());
     Ok(parse_search(&nodes))
 }
 
+/// A done search cut off, by most recently updated, keeps only the rows that
+/// ended after the last row read was updated. A row can't end after its last
+/// update, so every row that ended after then was read, and the list has no
+/// gaps by end time; an older row could have a newer one missing above it.
+fn complete_since(nodes: Vec<Value>) -> Vec<Value> {
+    let Some(cutoff) = nodes
+        .iter()
+        .filter_map(|node| seconds(node.get("updatedAt")?.as_str()?))
+        .min()
+    else {
+        return nodes;
+    };
+    nodes
+        .into_iter()
+        .filter(|node| {
+            ended(node)
+                .and_then(|ended| seconds(&ended.at))
+                .is_none_or(|at| at >= cutoff)
+        })
+        .collect()
+}
+
 /// What `search` found last time, if it has run before.
-pub fn cached_search(source: &Source) -> Option<Vec<Entry>> {
-    let nodes: Value = serde_json::from_str(&load(&source.cache_key())?).ok()?;
+pub fn cached_search(source: &Source, status: Status) -> Option<Vec<Entry>> {
+    let nodes: Value = serde_json::from_str(&load(&source.cache_key(status))?).ok()?;
     Some(parse_search(&nodes))
 }
 
-/// Keeps each pull request under the first heading it appears in, newest first.
-pub fn dedupe(groups: Vec<Group>) -> Vec<Group> {
-    let mut seen = std::collections::HashSet::new();
-    groups
-        .into_iter()
-        .map(|mut group| {
-            group.entries.retain(|entry| seen.insert(entry.pr.clone()));
-            group
-                .entries
-                .sort_by_key(|entry| std::cmp::Reverse(seconds(&entry.updated)));
-            group
-        })
-        .collect()
+/// One list from several searches: each row once, newest first. When two
+/// searches cached the same row, the fresher copy wins.
+pub fn merge(lists: impl IntoIterator<Item = Vec<Entry>>) -> Vec<Entry> {
+    let mut by_ref: std::collections::HashMap<PrRef, Entry> = std::collections::HashMap::new();
+    for entry in lists.into_iter().flatten() {
+        let fresher = match by_ref.get(&entry.pr) {
+            Some(kept) => seconds(&entry.updated) > seconds(&kept.updated),
+            None => true,
+        };
+        if fresher {
+            by_ref.insert(entry.pr.clone(), entry);
+        }
+    }
+    let mut out: Vec<Entry> = by_ref.into_values().collect();
+    // Rows updated at the same second keep a fixed order, so the picked row
+    // doesn't jump between redraws.
+    // Done rows go by when they ended, open ones by when they last changed.
+    out.sort_by(|a, b| {
+        seconds(b.when())
+            .cmp(&seconds(a.when()))
+            .then_with(|| a.pr.repo.cmp(&b.pr.repo))
+            .then_with(|| b.pr.number.cmp(&a.pr.number))
+    });
+    out
 }
 
 fn text(value: &Value, key: &str) -> String {
@@ -640,7 +910,30 @@ fn entry(item: &Value, repo: String) -> Entry {
             .get("isDraft")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        ended: ended(item),
     }
+}
+
+/// A merged pull request's or closed issue's ending, read from the search
+/// answer; `None` for an open one, or an answer cached before leaf asked.
+fn ended(item: &Value) -> Option<Ended> {
+    let at = |key| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .filter(|at| !at.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(at) = at("mergedAt") {
+        return Some(Ended {
+            how: Ending::Merged,
+            at,
+        });
+    }
+    let how = match item.get("stateReason").and_then(Value::as_str) {
+        Some("NOT_PLANNED") => Ending::NotPlanned,
+        _ => Ending::Completed,
+    };
+    at("closedAt").map(|at| Ended { how, at })
 }
 
 fn parse_search(json: &Value) -> Vec<Entry> {
@@ -708,12 +1001,117 @@ fn view_key(pr: &PrRef) -> String {
     format!("view-{}-{}", pr.repo, pr.number)
 }
 
-/// Reads a pull request in full: its page, the repository's merge settings,
-/// and the comments left on lines of the diff, all at once.
-pub fn view(pr: &PrRef) -> Result<Detail, PrFailed> {
+/// Reads a pull request or an issue in full.
+pub fn view(pr: &PrRef, kind: Kind) -> Result<Detail, PrFailed> {
     if !*GH {
         return Err(PrFailed::NoGh);
     }
+    match kind {
+        Kind::Pull => view_pull(pr),
+        Kind::Issue => view_issue(pr),
+    }
+}
+
+/// The page or issue as `view` read it last time, if it has been read before.
+pub fn cached_view(pr: &PrRef, kind: Kind) -> Option<Detail> {
+    match kind {
+        Kind::Pull => {
+            let saved: Value = serde_json::from_str(&load(&view_key(pr))?).ok()?;
+            Some(parse_saved(pr.clone(), &saved))
+        }
+        Kind::Issue => {
+            let page: Value = serde_json::from_str(&load(&issue_key(pr))?).ok()?;
+            Some(parse_issue(pr.clone(), &page))
+        }
+    }
+}
+
+const ISSUE_FIELDS: &str = "number,title,body,state,stateReason,author,createdAt,updatedAt,closedAt,labels,assignees,comments";
+
+fn issue_key(pr: &PrRef) -> String {
+    format!("issue-{}-{}", pr.repo, pr.number)
+}
+
+/// Reads an issue: its page and comments, and the rendered body for its uploads.
+fn view_issue(issue: &PrRef) -> Result<Detail, PrFailed> {
+    let rendered = {
+        let path = format!("repos/{}/issues/{}", issue.repo, issue.number);
+        std::thread::spawn(move || {
+            gh(&[
+                "api",
+                &path,
+                "-H",
+                "Accept: application/vnd.github.full+json",
+                "--jq",
+                ".body_html",
+            ])
+        })
+    };
+    let number = issue.number.to_string();
+    let page = gh_json(&[
+        "issue",
+        "view",
+        &number,
+        "-R",
+        &issue.repo,
+        "--json",
+        ISSUE_FIELDS,
+    ])?;
+    store(&issue_key(issue), &page.to_string());
+    let mut detail = parse_issue(issue.clone(), &page);
+    if let Some(html) = rendered.join().ok().and_then(Result::ok) {
+        detail.media = crate::prmedia::signed_links(&html);
+    }
+    Ok(detail)
+}
+
+fn parse_issue(issue: PrRef, page: &Value) -> Detail {
+    let state = match (
+        text(page, "state").as_str(),
+        text(page, "stateReason").as_str(),
+    ) {
+        ("CLOSED", "NOT_PLANNED") => State::NotPlanned,
+        ("CLOSED", _) => State::Completed,
+        _ => State::Open,
+    };
+    let names = |key: &str, field: &str| -> Vec<String> {
+        array(page, key)
+            .iter()
+            .map(|item| text(item, field))
+            .filter(|name| !name.is_empty())
+            .collect()
+    };
+    let author = login(page, "author");
+    let created = text(page, "createdAt");
+    Detail {
+        kind: Kind::Issue,
+        assignees: names("assignees", "login"),
+        title: text(page, "title"),
+        body: text(page, "body"),
+        state,
+        updated: text(page, "updatedAt"),
+        base: String::new(),
+        head: String::new(),
+        head_sha: String::new(),
+        additions: 0,
+        deletions: 0,
+        labels: names("labels", "name"),
+        reviewers: Vec::new(),
+        checks: Vec::new(),
+        mergeability: Mergeability::Unknown,
+        methods: Vec::new(),
+        // GitHub decides who may close or reopen; leaf lets it refuse.
+        can_write: true,
+        media: std::collections::HashMap::new(),
+        timeline: timeline(page, &Value::Null, &author, &created, state),
+        author,
+        pr: issue,
+    }
+}
+
+/// Reads a pull request in full: its page, the repository's merge settings,
+/// and the comments left on lines of the diff, all at once.
+fn view_pull(pr: &PrRef) -> Result<Detail, PrFailed> {
     let settings = {
         let repo = pr.repo.clone();
         std::thread::spawn(move || {
@@ -792,12 +1190,6 @@ pub fn fetch_patch(pr: &PrRef, head: &str) -> Result<String, String> {
     Ok(fetched.patch)
 }
 
-/// The pull request as `view` read it last time, if it has been read before.
-pub fn cached_view(pr: &PrRef) -> Option<Detail> {
-    let saved: Value = serde_json::from_str(&load(&view_key(pr))?).ok()?;
-    Some(parse_saved(pr.clone(), &saved))
-}
-
 fn parse_saved(pr: PrRef, saved: &Value) -> Detail {
     let settings = saved.get("settings").filter(|s| !s.is_null());
     parse_detail(
@@ -864,6 +1256,8 @@ fn parse_detail(pr: PrRef, page: &Value, settings: Option<&Value>, inline: &Valu
     let author = login(page, "author");
     let created = text(page, "createdAt");
     Detail {
+        kind: Kind::Pull,
+        assignees: Vec::new(),
         title: text(page, "title"),
         body: text(page, "body"),
         state,
@@ -992,7 +1386,7 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
             actor: String::new(),
             kind: EventKind::Merged,
         }),
-        State::Closed => events.push(Event {
+        State::Closed | State::Completed | State::NotPlanned => events.push(Event {
             at: text(page, "closedAt"),
             actor: String::new(),
             kind: EventKind::Closed,
@@ -1022,9 +1416,9 @@ pub fn visible(body: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Does `action` to the pull request and says what was done.
-pub fn perform(pr: &PrRef, action: &Action) -> Result<String, PrFailed> {
-    let args = action.args(pr);
+/// Does `action` to the pull request or issue and says what was done.
+pub fn perform(pr: &PrRef, kind: Kind, action: &Action) -> Result<String, PrFailed> {
+    let args = action.args(pr, kind);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     gh(&refs)?;
     Ok(action.done(pr))
@@ -1034,6 +1428,12 @@ pub fn perform(pr: &PrRef, action: &Action) -> Result<String, PrFailed> {
 pub fn open_in_browser(pr: &PrRef) -> Result<(), PrFailed> {
     let number = pr.number.to_string();
     gh(&["pr", "view", &number, "-R", &pr.repo, "--web"]).map(|_| ())
+}
+
+/// Opens an issue's page in the browser.
+pub fn open_issue(issue: &PrRef) -> Result<(), PrFailed> {
+    let number = issue.number.to_string();
+    gh(&["issue", "view", &number, "-R", &issue.repo, "--web"]).map(|_| ())
 }
 
 /// Seconds since 1970 for an ISO 8601 UTC time such as `2026-11-12T04:29:54Z`.
@@ -1135,25 +1535,95 @@ mod tests {
                     branch: "fix/q".into()
                 },
                 Source::Repo("o/r".into()),
-                Source::Yours,
+                Source::Authored(Kind::Pull),
                 Source::Reviewing,
-                Source::Owned,
+                Source::Owned(Kind::Pull),
+                Source::Authored(Kind::Issue),
+                Source::Owned(Kind::Issue),
             ]
         );
         assert_eq!(
             sources(Some("o/r"), Some("main"))[0],
             Source::Repo("o/r".into())
         );
-        assert_eq!(sources(None, Some("fix/q"))[0], Source::Yours);
+        assert_eq!(
+            sources(None, Some("fix/q"))[0],
+            Source::Authored(Kind::Pull)
+        );
+        assert_eq!(
+            Source::Authored(Kind::Issue).query(Status::Open).unwrap(),
+            "is:issue is:open archived:false author:@me sort:updated-desc"
+        );
         assert_eq!(
             Source::Branch {
                 repo: "o/r".into(),
                 branch: "fix/q".into()
             }
-            .query()
+            .query(Status::Open)
             .unwrap(),
-            "is:pr is:open archived:false repo:o/r head:fix/q"
+            "is:pr is:open archived:false repo:o/r head:fix/q sort:updated-desc"
         );
+    }
+
+    #[test]
+    fn done_searches_ask_for_merged_and_closed_rows() {
+        assert_eq!(
+            Source::Authored(Kind::Pull).query(Status::Done).unwrap(),
+            "is:pr is:merged archived:false author:@me sort:updated-desc"
+        );
+        assert_eq!(
+            Source::Authored(Kind::Issue).query(Status::Done).unwrap(),
+            "is:issue is:closed archived:false author:@me sort:updated-desc"
+        );
+        assert_eq!(
+            Source::Reviewing.query(Status::Done).unwrap(),
+            "is:pr is:merged archived:false reviewed-by:@me sort:updated-desc"
+        );
+        assert_ne!(
+            Source::Reviewing.cache_key(Status::Open),
+            Source::Reviewing.cache_key(Status::Done)
+        );
+    }
+
+    #[test]
+    fn a_cut_off_done_search_keeps_only_rows_with_nothing_missing_above() {
+        let node = |number: u64, updated: &str, merged: &str| serde_json::json!({"number": number, "updatedAt": updated, "mergedAt": merged});
+        let kept = complete_since(vec![
+            node(1, "2026-11-10T00:00:00Z", "2026-11-09T00:00:00Z"),
+            // Updated lately, merged long ago: a row merged between the two
+            // could have been cut off, so this one goes.
+            node(2, "2026-11-08T00:00:00Z", "2026-01-01T00:00:00Z"),
+            node(3, "2026-11-05T00:00:00Z", "2026-11-05T00:00:00Z"),
+        ]);
+        let numbers: Vec<u64> = kept
+            .iter()
+            .filter_map(|n| n.get("number")?.as_u64())
+            .collect();
+        assert_eq!(numbers, [1, 3]);
+    }
+
+    #[test]
+    fn done_rows_carry_how_and_when_they_ended_and_sort_by_it() {
+        let nodes = serde_json::json!([
+            {"number": 1, "title": "a", "updatedAt": "2026-11-10T00:00:00Z",
+             "mergedAt": "2026-11-01T00:00:00Z", "author": {"login": "me"},
+             "repository": {"nameWithOwner": "o/r"}},
+            {"number": 2, "title": "b", "updatedAt": "2026-11-02T00:00:00Z",
+             "closedAt": "2026-11-02T00:00:00Z", "stateReason": "NOT_PLANNED",
+             "author": {"login": "me"}, "repository": {"nameWithOwner": "o/r"}},
+            {"number": 3, "title": "c", "updatedAt": "2026-11-03T00:00:00Z",
+             "author": {"login": "me"}, "repository": {"nameWithOwner": "o/r"}}
+        ]);
+        let rows = parse_search(&nodes);
+        assert_eq!(rows[0].ended.as_ref().map(|e| e.how), Some(Ending::Merged));
+        assert_eq!(
+            rows[1].ended.as_ref().map(|e| e.how),
+            Some(Ending::NotPlanned)
+        );
+        assert_eq!(rows[2].ended, None);
+        // #1 changed last but merged first, so it goes last.
+        let order: Vec<u64> = merge([rows]).iter().map(|e| e.pr.number).collect();
+        assert_eq!(order, [3, 2, 1]);
     }
 
     #[test]
@@ -1317,20 +1787,80 @@ mod tests {
             author: String::new(),
             updated: updated.into(),
             draft: false,
+            ended: None,
         };
-        let groups = dedupe(vec![
-            Group {
-                title: "Yours".into(),
-                entries: vec![e(1, "2026-01-01T00:00:00Z"), e(2, "2026-02-01T00:00:00Z")],
-            },
-            Group {
-                title: "Review".into(),
-                entries: vec![e(2, "2026-02-01T00:00:00Z"), e(3, "2026-03-01T00:00:00Z")],
-            },
+        let merged = merge([
+            vec![e(1, "2026-01-01T00:00:00Z"), e(2, "2026-02-01T00:00:00Z")],
+            vec![e(2, "2026-02-01T00:00:00Z"), e(3, "2026-03-01T00:00:00Z")],
         ]);
-        let numbers = |g: &Group| g.entries.iter().map(|e| e.pr.number).collect::<Vec<_>>();
-        assert_eq!(numbers(&groups[0]), [2, 1]);
-        assert_eq!(numbers(&groups[1]), [3]);
+        let numbers: Vec<_> = merged.iter().map(|e| e.pr.number).collect();
+        assert_eq!(numbers, [3, 2, 1]);
+    }
+
+    #[test]
+    fn the_fresher_copy_of_a_row_wins() {
+        let e = |title: &str, updated: &str| Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number: 7,
+            },
+            title: title.into(),
+            author: String::new(),
+            updated: updated.into(),
+            draft: false,
+            ended: None,
+        };
+        let merged = merge([
+            vec![e("old", "2026-01-01T00:00:00Z")],
+            vec![e("new", "2026-02-01T00:00:00Z")],
+            vec![e("older", "2025-12-01T00:00:00Z")],
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].title, "new");
+    }
+
+    #[test]
+    fn rows_updated_together_keep_a_fixed_order() {
+        let e = |repo: &str, number| Entry {
+            pr: PrRef {
+                repo: repo.into(),
+                number,
+            },
+            title: String::new(),
+            author: String::new(),
+            updated: "2026-01-01T00:00:00Z".into(),
+            draft: false,
+            ended: None,
+        };
+        let rows = |lists: Vec<Vec<Entry>>| -> Vec<(String, u64)> {
+            merge(lists)
+                .into_iter()
+                .map(|e| (e.pr.repo, e.pr.number))
+                .collect()
+        };
+        let one = rows(vec![vec![e("b/r", 1), e("a/r", 2), e("a/r", 5)]]);
+        let other = rows(vec![vec![e("a/r", 5)], vec![e("a/r", 2), e("b/r", 1)]]);
+        assert_eq!(one, other);
+        assert_eq!(one[0], ("a/r".to_owned(), 5));
+    }
+
+    #[test]
+    fn rows_are_colored_by_whose_they_are_and_where() {
+        let e = |repo: &str, author: &str| Entry {
+            pr: PrRef {
+                repo: repo.into(),
+                number: 1,
+            },
+            title: String::new(),
+            author: author.into(),
+            updated: String::new(),
+            draft: false,
+            ended: None,
+        };
+        assert_eq!(Relation::of(&e("Me/leaf", "me"), "me"), Relation::Yours);
+        assert_eq!(Relation::of(&e("o/r", "me"), "me"), Relation::Outgoing);
+        assert_eq!(Relation::of(&e("me/leaf", "ann"), "me"), Relation::Incoming);
+        assert_eq!(Relation::of(&e("o/r", "ann"), "me"), Relation::Other);
     }
 
     #[test]
@@ -1340,16 +1870,69 @@ mod tests {
             number: 7,
         };
         assert_eq!(
-            Action::Merge(MergeMethod::Squash).args(&pr),
+            Action::Merge(MergeMethod::Squash).args(&pr, Kind::Pull),
             ["pr", "merge", "7", "-R", "o/r", "--squash"]
         );
         assert_eq!(
-            Action::Draft.args(&pr),
+            Action::Draft.args(&pr, Kind::Pull),
             ["pr", "ready", "7", "-R", "o/r", "--undo"]
         );
         assert_eq!(
-            Action::Comment("hi".into()).args(&pr),
+            Action::Comment("hi".into()).args(&pr, Kind::Pull),
             ["pr", "comment", "7", "-R", "o/r", "--body", "hi"]
+        );
+        assert_eq!(
+            Action::CloseAs(CloseReason::NotPlanned).args(&pr, Kind::Issue),
+            [
+                "issue",
+                "close",
+                "7",
+                "-R",
+                "o/r",
+                "--reason",
+                "not planned"
+            ]
+        );
+        assert_eq!(
+            Action::Reopen.args(&pr, Kind::Issue),
+            ["issue", "reopen", "7", "-R", "o/r"]
+        );
+    }
+
+    #[test]
+    fn an_issue_reads_its_state_reason_and_comments() {
+        let issue = PrRef {
+            repo: "o/r".into(),
+            number: 3,
+        };
+        let detail = parse_issue(
+            issue,
+            &json!({
+                "title": "Crash on open",
+                "state": "CLOSED",
+                "stateReason": "NOT_PLANNED",
+                "author": {"login": "ann"},
+                "createdAt": "2026-11-01T00:00:00Z",
+                "closedAt": "2026-11-03T00:00:00Z",
+                "assignees": [{"login": "me"}],
+                "labels": [{"name": "bug"}],
+                "comments": [{"author": {"login": "me"}, "body": "Can't reproduce", "createdAt": "2026-11-02T00:00:00Z"}]
+            }),
+        );
+        assert_eq!(detail.kind, Kind::Issue);
+        assert_eq!(detail.state, State::NotPlanned);
+        assert_eq!(detail.assignees, ["me"]);
+        assert_eq!(detail.labels, ["bug"]);
+        let kinds: Vec<_> = detail.timeline.iter().map(|e| &e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EventKind::Opened,
+                &EventKind::Comment {
+                    body: "Can't reproduce".into()
+                },
+                &EventKind::Closed
+            ]
         );
     }
 }
