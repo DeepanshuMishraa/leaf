@@ -323,8 +323,9 @@ pub struct ViewerOptions {
     pub speech: Backend,
     /// Path or URL this document was opened from, when leaf knows it.
     pub source: Option<String>,
-    /// A markdown file to read again whenever it changes.
-    pub watch: Option<std::path::PathBuf>,
+    /// A markdown file to read again whenever it changes, with its stamp from
+    /// before it was first read.
+    pub watch: Option<(std::path::PathBuf, Option<Stamp>)>,
 }
 
 impl Default for ViewerOptions {
@@ -355,13 +356,18 @@ impl Default for ViewerOptions {
 
 struct Watch {
     path: std::path::PathBuf,
-    loaded: Option<std::time::SystemTime>,
-    seen: Option<std::time::SystemTime>,
+    loaded: Option<Stamp>,
+    seen: Option<Stamp>,
     checked: Instant,
 }
 
-fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// A file's modification time and size. The size catches edits that land
+/// within one tick of a coarse clock, such as FAT's two seconds.
+pub type Stamp = (std::time::SystemTime, u64);
+
+pub fn stamp(path: &std::path::Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 pub struct App {
@@ -498,14 +504,11 @@ impl App {
                 stroke: stroke.clone(),
             })
             .collect();
-        let watch = options.watch.take().map(|path| {
-            let loaded = modified(&path);
-            Watch {
-                path,
-                loaded,
-                seen: loaded,
-                checked: Instant::now(),
-            }
+        let watch = options.watch.take().map(|(path, loaded)| Watch {
+            path,
+            loaded,
+            seen: loaded,
+            checked: Instant::now(),
         });
         let narrator = Narrator::new(
             options.voice.clone(),
@@ -572,16 +575,20 @@ impl App {
             return false;
         }
         watch.checked = Instant::now();
-        let now = modified(&watch.path);
+        let now = stamp(&watch.path);
         let settled = now == watch.seen;
         watch.seen = now;
         if !settled || now.is_none() || now == watch.loaded {
             return false;
         }
-        watch.loaded = now;
         let Ok(doc) = crate::markdown::open(&watch.path) else {
             return false;
         };
+        watch.loaded = now;
+        if self.narrator.active() {
+            self.narrator.stop();
+            self.notice = Some("the file changed, so reading aloud stopped".into());
+        }
         self.hold_anchor();
         self.doc = doc;
         self.laid.clear();

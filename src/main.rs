@@ -517,6 +517,7 @@ fn agents_command() -> ExitCode {
 
 fn open(target: &str) -> ExitCode {
     std::thread::spawn(syntax::warm);
+    let stamp = viewer::stamp(Path::new(target));
     let doc = match load(target) {
         Ok(doc) => doc,
         Err(message) => {
@@ -528,7 +529,7 @@ fn open(target: &str) -> ExitCode {
     let mut options = resume(target, doc.page_count, &failure);
     let lower = target.to_ascii_lowercase();
     if !is_url(target) && (lower.ends_with(".md") || lower.ends_with(".markdown")) {
-        options.watch = Some(PathBuf::from(target));
+        options.watch = Some((PathBuf::from(target), stamp));
     }
     let result = viewer::run(doc, options);
     if let Some(message) = failure.borrow().as_ref() {
