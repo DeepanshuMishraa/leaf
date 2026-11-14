@@ -1058,7 +1058,7 @@ fn animation(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Animation> {
 /// A picture's pixels: any format the image crate reads, or an SVG drawn at
 /// its own size.
 pub(crate) fn decode(bytes: &[u8]) -> Option<RgbaImage> {
-    if let Ok(image) = image::load_from_memory(bytes) {
+    if let Some(image) = oriented(bytes) {
         return Some(image.to_rgba8());
     }
     let options = usvg::Options {
@@ -1081,6 +1081,23 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<RgbaImage> {
         [c.red(), c.green(), c.blue(), c.alpha()]
     });
     RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixels.collect())
+}
+
+/// A raster image turned upright: a photo's EXIF orientation is a separate
+/// step the decoder leaves to the caller.
+fn oriented(bytes: &[u8]) -> Option<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder.orientation().ok();
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    if let Some(orientation) = orientation {
+        image.apply_orientation(orientation);
+    }
+    Some(image)
 }
 
 /// A frame from early in the video, taken with ffmpeg when it's installed.

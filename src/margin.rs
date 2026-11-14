@@ -344,26 +344,32 @@ pub fn review_command(args: &[String]) -> ExitCode {
 /// File and global notes for the diff `key`, kept like a plan's notes. A store
 /// failure is left in `failure`, which the diff screen reports on leaving.
 pub fn diff_margin(key: &str, failure: Rc<RefCell<Option<String>>>) -> Margin {
-    let (draft, save, failed) = drafts(&format!("diff:{key}"));
-    if let Some(message) = failed.borrow().clone() {
-        *failure.borrow_mut() = Some(message);
-    }
-    // Later save failures surface the same way.
-    let save: SaveNotes = {
-        let mut inner = save;
-        Box::new(move |json| {
-            inner(json);
-            if let Some(message) = failed.borrow().clone() {
-                *failure.borrow_mut() = Some(message);
-            }
-        })
-    };
+    let (draft, save) = diff_notes(key, &failure);
     Margin {
         draft,
         save,
         sends: Sends::Agent,
         overview_first: false,
+        reopen: Some(Box::new(move |key| diff_notes(key, &failure))),
     }
+}
+
+/// The draft and saver for the diff `key`'s notes.
+fn diff_notes(key: &str, failure: &Rc<RefCell<Option<String>>>) -> (Option<String>, SaveNotes) {
+    let (draft, save, failed) = drafts(&format!("diff:{key}"));
+    if let Some(message) = failed.borrow().clone() {
+        *failure.borrow_mut() = Some(message);
+    }
+    // Later save failures surface the same way.
+    let failure = failure.clone();
+    let mut inner = save;
+    let save: SaveNotes = Box::new(move |json| {
+        inner(json);
+        if let Some(message) = failed.borrow().clone() {
+            *failure.borrow_mut() = Some(message);
+        }
+    });
+    (draft, save)
 }
 
 /// A plan's path as the person would write it: from this folder when it's
@@ -408,9 +414,11 @@ pub enum Opened {
     Waited(Outcome),
 }
 
-/// Opens `leaf <args>` in a Rex pane beside the agent that ran this. Without
-/// `wait`, the pane sends the review to that agent itself; with it, the pane
-/// writes a result file that this process waits for and reads.
+/// Opens `leaf <args>` in a Rex pane beside the agent that ran this. With
+/// `wait` or `--print`, the pane writes a result file that this process waits
+/// for and reads (then copies to a `--result` file, when one was named).
+/// Otherwise this returns at once: the pane writes a `--result` file itself,
+/// or sends the review to the agent.
 pub fn beside(
     args: &[String],
     wait: bool,
@@ -427,14 +435,17 @@ pub fn beside(
         .unwrap_or_else(|_| "leaf".into());
     let (verb, rest) = args.split_first().ok_or_else(nowhere)?;
     let mut argv = vec![exe, verb.clone()];
-    // `--wait` and `--print` both need the outcome back in this process;
-    // `--result` names where it goes.
-    let result = match reply {
-        Reply::Result(path) => Some(path.clone()),
-        _ if wait || matches!(reply, Reply::Print) => Some(result_path()),
-        _ => None,
+    // `--wait` and `--print` both need the outcome back in this process, so
+    // the pane writes it to a file of leaf's own that this process awaits and
+    // then removes. A caller's `--result` file is never awaited or removed:
+    // without `--wait` the pane writes it, and with it this process copies the
+    // outcome there once it has it.
+    let awaited = (wait || matches!(reply, Reply::Print)).then(result_path);
+    let forwarded = match reply {
+        Reply::Result(path) if awaited.is_none() => Some(path.clone()),
+        _ => awaited.clone(),
     };
-    match (&result, &asking, reply) {
+    match (&forwarded, &asking, reply) {
         (Some(path), _, _) => argv.extend(["--result".into(), path.display().to_string()]),
         (None, _, Reply::Agent(Some(block))) => {
             argv.extend(["--reply-to".into(), block.clone()]);
@@ -449,10 +460,17 @@ pub fn beside(
     let pane = host
         .split_beside(asking.as_deref(), &dir, "review", &argv)
         .map_err(MarginFailed::Split)?;
-    match result {
-        None => Ok(Opened::Returned),
-        Some(path) => Ok(Opened::Waited(wait_for(&host, &path, &pane))),
+    let Some(path) = awaited else {
+        return Ok(Opened::Returned);
+    };
+    let outcome = wait_for(&host, &path, &pane);
+    if let Reply::Result(target) = reply {
+        write_result(target, &outcome).map_err(|cause| MarginFailed::WriteResult {
+            path: target.display().to_string(),
+            cause,
+        })?;
     }
+    Ok(Opened::Waited(outcome))
 }
 
 fn margin_dir() -> PathBuf {
@@ -624,6 +642,11 @@ pub fn finish(outcome: &Outcome, reply: &Reply) -> ExitCode {
                         "leaf: the review was closed without a verdict; told {}.",
                         found.describe()
                     ),
+                    // No agent was named, so there may be none to tell: a
+                    // person closing the screen in a plain terminal.
+                    Err(_) if pane.is_none() => {
+                        eprintln!("leaf: the review was closed without a verdict.")
+                    }
                     Err(e) => eprintln!("leaf: {e}"),
                 }
                 return ExitCode::SUCCESS;

@@ -236,23 +236,49 @@ fn plain(line: &str) -> String {
 }
 
 /// `[label](target)` becomes `label`, so a quote copied from the rendered
-/// plan matches the link syntax in its source.
+/// plan matches the link syntax in its source. Inline code renders as
+/// written, so link syntax inside it stays; and a `[` opens a link only when
+/// its `](` comes before any other `[`.
 fn links(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find('[') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        let Some(close) = after.find("](") else {
-            out.push_str(&rest[open..]);
-            return out;
-        };
-        let Some(end) = after[close + 2..].find(')') else {
-            out.push_str(&rest[open..]);
-            return out;
-        };
-        out.push_str(&after[..close]);
-        rest = &after[close + 2 + end + 1..];
+    while let Some(at) = rest.find(['[', '`']) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        if tail.starts_with('`') {
+            let ticks = tail.chars().take_while(|&c| c == '`').count();
+            let fence = &tail[..ticks];
+            match tail[ticks..].find(fence) {
+                Some(end) => {
+                    let span = ticks + end + ticks;
+                    out.push_str(&tail[..span]);
+                    rest = &tail[span..];
+                }
+                None => {
+                    out.push_str(fence);
+                    rest = &tail[ticks..];
+                }
+            }
+            continue;
+        }
+        let after = &tail[1..];
+        let link = after
+            .find("](")
+            .filter(|&close| !after[..close].contains(['[', '`']))
+            .and_then(|close| {
+                let end = after[close + 2..].find(')')?;
+                Some((close, close + 2 + end + 1))
+            });
+        match link {
+            Some((close, next)) => {
+                out.push_str(&after[..close]);
+                rest = &after[next..];
+            }
+            None => {
+                out.push('[');
+                rest = after;
+            }
+        }
     }
     out.push_str(rest);
     out
@@ -394,6 +420,22 @@ Loose closing paragraph.
         assert_eq!(locate(PLAN, "move sessions"), Some((7, 7)));
         assert_eq!(locate(PLAN, "nowhere in the plan"), None);
         assert_eq!(locate(PLAN, "  \n "), None);
+    }
+
+    #[test]
+    fn link_syntax_is_unwrapped_only_where_it_renders_as_a_link() {
+        assert_eq!(
+            links("Use [1] and see [docs](https://x)"),
+            "Use [1] and see docs"
+        );
+        assert_eq!(
+            links("Write `[a](b)` for [a link](c)"),
+            "Write `[a](b)` for a link"
+        );
+        // Quoting the second line's link text must not land on the code
+        // example above it.
+        let source = "Write `[a](b)` here\nWrite a here";
+        assert_eq!(locate(source, "Write a here"), Some((2, 2)));
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::agent;
 use crate::art;
 use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
-use crate::diffreview::{self, FileNotes, Margin, SaveNotes, Sends};
+use crate::diffreview::{self, FileNotes, Margin, Reopen, SaveNotes, Sends};
 use crate::github;
 use crate::look::Look;
 use crate::news::News;
@@ -556,6 +556,7 @@ struct App {
     /// File and global notes and viewed marks.
     notes: FileNotes,
     save_notes: SaveNotes,
+    reopen_notes: Option<Reopen>,
     sends: Sends,
     /// The overview of every file, with the row picked: 0 is the global
     /// note, then one row per file. `None` while reading a file.
@@ -629,6 +630,7 @@ impl App {
                 .map(FileNotes::from_json)
                 .unwrap_or_default(),
             save_notes: options.margin.save,
+            reopen_notes: options.margin.reopen,
             sends: options.margin.sends,
             overview: None,
             note_editor: None,
@@ -639,6 +641,7 @@ impl App {
             app.overview = Some(1);
         }
         app.rebuild_marks();
+        app.follow_renames();
         app
     }
 
@@ -774,7 +777,9 @@ impl App {
                     self.split = Split::new(&self.loaded.diff, self.layout);
                     if !same_key {
                         self.load_comments();
+                        self.load_notes();
                     }
+                    self.follow_renames();
                     self.cursor = remember
                         .and_then(|(file, side, line)| self.loaded.diff.row_for(&file, side, line))
                         .and_then(|row| self.split.line_for_row(row))
@@ -829,6 +834,21 @@ impl App {
             None => Vec::new(),
         };
         self.rebuild_marks();
+    }
+
+    /// The file and global notes kept for the current key, which also become
+    /// where later changes are saved.
+    fn load_notes(&mut self) {
+        let Some(reopen) = self.reopen_notes.as_mut() else {
+            return;
+        };
+        let (draft, save) = reopen(&self.key);
+        self.notes = draft
+            .as_deref()
+            .map(FileNotes::from_json)
+            .unwrap_or_default();
+        self.save_notes = save;
+        self.note_editor = None;
     }
 
     fn store_failure(&mut self, error: StoreFailed) {
@@ -3255,6 +3275,13 @@ impl App {
         (self.save_notes)(json.as_deref());
     }
 
+    /// Keeps file notes under the paths the diff shows now.
+    fn follow_renames(&mut self) {
+        if self.notes.follow_renames(&self.loaded.diff) {
+            self.persist_notes();
+        }
+    }
+
     /// `q` reviewing with notes unsent asks for a second `q`, so they aren't
     /// left behind by accident. They're kept either way.
     fn ask_quit(&mut self) {
@@ -3589,8 +3616,7 @@ impl App {
             let row = index + 1;
             let viewed = self.notes.is_viewed(diff, index);
             let old = file.old_path.as_deref().filter(|old| *old != file.path());
-            let has_note = self.notes.files.contains_key(file.path())
-                || old.is_some_and(|old| self.notes.files.contains_key(old));
+            let has_note = self.notes.files.contains_key(file.path());
             let comments = self.draft_comments_in(file.path())
                 + old.map_or(0, |old| self.draft_comments_in(old));
             let notes = comments + usize::from(has_note);
@@ -4387,6 +4413,92 @@ diff --git a/x b/x
         assert_eq!(app.current_file(), Some(1));
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.overview, Some(2));
+    }
+
+    #[test]
+    fn pasting_goes_into_the_note_editor() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        app.paste("one\r\ntwo");
+        assert_eq!(
+            app.note_editor.as_ref().map(|e| e.text.as_str()),
+            Some("one\ntwo")
+        );
+    }
+
+    #[test]
+    fn alt_backspace_over_a_wide_space_keeps_the_text_whole() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        app.paste("foo\u{3000}bar");
+        app.key(KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(
+            app.note_editor.as_ref().map(|e| e.text.as_str()),
+            Some("foo\u{3000}")
+        );
+    }
+
+    #[test]
+    fn the_note_editor_fits_a_short_area() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        type_text(
+            &mut app,
+            "a note long enough to wrap onto several rows of text",
+        );
+        for height in [1, 2, 3, 4] {
+            let mut terminal = Terminal::new(TestBackend::new(30, height)).expect("test terminal");
+            terminal
+                .draw(|f| app.draw_note_editor(f, f.area()))
+                .expect("draws");
+        }
+    }
+
+    #[test]
+    fn a_note_on_a_renamed_files_old_path_moves_to_its_new_one() {
+        let renamed = "\
+diff --git a/old.rs b/new.rs
+similarity index 90%
+rename from old.rs
+rename to new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -1,1 +1,1 @@
+-old
++new
+";
+        let saved = Rc::new(RefCell::new(None));
+        let sink = saved.clone();
+        let mut app = App::new(
+            loaded(renamed),
+            Options {
+                margin: Margin {
+                    draft: Some(r#"{"files":{"old.rs":"keep this"}}"#.into()),
+                    save: Box::new(move |json| *sink.borrow_mut() = json.map(str::to_owned)),
+                    sends: Sends::Return,
+                    overview_first: true,
+                    ..Margin::default()
+                },
+                ..Options::default()
+            },
+        );
+        assert_eq!(
+            app.notes.files.get("new.rs").map(String::as_str),
+            Some("keep this")
+        );
+        assert!(
+            saved
+                .borrow()
+                .as_deref()
+                .is_some_and(|s| s.contains("new.rs"))
+        );
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.notes.files.is_empty());
     }
 
     #[test]

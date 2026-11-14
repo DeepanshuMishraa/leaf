@@ -24,7 +24,7 @@ _leaf() {
   commands=(
     'open:Read a PDF, markdown file or web page'
     'diff:Review a diff'
-    'pr:Your pull requests and issues'
+    'pr:Pull requests and issues that concern you'
     'plan:Review a plan block by block and send a verdict'
     'review:Review changes file by file and send a verdict'
     'skills:Install the leaf skills for coding agents'
@@ -50,7 +50,10 @@ _leaf() {
 
   case $subcommand in
     open)
-      _arguments '*:document:_files -g "(#i)*.(pdf|epub|md|markdown|png|jpg|jpeg|jpe|jfif|gif|webp|bmp|ico|tif|tiff|tga|pnm|pbm|pgm|ppm|pam|qoi|hdr|exr|dds|ff|svg|jxl|heic|heif|avif)"'
+      # HEIC, HEIF, AVIF and JPEG XL need macOS's sips.
+      local pictures='png|jpg|jpeg|jpe|jfif|gif|webp|bmp|ico|tif|tiff|tga|pnm|pbm|pgm|ppm|pam|qoi|hdr|exr|dds|ff|svg'
+      [[ $OSTYPE == darwin* ]] && pictures+='|jxl|heic|heif|avif'
+      _arguments "*:document:_files -g \"(#i)*.(pdf|epub|md|markdown|$pictures)\""
       ;;
     diff)
       _leaf_diff
@@ -88,10 +91,10 @@ _leaf() {
     hook | hooks)
       if (( CURRENT == 2 )); then
         _values 'action' install uninstall status
-      else
+      elif [[ $words[2] == install ]]; then
         _arguments \
-          '--yes[write without asking]' \
-          '--dry-run[show what would change without writing]'
+          '(-y --yes)'{-y,--yes}'[write without asking]' \
+          '(-n --dry-run)'{-n,--dry-run}'[show what would change without writing]'
       fi
       ;;
     comments)

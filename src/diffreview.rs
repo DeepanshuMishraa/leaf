@@ -14,6 +14,10 @@ use crate::review::{CodeNote, CodeTarget, Notes, Review};
 /// change; `None` once the review is sent.
 pub type SaveNotes = Box<dyn FnMut(Option<&str>)>;
 
+/// The draft and saver for another diff key, for when the screen switches to
+/// a different diff (`o` to the paired view): its notes are its own.
+pub type Reopen = Box<dyn FnMut(&str) -> (Option<String>, SaveNotes)>;
+
 /// Where `S` sends the review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sends {
@@ -31,6 +35,9 @@ pub struct Margin {
     pub sends: Sends,
     /// Open on the overview of every file rather than the first file.
     pub overview_first: bool,
+    /// Loads another key's notes; without it, notes stay with the first key's
+    /// draft for the whole run.
+    pub reopen: Option<Reopen>,
 }
 
 impl Default for Margin {
@@ -40,6 +47,7 @@ impl Default for Margin {
             save: Box::new(|_| {}),
             sends: Sends::Agent,
             overview_first: false,
+            reopen: None,
         }
     }
 }
@@ -57,6 +65,26 @@ pub struct FileNotes {
 impl FileNotes {
     pub fn count(&self) -> usize {
         self.files.len() + usize::from(self.global.is_some())
+    }
+
+    /// Moves a note kept under a renamed file's old path to its new one, so
+    /// editing and deleting it by the shown path reach it. `true` when any
+    /// moved.
+    pub fn follow_renames(&mut self, diff: &Diff) -> bool {
+        let mut moved = false;
+        for file in diff.files() {
+            let (Some(old), Some(new)) = (&file.old_path, &file.new_path) else {
+                continue;
+            };
+            if old != new
+                && !self.files.contains_key(new)
+                && let Some(note) = self.files.remove(old)
+            {
+                self.files.insert(new.clone(), note);
+                moved = true;
+            }
+        }
+        moved
     }
 
     pub fn set_global(&mut self, text: &str) {
@@ -170,6 +198,7 @@ pub fn fingerprint(diff: &Diff, file: usize) -> u64 {
     info.new_path.hash(&mut hasher);
     info.binary.hash(&mut hasher);
     info.note.hash(&mut hasher);
+    info.identity.hash(&mut hasher);
     for hunk in &info.hunks {
         for row in hunk.first.saturating_sub(1)..hunk.end {
             diff.row_text(row).hash(&mut hasher);
@@ -259,6 +288,28 @@ diff --git a/src/z.rs b/src/z.rs
 -old
 +new
 ";
+
+    #[test]
+    fn a_new_revision_of_a_binary_or_mode_change_has_a_new_fingerprint() {
+        let binary = |index: &str| {
+            Diff::parse(format!(
+                "diff --git a/logo.png b/logo.png\nindex {index} 100644\nBinary files a/logo.png and b/logo.png differ\n"
+            ))
+        };
+        assert_ne!(
+            fingerprint(&binary("1111111..2222222"), 0),
+            fingerprint(&binary("1111111..3333333"), 0)
+        );
+        let mode = |new: &str| {
+            Diff::parse(format!(
+                "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode {new}\n"
+            ))
+        };
+        assert_ne!(
+            fingerprint(&mode("100755"), 0),
+            fingerprint(&mode("100775"), 0)
+        );
+    }
 
     fn comment(file: &str, line: u32, body: &str, state: State) -> SavedComment {
         SavedComment {

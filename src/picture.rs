@@ -1,7 +1,7 @@
 //! A picture file opened on its own: one page holding the image, so `i`
 //! switches it between its own colors and the theme's, as in any document.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
@@ -9,9 +9,9 @@ use image::RgbaImage;
 
 use crate::doc::{Doc, Source};
 
-/// Extensions leaf opens as pictures. HEIC, HEIF, AVIF and JPEG XL need
-/// macOS's `sips`, so elsewhere they're left out rather than offered and
-/// then failing to decode.
+/// Extensions leaf may open as pictures. HEIC, HEIF, AVIF and JPEG XL need
+/// macOS's `sips`, so `is_picture` rejects them elsewhere rather than
+/// failing to decode them; the shell completions gate them the same way.
 pub const EXTENSIONS: [&str; 27] = [
     "png", "jpg", "jpeg", "jpe", "jfif", "gif", "webp", "bmp", "ico", "tif", "tiff", "tga", "pnm",
     "pbm", "pgm", "ppm", "pam", "qoi", "hdr", "exr", "dds", "ff", "svg", "jxl", "heic", "heif",
@@ -42,9 +42,12 @@ pub fn is_picture(path: &Path) -> bool {
     })
 }
 
+/// Holds the path and size, not the pixels: a large photo would otherwise
+/// keep its full-resolution decode in memory while the document is open.
 struct Picture {
     text: Rc<str>,
-    pixels: RgbaImage,
+    path: PathBuf,
+    size: (u32, u32),
 }
 
 impl Source for Picture {
@@ -53,18 +56,18 @@ impl Source for Picture {
     }
 
     fn image_size(&self, _id: &str) -> Option<(u32, u32)> {
-        Some(self.pixels.dimensions())
+        Some(self.size)
     }
 
     fn decode(&self, _id: &str, width: u32) -> Option<RgbaImage> {
+        let pixels = pixels(&self.path, &std::fs::read(&self.path).ok()?)?;
         let width = width.max(1);
-        if self.pixels.width() <= width {
-            return Some(self.pixels.clone());
+        if pixels.width() <= width {
+            return Some(pixels);
         }
-        let height =
-            (self.pixels.height() as u64 * width as u64 / self.pixels.width() as u64).max(1) as u32;
+        let height = (pixels.height() as u64 * width as u64 / pixels.width() as u64).max(1) as u32;
         Some(image::imageops::resize(
-            &self.pixels,
+            &pixels,
             width,
             height,
             image::imageops::FilterType::Triangle,
@@ -87,9 +90,9 @@ pub fn open(path: &Path) -> Result<Doc, PictureFailed> {
             }
         }
     })?;
-    let pixels = crate::prmedia::decode(&bytes)
-        .or_else(|| through_sips(path))
-        .ok_or_else(|| PictureFailed::Undecodable { path: shown() })?;
+    let size = pixels(path, &bytes)
+        .ok_or_else(|| PictureFailed::Undecodable { path: shown() })?
+        .dimensions();
     Ok(Doc {
         title: path
             .file_name()
@@ -98,9 +101,14 @@ pub fn open(path: &Path) -> Result<Doc, PictureFailed> {
         page_count: None,
         source: Box::new(Picture {
             text: format!("![]({})", Doc::image_href("0")).into(),
-            pixels,
+            path: path.to_path_buf(),
+            size,
         }),
     })
+}
+
+fn pixels(path: &Path, bytes: &[u8]) -> Option<RgbaImage> {
+    crate::prmedia::decode(bytes).or_else(|| through_sips(path))
 }
 
 /// Formats the image crate can't read (HEIC, AVIF, JPEG XL), converted to PNG
@@ -168,7 +176,7 @@ mod tests {
     #[test]
     fn recognizes_extensions_in_any_case() {
         assert!(is_picture(Path::new("a/B.JPG")));
-        assert!(is_picture(Path::new("x.heic")));
+        assert_eq!(is_picture(Path::new("x.heic")), cfg!(target_os = "macos"));
         assert!(!is_picture(Path::new("notes.md")));
     }
 }

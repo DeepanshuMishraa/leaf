@@ -291,23 +291,22 @@ fn agent_in_args(args: &str) -> Option<&'static str> {
 /// The panes in `list-panes` output (`%id<TAB>pid`) that have an agent CLI
 /// running under them, found in `ps -A -o pid=,ppid=,stat=,args=` output.
 fn tmux_agents(panes: &str, processes: &str) -> Vec<(String, String)> {
-    let procs: Vec<(u32, u32, &str)> = processes
+    let procs: Vec<(u32, u32, bool, &str)> = processes
         .lines()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
             let pid = parts.next()?.parse().ok()?;
             let ppid = parts.next()?.parse().ok()?;
-            // A stopped process (Ctrl+Z) doesn't own the terminal, so the
-            // shell under it would get the paste instead.
+            // Only a process in its terminal's foreground group (`+`) gets
+            // what's typed into the pane. A stopped (Ctrl+Z) or background
+            // agent doesn't: the shell would get the paste instead.
             let state = parts.next()?;
-            if state.starts_with('T') {
-                return None;
-            }
+            let foreground = state.contains('+') && !state.starts_with('T');
             let args = line.trim_start();
             let args = args[args.find(char::is_whitespace)?..].trim_start();
             let args = args[args.find(char::is_whitespace)?..].trim_start();
             let args = args[args.find(char::is_whitespace)?..].trim_start();
-            Some((pid, ppid, args))
+            Some((pid, ppid, foreground, args))
         })
         .collect();
     // The pane's process and everything under it, nearest first.
@@ -319,8 +318,9 @@ fn tmux_agents(panes: &str, processes: &str) -> Vec<(String, String)> {
             if visited > 4096 {
                 break;
             }
-            for (child, parent, args) in &procs {
+            for (child, parent, foreground, args) in &procs {
                 if *child == pid
+                    && *foreground
                     && let Some(name) = agent_in_args(args)
                 {
                     return Some(name.to_owned());
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn tmux_panes_with_an_agent_under_them_are_found() {
-        let panes = "%1\t100\n%2\t200\n%3\t300\n%4\t400\n";
+        let panes = "%1\t100\n%2\t200\n%3\t300\n%4\t400\n%5\t500\n";
         let processes = "  100     1 Ss   -zsh
   101   100 S+   node /opt/homebrew/bin/codex
   200     1 Ss   -fish
@@ -416,6 +416,8 @@ mod tests {
   301   300 S+   /Users/me/.local/bin/claude --resume
   400     1 Ss   /bin/zsh
   401   400 T    /Users/me/.local/bin/claude
+  500     1 Ss+  /bin/zsh
+  501   500 S    /Users/me/.local/bin/claude
 ";
         assert_eq!(
             tmux_agents(panes, processes),

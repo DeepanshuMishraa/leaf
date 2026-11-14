@@ -339,6 +339,22 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_skill_file_is_left_alone() {
+        let dir = scratch("unreadable");
+        let skill = SKILLS[0];
+        let path = path_of(&dir, skill);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = [0xff, 0xfe, b'h', 0x00, b'i', 0x00];
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(found(&dir, skill), Found::Foreign);
+        let reports = install(std::slice::from_ref(&dir));
+        let report = reports.iter().find(|r| r.path == path).unwrap();
+        assert_eq!(report.result, Ok(Change::Kept));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn install_writes_updates_and_leaves_edited_files_alone() {
         let dir = scratch("install");
         let dirs = vec![dir.clone()];

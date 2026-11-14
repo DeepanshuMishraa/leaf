@@ -346,14 +346,15 @@ fn strip(value: &mut Value, touched: &mut bool) -> bool {
                 *touched = true;
                 return false;
             }
-            let drop_hooks = match map.get_mut("hooks") {
-                Some(hooks) => !strip(hooks, touched),
+            let mut ours = false;
+            let emptied = match map.get_mut("hooks") {
+                Some(hooks) => !strip(hooks, &mut ours),
                 None => false,
             };
-            if drop_hooks {
-                map.remove("hooks");
-            }
-            !map.is_empty()
+            *touched |= ours;
+            // An entry whose only handlers were leaf's is leaf's: what's left
+            // (a `matcher`) means nothing without them.
+            !(ours && emptied) && !map.is_empty()
         }
         _ => true,
     }
@@ -470,7 +471,21 @@ fn apply(change: &FileChange) -> Result<(), String> {
     }
 }
 
+/// Replaces `path` through a temporary file, so a failed write leaves the old
+/// text whole. A symlinked config is written at its target, keeping the link,
+/// and a read-only one is refused as a plain write would be.
 fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let path = target.as_path();
+    if fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the file is read-only",
+        ));
+    }
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1103,6 +1118,45 @@ mod tests {
             .flatten()
             .unwrap_or_default();
         assert!(removed.contains("guard") && !removed.contains(MARK));
+    }
+
+    #[test]
+    fn uninstall_leaves_no_empty_matcher_behind() {
+        let once = install_text(Agent::Claude, Some(r#"{"model": "opus"}"#));
+        let removed = removed_text(Agent::Claude, &once)
+            .flatten()
+            .unwrap_or_default();
+        let value: Value = serde_json::from_str(&removed).unwrap_or_default();
+        assert_eq!(value, serde_json::json!({"model": "opus"}), "{removed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_written_through_its_link() {
+        let dir = std::env::temp_dir().join(format!("leaf-hook-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        let link = dir.join("settings.json");
+        fs::write(&real, "{}").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        atomic_write(&link, "{\"a\":1}").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&real).unwrap(), "{\"a\":1}");
+
+        let locked = dir.join("locked.json");
+        fs::write(&locked, "{}").unwrap();
+        let mut permissions = fs::metadata(&locked).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&locked, permissions).unwrap();
+        assert!(atomic_write(&locked, "{\"a\":1}").is_err());
+        assert_eq!(fs::read_to_string(&locked).unwrap(), "{}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

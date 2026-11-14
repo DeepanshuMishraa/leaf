@@ -46,7 +46,9 @@ const splitArgs = (text: string): string[] => {
 		if (quote) {
 			if (ch === quote) quote = null;
 			else current += ch;
-		} else if (ch === '"' || ch === "'") {
+		} else if ((ch === '"' || ch === "'") && current === "") {
+			// Quotes open only at a token's start, so an apostrophe inside a
+			// word (it's-a.patch, /Users/o'neil) stays literal.
 			quote = ch;
 		} else if (/\s/.test(ch)) {
 			if (current) {

@@ -88,6 +88,15 @@ enum Dialog {
     },
 }
 
+/// One row of the notes list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listed {
+    /// The note on the whole plan.
+    Global,
+    /// `notes[index]`.
+    Note(usize),
+}
+
 /// Text selected with the mouse inside one block: character offsets into
 /// that block's laid-out text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -876,11 +885,17 @@ impl App {
         }
     }
 
-    /// Note indexes in the order the list shows them: by block, then as written.
-    fn listed(&self) -> Vec<usize> {
+    /// Notes in the order the list shows them: the whole-plan note first, then
+    /// by block, then as written.
+    fn listed(&self) -> Vec<Listed> {
         let mut order: Vec<usize> = (0..self.notes.len()).collect();
         order.sort_by_key(|at| block_of(&self.notes[*at].target));
-        order
+        self.global
+            .is_some()
+            .then_some(Listed::Global)
+            .into_iter()
+            .chain(order.into_iter().map(Listed::Note))
+            .collect()
     }
 
     fn toggle_remove(&mut self, block: usize) {
@@ -955,22 +970,34 @@ impl App {
                     selected: selected.saturating_sub(1),
                 };
             }
-            KeyCode::Enter => {
-                if let Some(at) = picked {
+            KeyCode::Enter => match picked {
+                Some(Listed::Note(at)) => {
                     let block = block_of(&self.notes[at].target);
                     self.dialog = Dialog::None;
                     self.set_focus_index(block as isize);
                 }
-            }
-            KeyCode::Char('e') => {
-                if let Some(at) = picked {
-                    self.edit_note(at);
+                Some(Listed::Global) => {
+                    self.dialog = Dialog::None;
+                    self.set_focus_index(-1);
                 }
-            }
+                None => {}
+            },
+            KeyCode::Char('e') => match picked {
+                Some(Listed::Note(at)) => self.edit_note(at),
+                Some(Listed::Global) => self.compose_global(),
+                None => {}
+            },
             KeyCode::Char('x') | KeyCode::Char('d') => {
-                if let Some(at) = picked {
-                    self.delete_note(at);
-                    let left = self.notes.len();
+                if let Some(picked) = picked {
+                    match picked {
+                        Listed::Note(at) => self.delete_note(at),
+                        Listed::Global => {
+                            self.global = None;
+                            self.toast = Some("global note cleared".into());
+                            self.persist();
+                        }
+                    }
+                    let left = self.note_count();
                     self.dialog = if left == 0 {
                         Dialog::None
                     } else {
@@ -1079,7 +1106,7 @@ impl App {
                 self.next_change()
             }
             KeyCode::Char('L') => {
-                if self.notes.is_empty() {
+                if self.note_count() == 0 {
                     self.toast = Some("no notes yet".into());
                 } else {
                     self.dialog = Dialog::Notes { selected: 0 };
@@ -1294,21 +1321,35 @@ impl App {
     fn draw_notes(&self, f: &mut Frame, area: Rect, selected: usize) {
         let mut lines = vec![
             Line::from(Span::styled(
-                format!("Notes ({})", self.notes.len()),
+                format!("Notes ({})", self.note_count()),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
         ];
         let width = area.width.saturating_sub(8).min(76) as usize;
-        for (row, at) in self.listed().into_iter().enumerate() {
-            let note = &self.notes[at];
-            let text = format!(
-                "{} {} · {}",
-                if row == selected { "›" } else { " " },
-                target_label(&note.target),
-                note_summary(note)
-            );
-            let mut style = Style::default().fg(hue_of(&note.edit));
+        for (row, listed) in self.listed().into_iter().enumerate() {
+            let marker = if row == selected { "›" } else { " " };
+            let (text, hue) = match listed {
+                Listed::Global => (
+                    format!(
+                        "{marker} Whole plan · {}",
+                        self.global.as_deref().unwrap_or_default()
+                    ),
+                    Hue::Yellow.marker(),
+                ),
+                Listed::Note(at) => {
+                    let note = &self.notes[at];
+                    (
+                        format!(
+                            "{marker} {} · {}",
+                            target_label(&note.target),
+                            note_summary(note)
+                        ),
+                        hue_of(&note.edit),
+                    )
+                }
+            };
+            let mut style = Style::default().fg(hue);
             if row == selected {
                 style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
             }
@@ -1995,6 +2036,64 @@ create table tokens (id int);
     }
 
     #[test]
+    fn the_notes_list_holds_the_whole_plan_note_too() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "whole plan");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(app.dialog, Dialog::Notes { selected: 0 });
+        let screen = draw(&mut app, 90, 30);
+        assert!(screen.contains("Whole plan · whole plan"), "{screen}");
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(
+            app.composer.as_ref().map(|c| c.text.as_str()),
+            Some("whole plan")
+        );
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.global, None);
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn a_composer_fits_a_short_terminal() {
+        for height in [3, 4, 5] {
+            let mut app = app();
+            press(&mut app, KeyCode::Char('c'));
+            type_text(
+                &mut app,
+                "a note long enough to wrap onto more than one row here",
+            );
+            draw(&mut app, 40, height);
+        }
+    }
+
+    #[test]
+    fn a_repeated_block_that_gains_or_loses_a_copy_is_marked() {
+        let once = "# Plan\n\nIntro.\n\n## Step\n\nDo it.\n";
+        let twice = "# Plan\n\nIntro.\n\n## Step\n\nDo it.\n\n## Step\n\nDo it.\n";
+        let round = |previous: &str, source: &str| {
+            App::new(Plan {
+                subject: "plan.md".into(),
+                source: source.into(),
+                round: Some(2),
+                previous: Some(previous.into()),
+                draft: None,
+                save: Box::new(|_| {}),
+            })
+        };
+        let gained = round(once, twice);
+        let marked: Vec<usize> = (0..gained.blocks.len())
+            .filter(|b| gained.changed(*b))
+            .collect();
+        assert_eq!(marked, [2]);
+        let lost = round(twice, once);
+        assert_eq!(lost.changed_count(), 0);
+        assert_eq!(lost.dropped_blocks, 1);
+    }
+
+    #[test]
     fn the_notes_list_edits_and_deletes_notes() {
         let mut app = app();
         press(&mut app, KeyCode::Char('c'));
@@ -2046,11 +2145,13 @@ create table tokens (id int);
     #[test]
     fn a_note_whose_block_changed_is_dropped_and_sending_clears_the_draft() {
         let (mut first, saved) = saving(PLAN, None);
-        // On block 1's first line; j then goes to block 2.
+        // On block 1's first line; ] then goes to block 2, the one rewritten
+        // below.
         press(&mut first, KeyCode::Char('c'));
         type_text(&mut first, "keep");
         press(&mut first, KeyCode::Enter);
-        press(&mut first, KeyCode::Char('j'));
+        press(&mut first, KeyCode::Char(']'));
+        assert_eq!(first.focus, Focus::Block(1));
         press(&mut first, KeyCode::Char('x'));
         let draft = saved.borrow().clone();
         let changed = PLAN.replace("- Backfill it", "- Backfill it in batches");

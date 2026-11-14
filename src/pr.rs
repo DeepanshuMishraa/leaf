@@ -733,7 +733,14 @@ pub fn merge(lists: impl IntoIterator<Item = Vec<Entry>>) -> Vec<Entry> {
         }
     }
     let mut out: Vec<Entry> = by_ref.into_values().collect();
-    out.sort_by_key(|entry| std::cmp::Reverse(seconds(&entry.updated)));
+    // Rows updated at the same second keep a fixed order, so the picked row
+    // doesn't jump between redraws.
+    out.sort_by(|a, b| {
+        seconds(&b.updated)
+            .cmp(&seconds(&a.updated))
+            .then_with(|| a.pr.repo.cmp(&b.pr.repo))
+            .then_with(|| b.pr.number.cmp(&a.pr.number))
+    });
     out
 }
 
@@ -1578,6 +1585,51 @@ mod tests {
         ]);
         let numbers: Vec<_> = merged.iter().map(|e| e.pr.number).collect();
         assert_eq!(numbers, [3, 2, 1]);
+    }
+
+    #[test]
+    fn the_fresher_copy_of_a_row_wins() {
+        let e = |title: &str, updated: &str| Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number: 7,
+            },
+            title: title.into(),
+            author: String::new(),
+            updated: updated.into(),
+            draft: false,
+        };
+        let merged = merge([
+            vec![e("old", "2026-01-01T00:00:00Z")],
+            vec![e("new", "2026-02-01T00:00:00Z")],
+            vec![e("older", "2025-12-01T00:00:00Z")],
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].title, "new");
+    }
+
+    #[test]
+    fn rows_updated_together_keep_a_fixed_order() {
+        let e = |repo: &str, number| Entry {
+            pr: PrRef {
+                repo: repo.into(),
+                number,
+            },
+            title: String::new(),
+            author: String::new(),
+            updated: "2026-01-01T00:00:00Z".into(),
+            draft: false,
+        };
+        let rows = |lists: Vec<Vec<Entry>>| -> Vec<(String, u64)> {
+            merge(lists)
+                .into_iter()
+                .map(|e| (e.pr.repo, e.pr.number))
+                .collect()
+        };
+        let one = rows(vec![vec![e("b/r", 1), e("a/r", 2), e("a/r", 5)]]);
+        let other = rows(vec![vec![e("a/r", 5)], vec![e("a/r", 2), e("b/r", 1)]]);
+        assert_eq!(one, other);
+        assert_eq!(one[0], ("a/r".to_owned(), 5));
     }
 
     #[test]

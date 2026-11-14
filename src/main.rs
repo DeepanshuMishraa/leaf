@@ -273,6 +273,7 @@ fn main() -> ExitCode {
             args.get(1).map(String::as_str)
         ),
         (Some("rex" | "plugin"), Some("install" | "uninstall"))
+            | (Some("skills" | "skill"), Some("uninstall"))
     ) || args
         .first()
         .is_some_and(|arg| arg == "hook" || arg == "hooks");

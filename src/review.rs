@@ -533,6 +533,42 @@ Address every numbered item, then ask for a review again.
     }
 
     #[test]
+    fn a_note_whose_lines_left_the_diff_goes_without_a_quote() {
+        let review = Review {
+            subject: "feat/x against main".into(),
+            round: None,
+            global: None,
+            notes: Notes::Code(vec![CodeNote {
+                target: CodeTarget::Lines {
+                    anchor: Anchor {
+                        file: "src/a.rs".into(),
+                        side: Side::Old,
+                        start_line: 3,
+                        end_line: 5,
+                    },
+                    hunk: String::new(),
+                },
+                body: "Why remove this?".into(),
+            }]),
+        };
+        assert_eq!(
+            review.render(Verdict::RequestChanges),
+            "# Review of feat/x against main: changes requested
+
+Changes requested. Revise, then submit again.
+
+## src/a.rs
+
+### 1. Lines 3-5 (old side)
+
+Why remove this?
+
+Address every numbered item, then ask for a review again.
+"
+        );
+    }
+
+    #[test]
     fn verdicts_round_trip_through_their_names() {
         for verdict in [
             Verdict::Approve,
