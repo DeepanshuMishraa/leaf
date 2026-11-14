@@ -670,15 +670,28 @@
 
     // Contributors, fetched live so new ones appear without a deploy. Leaves out
     // the owner, bots and Claude. The section stays hidden if nobody is left.
+    // GitHub caches /contributors and can lag a merge by days, so authors of
+    // recent commits are merged in after it.
     const skip = (person) =>
       person.type !== "User" || person.login.toLowerCase() === owner.toLowerCase() || /claude/i.test(person.login);
-    fetch(`https://api.github.com/repos/${owner}/${repo}/contributors?per_page=100`)
-      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`GitHub API ${res.status}`))))
-      .then((people) => {
-        if (!Array.isArray(people)) throw new Error("GitHub API: contributors is not a list");
+    const api = (path) =>
+      fetch(`https://api.github.com/repos/${owner}/${repo}/${path}`)
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`GitHub API ${path}: ${res.status}`))))
+        .then((data) => (Array.isArray(data) ? data : Promise.reject(new Error(`GitHub API ${path}: not a list`))));
+    Promise.allSettled([api("contributors?per_page=100"), api("commits?per_page=100")])
+      .then(([contributors, commits]) => {
+        if (contributors.status === "rejected" && commits.status === "rejected") throw contributors.reason;
+        const people = [
+          ...(contributors.status === "fulfilled" ? contributors.value : []),
+          ...(commits.status === "fulfilled" ? commits.value.map((c) => c.author).filter(Boolean) : []),
+        ];
+        const seen = new Set();
         const list = $("people");
         for (const person of people) {
           if (typeof person.login !== "string" || skip(person)) continue;
+          const key = person.login.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
           const li = document.createElement("li");
           const a = document.createElement("a");
           a.href = `https://github.com/${person.login}`;
