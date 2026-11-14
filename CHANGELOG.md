@@ -16,6 +16,8 @@ per change, starting with `- `.
 - Asking an agent about a selection (`@`) works in tmux and Herdr as well as Rex.
 - `leaf pr` has two tabs, pull requests and issues, each one list newest first; a colored dot and the legend say whose it is — green yours, blue yours in someone else's repository, yellow someone else's in yours, grey the rest.
 - Issues open in leaf now: read the summary and timeline, comment, reply to a comment quoting it, open the issue on GitHub, close it as completed or not planned, and reopen it.
+- Pull requests and issues have a Comments tab: every comment and review in full, `j`/`k` to pick one, `enter` to reply quoting it, `c` to comment.
+- `R` in the `leaf pr` list reloads both tabs now rather than waiting.
 - Open a picture file on its own: leaf reads PNG, JPEG, GIF, WebP, SVG, HEIC and more, and `i` switches it between its own colors and the theme's.
 
 ## 0.15.2

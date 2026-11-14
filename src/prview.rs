@@ -119,6 +119,23 @@ enum Msg {
 enum Tab {
     Summary,
     Timeline,
+    /// Only the comments and reviews, each in full, to pick and reply to.
+    Comments,
+}
+
+impl Tab {
+    /// The page's own tabs in order; a pull request's Code tab follows them.
+    const ALL: [Tab; 3] = [Tab::Summary, Tab::Timeline, Tab::Comments];
+}
+
+/// Where moving one tab on or back from the shown one lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Tab(Tab),
+    /// A pull request's diff, which opens in the reviewer.
+    Code,
+    /// Past the first or last tab, with no wrapping asked for.
+    Stay,
 }
 
 /// What a click in the tab row asks for.
@@ -126,6 +143,7 @@ enum Tab {
 enum TabHit {
     Summary,
     Timeline,
+    Comments,
     Code,
 }
 
@@ -377,6 +395,36 @@ impl Page {
             self.tab = tab;
             self.scroll = 0;
             self.selection = None;
+            self.cache = None;
+        }
+        // Comments opens on a comment picked, so enter replies at once.
+        // With none to pick, the tab says so itself, so no toast.
+        if tab == Tab::Comments && self.focus.is_none() {
+            let toast = self.toast.take();
+            self.pick(1);
+            self.toast = toast;
+        }
+    }
+
+    /// The tab `step` places on (1) or back (-1) from the shown one. A pull
+    /// request's Code tab comes after Comments; `wrap` goes round past the
+    /// ends, as tab and shift-tab do.
+    fn step(&self, step: isize, wrap: bool) -> Step {
+        let at = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0) as isize;
+        let tabs = Tab::ALL.len() as isize;
+        // Code is one more place, after the last tab, for a pull request.
+        let places = tabs + isize::from(self.kind == Kind::Pull);
+        let next = at + step;
+        let next = if wrap {
+            next.rem_euclid(places)
+        } else if (0..places).contains(&next) {
+            next
+        } else {
+            return Step::Stay;
+        };
+        match Tab::ALL.get(next as usize) {
+            Some(tab) => Step::Tab(*tab),
+            None => Step::Code,
         }
     }
 
@@ -411,7 +459,9 @@ impl Page {
                 .or(replyable.first()),
         };
         if let Some(&next) = next {
-            self.show(Tab::Timeline);
+            if self.tab != Tab::Comments {
+                self.show(Tab::Timeline);
+            }
             self.focus = Some(next);
             self.reveal = true;
             self.cache = None;
@@ -555,11 +605,7 @@ impl App {
             .into_iter()
             .enumerate()
             .map(|(index, source)| {
-                let (tx, asked) = (self.tx.clone(), source.clone());
-                std::thread::spawn(move || {
-                    let result = pr::search(&asked).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::Searched(index, result));
-                });
+                self.search(index, &source);
                 Slot {
                     entries: pr::cached_search(&source),
                     source,
@@ -583,6 +629,36 @@ impl App {
             selection: None,
             dragging: false,
         });
+    }
+
+    /// Asks search `index` again; the answer arrives as `Msg::Searched`.
+    fn search(&self, index: usize, source: &Source) {
+        let (tx, asked) = (self.tx.clone(), source.clone());
+        std::thread::spawn(move || {
+            let result = pr::search(&asked).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Searched(index, result));
+        });
+    }
+
+    /// `R` on the list: asks every search again now, keeping the rows shown
+    /// until the answers arrive, and lets rows be read ahead afresh.
+    fn reload_list(&mut self) {
+        let Some(list) = &mut self.list else {
+            return;
+        };
+        if list.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading)) {
+            list.note = Some("Already reloading".to_owned());
+            return;
+        }
+        let sources: Vec<Source> = list.slots.iter().map(|s| s.source.clone()).collect();
+        for slot in &mut list.slots {
+            slot.fetch = Fetch::Loading;
+        }
+        // The tab row's spinner shows it's asking.
+        self.prefetched.clear();
+        for (index, source) in sources.iter().enumerate() {
+            self.search(index, source);
+        }
     }
 
     /// Opens a pull request on what's known of it, and reads it again unless that's fresh.
@@ -829,6 +905,7 @@ impl App {
             match &result {
                 Ok(Leave::Summary) => page.show(Tab::Summary),
                 Ok(Leave::Timeline) => page.show(Tab::Timeline),
+                Ok(Leave::Comments) => page.show(Tab::Comments),
                 Ok(Leave::Quit) | Err(_) => {}
             }
             page.toast = match (result, failure.borrow().as_ref()) {
@@ -932,6 +1009,7 @@ impl App {
                     match hit {
                         TabHit::Summary => page.show(Tab::Summary),
                         TabHit::Timeline => page.show(Tab::Timeline),
+                        TabHit::Comments => page.show(Tab::Comments),
                         TabHit::Code => return self.open_code(terminal),
                     }
                     return Ok(());
@@ -1132,6 +1210,17 @@ impl App {
                 });
                 return Ok(true);
             }
+            // Asks every search again now rather than waiting. `R` only while
+            // nothing's typed, so a filter can still hold an R (it ignores
+            // case, so `r` starts one); ctrl+r works either way.
+            KeyCode::Char('R') if list.typed.is_empty() => {
+                self.reload_list();
+                return Ok(true);
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reload_list();
+                return Ok(true);
+            }
             // Letters filter the list, so copying the number takes ctrl.
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(pr) = &picked {
@@ -1280,6 +1369,9 @@ impl App {
                     return Ok(false);
                 }
             }
+            // On Comments, j and k move between comments rather than lines.
+            KeyCode::Char('j') | KeyCode::Down if page.tab == Tab::Comments => page.pick(1),
+            KeyCode::Char('k') | KeyCode::Up if page.tab == Tab::Comments => page.pick(-1),
             KeyCode::Char('j') | KeyCode::Down => page.scroll += 1,
             KeyCode::Char('k') | KeyCode::Up => page.scroll = page.scroll.saturating_sub(1),
             KeyCode::Char('d') if ctrl => page.scroll += half,
@@ -1290,30 +1382,29 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
-            // An issue has no Code tab, so its keys flip between the two it has.
-            KeyCode::Tab | KeyCode::BackTab if page.kind == Kind::Issue => {
-                page.show(match page.tab {
-                    Tab::Summary => Tab::Timeline,
-                    Tab::Timeline => Tab::Summary,
-                })
-            }
-            KeyCode::Right | KeyCode::Char('l' | '3') if page.kind == Kind::Issue => {
-                page.show(Tab::Timeline)
-            }
             KeyCode::Char(']') => page.pick(1),
             KeyCode::Char('[') => page.pick(-1),
             KeyCode::Enter if page.busy.is_none() && page.focus.is_some() => page.reply(),
-            // Tab cycles Summary → Timeline → Code; shift-tab goes the other way.
-            KeyCode::Tab if page.tab == Tab::Summary => page.show(Tab::Timeline),
-            KeyCode::BackTab if page.tab == Tab::Timeline => page.show(Tab::Summary),
-            KeyCode::Tab | KeyCode::BackTab => self.open_code(terminal)?,
+            // Tab cycles Summary → Timeline → Comments (→ Code) and round;
+            // shift-tab goes the other way. The arrows stop at the ends.
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h' | 'l') => {
+                let forward =
+                    matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Char('l'));
+                let wrap = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+                match page.step(if forward { 1 } else { -1 }, wrap) {
+                    Step::Tab(tab) => page.show(tab),
+                    Step::Code => self.open_code(terminal)?,
+                    Step::Stay => {}
+                }
+            }
             KeyCode::Char('1') => page.show(Tab::Summary),
             KeyCode::Char('2') => page.show(Tab::Timeline),
-            KeyCode::Left | KeyCode::Char('h') => page.show(Tab::Summary),
-            KeyCode::Right | KeyCode::Char('l') if page.tab == Tab::Summary => {
-                page.show(Tab::Timeline)
-            }
-            KeyCode::Right | KeyCode::Char('l' | '3') => self.open_code(terminal)?,
+            KeyCode::Char('3') => page.show(Tab::Comments),
+            KeyCode::Char('4') if page.kind == Kind::Pull => self.open_code(terminal)?,
             KeyCode::Char('e') => {
                 page.expanded = !page.expanded;
                 page.cache = None;
@@ -1681,6 +1772,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
                 ("tab", "switch"),
                 ("type", "filter"),
                 ("^y", "copy #"),
+                ("R", "reload"),
                 ("esc", "quit"),
             ],
             w,
@@ -1939,14 +2031,28 @@ fn draw_page(
     let mut tabs = Vec::new();
     page.tab_hits.clear();
     let mut at = x;
+    let comment_count = detail
+        .timeline
+        .iter()
+        .filter(|e| quoted(e).is_some())
+        .count();
+    let comments_label = match comment_count {
+        0 => "Comments".to_owned(),
+        n => format!("Comments {n}"),
+    };
     let tab_labels = [
         ("Summary", TabHit::Summary, page.tab == Tab::Summary),
         ("Timeline", TabHit::Timeline, page.tab == Tab::Timeline),
+        (
+            comments_label.as_str(),
+            TabHit::Comments,
+            page.tab == Tab::Comments,
+        ),
         ("Code", TabHit::Code, false),
     ];
     let shown_tabs = match page.kind {
         Kind::Pull => &tab_labels[..],
-        Kind::Issue => &tab_labels[..2],
+        Kind::Issue => &tab_labels[..3],
     };
     for &(label, hit, on) in shown_tabs {
         let text = if hit == TabHit::Code && page.code {
@@ -2001,6 +2107,14 @@ fn draw_page(
             Tab::Summary => summary(detail, w, gallery),
             Tab::Timeline => {
                 let (lines, starts) = timeline(detail, w, now, page.expanded, page.focus);
+                page.starts = starts;
+                Body {
+                    lines,
+                    figures: Vec::new(),
+                }
+            }
+            Tab::Comments => {
+                let (lines, starts) = comments(detail, w, now, page.focus);
                 page.starts = starts;
                 Body {
                     lines,
@@ -2193,6 +2307,16 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 format!("{} Loading the diff…", spinner()),
                 dim,
             )),
+            _ if page.tab == Tab::Comments => keys_line(
+                &[
+                    ("j/k", "pick"),
+                    ("enter", "reply"),
+                    ("c", "comment"),
+                    ("←→", "tabs"),
+                    ("q", "back"),
+                ],
+                width as usize,
+            ),
             _ if page.focus.is_some() => keys_line(
                 &[("enter", "reply"), ("[ ]", "pick"), ("esc", "done")],
                 width as usize,
@@ -2209,8 +2333,8 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
 fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
     let keys: &[(&str, &str)] = match kind {
         Kind::Pull => &[
-            ("←→, tab", "Summary, Timeline, Code"),
-            ("1, 2, 3", "the same tabs"),
+            ("←→, tab", "Summary, Timeline, Comments, Code"),
+            ("1, 2, 3, 4", "the same tabs"),
             ("j/k, ctrl+d/u", "scroll a line, half a screen"),
             ("space/b, g/G", "a screen, top and bottom"),
             ("drag", "select text; it's copied"),
@@ -2222,6 +2346,7 @@ fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
             ("a", "approve"),
             ("c", "comment"),
             ("] [, enter", "pick a comment, reply quoting it"),
+            ("j/k on Comments", "pick the next or previous comment"),
             ("o", "open on GitHub"),
             ("y, Y, n", "copy the checkout command, link, number"),
             ("click #", "the number in the header copies it"),
@@ -2229,8 +2354,8 @@ fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
             ("q, esc", "back to the list, or quit"),
         ],
         Kind::Issue => &[
-            ("←→, tab", "Summary, Timeline"),
-            ("1, 2", "the same tabs"),
+            ("←→, tab", "Summary, Timeline, Comments"),
+            ("1, 2, 3", "the same tabs"),
             ("j/k, ctrl+d/u", "scroll a line, half a screen"),
             ("space/b, g/G", "a screen, top and bottom"),
             ("drag", "select text; it's copied"),
@@ -2239,6 +2364,7 @@ fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
             ("x", "close as done or not planned, reopen"),
             ("c", "comment"),
             ("] [, enter", "pick a comment, reply quoting it"),
+            ("j/k on Comments", "pick the next or previous comment"),
             ("o", "open on GitHub"),
             ("y, n", "copy the link, number"),
             ("click #", "the number in the header copies it"),
@@ -2557,6 +2683,14 @@ fn quoted(event: &pr::Event) -> Option<String> {
     Some(quote)
 }
 
+/// Which events a list of them holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Events {
+    All,
+    /// Only those with a comment to quote, each in full.
+    Comments,
+}
+
 /// The timeline's lines, and the first line of each event. The `focus`
 /// event, picked to reply to, has its rail drawn bright instead of dim.
 fn timeline(
@@ -2565,6 +2699,40 @@ fn timeline(
     now: i64,
     expanded: bool,
     focus: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    events(detail, width, now, expanded, focus, Events::All)
+}
+
+/// The Comments tab: every comment and review with something to say, in
+/// full. `starts` is still by timeline index, as `focus` is.
+fn comments(
+    detail: &Detail,
+    width: usize,
+    now: i64,
+    focus: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let (lines, starts) = events(detail, width, now, true, focus, Events::Comments);
+    if !lines.is_empty() {
+        return (lines, starts);
+    }
+    let subject = match detail.kind {
+        Kind::Pull => "pull request",
+        Kind::Issue => "issue",
+    };
+    let empty = vec![Line::from(Span::styled(
+        format!("No comments on this {subject} yet. c writes the first one."),
+        Style::default().fg(DIM),
+    ))];
+    (empty, starts)
+}
+
+fn events(
+    detail: &Detail,
+    width: usize,
+    now: i64,
+    expanded: bool,
+    focus: Option<usize>,
+    which: Events,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -2583,6 +2751,9 @@ fn timeline(
     let closed_color = state_color(detail.state);
     for (index, event) in detail.timeline.iter().enumerate() {
         starts.push(lines.len());
+        if which == Events::Comments && quoted(event).is_none() {
+            continue;
+        }
         let rail = if focus == Some(index) { bold } else { dim };
         let when = Span::styled(pr::ago(&event.at, now), dim);
         let actor = Span::styled(event.actor.clone(), bold);
@@ -2788,6 +2959,58 @@ mod tests {
             .iter()
             .map(|l| plain(l).trim_end().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn the_comments_tab_holds_only_comments_in_full() {
+        let now = pr::seconds("2026-11-12T04:30:00Z").unwrap();
+        let mut d = detail(State::Open);
+        d.timeline.push(pr::Event {
+            at: "2026-11-12T04:00:00Z".into(),
+            actor: "ana".into(),
+            kind: EventKind::Commit {
+                sha: "abc1234".into(),
+                headline: "fix it".into(),
+            },
+        });
+        let (lines, starts) = comments(&d, 60, now, Some(1));
+        let shown = texts(&lines);
+        assert!(shown[0].starts_with("◆  bot commented"), "{shown:?}");
+        assert!(shown.iter().any(|l| l.contains("line 30")));
+        assert!(
+            !shown
+                .iter()
+                .any(|l| l.contains("opened") || l.contains("abc1234"))
+        );
+        assert_eq!(starts.len(), d.timeline.len());
+        assert_eq!(starts[1], 0);
+
+        d.timeline.truncate(1);
+        let (lines, _) = comments(&d, 60, now, None);
+        assert!(texts(&lines)[0].starts_with("No comments on this pull request yet"));
+    }
+
+    #[test]
+    fn tabs_step_through_comments_to_code_for_a_pull_request_only() {
+        let pr = PrRef {
+            repo: "o/r".into(),
+            number: 1,
+        };
+        let mut page = Page::new(pr.clone(), Kind::Pull, Load::Ready(detail(State::Open)));
+        assert_eq!(page.step(1, false), Step::Tab(Tab::Timeline));
+        assert_eq!(page.step(-1, false), Step::Stay);
+        assert_eq!(page.step(-1, true), Step::Code);
+        page.show(Tab::Comments);
+        // Opening Comments picks the first comment, ready to reply to.
+        assert_eq!(page.focus, Some(1));
+        assert_eq!(page.step(1, false), Step::Code);
+
+        let mut issue = Page::new(pr, Kind::Issue, Load::Ready(detail(State::Open)));
+        issue.show(Tab::Comments);
+        assert_eq!(issue.step(1, false), Step::Stay);
+        assert_eq!(issue.step(1, true), Step::Tab(Tab::Summary));
+        issue.pick(1);
+        assert_eq!(issue.tab, Tab::Comments, "picking stays on Comments");
     }
 
     #[test]

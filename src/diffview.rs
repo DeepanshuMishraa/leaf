@@ -131,7 +131,7 @@ pub struct Options {
     pub store: Option<Store>,
     /// Store failures are reported after the terminal is restored.
     pub failure: Rc<RefCell<Option<String>>>,
-    /// Opened as a pull request's Code tab: `1`, `2` and `←` go back to its
+    /// Opened as a pull request's Code tab: `1`, `2`, `3` and `←` go back to its
     /// other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
     pub layout: Layout,
@@ -175,9 +175,10 @@ impl Default for Options {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Leave {
     Quit,
-    /// For a pull request's Code tab: to its Summary or Timeline.
+    /// For a pull request's Code tab: to its Summary, Timeline or Comments.
     Summary,
     Timeline,
+    Comments,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1278,11 +1279,15 @@ impl App {
                 self.leave = Leave::Summary;
                 self.quit = true;
             }
-            KeyCode::Char('2') | KeyCode::Left | KeyCode::BackTab if self.tabs => {
+            KeyCode::Char('2') if self.tabs => {
                 self.leave = Leave::Timeline;
                 self.quit = true;
             }
-            KeyCode::Char('3') | KeyCode::Right if self.tabs => {}
+            KeyCode::Char('3') | KeyCode::Left | KeyCode::BackTab if self.tabs => {
+                self.leave = Leave::Comments;
+                self.quit = true;
+            }
+            KeyCode::Char('4') | KeyCode::Right if self.tabs => {}
             KeyCode::Char('h') | KeyCode::Left => {
                 self.left = self.left.saturating_sub(4);
             }
@@ -3850,9 +3855,13 @@ diff --git a/b.rs b/b.rs
         assert!(app.quit);
         assert_eq!(
             app.leave,
-            Leave::Timeline,
-            "shift-tab goes back to Timeline"
+            Leave::Comments,
+            "shift-tab goes back to Comments"
         );
+
+        let mut app = App::new(loaded(PATCH), as_code_tab());
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.leave, Leave::Timeline);
 
         // Outside a pull request, tab is not a way out.
         let mut app = App::new(loaded(PATCH), Options::default());
