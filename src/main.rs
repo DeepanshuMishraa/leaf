@@ -97,7 +97,10 @@ Diff keys: j/k move, V visual, c comment, m comments, f files, y copy, o other
 side, i split/inline, r reload, ? keys, q quit
 
 Pull request keys: tab summary/timeline, 3 code, m merge, x close/reopen, r ready/draft,
-a approve, c comment, o browser, y copy checkout, R reload, ? keys, q back
+a approve, c comment, ] [ pick a comment, enter reply, o browser, y copy, R reload,
+? keys, q back
+Issue keys: tab summary/timeline, x close as completed/not planned or reopen, c comment,
+] [ pick a comment, enter reply, o browser, y copy link, R reload, ? keys, q back
 
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.

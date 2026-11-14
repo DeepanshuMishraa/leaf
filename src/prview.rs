@@ -39,8 +39,8 @@ use crate::look::Look;
 use crate::news::News;
 use crate::popover::{self, Edit};
 use crate::pr::{
-    self, Action, CheckStatus, Detail, Entry, EventKind, Kind, Mergeability, PrRef, Relation,
-    Source, State, Verdict,
+    self, Action, CheckStatus, CloseReason, Detail, Entry, EventKind, Kind, Mergeability, PrRef,
+    Relation, Source, State, Verdict,
 };
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
@@ -65,6 +65,16 @@ const FRESH: Duration = Duration::from_secs(30);
 /// How long the list's selection rests before that pull request is fetched.
 const SETTLE: Duration = Duration::from_millis(150);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// The keys an issue's footer offers, in the order they're dropped to fit.
+const ISSUE_KEYS: [(&str, &str); 7] = [
+    ("←→", "tabs"),
+    ("c", "comment"),
+    ("]", "reply"),
+    ("x", "close"),
+    ("o", "browser"),
+    ("?", "keys"),
+    ("q", "back"),
+];
 /// The keys the page's footer offers, in the order they're dropped to fit.
 const KEYS: [(&str, &str); 8] = [
     ("←→", "tabs"),
@@ -100,7 +110,7 @@ enum Msg {
     /// Your GitHub login, which colors the list's rows.
     Me(String),
     Viewed(PrRef, Box<Result<Detail, String>>),
-    Acted(PrRef, Result<String, String>),
+    Acted(PrRef, Kind, Result<String, String>),
     /// The patch fetched for a head commit.
     Patched(PrRef, String, Result<String, String>),
 }
@@ -123,10 +133,14 @@ enum Mode {
     Normal,
     /// Picking how to merge.
     Merge,
+    /// Picking why an issue is closed.
+    Close,
     Confirm(Action),
     Compose {
         text: Vec<char>,
         cursor: usize,
+        /// Whose comment this replies to, quoted at the top of `text`.
+        reply: Option<String>,
     },
     Help,
 }
@@ -161,8 +175,7 @@ struct List {
     /// The pull request a press on the picked row landed on, which opens on
     /// release unless the mouse was dragged or the list changed under it.
     pressed: Option<PrRef>,
-    /// What ctrl+y or a drag copied, or what opening an issue said, shown in
-    /// the footer until the next key.
+    /// What ctrl+y or a drag copied, shown in the footer until the next key.
     note: Option<String>,
     /// The rows' lines as drawn last, and where, so a drag can select their text.
     shown: Vec<Line<'static>>,
@@ -299,8 +312,15 @@ struct Body {
 
 struct Page {
     pr: PrRef,
+    kind: Kind,
     detail: Load<Detail>,
     tab: Tab,
+    /// The timeline event picked to reply to, by its index.
+    focus: Option<usize>,
+    /// The timeline's first line of each event, as laid out last.
+    starts: Vec<usize>,
+    /// Scroll the picked event into view on the next draw.
+    reveal: bool,
     scroll: usize,
     mode: Mode,
     /// What the footer says until the next key.
@@ -326,11 +346,15 @@ struct Page {
 }
 
 impl Page {
-    fn new(pr: PrRef, detail: Load<Detail>) -> Self {
+    fn new(pr: PrRef, kind: Kind, detail: Load<Detail>) -> Self {
         Page {
             pr,
+            kind,
             detail,
             tab: Tab::Summary,
+            focus: None,
+            starts: Vec::new(),
+            reveal: false,
             scroll: 0,
             mode: Mode::Normal,
             toast: None,
@@ -354,6 +378,64 @@ impl Page {
             self.scroll = 0;
             self.selection = None;
         }
+    }
+
+    /// The link to this pull request or issue.
+    fn url(&self) -> String {
+        match self.kind {
+            Kind::Pull => self.pr.url(),
+            Kind::Issue => self.pr.issue_url(),
+        }
+    }
+
+    /// Picks the next (`step` 1) or previous (-1) comment on the timeline to reply to.
+    fn pick(&mut self, step: isize) {
+        let Load::Ready(detail) = &self.detail else {
+            return;
+        };
+        let replyable: Vec<usize> = detail
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| quoted(e).is_some())
+            .map(|(i, _)| i)
+            .collect();
+        let next = match (self.focus, step > 0) {
+            (None, true) => replyable.first(),
+            (None, false) => replyable.last(),
+            (Some(at), true) => replyable.iter().find(|i| **i > at).or(replyable.last()),
+            (Some(at), false) => replyable
+                .iter()
+                .rev()
+                .find(|i| **i < at)
+                .or(replyable.first()),
+        };
+        if let Some(&next) = next {
+            self.show(Tab::Timeline);
+            self.focus = Some(next);
+            self.reveal = true;
+            self.cache = None;
+        } else {
+            self.toast = Some("No comments to reply to yet".to_owned());
+        }
+    }
+
+    /// The composer, holding the picked comment quoted.
+    fn reply(&mut self) {
+        let Load::Ready(detail) = &self.detail else {
+            return;
+        };
+        let Some(event) = self.focus.and_then(|i| detail.timeline.get(i)) else {
+            self.toast = Some("Press ] or [ to pick a comment first".to_owned());
+            return;
+        };
+        let Some(quote) = quoted(event) else { return };
+        let text: Vec<char> = quote.chars().collect();
+        self.mode = Mode::Compose {
+            cursor: text.len(),
+            text,
+            reply: Some(event.actor.clone()),
+        };
     }
 
     fn head(&self) -> String {
@@ -451,7 +533,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
     };
     match start {
         Start::List => app.open_list(),
-        Start::Pr(pr) => app.open_page(pr),
+        Start::Pr(pr) => app.open_page(pr, Kind::Pull),
     }
     let result = setup.and_then(|_| app.event_loop(&mut terminal));
     let _ = app.gallery.clear();
@@ -504,7 +586,7 @@ impl App {
     }
 
     /// Opens a pull request on what's known of it, and reads it again unless that's fresh.
-    fn open_page(&mut self, pr: PrRef) {
+    fn open_page(&mut self, pr: PrRef, kind: Kind) {
         let known = self
             .details
             .get(&pr)
@@ -516,20 +598,22 @@ impl App {
                 }
                 detail
             })
-            .or_else(|| pr::cached_view(&pr));
+            .or_else(|| pr::cached_view(&pr, kind));
         let detail = match known {
             Some(detail) => {
-                let head = detail.head_sha.clone();
-                self.want_patch(&pr, &head);
+                if kind == Kind::Pull {
+                    let head = detail.head_sha.clone();
+                    self.want_patch(&pr, &head);
+                }
                 Load::Ready(detail)
             }
             None => Load::Loading,
         };
-        self.page = Some(Page::new(pr.clone(), detail));
-        self.fetch(pr, false);
+        self.page = Some(Page::new(pr.clone(), kind, detail));
+        self.fetch(pr, kind, false);
     }
 
-    fn fetch(&mut self, pr: PrRef, force: bool) {
+    fn fetch(&mut self, pr: PrRef, kind: Kind, force: bool) {
         let fresh = self
             .details
             .get(&pr)
@@ -540,7 +624,7 @@ impl App {
         self.inflight.insert(pr.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = pr::view(&pr).map_err(|e| e.to_string());
+            let result = pr::view(&pr, kind).map_err(|e| e.to_string());
             let _ = tx.send(Msg::Viewed(pr, Box::new(result)));
         });
     }
@@ -575,9 +659,7 @@ impl App {
             return;
         }
         let Some(list) = &mut self.list else { return };
-        if list.kind != Kind::Pull {
-            return;
-        }
+        let kind = list.kind;
         let Some(picked) = list.picked() else { return };
         match &list.resting {
             Some((pr, at)) if *pr == picked => {
@@ -585,7 +667,7 @@ impl App {
                     && !self.details.contains_key(&picked)
                     && self.prefetched.insert(picked.clone())
                 {
-                    self.fetch(picked, false);
+                    self.fetch(picked, kind, false);
                 }
             }
             _ => list.resting = Some((picked, Instant::now())),
@@ -598,16 +680,17 @@ impl App {
         page.busy = Some(match &action {
             Action::Merge(method) => format!("{}…", method.label()),
             Action::Close => "Closing…".to_owned(),
+            Action::CloseAs(reason) => format!("Closing as {}…", reason.label()),
             Action::Reopen => "Reopening…".to_owned(),
             Action::Ready => "Marking ready…".to_owned(),
             Action::Draft => "Converting to draft…".to_owned(),
             Action::Approve => "Approving…".to_owned(),
             Action::Comment(_) => "Posting comment…".to_owned(),
         });
-        let (tx, pr) = (self.tx.clone(), page.pr.clone());
+        let (tx, pr, kind) = (self.tx.clone(), page.pr.clone(), page.kind);
         std::thread::spawn(move || {
-            let result = pr::perform(&pr, &action).map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Acted(pr, result));
+            let result = pr::perform(&pr, kind, &action).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Acted(pr, kind, result));
         });
     }
 
@@ -616,6 +699,10 @@ impl App {
         let Some(page) = &mut self.page else {
             return Ok(());
         };
+        // An issue has no diff, so there is nothing to open.
+        if page.kind == Kind::Issue {
+            return Ok(());
+        }
         let (pr, head) = (page.pr.clone(), page.head());
         self.want_patch(&pr, &head);
         match self.patches.get(&pr) {
@@ -655,7 +742,7 @@ impl App {
                 let shown = self.page.as_ref().is_some_and(|p| p.pr == pr);
                 match *result {
                     Ok(detail) => {
-                        if shown {
+                        if shown && detail.kind == Kind::Pull {
                             // The diff is fetched while the page is read, so Code opens at once.
                             let head = detail.head_sha.clone();
                             self.want_patch(&pr, &head);
@@ -678,7 +765,7 @@ impl App {
                     }
                 }
             }
-            Msg::Acted(pr, result) => {
+            Msg::Acted(pr, kind, result) => {
                 if let Some(page) = self.page.as_mut().filter(|p| p.pr == pr) {
                     page.busy = None;
                     page.toast = Some(match result {
@@ -686,7 +773,7 @@ impl App {
                         Err(e) => e,
                     });
                 }
-                self.fetch(pr, true);
+                self.fetch(pr, kind, true);
             }
             Msg::Patched(pr, head, result) => {
                 self.patching.remove(&pr);
@@ -939,18 +1026,11 @@ impl App {
         Ok(())
     }
 
-    /// Opens a row: a pull request here, an issue in the browser.
+    /// Opens a row's pull request or issue.
     fn choose(&mut self, pr: PrRef) {
-        let Some(list) = &mut self.list else { return };
-        match list.kind {
-            Kind::Pull => self.open_page(pr),
-            Kind::Issue => {
-                list.note = Some(match pr::open_issue(&pr) {
-                    Ok(()) => format!("Opened {} in the browser", pr.label()),
-                    Err(e) => e.to_string(),
-                });
-            }
-        }
+        let Some(list) = &self.list else { return };
+        let kind = list.kind;
+        self.open_page(pr, kind);
     }
 
     fn list_mouse(&mut self, mouse: MouseEvent) {
@@ -1127,6 +1207,18 @@ impl App {
                 };
                 return Ok(true);
             }
+            Mode::Close => {
+                let picked = match key.code {
+                    KeyCode::Char(c) => CloseReason::ALL.into_iter().find(|r| r.key() == c),
+                    KeyCode::Enter => Some(CloseReason::Completed),
+                    _ => None,
+                };
+                match picked {
+                    Some(reason) => self.act(Action::CloseAs(reason)),
+                    None => page.mode = Mode::Normal,
+                }
+                return Ok(true);
+            }
             Mode::Confirm(action) => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char('y')) {
                     let action = action.clone();
@@ -1136,7 +1228,7 @@ impl App {
                 }
                 return Ok(true);
             }
-            Mode::Compose { text, cursor } => {
+            Mode::Compose { text, cursor, .. } => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Esc => page.mode = Mode::Normal,
@@ -1178,6 +1270,10 @@ impl App {
             // Escape lets go of a selection before it leaves.
             KeyCode::Esc if self.gallery.any_playing() => self.gallery.stop(),
             KeyCode::Esc if page.selection.is_some() => page.selection = None,
+            KeyCode::Esc if page.focus.is_some() => {
+                page.focus = None;
+                page.cache = None;
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.page = None;
                 if self.list.is_none() {
@@ -1194,6 +1290,19 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
+            // An issue has no Code tab, so its keys flip between the two it has.
+            KeyCode::Tab | KeyCode::BackTab if page.kind == Kind::Issue => {
+                page.show(match page.tab {
+                    Tab::Summary => Tab::Timeline,
+                    Tab::Timeline => Tab::Summary,
+                })
+            }
+            KeyCode::Right | KeyCode::Char('l' | '3') if page.kind == Kind::Issue => {
+                page.show(Tab::Timeline)
+            }
+            KeyCode::Char(']') => page.pick(1),
+            KeyCode::Char('[') => page.pick(-1),
+            KeyCode::Enter if page.busy.is_none() && page.focus.is_some() => page.reply(),
             // Tab cycles Summary → Timeline → Code; shift-tab goes the other way.
             KeyCode::Tab if page.tab == Tab::Summary => page.show(Tab::Timeline),
             KeyCode::BackTab if page.tab == Tab::Timeline => page.show(Tab::Summary),
@@ -1211,22 +1320,27 @@ impl App {
             }
             KeyCode::Char('?') => page.mode = Mode::Help,
             KeyCode::Char('R') => {
-                let pr = page.pr.clone();
-                self.fetch(pr, true);
+                let (pr, kind) = (page.pr.clone(), page.kind);
+                self.fetch(pr, kind, true);
             }
             KeyCode::Char('o') => {
-                page.toast = Some(match pr::open_in_browser(&page.pr) {
+                let opened = match page.kind {
+                    Kind::Pull => pr::open_in_browser(&page.pr),
+                    Kind::Issue => pr::open_issue(&page.pr),
+                };
+                page.toast = Some(match opened {
                     Ok(()) => format!("Opened {} in the browser", page.pr.label()),
                     Err(e) => e.to_string(),
                 });
             }
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') if page.kind == Kind::Pull => {
                 copy(&page.pr.checkout());
                 page.toast = Some(format!("Copied {}", page.pr.checkout()));
             }
-            KeyCode::Char('Y') => {
-                copy(&page.pr.url());
-                page.toast = Some(format!("Copied {}", page.pr.url()));
+            KeyCode::Char('y' | 'Y') => {
+                let url = page.url();
+                copy(&url);
+                page.toast = Some(format!("Copied {url}"));
             }
             KeyCode::Char('n') => {
                 let number = format!("#{}", page.pr.number);
@@ -1237,6 +1351,7 @@ impl App {
                 page.mode = Mode::Compose {
                     text: Vec::new(),
                     cursor: 0,
+                    reply: None,
                 };
             }
             KeyCode::Char(c @ ('m' | 'x' | 'r' | 'a')) => {
@@ -1250,6 +1365,7 @@ impl App {
                 };
                 match available(detail, c) {
                     Ok(Next::Merge) => page.mode = Mode::Merge,
+                    Ok(Next::Close) => page.mode = Mode::Close,
                     Ok(Next::Confirm(action)) => page.mode = Mode::Confirm(action),
                     Ok(Next::Now(action)) => self.act(action),
                     Err(why) => page.toast = Some(why),
@@ -1280,12 +1396,14 @@ impl App {
 /// What a key leads to on a pull request in this state.
 enum Next {
     Merge,
+    /// Pick why the issue is closed.
+    Close,
     Confirm(Action),
     Now(Action),
 }
 
 fn available(detail: &Detail, key: char) -> Result<Next, String> {
-    let open = matches!(detail.state, State::Open | State::Draft);
+    let open = detail.state.is_open();
     let state = || {
         format!(
             "#{} is {}",
@@ -1293,6 +1411,16 @@ fn available(detail: &Detail, key: char) -> Result<Next, String> {
             detail.state.label().to_lowercase()
         )
     };
+    if detail.kind == Kind::Issue {
+        return match key {
+            'x' if open => Ok(Next::Close),
+            'x' => Ok(Next::Confirm(Action::Reopen)),
+            'm' | 'r' | 'a' => {
+                Err("Only pull requests can be merged, drafted or approved".to_owned())
+            }
+            _ => Err(String::new()),
+        };
+    }
     match key {
         'm' => {
             if !open {
@@ -1317,13 +1445,15 @@ fn available(detail: &Detail, key: char) -> Result<Next, String> {
         }
         'x' => match detail.state {
             State::Merged => Err(state()),
-            State::Closed => Ok(Next::Confirm(Action::Reopen)),
+            State::Closed | State::Completed | State::NotPlanned => {
+                Ok(Next::Confirm(Action::Reopen))
+            }
             State::Open | State::Draft => Ok(Next::Confirm(Action::Close)),
         },
         'r' => match detail.state {
             State::Draft => Ok(Next::Now(Action::Ready)),
             State::Open => Ok(Next::Confirm(Action::Draft)),
-            State::Merged | State::Closed => Err(state()),
+            State::Merged | State::Closed | State::Completed | State::NotPlanned => Err(state()),
         },
         'a' if open => Ok(Next::Confirm(Action::Approve)),
         'a' => Err(state()),
@@ -1341,8 +1471,9 @@ fn state_color(state: State) -> Color {
     match state {
         State::Open => GREEN,
         State::Draft => DIM,
-        State::Merged => PURPLE,
+        State::Merged | State::Completed => PURPLE,
         State::Closed => RED,
+        State::NotPlanned => DIM,
     }
 }
 
@@ -1546,13 +1677,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         _ => keys_line(
             &[
                 ("↑↓", "move"),
-                (
-                    "enter",
-                    match list.kind {
-                        Kind::Pull => "open",
-                        Kind::Issue => "browser",
-                    },
-                ),
+                ("enter", "open"),
                 ("tab", "switch"),
                 ("type", "filter"),
                 ("^y", "copy #"),
@@ -1789,25 +1914,41 @@ fn draw_page(
         label_width,
         1,
     ));
-    header.push(spread(
-        meta,
-        vec![
+    let size = match detail.kind {
+        Kind::Pull => vec![
             Span::styled(format!("+{}", detail.additions), Style::default().fg(GREEN)),
             Span::raw(" "),
             Span::styled(format!("−{}", detail.deletions), Style::default().fg(RED)),
         ],
-        w,
-    ));
+        Kind::Issue => {
+            let comments = detail
+                .timeline
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::Comment { .. }))
+                .count();
+            match comments {
+                0 => Vec::new(),
+                1 => vec![Span::styled("1 comment", dim)],
+                n => vec![Span::styled(format!("{n} comments"), dim)],
+            }
+        }
+    };
+    header.push(spread(meta, size, w));
     header.push(Line::default());
     let tabs_row = area.y + header.len() as u16;
     let mut tabs = Vec::new();
     page.tab_hits.clear();
     let mut at = x;
-    for (label, hit, on) in [
+    let tab_labels = [
         ("Summary", TabHit::Summary, page.tab == Tab::Summary),
         ("Timeline", TabHit::Timeline, page.tab == Tab::Timeline),
         ("Code", TabHit::Code, false),
-    ] {
+    ];
+    let shown_tabs = match page.kind {
+        Kind::Pull => &tab_labels[..],
+        Kind::Issue => &tab_labels[..2],
+    };
+    for &(label, hit, on) in shown_tabs {
         let text = if hit == TabHit::Code && page.code {
             format!("{} Code", spinner())
         } else {
@@ -1858,16 +1999,26 @@ fn draw_page(
     if page.cache.as_ref().is_none_or(|(k, _)| *k != key) {
         let body = match page.tab {
             Tab::Summary => summary(detail, w, gallery),
-            Tab::Timeline => Body {
-                lines: timeline(detail, w, now, page.expanded),
-                figures: Vec::new(),
-            },
+            Tab::Timeline => {
+                let (lines, starts) = timeline(detail, w, now, page.expanded, page.focus);
+                page.starts = starts;
+                Body {
+                    lines,
+                    figures: Vec::new(),
+                }
+            }
         };
         page.cache = Some((key, body));
     }
     let Some((_, body)) = page.cache.as_ref() else {
         return;
     };
+    // The picked comment comes into view a line below the top.
+    if std::mem::take(&mut page.reveal)
+        && let Some(start) = page.focus.and_then(|i| page.starts.get(i))
+    {
+        page.scroll = start.saturating_sub(1);
+    }
     let last = body.lines.len().saturating_sub(body_height as usize);
     page.scroll = page.scroll.min(last);
     let visible: Vec<Line> = body
@@ -1931,7 +2082,7 @@ fn draw_page(
     }
     footer(f, page, area, x, width);
     if let Mode::Help = page.mode {
-        draw_help(f, area, ink);
+        draw_help(f, area, page.kind, ink);
     }
 }
 
@@ -1958,13 +2109,21 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
         _ => String::new(),
     };
     let line = match &page.mode {
-        Mode::Compose { text, cursor } => {
+        Mode::Compose {
+            text,
+            cursor,
+            reply,
+        } => {
             let height = footer_height(page, width);
             let top = y + 1 - height;
+            let title = match reply {
+                Some(who) => format!("Reply to {who} on #{}", page.pr.number),
+                None => format!("Comment on #{}", page.pr.number),
+            };
             let mut lines = vec![
                 Line::default(),
                 Line::from(vec![
-                    Span::styled(format!("Comment on #{}", page.pr.number), accent),
+                    Span::styled(title, accent),
                     Span::styled("   enter send · alt+enter new line · esc cancel", dim),
                 ]),
             ];
@@ -1992,12 +2151,27 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
             spans.push(Span::styled("esc cancel", dim));
             Line::from(spans)
         }
+        Mode::Close => {
+            let mut spans = vec![Span::styled(
+                format!("Close #{} as   ", page.pr.number),
+                accent,
+            )];
+            for reason in CloseReason::ALL {
+                spans.push(Span::styled(format!("{} ", reason.key()), accent));
+                spans.push(Span::styled(format!("{}   ", reason.label()), dim));
+            }
+            spans.push(Span::styled("esc cancel", dim));
+            Line::from(spans)
+        }
         Mode::Confirm(action) => {
             let question = match action {
                 Action::Merge(method) => {
                     format!("{} #{} into {base}?", method.label(), page.pr.number)
                 }
                 Action::Close => format!("Close #{}?", page.pr.number),
+                Action::CloseAs(reason) => {
+                    format!("Close #{} as {}?", page.pr.number, reason.label())
+                }
                 Action::Reopen => format!("Reopen #{}?", page.pr.number),
                 Action::Draft => format!("Convert #{} to a draft?", page.pr.number),
                 Action::Approve => format!("Approve #{}?", page.pr.number),
@@ -2019,32 +2193,59 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 format!("{} Loading the diff…", spinner()),
                 dim,
             )),
-            _ => keys_line(&KEYS, width as usize),
+            _ if page.focus.is_some() => keys_line(
+                &[("enter", "reply"), ("[ ]", "pick"), ("esc", "done")],
+                width as usize,
+            ),
+            _ => match page.kind {
+                Kind::Pull => keys_line(&KEYS, width as usize),
+                Kind::Issue => keys_line(&ISSUE_KEYS, width as usize),
+            },
         },
     };
     f.render_widget(Paragraph::new(line), Rect::new(x, y, width, 1));
 }
 
-fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
-    let keys = [
-        ("←→, tab", "Summary, Timeline, Code"),
-        ("1, 2, 3", "the same tabs"),
-        ("j/k, ctrl+d/u", "scroll a line, half a screen"),
-        ("space/b, g/G", "a screen, top and bottom"),
-        ("drag", "select text; it's copied"),
-        ("click", "a picture opens it, a video plays"),
-        ("e", "expand or cut short long comments"),
-        ("m", "merge: squash, merge commit or rebase"),
-        ("x", "close, or reopen a closed one"),
-        ("r", "mark ready, or convert to draft"),
-        ("a", "approve"),
-        ("c", "comment"),
-        ("o", "open on GitHub"),
-        ("y, Y, n", "copy the checkout command, link, number"),
-        ("click #", "the number in the header copies it"),
-        ("R", "reload"),
-        ("q, esc", "back to the list, or quit"),
-    ];
+fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
+    let keys: &[(&str, &str)] = match kind {
+        Kind::Pull => &[
+            ("←→, tab", "Summary, Timeline, Code"),
+            ("1, 2, 3", "the same tabs"),
+            ("j/k, ctrl+d/u", "scroll a line, half a screen"),
+            ("space/b, g/G", "a screen, top and bottom"),
+            ("drag", "select text; it's copied"),
+            ("click", "a picture opens it, a video plays"),
+            ("e", "expand or cut short long comments"),
+            ("m", "merge: squash, merge commit or rebase"),
+            ("x", "close, or reopen a closed one"),
+            ("r", "mark ready, or convert to draft"),
+            ("a", "approve"),
+            ("c", "comment"),
+            ("] [, enter", "pick a comment, reply quoting it"),
+            ("o", "open on GitHub"),
+            ("y, Y, n", "copy the checkout command, link, number"),
+            ("click #", "the number in the header copies it"),
+            ("R", "reload"),
+            ("q, esc", "back to the list, or quit"),
+        ],
+        Kind::Issue => &[
+            ("←→, tab", "Summary, Timeline"),
+            ("1, 2", "the same tabs"),
+            ("j/k, ctrl+d/u", "scroll a line, half a screen"),
+            ("space/b, g/G", "a screen, top and bottom"),
+            ("drag", "select text; it's copied"),
+            ("click", "a picture opens it, a video plays"),
+            ("e", "expand or cut short long comments"),
+            ("x", "close as done or not planned, reopen"),
+            ("c", "comment"),
+            ("] [, enter", "pick a comment, reply quoting it"),
+            ("o", "open on GitHub"),
+            ("y, n", "copy the link, number"),
+            ("click #", "the number in the header copies it"),
+            ("R", "reload"),
+            ("q, esc", "back to the list, or quit"),
+        ],
+    };
     let width = 54.min(area.width.saturating_sub(4));
     let height = (keys.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
@@ -2125,9 +2326,38 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
     let dim = Style::default().fg(DIM);
     let mut lines = Vec::new();
 
+    if detail.kind == Kind::Issue {
+        let (status, color) = match detail.state {
+            State::Completed => ("Closed as completed", PURPLE),
+            State::NotPlanned => ("Closed as not planned", DIM),
+            _ => ("Open", GREEN),
+        };
+        lines.push(field(
+            "Status",
+            vec![Span::styled(status, Style::default().fg(color))],
+        ));
+        lines.push(field(
+            "Assignees",
+            vec![if detail.assignees.is_empty() {
+                Span::styled("No one", dim)
+            } else {
+                Span::raw(detail.assignees.join("  "))
+            }],
+        ));
+        if !detail.labels.is_empty() {
+            lines.push(field(
+                "Labels",
+                vec![Span::styled(detail.labels.join("  "), dim)],
+            ));
+        }
+        return with_description(lines, detail, width, gallery);
+    }
+
     let (status, color) = match (detail.state, detail.mergeability) {
         (State::Merged, _) => ("Merged".to_owned(), PURPLE),
-        (State::Closed, _) => ("Closed without merging".to_owned(), RED),
+        (State::Closed | State::Completed | State::NotPlanned, _) => {
+            ("Closed without merging".to_owned(), RED)
+        }
         (State::Draft, _) => ("Draft".to_owned(), DIM),
         (_, Mergeability::Ready) => ("Ready to merge".to_owned(), GREEN),
         (_, Mergeability::Conflicts) => (format!("Conflicts with {}", detail.base), RED),
@@ -2189,6 +2419,16 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
         }
     }
 
+    with_description(lines, detail, width, gallery)
+}
+
+/// The summary's fields, then two blank lines and the description.
+fn with_description(
+    mut lines: Vec<Line<'static>>,
+    detail: &Detail,
+    width: usize,
+    gallery: &mut Gallery,
+) -> Body {
     lines.push(Line::default());
     lines.push(Line::default());
     let offset = lines.len();
@@ -2301,12 +2541,49 @@ fn rows(rows: &[render::Row], indent: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line<'static>> {
+/// A comment quoted to start a reply, or `None` for an event with nothing to quote.
+fn quoted(event: &pr::Event) -> Option<String> {
+    let body = match &event.kind {
+        EventKind::Comment { body }
+        | EventKind::Review { body, .. }
+        | EventKind::Inline { body, .. } => pr::visible(body),
+        _ => return None,
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let mut quote: String = body.lines().map(|line| format!("> {line}\n")).collect();
+    quote.push('\n');
+    Some(quote)
+}
+
+/// The timeline's lines, and the first line of each event. The `focus`
+/// event, picked to reply to, has its rail drawn bright instead of dim.
+fn timeline(
+    detail: &Detail,
+    width: usize,
+    now: i64,
+    expanded: bool,
+    focus: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = Vec::new();
+    let mut starts = Vec::new();
     let indent = 4u16;
-    for event in &detail.timeline {
+    let subject = match detail.kind {
+        Kind::Pull => "pull request",
+        Kind::Issue => "issue",
+    };
+    let closed = match detail.state {
+        State::Completed => "Closed as completed",
+        State::NotPlanned => "Closed as not planned",
+        _ => "Closed",
+    };
+    let closed_color = state_color(detail.state);
+    for (index, event) in detail.timeline.iter().enumerate() {
+        starts.push(lines.len());
+        let rail = if focus == Some(index) { bold } else { dim };
         let when = Span::styled(pr::ago(&event.at, now), dim);
         let actor = Span::styled(event.actor.clone(), bold);
         let (glyph, color, what, body): (&str, Color, Vec<Span<'static>>, Option<String>) =
@@ -2314,7 +2591,7 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
                 EventKind::Opened => (
                     "●",
                     GREEN,
-                    vec![actor, Span::styled(" opened this pull request", dim)],
+                    vec![actor, Span::styled(format!(" opened this {subject}"), dim)],
                     None,
                 ),
                 EventKind::Commit { sha, headline } => (
@@ -2363,10 +2640,12 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
                 ),
                 EventKind::Closed => (
                     "●",
-                    RED,
+                    closed_color,
                     vec![Span::styled(
-                        "Closed",
-                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                        closed,
+                        Style::default()
+                            .fg(closed_color)
+                            .add_modifier(Modifier::BOLD),
                     )],
                     None,
                 ),
@@ -2382,7 +2661,7 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
             let total = rendered.len();
             let shown = if expanded { total } else { total.min(EXCERPT) };
             lines.extend(rendered.into_iter().take(shown).map(|mut line| {
-                line.spans.insert(0, Span::styled("│", dim));
+                line.spans.insert(0, Span::styled("│", rail));
                 line.spans[1] = Span::styled(
                     line.spans[1].content.chars().skip(1).collect::<String>(),
                     line.spans[1].style,
@@ -2399,7 +2678,7 @@ fn timeline(detail: &Detail, width: usize, now: i64, expanded: bool) -> Vec<Line
         lines.push(Line::from(Span::styled("│", dim)));
     }
     lines.pop();
-    lines
+    (lines, starts)
 }
 
 /// Swaps markdown and HTML images for `▣ alt` so they don't leave blank space.
@@ -2454,6 +2733,8 @@ mod tests {
                 repo: "o/r".into(),
                 number: 7,
             },
+            kind: Kind::Pull,
+            assignees: Vec::new(),
             title: "fix: Find curly quotes and Unicode hyphens from typed ones".into(),
             body: "Searching `don't` skips **every** `don’t`.\n\n![Before](https://x/a.png)".into(),
             state,
@@ -2542,10 +2823,10 @@ mod tests {
     #[test]
     fn long_timeline_comments_are_cut_short_until_expanded() {
         let now = pr::seconds("2026-11-12T04:30:00Z").unwrap();
-        let short = texts(&timeline(&detail(State::Open), 60, now, false));
+        let short = texts(&timeline(&detail(State::Open), 60, now, false, None).0);
         assert!(short[0].starts_with("●  marcos opened this pull request"));
         assert!(short.iter().any(|l| l.contains("more lines · e expands")));
-        let long = texts(&timeline(&detail(State::Open), 60, now, true));
+        let long = texts(&timeline(&detail(State::Open), 60, now, true, None).0);
         assert!(long.iter().any(|l| l.contains("line 30")));
         assert!(!long.iter().any(|l| l.contains("more lines")));
     }
@@ -2638,6 +2919,7 @@ mod tests {
                 repo: "o/r".into(),
                 number: 1,
             },
+            Kind::Pull,
             Load::Loading,
         );
         page.cache = Some((
@@ -2673,6 +2955,7 @@ mod tests {
                 repo: "o/r".into(),
                 number: 1,
             },
+            Kind::Pull,
             Load::Loading,
         );
         page.header = vec![

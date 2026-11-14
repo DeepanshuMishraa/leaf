@@ -98,6 +98,10 @@ impl PrRef {
         format!("https://github.com/{}/pull/{}", self.repo, self.number)
     }
 
+    pub fn issue_url(&self) -> String {
+        format!("https://github.com/{}/issues/{}", self.repo, self.number)
+    }
+
     pub fn resource(&self) -> Resource {
         let (owner, repo) = self.repo.split_once('/').unwrap_or(("", &self.repo));
         Resource::Pull {
@@ -125,9 +129,16 @@ pub struct Entry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Open,
+    /// A pull request only.
     Draft,
+    /// A pull request only.
     Merged,
+    /// A pull request closed without merging.
     Closed,
+    /// An issue closed as done.
+    Completed,
+    /// An issue closed as not planned.
+    NotPlanned,
 }
 
 impl State {
@@ -136,7 +147,36 @@ impl State {
             State::Open => "Open",
             State::Draft => "Draft",
             State::Merged => "Merged",
-            State::Closed => "Closed",
+            State::Closed | State::Completed | State::NotPlanned => "Closed",
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        matches!(self, State::Open | State::Draft)
+    }
+}
+
+/// Why an issue is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    Completed,
+    NotPlanned,
+}
+
+impl CloseReason {
+    pub const ALL: [CloseReason; 2] = [CloseReason::Completed, CloseReason::NotPlanned];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CloseReason::Completed => "completed",
+            CloseReason::NotPlanned => "not planned",
+        }
+    }
+
+    pub fn key(self) -> char {
+        match self {
+            CloseReason::Completed => 'c',
+            CloseReason::NotPlanned => 'n',
         }
     }
 }
@@ -313,10 +353,14 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-/// A pull request read in full.
+/// A pull request or issue read in full. An issue leaves the branch, size,
+/// reviewer, check and merge fields empty.
 #[derive(Debug, Clone)]
 pub struct Detail {
     pub pr: PrRef,
+    pub kind: Kind,
+    /// Who an issue is assigned to.
+    pub assignees: Vec<String>,
     pub title: String,
     pub body: String,
     pub state: State,
@@ -342,11 +386,13 @@ pub struct Detail {
     pub timeline: Vec<Event>,
 }
 
-/// Something done to a pull request.
+/// Something done to a pull request or an issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Merge(MergeMethod),
     Close,
+    /// Closes an issue, saying why.
+    CloseAs(CloseReason),
     Reopen,
     Ready,
     Draft,
@@ -355,19 +401,27 @@ pub enum Action {
 }
 
 impl Action {
-    fn args(&self, pr: &PrRef) -> Vec<String> {
+    fn args(&self, pr: &PrRef, kind: Kind) -> Vec<String> {
         let number = pr.number.to_string();
         let (verb, extra): (&str, Vec<String>) = match self {
             Action::Merge(method) => ("merge", vec![method.flag().to_owned()]),
             Action::Close => ("close", Vec::new()),
+            Action::CloseAs(reason) => (
+                "close",
+                vec!["--reason".to_owned(), reason.label().to_owned()],
+            ),
             Action::Reopen => ("reopen", Vec::new()),
             Action::Ready => ("ready", Vec::new()),
             Action::Draft => ("ready", vec!["--undo".to_owned()]),
             Action::Approve => ("review", vec!["--approve".to_owned()]),
             Action::Comment(body) => ("comment", vec!["--body".to_owned(), body.clone()]),
         };
+        let noun = match kind {
+            Kind::Pull => "pr",
+            Kind::Issue => "issue",
+        };
         let mut args = vec![
-            "pr".to_owned(),
+            noun.to_owned(),
             verb.to_owned(),
             number,
             "-R".to_owned(),
@@ -383,6 +437,7 @@ impl Action {
         match self {
             Action::Merge(method) => format!("{label} merged ({})", method.label().to_lowercase()),
             Action::Close => format!("{label} closed"),
+            Action::CloseAs(reason) => format!("{label} closed as {}", reason.label()),
             Action::Reopen => format!("{label} reopened"),
             Action::Ready => format!("{label} is ready for review"),
             Action::Draft => format!("{label} is a draft again"),
@@ -785,12 +840,117 @@ fn view_key(pr: &PrRef) -> String {
     format!("view-{}-{}", pr.repo, pr.number)
 }
 
-/// Reads a pull request in full: its page, the repository's merge settings,
-/// and the comments left on lines of the diff, all at once.
-pub fn view(pr: &PrRef) -> Result<Detail, PrFailed> {
+/// Reads a pull request or an issue in full.
+pub fn view(pr: &PrRef, kind: Kind) -> Result<Detail, PrFailed> {
     if !*GH {
         return Err(PrFailed::NoGh);
     }
+    match kind {
+        Kind::Pull => view_pull(pr),
+        Kind::Issue => view_issue(pr),
+    }
+}
+
+/// The page or issue as `view` read it last time, if it has been read before.
+pub fn cached_view(pr: &PrRef, kind: Kind) -> Option<Detail> {
+    match kind {
+        Kind::Pull => {
+            let saved: Value = serde_json::from_str(&load(&view_key(pr))?).ok()?;
+            Some(parse_saved(pr.clone(), &saved))
+        }
+        Kind::Issue => {
+            let page: Value = serde_json::from_str(&load(&issue_key(pr))?).ok()?;
+            Some(parse_issue(pr.clone(), &page))
+        }
+    }
+}
+
+const ISSUE_FIELDS: &str = "number,title,body,state,stateReason,author,createdAt,updatedAt,closedAt,labels,assignees,comments";
+
+fn issue_key(pr: &PrRef) -> String {
+    format!("issue-{}-{}", pr.repo, pr.number)
+}
+
+/// Reads an issue: its page and comments, and the rendered body for its uploads.
+fn view_issue(issue: &PrRef) -> Result<Detail, PrFailed> {
+    let rendered = {
+        let path = format!("repos/{}/issues/{}", issue.repo, issue.number);
+        std::thread::spawn(move || {
+            gh(&[
+                "api",
+                &path,
+                "-H",
+                "Accept: application/vnd.github.full+json",
+                "--jq",
+                ".body_html",
+            ])
+        })
+    };
+    let number = issue.number.to_string();
+    let page = gh_json(&[
+        "issue",
+        "view",
+        &number,
+        "-R",
+        &issue.repo,
+        "--json",
+        ISSUE_FIELDS,
+    ])?;
+    store(&issue_key(issue), &page.to_string());
+    let mut detail = parse_issue(issue.clone(), &page);
+    if let Some(html) = rendered.join().ok().and_then(Result::ok) {
+        detail.media = crate::prmedia::signed_links(&html);
+    }
+    Ok(detail)
+}
+
+fn parse_issue(issue: PrRef, page: &Value) -> Detail {
+    let state = match (
+        text(page, "state").as_str(),
+        text(page, "stateReason").as_str(),
+    ) {
+        ("CLOSED", "NOT_PLANNED") => State::NotPlanned,
+        ("CLOSED", _) => State::Completed,
+        _ => State::Open,
+    };
+    let names = |key: &str, field: &str| -> Vec<String> {
+        array(page, key)
+            .iter()
+            .map(|item| text(item, field))
+            .filter(|name| !name.is_empty())
+            .collect()
+    };
+    let author = login(page, "author");
+    let created = text(page, "createdAt");
+    Detail {
+        kind: Kind::Issue,
+        assignees: names("assignees", "login"),
+        title: text(page, "title"),
+        body: text(page, "body"),
+        state,
+        updated: text(page, "updatedAt"),
+        base: String::new(),
+        head: String::new(),
+        head_sha: String::new(),
+        additions: 0,
+        deletions: 0,
+        labels: names("labels", "name"),
+        reviewers: Vec::new(),
+        checks: Vec::new(),
+        mergeability: Mergeability::Unknown,
+        methods: Vec::new(),
+        // GitHub decides who may close or reopen; leaf lets it refuse.
+        can_write: true,
+        media: std::collections::HashMap::new(),
+        timeline: timeline(page, &Value::Null, &author, &created, state),
+        author,
+        pr: issue,
+    }
+}
+
+/// Reads a pull request in full: its page, the repository's merge settings,
+/// and the comments left on lines of the diff, all at once.
+fn view_pull(pr: &PrRef) -> Result<Detail, PrFailed> {
     let settings = {
         let repo = pr.repo.clone();
         std::thread::spawn(move || {
@@ -869,12 +1029,6 @@ pub fn fetch_patch(pr: &PrRef, head: &str) -> Result<String, String> {
     Ok(fetched.patch)
 }
 
-/// The pull request as `view` read it last time, if it has been read before.
-pub fn cached_view(pr: &PrRef) -> Option<Detail> {
-    let saved: Value = serde_json::from_str(&load(&view_key(pr))?).ok()?;
-    Some(parse_saved(pr.clone(), &saved))
-}
-
 fn parse_saved(pr: PrRef, saved: &Value) -> Detail {
     let settings = saved.get("settings").filter(|s| !s.is_null());
     parse_detail(
@@ -941,6 +1095,8 @@ fn parse_detail(pr: PrRef, page: &Value, settings: Option<&Value>, inline: &Valu
     let author = login(page, "author");
     let created = text(page, "createdAt");
     Detail {
+        kind: Kind::Pull,
+        assignees: Vec::new(),
         title: text(page, "title"),
         body: text(page, "body"),
         state,
@@ -1069,7 +1225,7 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
             actor: String::new(),
             kind: EventKind::Merged,
         }),
-        State::Closed => events.push(Event {
+        State::Closed | State::Completed | State::NotPlanned => events.push(Event {
             at: text(page, "closedAt"),
             actor: String::new(),
             kind: EventKind::Closed,
@@ -1099,9 +1255,9 @@ pub fn visible(body: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Does `action` to the pull request and says what was done.
-pub fn perform(pr: &PrRef, action: &Action) -> Result<String, PrFailed> {
-    let args = action.args(pr);
+/// Does `action` to the pull request or issue and says what was done.
+pub fn perform(pr: &PrRef, kind: Kind, action: &Action) -> Result<String, PrFailed> {
+    let args = action.args(pr, kind);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     gh(&refs)?;
     Ok(action.done(pr))
@@ -1113,7 +1269,7 @@ pub fn open_in_browser(pr: &PrRef) -> Result<(), PrFailed> {
     gh(&["pr", "view", &number, "-R", &pr.repo, "--web"]).map(|_| ())
 }
 
-/// Opens an issue's page in the browser; leaf has no issue page of its own.
+/// Opens an issue's page in the browser.
 pub fn open_issue(issue: &PrRef) -> Result<(), PrFailed> {
     let number = issue.number.to_string();
     gh(&["issue", "view", &number, "-R", &issue.repo, "--web"]).map(|_| ())
@@ -1443,16 +1599,69 @@ mod tests {
             number: 7,
         };
         assert_eq!(
-            Action::Merge(MergeMethod::Squash).args(&pr),
+            Action::Merge(MergeMethod::Squash).args(&pr, Kind::Pull),
             ["pr", "merge", "7", "-R", "o/r", "--squash"]
         );
         assert_eq!(
-            Action::Draft.args(&pr),
+            Action::Draft.args(&pr, Kind::Pull),
             ["pr", "ready", "7", "-R", "o/r", "--undo"]
         );
         assert_eq!(
-            Action::Comment("hi".into()).args(&pr),
+            Action::Comment("hi".into()).args(&pr, Kind::Pull),
             ["pr", "comment", "7", "-R", "o/r", "--body", "hi"]
+        );
+        assert_eq!(
+            Action::CloseAs(CloseReason::NotPlanned).args(&pr, Kind::Issue),
+            [
+                "issue",
+                "close",
+                "7",
+                "-R",
+                "o/r",
+                "--reason",
+                "not planned"
+            ]
+        );
+        assert_eq!(
+            Action::Reopen.args(&pr, Kind::Issue),
+            ["issue", "reopen", "7", "-R", "o/r"]
+        );
+    }
+
+    #[test]
+    fn an_issue_reads_its_state_reason_and_comments() {
+        let issue = PrRef {
+            repo: "o/r".into(),
+            number: 3,
+        };
+        let detail = parse_issue(
+            issue,
+            &json!({
+                "title": "Crash on open",
+                "state": "CLOSED",
+                "stateReason": "NOT_PLANNED",
+                "author": {"login": "ann"},
+                "createdAt": "2026-11-01T00:00:00Z",
+                "closedAt": "2026-11-03T00:00:00Z",
+                "assignees": [{"login": "me"}],
+                "labels": [{"name": "bug"}],
+                "comments": [{"author": {"login": "me"}, "body": "Can't reproduce", "createdAt": "2026-11-02T00:00:00Z"}]
+            }),
+        );
+        assert_eq!(detail.kind, Kind::Issue);
+        assert_eq!(detail.state, State::NotPlanned);
+        assert_eq!(detail.assignees, ["me"]);
+        assert_eq!(detail.labels, ["bug"]);
+        let kinds: Vec<_> = detail.timeline.iter().map(|e| &e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EventKind::Opened,
+                &EventKind::Comment {
+                    body: "Can't reproduce".into()
+                },
+                &EventKind::Closed
+            ]
         );
     }
 }

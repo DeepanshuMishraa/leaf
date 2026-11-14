@@ -291,8 +291,9 @@ function M.setup(opts)
     name = "leaf_pr",
     title = "Leaf: Pull Requests & Issues",
     description = "Your open pull requests and issues across GitHub, newest first, in this"
-      .. " pane. Pick a pull request to read its summary, timeline and diff, then merge,"
-      .. " close, approve or comment.",
+      .. " pane. Pick one to read its summary and timeline; pull requests also show a diff"
+      .. " and can be merged, closed, approved or commented, and issues can be commented"
+      .. " on, replied to, closed or reopened.",
     category = "Leaf",
     keywords = "leaf pr pull request issue issues github review merge squash rebase checks timeline branch",
     args = { target = "string?" },
