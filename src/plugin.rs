@@ -193,8 +193,19 @@ fn loader(plugin_path: &Path, bin: &Path) -> String {
 
 /// FNV-1a, 64 bits: stable across builds, unlike std's hasher.
 pub(crate) fn fnv1a(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    fnv1a_bytes(text.as_bytes())
+}
+
+/// FNV-1a over bytes: stable across builds and Rust releases, unlike
+/// `DefaultHasher`, so it's safe for values that are saved.
+pub(crate) fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    fnv1a_continue(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+/// FNV-1a carried on from `hash` over more bytes.
+pub(crate) fn fnv1a_continue(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 

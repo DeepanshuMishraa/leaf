@@ -262,13 +262,10 @@ fn links(text: &str) -> String {
             continue;
         }
         let after = &tail[1..];
-        let link = after
-            .find("](")
-            .filter(|&close| !after[..close].contains(['[', '`']))
-            .and_then(|close| {
-                let end = after[close + 2..].find(')')?;
-                Some((close, close + 2 + end + 1))
-            });
+        let link = label_end(after).and_then(|close| {
+            let end = after[close + 2..].find(')')?;
+            Some((close, close + 2 + end + 1))
+        });
         match link {
             Some((close, next)) => {
                 out.push_str(&after[..close]);
@@ -282,6 +279,32 @@ fn links(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Where a link label that starts `text` ends: the `](` after it, looked
+/// for outside inline code, so a label may hold code. `None` when another
+/// `[` comes first or there's no `](`.
+fn label_end(text: &str) -> Option<usize> {
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if rest.starts_with("](") {
+            return Some(at);
+        }
+        if rest.starts_with('[') {
+            return None;
+        }
+        if rest.starts_with('`') {
+            let ticks = rest.chars().take_while(|&c| c == '`').count();
+            at += match rest[ticks..].find(&rest[..ticks]) {
+                Some(end) => ticks + end + ticks,
+                None => ticks,
+            };
+            continue;
+        }
+        at += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    None
 }
 
 /// The source lines a quoted passage spans, when it can be found: its first
@@ -431,6 +454,10 @@ Loose closing paragraph.
         assert_eq!(
             links("Write `[a](b)` for [a link](c)"),
             "Write `[a](b)` for a link"
+        );
+        assert_eq!(
+            links("Run [the `leaf` command](https://x) now"),
+            "Run the `leaf` command now"
         );
         // Quoting the second line's link text must not land on the code
         // example above it.

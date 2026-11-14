@@ -64,6 +64,8 @@ const WHEEL_ROWS: usize = 3;
 const FRESH: Duration = Duration::from_secs(30);
 /// How long the list's selection rests before that pull request is fetched.
 const SETTLE: Duration = Duration::from_millis(150);
+/// The list's note while an `R` is still being answered.
+const RELOADING: &str = "Already reloading";
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// The keys an issue's footer offers, in the order they're dropped to fit.
 const ISSUE_KEYS: [(&str, &str); 7] = [
@@ -711,7 +713,7 @@ impl App {
             return;
         };
         if list.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading)) {
-            list.note = Some("Already reloading".to_owned());
+            list.note = Some(RELOADING.to_owned());
             return;
         }
         let shown = list.status;
@@ -877,6 +879,16 @@ impl App {
                         }
                         Err(e) => slot.fetch = Fetch::Failed(e),
                     }
+                }
+                // "Already reloading" is about the searches now answered, so
+                // the keys come back once the last one is.
+                if let Some(list) = self
+                    .list
+                    .as_mut()
+                    .filter(|l| !l.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading)))
+                    && list.note.as_deref() == Some(RELOADING)
+                {
+                    list.note = None;
                 }
             }
             Msg::Me(me) => {

@@ -984,7 +984,10 @@ impl App {
             },
             KeyCode::Char('e') => match picked {
                 Some(Listed::Note(at)) => self.edit_note(at),
-                Some(Listed::Global) => self.compose_global(),
+                Some(Listed::Global) => {
+                    self.dialog = Dialog::None;
+                    self.compose_global();
+                }
                 None => {}
             },
             KeyCode::Char('x') | KeyCode::Char('d') => {
@@ -1333,7 +1336,7 @@ impl App {
                 Listed::Global => (
                     format!(
                         "{marker} Whole plan · {}",
-                        self.global.as_deref().unwrap_or_default()
+                        one_line(self.global.as_deref().unwrap_or_default())
                     ),
                     Hue::Yellow.marker(),
                 ),
@@ -1675,13 +1678,18 @@ fn note_summary(note: &PlanNote) -> String {
         },
         PlanEdit::Replace(with) => ("replace", with.as_str()),
     };
+    format!("{label}  {}", one_line(body))
+}
+
+/// A note's first line for a one-line list row, with `…` when there's more.
+fn one_line(body: &str) -> String {
     let first = body.lines().next().unwrap_or("");
     let more = if body.lines().nth(1).is_some() {
         " …"
     } else {
         ""
     };
-    format!("{label}  {first}{more}")
+    format!("{first}{more}")
 }
 
 /// Key hints, `key action` apart, as many as fit `room` columns.
@@ -2050,7 +2058,9 @@ create table tokens (id int);
             app.composer.as_ref().map(|c| c.text.as_str()),
             Some("whole plan")
         );
+        assert_eq!(app.dialog, Dialog::None, "the editor replaces the list");
         press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('L'));
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.global, None);
         assert_eq!(app.dialog, Dialog::None);

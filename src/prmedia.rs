@@ -1311,6 +1311,28 @@ mod tests {
     }
 
     #[test]
+    fn a_photo_is_turned_upright_by_its_exif_orientation() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image::RgbImage::from_pixel(40, 20, image::Rgb([9, 9, 9])))
+            .expect("a JPEG encodes");
+        assert_eq!(decode(&jpeg).map(|p| p.dimensions()), Some((40, 20)));
+        // An APP1 segment right after SOI: one IFD entry, Orientation = 6
+        // (turned a quarter clockwise), so width and height swap.
+        let exif: &[u8] = &[
+            b'E', b'x', b'i', b'f', 0, 0, b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0,
+            0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+        ];
+        let length = u16::try_from(exif.len() + 2).expect("short segment");
+        let mut rotated = jpeg[..2].to_vec();
+        rotated.extend([0xFF, 0xE1]);
+        rotated.extend(length.to_be_bytes());
+        rotated.extend(exif);
+        rotated.extend(&jpeg[2..]);
+        assert_eq!(decode(&rotated).map(|p| p.dimensions()), Some((20, 40)));
+    }
+
+    #[test]
     fn gifs_with_frames_play_on_their_delays_and_loop() {
         let frame = |c: u8, ms: u32| {
             image::Frame::from_parts(

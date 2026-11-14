@@ -464,11 +464,16 @@ pub fn beside(
         return Ok(Opened::Returned);
     };
     let outcome = wait_for(&host, &path, &pane);
-    if let Reply::Result(target) = reply {
-        write_result(target, &outcome).map_err(|cause| MarginFailed::WriteResult {
+    if let Reply::Result(target) = reply
+        && let Err(cause) = write_result(target, &outcome)
+    {
+        // The error says the review is printed below, so it is: the review
+        // isn't lost with the file.
+        print_outcome(&outcome);
+        return Err(MarginFailed::WriteResult {
             path: target.display().to_string(),
             cause,
-        })?;
+        });
     }
     Ok(Opened::Waited(outcome))
 }

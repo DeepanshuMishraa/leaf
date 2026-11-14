@@ -3,7 +3,7 @@
 //! that goes back to the agent.
 
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 use crate::comment::State;
 use crate::diff::Diff;
@@ -186,9 +186,24 @@ impl FileNotes {
     }
 }
 
+/// FNV-1a as a `Hasher`. Fingerprints are saved with viewed marks, so they
+/// must come out the same after a rebuild, which `DefaultHasher` doesn't
+/// promise.
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = crate::plugin::fnv1a_continue(self.0, bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Stands for file `file`'s changes: it differs once any of them does.
 pub fn fingerprint(diff: &Diff, file: usize) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fnv(crate::plugin::fnv1a_bytes(&[]));
     let Some(info) = diff.file(file) else {
         return 0;
     };

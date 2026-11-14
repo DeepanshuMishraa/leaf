@@ -1048,7 +1048,16 @@ fn synth_untracked(root: &Path, path: &str, patch: &mut String) {
     let new = quote_path(&format!("b/{path}"));
     let _ = writeln!(patch, "diff --git {old} {new}");
     let _ = writeln!(patch, "new file mode 100644");
+    // Git leaves untracked files unhashed, so leaf stamps a binary or
+    // too-large one itself, and a viewed mark then lapses when it changes:
+    // by its content, or for a file too large to read, its size and time.
     if metadata.len() > MAX_UNTRACKED_BYTES {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |at| at.as_nanos());
+        let _ = writeln!(patch, "index 0000000..{:x}-{modified:x}", metadata.len());
         let _ = writeln!(
             patch,
             "leaf: {} MB file, too large to show",
@@ -1060,14 +1069,10 @@ fn synth_untracked(root: &Path, path: &str, patch: &mut String) {
         return;
     };
     if bytes.iter().take(SNIFF_BYTES).any(|byte| *byte == 0) {
-        // Git leaves untracked files unhashed, so leaf stamps the content
-        // itself: a viewed mark then lapses when the file changes.
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&bytes, &mut hasher);
         let _ = writeln!(
             patch,
             "index 0000000..{:016x}",
-            std::hash::Hasher::finish(&hasher)
+            crate::plugin::fnv1a_bytes(&bytes)
         );
         let _ = writeln!(patch, "Binary files {old} and {new} differ");
         return;

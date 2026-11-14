@@ -352,9 +352,14 @@ fn strip(value: &mut Value, touched: &mut bool) -> bool {
                 None => false,
             };
             *touched |= ours;
-            // An entry whose only handlers were leaf's is leaf's: what's left
-            // (a `matcher`) means nothing without them.
-            !(ours && emptied) && !map.is_empty()
+            if emptied {
+                map.remove("hooks");
+            }
+            // An entry whose only handlers were leaf's goes when nothing but
+            // its `matcher` is left, which means nothing without them; any
+            // other field keeps it.
+            let only_matcher = map.keys().all(|key| key == "matcher");
+            !(ours && emptied && only_matcher) && !map.is_empty()
         }
         _ => true,
     }
@@ -1128,6 +1133,21 @@ mod tests {
             .unwrap_or_default();
         let value: Value = serde_json::from_str(&removed).unwrap_or_default();
         assert_eq!(value, serde_json::json!({"model": "opus"}), "{removed}");
+
+        // Someone else's field on the same entry keeps it.
+        let command = format!("'{EXE}' hook claude # {MARK}");
+        let shared = format!(
+            r#"{{"hooks":{{"PermissionRequest":[{{"matcher":"ExitPlanMode","note":"mine","hooks":[{{"type":"command","command":"{command}"}}]}}]}}}}"#
+        );
+        let removed = removed_text(Agent::Claude, &shared)
+            .flatten()
+            .unwrap_or_default();
+        let value: Value = serde_json::from_str(&removed).unwrap_or_default();
+        assert_eq!(
+            value["hooks"]["PermissionRequest"][0],
+            serde_json::json!({"matcher": "ExitPlanMode", "note": "mine"}),
+            "{removed}"
+        );
     }
 
     #[cfg(unix)]
