@@ -586,7 +586,7 @@ impl Source {
             Source::Owned(_) => format!("user:{}", viewer()?),
         };
         Ok(format!(
-            "{} is:open archived:false {filter}",
+            "{} is:open archived:false {filter} sort:updated-desc",
             self.kind().qualifier()
         ))
     }
@@ -719,14 +719,20 @@ pub fn cached_search(source: &Source) -> Option<Vec<Entry>> {
     Some(parse_search(&nodes))
 }
 
-/// One list from several searches: each row once, newest first.
+/// One list from several searches: each row once, newest first. When two
+/// searches cached the same row, the fresher copy wins.
 pub fn merge(lists: impl IntoIterator<Item = Vec<Entry>>) -> Vec<Entry> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<Entry> = lists
-        .into_iter()
-        .flatten()
-        .filter(|entry| seen.insert(entry.pr.clone()))
-        .collect();
+    let mut by_ref: std::collections::HashMap<PrRef, Entry> = std::collections::HashMap::new();
+    for entry in lists.into_iter().flatten() {
+        let fresher = match by_ref.get(&entry.pr) {
+            Some(kept) => seconds(&entry.updated) > seconds(&kept.updated),
+            None => true,
+        };
+        if fresher {
+            by_ref.insert(entry.pr.clone(), entry);
+        }
+    }
+    let mut out: Vec<Entry> = by_ref.into_values().collect();
     out.sort_by_key(|entry| std::cmp::Reverse(seconds(&entry.updated)));
     out
 }
@@ -1391,7 +1397,7 @@ mod tests {
         );
         assert_eq!(
             Source::Authored(Kind::Issue).query().unwrap(),
-            "is:issue is:open archived:false author:@me"
+            "is:issue is:open archived:false author:@me sort:updated-desc"
         );
         assert_eq!(
             Source::Branch {
@@ -1400,7 +1406,7 @@ mod tests {
             }
             .query()
             .unwrap(),
-            "is:pr is:open archived:false repo:o/r head:fix/q"
+            "is:pr is:open archived:false repo:o/r head:fix/q sort:updated-desc"
         );
     }
 

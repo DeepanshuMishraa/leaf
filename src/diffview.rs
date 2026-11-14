@@ -1447,6 +1447,12 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        if let Some(editor) = &mut self.note_editor {
+            for ch in text.chars().filter(|ch| *ch != '\r') {
+                editor.text.push(ch);
+            }
+            return;
+        }
         if let Some(composer) = &mut self.composer {
             composer.insert(text);
         }
@@ -3406,10 +3412,13 @@ impl App {
                 self.toast(message);
             }
             KeyCode::Backspace if alt || ctrl => {
-                let kept = editor.text.trim_end().len();
-                let word = editor.text[..kept]
+                let word = editor
+                    .text
+                    .trim_end()
                     .rfind(char::is_whitespace)
-                    .map_or(0, |at| at + 1);
+                    .map_or(0, |at| {
+                        at + editor.text[at..].chars().next().map_or(1, char::len_utf8)
+                    });
                 editor.text.truncate(word);
             }
             KeyCode::Backspace => {
@@ -3579,8 +3588,11 @@ impl App {
         for (index, file) in files.iter().enumerate().skip(first).take(room) {
             let row = index + 1;
             let viewed = self.notes.is_viewed(diff, index);
-            let has_note = self.notes.files.contains_key(file.path());
-            let comments = self.draft_comments_in(file.path());
+            let old = file.old_path.as_deref().filter(|old| *old != file.path());
+            let has_note = self.notes.files.contains_key(file.path())
+                || old.is_some_and(|old| self.notes.files.contains_key(old));
+            let comments = self.draft_comments_in(file.path())
+                + old.map_or(0, |old| self.draft_comments_in(old));
             let notes = comments + usize::from(has_note);
             let (status, color) = file_status(file);
             let mark = match (viewed, notes > 0) {
@@ -3634,7 +3646,7 @@ impl App {
         let text = format!("{}▏", editor.text);
         let lines = wrap_text(&text, inner_width);
         let height = (lines.len() as u16 + 2)
-            .clamp(3, area.height / 2 + 1)
+            .clamp(3, (area.height / 2 + 1).max(3))
             .min(area.height);
         let rect = Rect {
             x: area.x,

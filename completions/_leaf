@@ -50,7 +50,7 @@ _leaf() {
 
   case $subcommand in
     open)
-      _arguments '*:document:_files -g "(#i)*.(pdf|epub|md|markdown|png|jpg|jpeg|gif|webp|svg|bmp|tif|tiff|heic|heif|avif)"'
+      _arguments '*:document:_files -g "(#i)*.(pdf|epub|md|markdown|png|jpg|jpeg|jpe|jfif|gif|webp|bmp|ico|tif|tiff|tga|pnm|pbm|pgm|ppm|pam|qoi|hdr|exr|dds|ff|svg|jxl|heic|heif|avif)"'
       ;;
     diff)
       _leaf_diff
@@ -59,22 +59,40 @@ _leaf() {
       _arguments \
         '--wait[block until the review is sent and print it]' \
         '--print[print the review instead of sending it to the agent]' \
+        '--reply-to=[send into this Rex block]:block:' \
+        '--result=[write the review to this file]:file:_files' \
+        '--title=[name shown for the plan]:title:' \
         '*:plan:_files -g "(#i)*.(md|markdown)"'
       ;;
     review)
       _arguments \
         '--wait[block until the review is sent and print it]' \
         '--print[print the review instead of sending it to the agent]' \
+        '--reply-to=[send into this Rex block]:block:' \
+        '--result=[write the review to this file]:file:_files' \
         '(-s --staged)'{-s,--staged}'[staged changes]' \
         '(-b --branch)'{-b,--branch}'[this branch against its base branch]' \
+        '(-i --inline)'{-i,--inline}'[one column, removed lines above added ones]' \
         '--base=[compare against a base]:ref:_leaf_refs' \
+        '(-r --range)'{-r,--range=}'[revision or revision range]:range:' \
+        '--patch=[diff or patch file]:patch file:_files -g "(#i)*.(diff|patch)"' \
         '*:path, revision or GitHub url:_files'
       ;;
     skills | skill)
-      _values 'action' install uninstall status print
+      if (( CURRENT == 2 )); then
+        _values 'action' install uninstall status print
+      elif [[ $words[2] == print ]]; then
+        _values 'skill' leaf leaf-plan leaf-review
+      fi
       ;;
     hook | hooks)
-      _values 'action' install uninstall status
+      if (( CURRENT == 2 )); then
+        _values 'action' install uninstall status
+      else
+        _arguments \
+          '--yes[write without asking]' \
+          '--dry-run[show what would change without writing]'
+      fi
       ;;
     comments)
       _arguments '--json[machine-readable JSON]'

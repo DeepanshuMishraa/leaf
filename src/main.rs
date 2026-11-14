@@ -70,7 +70,7 @@ use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
-       leaf pr [number | owner/repo#number | url]   your open pull requests and issues, or the pull request named
+       leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf skills install | uninstall | status   teach coding agents to use leaf
@@ -141,7 +141,7 @@ fn load(target: &str) -> Result<Doc, String> {
         return picture::open(Path::new(target)).map_err(|e| e.to_string());
     }
     Err(format!(
-        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), pictures (.png, .jpg, .gif, .webp, .svg, .heic and more) and web pages (http:// or https:// URLs)."
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
     ))
 }
 
@@ -273,7 +273,9 @@ fn main() -> ExitCode {
             args.get(1).map(String::as_str)
         ),
         (Some("rex" | "plugin"), Some("install" | "uninstall"))
-    ) || args.first().is_some_and(|arg| arg == "hook");
+    ) || args
+        .first()
+        .is_some_and(|arg| arg == "hook" || arg == "hooks");
     if !installing {
         let _ = plugin::refresh();
         skills::refresh();
@@ -599,7 +601,7 @@ fn diff_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `leaf pr`: lists your open pull requests and issues, or opens the pull request named.
+/// `leaf pr`: lists the pull requests and issues that concern you, or opens the pull request named.
 fn pr_command(args: &[String]) -> ExitCode {
     let here = pr::current_repo();
     let start = match args {

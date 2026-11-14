@@ -38,6 +38,29 @@ const submitPlan = (pi: ExtensionAPI) =>
 		},
 	});
 
+const splitArgs = (text: string): string[] => {
+	const out: string[] = [];
+	let current = "";
+	let quote: '"' | "'" | null = null;
+	for (const ch of text) {
+		if (quote) {
+			if (ch === quote) quote = null;
+			else current += ch;
+		} else if (ch === '"' || ch === "'") {
+			quote = ch;
+		} else if (/\s/.test(ch)) {
+			if (current) {
+				out.push(current);
+				current = "";
+			}
+		} else {
+			current += ch;
+		}
+	}
+	if (current) out.push(current);
+	return out;
+};
+
 const requestReview = (pi: ExtensionAPI) =>
 	defineTool({
 		name: "leaf_review_changes",
@@ -55,7 +78,7 @@ const requestReview = (pi: ExtensionAPI) =>
 			),
 		}),
 		async execute(_id, params, signal) {
-			const source = (params.source ?? "").split(/\s+/).filter(Boolean);
+			const source = splitArgs(params.source ?? "");
 			return review(pi, ["review", ...source], signal);
 		},
 	});

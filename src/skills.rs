@@ -89,8 +89,13 @@ fn path_of(dir: &Path, skill: Skill) -> PathBuf {
 }
 
 pub fn found(dir: &Path, skill: Skill) -> Found {
-    let Ok(text) = fs::read_to_string(path_of(dir, skill)) else {
-        return Found::Missing;
+    let text = match fs::read_to_string(path_of(dir, skill)) {
+        Ok(text) => text,
+        // Only a file that isn't there counts as leaf's to write. One that
+        // can't be read (bad UTF-8, permissions) is treated as not leaf's,
+        // so installing leaves it alone.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Found::Missing,
+        Err(_) => return Found::Foreign,
     };
     match unstamped(&text) {
         None => Found::Foreign,
@@ -186,7 +191,7 @@ pub fn uninstall(dirs: &[PathBuf]) -> Vec<Report> {
 /// Brings leaf's own installed skills up to this version. Quiet: a copy that
 /// can't be updated keeps working as it was.
 pub fn refresh() {
-    for dir in default_dirs() {
+    for dir in all_dirs() {
         for skill in SKILLS {
             if found(&dir, skill) == (Found::Ours { current: false }) {
                 let _ = write(&path_of(&dir, skill), &skill.rendered());
@@ -206,6 +211,20 @@ fn home() -> PathBuf {
 pub fn default_dirs() -> Vec<PathBuf> {
     let home = home();
     vec![home.join(".claude/skills"), home.join(".agents/skills")]
+}
+
+/// Every folder a leaf skill may already live in, including the separate
+/// ones Cursor and Antigravity read. Upgrades refresh these too.
+fn all_dirs() -> Vec<PathBuf> {
+    let home = home();
+    let mut dirs = default_dirs();
+    for extra in [".cursor/skills", ".gemini/config/skills"] {
+        let dir = home.join(extra);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 const USAGE: &str = "Usage: leaf skills install | uninstall | status | print <name>

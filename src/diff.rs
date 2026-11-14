@@ -185,26 +185,42 @@ impl Diff {
     }
 
     /// The row for a line on one side of a file, when the diff still has it.
+    /// The row a line is at, when it's still in the diff. Unlike `row_for`,
+    /// there's no fallback: a line that left the diff has no row.
+    pub fn exact_row(&self, file: &str, side: Side, line: u32) -> Option<usize> {
+        let index = self.files.iter().position(|f| match side {
+            Side::Old => f.old_path.as_deref() == Some(file),
+            Side::New => f.new_path.as_deref() == Some(file),
+        })?;
+        self.row_in(index, side, line)
+    }
+
+    fn row_in(&self, index: usize, side: Side, line: u32) -> Option<usize> {
+        let f = &self.files[index];
+        for hunk in &f.hunks {
+            for row in hunk.first..hunk.end {
+                let r = self.rows[row];
+                let number = match side {
+                    Side::Old => r.old,
+                    Side::New => r.new,
+                };
+                if number == line {
+                    return Some(row);
+                }
+            }
+        }
+        None
+    }
+
     pub fn row_for(&self, file: &str, side: Side, line: u32) -> Option<usize> {
         let wanted = self.files.iter().position(|f| match side {
             Side::Old => f.old_path.as_deref() == Some(file),
             Side::New => f.new_path.as_deref() == Some(file),
         });
         if let Some(index) = wanted {
-            let f = &self.files[index];
-            for hunk in &f.hunks {
-                for row in hunk.first..hunk.end {
-                    let r = self.rows[row];
-                    let number = match side {
-                        Side::Old => r.old,
-                        Side::New => r.new,
-                    };
-                    if number == line {
-                        return Some(row);
-                    }
-                }
-            }
-            return self.first_content(index);
+            return self
+                .row_in(index, side, line)
+                .or_else(|| self.first_content(index));
         }
         // A path may have come from another revision; land on a file with the
         // same tail rather than nowhere.

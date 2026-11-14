@@ -902,7 +902,7 @@ pub fn deliver_to(pane: &str, text: &str) -> Result<Agent, AgentFailed> {
 }
 
 /// Opens a pane to the right of `beside` (or of this pane) running `argv` in
-/// `dir`, without taking focus from the agent, and returns its block id.
+/// `dir`, focusing it, and returns its block id.
 pub fn split_beside(
     beside: Option<&str>,
     dir: &Path,

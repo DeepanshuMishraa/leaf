@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use serde_json::{Map, Value, json};
 
 use crate::agent;
-use crate::margin::{self, Opened};
+use crate::margin::{self, Opened, Reply};
 use crate::plugin::fnv1a;
 use crate::review::{Outcome, Verdict};
 use crate::skills;
@@ -270,11 +270,37 @@ fn upsert_event(
             what: format!("\"hooks.{event}\" isn't a list"),
         });
     };
-    match list.iter().position(has_mark) {
-        Some(at) => list[at] = entry,
+    match list.iter_mut().find(|item| has_mark(item)) {
+        Some(found) => refresh(found, entry),
         None => list.push(entry),
     }
     Ok(pretty(&settings))
+}
+
+/// Updates leaf's own parts of `existing` from `fresh`, leaving anything else
+/// in the entry (another command in the same hook list, say) as it was.
+fn refresh(existing: &mut Value, fresh: Value) {
+    match (existing, fresh) {
+        (Value::Object(old), Value::Object(new)) => {
+            for (key, value) in new {
+                match old.get_mut(&key) {
+                    Some(slot) => refresh(slot, value),
+                    None => {
+                        old.insert(key, value);
+                    }
+                }
+            }
+        }
+        (Value::Array(old), Value::Array(new)) => {
+            for value in new {
+                match old.iter_mut().find(|item| has_mark(item)) {
+                    Some(slot) => refresh(slot, value),
+                    None => old.push(value),
+                }
+            }
+        }
+        (slot, fresh) => *slot = fresh,
+    }
 }
 
 /// The settings without leaf's entry under `hooks.<event>`; `None` when it
@@ -283,9 +309,9 @@ fn remove_event(text: &str, event: &str) -> Option<String> {
     let mut settings: Value = serde_json::from_str(text).ok()?;
     let hooks = settings.get_mut("hooks")?.as_object_mut()?;
     let list = hooks.get_mut(event)?.as_array_mut()?;
-    let before = list.len();
-    list.retain(|entry| !has_mark(entry));
-    if list.len() == before {
+    let mut touched = false;
+    list.retain_mut(|entry| strip(entry, &mut touched));
+    if !touched {
         return None;
     }
     if list.is_empty() {
@@ -297,6 +323,40 @@ fn remove_event(text: &str, event: &str) -> Option<String> {
         root.remove("hooks");
     }
     Some(pretty(&settings))
+}
+
+/// Removes leaf's own handler from `value`, keeping everything else; `false`
+/// when nothing worth keeping is left in it.
+fn strip(value: &mut Value, touched: &mut bool) -> bool {
+    match value {
+        Value::String(text) => {
+            let leaf = text.contains(MARK);
+            *touched |= leaf;
+            !leaf
+        }
+        Value::Array(items) => {
+            items.retain_mut(|item| strip(item, touched));
+            !items.is_empty()
+        }
+        Value::Object(map) => {
+            let leaf = map
+                .values()
+                .any(|value| matches!(value, Value::String(text) if text.contains(MARK)));
+            if leaf {
+                *touched = true;
+                return false;
+            }
+            let drop_hooks = match map.get_mut("hooks") {
+                Some(hooks) => !strip(hooks, touched),
+                None => false,
+            };
+            if drop_hooks {
+                map.remove("hooks");
+            }
+            !map.is_empty()
+        }
+        _ => true,
+    }
 }
 
 /// The new text of `agent`'s hook file with leaf in it, or `None` when it
@@ -339,7 +399,16 @@ fn installed_text(
             );
             pretty(&settings)
         }
-        Agent::Pi => PI_EXTENSION.replace("__LEAF__", &exe.display().to_string()),
+        Agent::Pi => {
+            // The path sits inside a TypeScript string literal, so escape it
+            // as a JSON string's contents rather than its quoted form.
+            let quoted = Value::String(exe.display().to_string()).to_string();
+            let escaped = quoted
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or(&quoted);
+            PI_EXTENSION.replace("__LEAF__", escaped)
+        }
         Agent::OpenCode => return Ok(None),
     };
     Ok(Some(text))
@@ -377,27 +446,43 @@ fn summary(change: &FileChange) -> String {
     out
 }
 
-/// Writes a change, keeping a JSON file as it first was beside it.
+/// Writes a change, keeping a JSON file as it first was beside it. The write
+/// goes to a temporary file first so a failure can't truncate the original.
 fn apply(change: &FileChange) -> Result<(), String> {
     let path = &change.path;
     let fail = |e: std::io::Error| format!("{}: {e}", path.display());
-    if let (Some(before), Some(extension)) = (&change.before, path.extension())
-        && extension == "json"
-    {
-        let backup = path.with_extension("json.leaf-backup");
-        if !backup.exists() {
-            fs::write(&backup, before).map_err(fail)?;
-        }
-    }
     match &change.after {
         Some(after) => {
+            if let (Some(before), Some(extension)) = (&change.before, path.extension())
+                && extension == "json"
+            {
+                let backup = path.with_extension("json.leaf-backup");
+                if !backup.exists() {
+                    fs::write(&backup, before).map_err(fail)?;
+                }
+            }
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(fail)?;
             }
-            fs::write(path, after).map_err(fail)
+            atomic_write(path, after).map_err(fail)
         }
         None => fs::remove_file(path).map_err(fail),
     }
+}
+
+fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "leaf".to_owned());
+    let temp = path.with_file_name(format!(".{name}.leaf-{}.tmp", std::process::id()));
+    fs::write(&temp, text)?;
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&temp, meta.permissions());
+    }
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
 
 fn confirm(question: &str) -> bool {
@@ -461,7 +546,18 @@ fn plan_install(home: &Path, agents: &[Agent], exe: &Path) -> (Vec<FileChange>, 
         let Some(path) = agent.hook_file(home) else {
             continue;
         };
-        let before = fs::read_to_string(&path).ok();
+        let before = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                problems.push(format!(
+                    "{}: {} couldn't be read ({e}), so leaf left it alone.",
+                    agent.name(),
+                    path.display()
+                ));
+                continue;
+            }
+        };
         match installed_text(*agent, &path, before.as_deref(), exe) {
             Ok(Some(after)) if Some(&after) != before.as_ref() => changes.push(FileChange {
                 path,
@@ -792,21 +888,26 @@ fn review_file(agent: Agent, handoff: &Handoff, data: &Path) -> Result<PathBuf, 
     Ok(path)
 }
 
+/// The file that records the last plan reviewed in this conversation.
+fn seen_path(agent: Agent, handoff: &Handoff, data: &Path) -> PathBuf {
+    data.join("seen")
+        .join(format!("{}-{}", agent.word(), safe_name(&handoff.session)))
+}
+
 /// Whether this exact plan was already reviewed in this conversation, for
-/// the agents whose hook fires at every turn's end. Marks it reviewed.
+/// the agents whose hook fires at every turn's end.
 fn seen_before(agent: Agent, handoff: &Handoff, data: &Path) -> bool {
-    let path = data
-        .join("seen")
-        .join(format!("{}-{}", agent.word(), safe_name(&handoff.session)));
     let stamp = format!("{:016x}", fnv1a(&handoff.plan));
-    if fs::read_to_string(&path).is_ok_and(|seen| seen.trim() == stamp) {
-        return true;
-    }
+    fs::read_to_string(seen_path(agent, handoff, data)).is_ok_and(|seen| seen.trim() == stamp)
+}
+
+/// Records the plan as reviewed, so the same one isn't shown again.
+fn remember(agent: Agent, handoff: &Handoff, data: &Path) {
+    let path = seen_path(agent, handoff, data);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(&path, stamp);
-    false
+    let _ = fs::write(&path, format!("{:016x}", fnv1a(&handoff.plan)));
 }
 
 /// What the agent is told for an outcome; `None` says nothing, so it goes
@@ -868,7 +969,8 @@ fn run(agent: Agent) -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let data = margin::data_dir();
-    if matches!(agent, Agent::Codex | Agent::Antigravity) && seen_before(agent, &handoff, &data) {
+    let watches = matches!(agent, Agent::Codex | Agent::Antigravity);
+    if watches && seen_before(agent, &handoff, &data) {
         return ExitCode::SUCCESS;
     }
     let file = match review_file(agent, &handoff, &data) {
@@ -889,6 +991,7 @@ fn run(agent: Agent) -> ExitCode {
         ],
         true,
         &format!("leaf plan {shown}"),
+        &Reply::Print,
     ) {
         Ok(Opened::Waited(outcome)) => outcome,
         Ok(Opened::Returned) => Outcome::Closed,
@@ -897,6 +1000,11 @@ fn run(agent: Agent) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+    // Only a review that went through counts as seen, so closing it or
+    // failing to open it leaves the plan open to a later try.
+    if watches && matches!(outcome, Outcome::Sent { .. }) {
+        remember(agent, &handoff, &data);
+    }
     if let Outcome::Sent {
         verdict: Verdict::ApproveWithNotes,
         text,
@@ -995,6 +1103,33 @@ mod tests {
             .flatten()
             .unwrap_or_default();
         assert!(removed.contains("guard") && !removed.contains(MARK));
+    }
+
+    #[test]
+    fn another_handler_in_leafs_hook_entry_is_kept() {
+        let command = format!("'{EXE}' hook claude # {MARK}");
+        let before = format!(
+            r#"{{"hooks":{{"PermissionRequest":[{{"matcher":"ExitPlanMode","hooks":[{{"type":"command","command":"{command}"}},{{"type":"command","command":"audit"}}]}}]}}}}"#
+        );
+        let once = install_text(Agent::Claude, Some(&before));
+        let value: Value = serde_json::from_str(&once).unwrap_or_default();
+        let hooks = value["hooks"]["PermissionRequest"][0]["hooks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(hooks.len(), 2, "{once}");
+        assert!(
+            hooks.iter().any(|hook| hook["command"] == "audit"),
+            "{once}"
+        );
+        assert!(
+            hooks.iter().any(|hook| hook["command"] == command),
+            "{once}"
+        );
+        let removed = removed_text(Agent::Claude, &once)
+            .flatten()
+            .unwrap_or_default();
+        assert!(removed.contains("audit") && !removed.contains(MARK));
     }
 
     #[test]
@@ -1148,6 +1283,7 @@ mod tests {
             input: Value::Null,
         };
         assert!(!seen_before(Agent::Codex, &plan("one"), &data));
+        remember(Agent::Codex, &plan("one"), &data);
         assert!(seen_before(Agent::Codex, &plan("one"), &data));
         assert!(!seen_before(Agent::Codex, &plan("two"), &data));
         assert!(!seen_before(Agent::Antigravity, &plan("two"), &data));

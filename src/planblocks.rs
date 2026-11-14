@@ -213,7 +213,9 @@ fn plain(line: &str) -> String {
             .trim_start_matches('#')
             .trim_start_matches('>')
             .trim_start();
-        for marker in ["- [ ] ", "- [x] ", "- [X] ", "* ", "- ", "+ "] {
+        for marker in [
+            "- [ ] ", "- [x] ", "- [X] ", "[ ] ", "[x] ", "[X] ", "* ", "- ", "+ ",
+        ] {
             if let Some(rest) = text.strip_prefix(marker) {
                 text = rest;
             }
@@ -226,11 +228,34 @@ fn plain(line: &str) -> String {
             break;
         }
     }
-    let unmarked: String = text
+    let unmarked: String = links(text)
         .chars()
         .filter(|c| !matches!(c, '*' | '_' | '`' | '~'))
         .collect();
     unmarked.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `[label](target)` becomes `label`, so a quote copied from the rendered
+/// plan matches the link syntax in its source.
+fn links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find("](") else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let Some(end) = after[close + 2..].find(')') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        out.push_str(&after[..close]);
+        rest = &after[close + 2 + end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The source lines a quoted passage spans, when it can be found: its first

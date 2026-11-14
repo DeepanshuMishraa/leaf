@@ -9,17 +9,22 @@ use image::RgbaImage;
 
 use crate::doc::{Doc, Source};
 
-/// Extensions leaf opens as pictures. HEIC, AVIF and JPEG XL go through
-/// macOS's `sips`, so they open only there.
-pub const EXTENSIONS: [&str; 26] = [
+/// Extensions leaf opens as pictures. HEIC, HEIF, AVIF and JPEG XL need
+/// macOS's `sips`, so elsewhere they're left out rather than offered and
+/// then failing to decode.
+pub const EXTENSIONS: [&str; 27] = [
     "png", "jpg", "jpeg", "jpe", "jfif", "gif", "webp", "bmp", "ico", "tif", "tiff", "tga", "pnm",
-    "pbm", "pgm", "ppm", "pam", "qoi", "hdr", "exr", "dds", "ff", "svg", "heic", "heif", "avif",
+    "pbm", "pgm", "ppm", "pam", "qoi", "hdr", "exr", "dds", "ff", "svg", "jxl", "heic", "heif",
+    "avif",
 ];
+
+/// The extensions only macOS's `sips` can read.
+const SIPS_ONLY: [&str; 4] = ["heic", "heif", "avif", "jxl"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum PictureFailed {
     #[error(
-        "macOS blocked access to {path} ({cause}). Allow your terminal in System Settings → Privacy & Security → Files & Folders, then restart it."
+        "Could not read {path} because the operating system denied access ({cause}). Allow your terminal to read it in your system's privacy settings, then restart it."
     )]
     Blocked { path: String, cause: std::io::Error },
     #[error("Could not read {path} ({cause}). Check that the path is right and the file exists.")]
@@ -31,9 +36,10 @@ pub enum PictureFailed {
 }
 
 pub fn is_picture(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x))
+            && (cfg!(target_os = "macos") || !SIPS_ONLY.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    })
 }
 
 struct Picture {

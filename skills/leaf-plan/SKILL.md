@@ -45,7 +45,7 @@ Make the expiry configurable.
 ...
 ```
 
-A note with `(lines …)` after the heading is on the whole block. One with `, line N` or `, lines N-M` is on just those lines, quoted below it.
+A note with `(lines …)` after the heading is on the whole block. One with `, line N` or `, lines N-M` is on just those lines, quoted below it. A `Global:` note is on the whole plan rather than one block: address it as well as the numbered items.
 
 - **approved**: carry on with the plan as written.
 - **approved with notes**: carry on, and apply every numbered item as you go.

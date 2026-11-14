@@ -124,13 +124,21 @@ impl Host {
                 .map(drop)
                 .map_err(|e| e.to_string()),
             Host::Tmux => {
-                let buffer = "leaf-margin";
-                output("tmux", &["load-buffer", "-b", buffer, "-"], Some(text))?;
-                output(
+                let pasted = text.replace("\u{1b}[201~", "");
+                static DELIVERIES: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let serial = DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let buffer = format!("leaf-margin-{}-{serial}", std::process::id());
+                output("tmux", &["load-buffer", "-b", &buffer, "-"], Some(&pasted))?;
+                let pasted = output(
                     "tmux",
-                    &["paste-buffer", "-p", "-d", "-b", buffer, "-t", pane],
+                    &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", pane],
                     None,
-                )?;
+                );
+                if pasted.is_err() {
+                    let _ = output("tmux", &["delete-buffer", "-b", &buffer], None);
+                }
+                pasted?;
                 output("tmux", &["send-keys", "-t", pane, "Enter"], None).map(drop)
             }
             Host::Herdr => {
@@ -159,7 +167,7 @@ impl Host {
                     None,
                 )
                 .ok()?;
-                let processes = output("ps", &["-A", "-o", "pid=,ppid=,args="], None).ok()?;
+                let processes = output("ps", &["-A", "-o", "pid=,ppid=,stat=,args="], None).ok()?;
                 tmux_agents(&listed, &processes)
                     .into_iter()
                     .find(|(pane, _)| Some(pane) != own.as_ref())
@@ -261,8 +269,27 @@ fn herdr_agents(printed: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The agent named by a process's command line: the executable itself, or
+/// the script an interpreter was given. Other arguments don't count, so
+/// `vim /usr/local/bin/claude` isn't taken for Claude.
+fn agent_in_args(args: &str) -> Option<&'static str> {
+    let mut words = args.split_whitespace();
+    let exe = words.next()?;
+    if let Some(name) = agent::agent_name(exe) {
+        return Some(name);
+    }
+    let tag = Path::new(exe).file_name()?.to_str()?.to_ascii_lowercase();
+    let interpreter = matches!(
+        tag.as_str(),
+        "node" | "bun" | "deno" | "python" | "python3" | "sh" | "bash" | "zsh"
+    );
+    interpreter
+        .then(|| words.take(3).find_map(agent::agent_name))
+        .flatten()
+}
+
 /// The panes in `list-panes` output (`%id<TAB>pid`) that have an agent CLI
-/// running under them, found in `ps -A -o pid=,ppid=,args=` output.
+/// running under them, found in `ps -A -o pid=,ppid=,stat=,args=` output.
 fn tmux_agents(panes: &str, processes: &str) -> Vec<(String, String)> {
     let procs: Vec<(u32, u32, &str)> = processes
         .lines()
@@ -270,7 +297,14 @@ fn tmux_agents(panes: &str, processes: &str) -> Vec<(String, String)> {
             let mut parts = line.split_whitespace();
             let pid = parts.next()?.parse().ok()?;
             let ppid = parts.next()?.parse().ok()?;
+            // A stopped process (Ctrl+Z) doesn't own the terminal, so the
+            // shell under it would get the paste instead.
+            let state = parts.next()?;
+            if state.starts_with('T') {
+                return None;
+            }
             let args = line.trim_start();
+            let args = args[args.find(char::is_whitespace)?..].trim_start();
             let args = args[args.find(char::is_whitespace)?..].trim_start();
             let args = args[args.find(char::is_whitespace)?..].trim_start();
             Some((pid, ppid, args))
@@ -287,7 +321,7 @@ fn tmux_agents(panes: &str, processes: &str) -> Vec<(String, String)> {
             }
             for (child, parent, args) in &procs {
                 if *child == pid
-                    && let Some(name) = args.split_whitespace().take(3).find_map(agent::agent_name)
+                    && let Some(name) = agent_in_args(args)
                 {
                     return Some(name.to_owned());
                 }
@@ -373,13 +407,15 @@ mod tests {
 
     #[test]
     fn tmux_panes_with_an_agent_under_them_are_found() {
-        let panes = "%1\t100\n%2\t200\n%3\t300\n";
-        let processes = "  100     1 -zsh
-  101   100 node /opt/homebrew/bin/codex
-  200     1 -fish
-  201   200 vim notes.md
-  300     1 /bin/zsh
-  301   300 /Users/me/.local/bin/claude --resume
+        let panes = "%1\t100\n%2\t200\n%3\t300\n%4\t400\n";
+        let processes = "  100     1 Ss   -zsh
+  101   100 S+   node /opt/homebrew/bin/codex
+  200     1 Ss   -fish
+  201   200 S+   vim /usr/local/bin/claude
+  300     1 Ss   /bin/zsh
+  301   300 S+   /Users/me/.local/bin/claude --resume
+  400     1 Ss   /bin/zsh
+  401   400 T    /Users/me/.local/bin/claude
 ";
         assert_eq!(
             tmux_agents(panes, processes),

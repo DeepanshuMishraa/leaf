@@ -207,7 +207,9 @@ impl Review {
             Notes::Plan(notes) => render_plan(&mut out, notes),
             Notes::Code(notes) => render_code(&mut out, notes),
         }
-        if let Some(closing) = verdict.closing(plan) {
+        if self.notes.len() > 0
+            && let Some(closing) = verdict.closing(plan)
+        {
             let _ = writeln!(out, "\n{closing}");
         }
         out
@@ -321,12 +323,22 @@ fn render_code(out: &mut String, notes: &[CodeNote]) {
                     } else {
                         format!("Lines {}-{}", anchor.start_line, anchor.end_line)
                     };
-                    let _ = writeln!(
-                        out,
-                        "\n### {number}. {range} ({side})\n\n```diff\n{}\n```\n\n{}",
-                        hunk.trim_end(),
-                        note.body.trim()
-                    );
+                    let hunk = hunk.trim_end();
+                    if hunk.is_empty() {
+                        // The anchored lines left the diff, so there's nothing
+                        // to quote; the note still goes.
+                        let _ = writeln!(
+                            out,
+                            "\n### {number}. {range} ({side})\n\n{}",
+                            note.body.trim()
+                        );
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "\n### {number}. {range} ({side})\n\n````diff\n{hunk}\n````\n\n{}",
+                            note.body.trim()
+                        );
+                    }
                 }
             }
         }
@@ -499,9 +511,9 @@ Split this file.
 
 ### 2. Line 4 (new side)
 
-```diff
+````diff
 +line 4
-```
+````
 
 Name this.
 
@@ -509,9 +521,9 @@ Name this.
 
 ### 3. Line 9 (new side)
 
-```diff
+````diff
 +line 9
-```
+````
 
 Leaks.
 

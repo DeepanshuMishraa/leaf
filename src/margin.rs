@@ -159,7 +159,14 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             );
         }
         return match result {
-            Ok(outcome) => finish(&outcome, &request.reply),
+            Ok(outcome) => finish(
+                &outcome,
+                if request.wait {
+                    &Reply::Print
+                } else {
+                    &request.reply
+                },
+            ),
             Err(e) => {
                 eprintln!("leaf: {}", MarginFailed::Terminal(e));
                 ExitCode::from(1)
@@ -172,7 +179,7 @@ pub fn plan_command(args: &[String]) -> ExitCode {
         forwarded.extend(["--title".to_owned(), title.clone()]);
     }
     forwarded.push(request.file.clone());
-    match beside(&forwarded, request.wait, &command) {
+    match beside(&forwarded, request.wait, &command, &request.reply) {
         Ok(Opened::Returned) => {
             println!(
                 "Opened {} for review in a pane beside you. The review arrives as your next message: end your turn now and don't poll for it.",
@@ -286,7 +293,7 @@ pub fn review_command(args: &[String]) -> ExitCode {
         let mut forwarded = vec!["review".to_owned()];
         forwarded.extend(rest.iter().cloned());
         let command = format!("leaf {}", forwarded.join(" "));
-        return match beside(&forwarded, wait, &command) {
+        return match beside(&forwarded, wait, &command, &reply) {
             Ok(Opened::Returned) => {
                 println!(
                     "Opened the changes for review in a pane beside you. The review arrives as your next message: end your turn now and don't poll for it."
@@ -326,7 +333,7 @@ pub fn review_command(args: &[String]) -> ExitCode {
         eprintln!("leaf: {message}");
     }
     match result {
-        Ok(outcome) => finish(&outcome, &reply),
+        Ok(outcome) => finish(&outcome, if wait { &Reply::Print } else { &reply }),
         Err(e) => {
             eprintln!("leaf: {}", MarginFailed::Terminal(e));
             ExitCode::from(1)
@@ -404,7 +411,12 @@ pub enum Opened {
 /// Opens `leaf <args>` in a Rex pane beside the agent that ran this. Without
 /// `wait`, the pane sends the review to that agent itself; with it, the pane
 /// writes a result file that this process waits for and reads.
-pub fn beside(args: &[String], wait: bool, command: &str) -> Result<Opened, MarginFailed> {
+pub fn beside(
+    args: &[String],
+    wait: bool,
+    command: &str,
+    reply: &Reply,
+) -> Result<Opened, MarginFailed> {
     let nowhere = || MarginFailed::Nowhere {
         command: command.to_owned(),
     };
@@ -415,11 +427,22 @@ pub fn beside(args: &[String], wait: bool, command: &str) -> Result<Opened, Marg
         .unwrap_or_else(|_| "leaf".into());
     let (verb, rest) = args.split_first().ok_or_else(nowhere)?;
     let mut argv = vec![exe, verb.clone()];
-    let result = wait.then(result_path);
-    match (&result, &asking) {
-        (Some(path), _) => argv.extend(["--result".into(), path.display().to_string()]),
-        (None, Some(block)) => argv.extend(["--reply-to".into(), block.clone()]),
-        (None, None) => {}
+    // `--wait` and `--print` both need the outcome back in this process;
+    // `--result` names where it goes.
+    let result = match reply {
+        Reply::Result(path) => Some(path.clone()),
+        _ if wait || matches!(reply, Reply::Print) => Some(result_path()),
+        _ => None,
+    };
+    match (&result, &asking, reply) {
+        (Some(path), _, _) => argv.extend(["--result".into(), path.display().to_string()]),
+        (None, _, Reply::Agent(Some(block))) => {
+            argv.extend(["--reply-to".into(), block.clone()]);
+        }
+        (None, Some(block), Reply::Agent(None)) => {
+            argv.extend(["--reply-to".into(), block.clone()]);
+        }
+        _ => {}
     }
     argv.extend(rest.iter().cloned());
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -589,6 +612,20 @@ pub fn finish(outcome: &Outcome, reply: &Reply) -> ExitCode {
         }
         Reply::Agent(pane) => {
             let Outcome::Sent { text, verdict } = outcome else {
+                // The agent was told to end its turn and wait, so a silent
+                // close would leave it waiting with nothing to go on.
+                let notice = "The review was closed without a verdict. Ask the person how they'd like to go on.";
+                let delivered = match pane {
+                    Some(pane) => agent::deliver_to_pane(pane, notice),
+                    None => agent::deliver(notice),
+                };
+                match delivered {
+                    Ok(found) => eprintln!(
+                        "leaf: the review was closed without a verdict; told {}.",
+                        found.describe()
+                    ),
+                    Err(e) => eprintln!("leaf: {e}"),
+                }
                 return ExitCode::SUCCESS;
             };
             let delivered = match pane {

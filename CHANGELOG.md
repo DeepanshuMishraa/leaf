@@ -9,7 +9,7 @@ per change, starting with `- `.
 - Review your agent's plans: `leaf plan plan.md` shows a plan block by block and line by line. `V` selects lines, `c` comments on them or on the cursor line, `B` the whole block, `x`/`r` remove or replace the selection or the block, `C` adds a note on the whole plan, and `S` sends one review with a verdict.
 - Review your agent's changes: `leaf review` starts from an overview of every changed file. `V` selects lines to comment on with `c`, `F` notes a whole file, `M` the whole change, `w` marks a file viewed, and `S` sends one review.
 - Agents can ask for a review themselves. In Rex, tmux or Herdr the review opens beside the agent, and your verdict comes back to it as its next message.
-- `leaf hook install` sets up Claude Code, Codex, Antigravity, Grok Build, Cursor, Pi and OpenCode to hand you their plans before they build.
+- `leaf hook install` sets up Claude Code, Codex, Antigravity, Grok Build, Cursor and Pi to hand you their plans before they build; OpenCode gets the skills, so it runs `leaf plan` and `leaf review` itself.
 - `leaf skills install` teaches agents to use leaf.
 - A resubmitted plan marks the blocks that changed since you last reviewed it, and `D` steps through them.
 - `leaf diff` has the overview (`tab`), file and whole-change notes, and `S` to send everything as one review.

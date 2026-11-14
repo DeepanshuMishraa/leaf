@@ -453,7 +453,6 @@ impl Store {
         self.save_setting("voice", voice)
     }
 
-    /// The agent CLI questions go to, such as `claude`; `None` means any agent pane.
     /// The unsent Margin notes on the plan `key`, as the review screen saved them.
     pub fn load_margin_draft(&self, key: &str) -> Result<Option<String>, StoreFailed> {
         Ok(self
@@ -474,6 +473,7 @@ impl Store {
         }
     }
 
+    /// The agent CLI questions go to, such as `claude`; `None` means any agent pane.
     pub fn load_agent(&self) -> Result<Option<String>, StoreFailed> {
         Ok(self.setting("agent")?.filter(|name| !name.is_empty()))
     }

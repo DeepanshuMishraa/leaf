@@ -164,7 +164,12 @@ pub fn fingerprint(diff: &Diff, file: usize) -> u64 {
     let Some(info) = diff.file(file) else {
         return 0;
     };
-    info.path().hash(&mut hasher);
+    // Both paths and the change's metadata, so a rename, mode change or
+    // binary switch lapses an earlier viewed mark even with the same rows.
+    info.old_path.hash(&mut hasher);
+    info.new_path.hash(&mut hasher);
+    info.binary.hash(&mut hasher);
+    info.note.hash(&mut hasher);
     for hunk in &info.hunks {
         for row in hunk.first.saturating_sub(1)..hunk.end {
             diff.row_text(row).hash(&mut hasher);
@@ -204,9 +209,9 @@ pub fn build(diff: &Diff, subject: &str, notes: &FileNotes, comments: &[SavedCom
         .filter(|saved| saved.comment.state == State::Draft)
     {
         let anchor = &saved.comment.anchor;
-        let first = diff.row_for(&anchor.file, anchor.side, anchor.start_line);
+        let first = diff.exact_row(&anchor.file, anchor.side, anchor.start_line);
         let last = diff
-            .row_for(&anchor.file, anchor.side, anchor.end_line)
+            .exact_row(&anchor.file, anchor.side, anchor.end_line)
             .or(first);
         let hunk = match (first, last) {
             (Some(first), Some(last)) => diff.neighborhood(first, last, HUNK_PAD),
@@ -289,7 +294,7 @@ diff --git a/src/z.rs b/src/z.rs
         let z = text.find("## src/z.rs").unwrap_or(0);
         assert!(a < z, "{text}");
         assert!(text.contains("Global: Looks close."));
-        assert!(text.contains("### 1. Line 2 (new side)\n\n```diff\n@@ -1,2 +1,3 @@\n fn a() {}\n+fn b() {}\n fn c() {}\n```\n\nname b better"), "{text}");
+        assert!(text.contains("### 1. Line 2 (new side)\n\n````diff\n@@ -1,2 +1,3 @@\n fn a() {}\n+fn b() {}\n fn c() {}\n````\n\nname b better"), "{text}");
         assert!(
             text.contains("### 2. Whole file\n\nWhy rename?\n\n### 3. Line 1"),
             "{text}"

@@ -133,9 +133,9 @@ struct App {
     subject: String,
     round: Option<u32>,
     blocks: Vec<Block>,
-    /// The blocks the round before had, when there was one: a block not
-    /// among them is new or rewritten.
-    before: Option<std::collections::HashSet<String>>,
+    /// The blocks the round before had, when there was one: a block whose
+    /// occurrence here is beyond the count before is new or rewritten.
+    before: Option<std::collections::HashMap<String, usize>>,
     /// How many of the round before's blocks are gone.
     dropped_blocks: usize,
     /// Each block laid out at `laid_width`.
@@ -201,14 +201,17 @@ impl App {
             save: plan.save,
         };
         if let Some(previous) = plan.previous.as_deref() {
-            let before: std::collections::HashSet<String> = planblocks::blocks(previous)
-                .into_iter()
-                .map(|block| block.text)
-                .collect();
+            let mut before: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for block in planblocks::blocks(previous) {
+                *before.entry(block.text).or_default() += 1;
+            }
             app.dropped_blocks = before
                 .iter()
-                .filter(|text| !app.blocks.iter().any(|block| &block.text == *text))
-                .count();
+                .map(|(text, count)| {
+                    count.saturating_sub(app.blocks.iter().filter(|b| &b.text == text).count())
+                })
+                .sum();
             app.before = Some(before);
         }
         if let Some(draft) = plan.draft.as_deref() {
@@ -297,6 +300,11 @@ impl App {
                 dropped
             ),
         });
+        // Save the trimmed set now, so a dropped note can't come back if the
+        // plan later grows the text it was tied to again.
+        if dropped > 0 {
+            self.persist();
+        }
     }
 
     fn persist(&mut self) {
@@ -460,9 +468,15 @@ impl App {
 
     /// Whether block `block` is new or rewritten since the round before.
     fn changed(&self, block: usize) -> bool {
-        self.before
-            .as_ref()
-            .is_some_and(|before| !before.contains(&self.blocks[block].text))
+        let Some(before) = self.before.as_ref() else {
+            return false;
+        };
+        let text = &self.blocks[block].text;
+        let seen = self.blocks[..=block]
+            .iter()
+            .filter(|other| &other.text == text)
+            .count();
+        seen > before.get(text).copied().unwrap_or(0)
     }
 
     fn changed_count(&self) -> usize {
@@ -833,11 +847,17 @@ impl App {
             let quote = self.selected_text(selection);
             if !quote.trim().is_empty() {
                 let target = self.passage_target(selection.block, &quote);
+                if !self
+                    .notes
+                    .iter()
+                    .any(|note| note.target == target && note.edit == PlanEdit::Remove)
+                {
+                    self.notes.push(PlanNote {
+                        target: target.clone(),
+                        edit: PlanEdit::Remove,
+                    });
+                }
                 self.toast = Some(format!("{} marked for removal", target_label(&target)));
-                self.notes.push(PlanNote {
-                    target,
-                    edit: PlanEdit::Remove,
-                });
                 self.persist();
                 return;
             }
@@ -1231,7 +1251,9 @@ impl App {
         }
         let composer_height = self.composer.as_ref().map_or(0, |c| {
             let width = area.width.saturating_sub(4).max(1) as usize;
-            (wrapped(&c.text, width).len() as u16 + 2).clamp(3, area.height / 2)
+            (wrapped(&c.text, width).len() as u16 + 2)
+                .clamp(3, (area.height / 2).max(3))
+                .min(area.height.saturating_sub(3).max(1))
         });
         let header = Rect { height: 1, ..area };
         let footer = Rect {
@@ -1726,7 +1748,7 @@ const KEYS: &[(&str, &str)] = &[
     ("r", "replace the selection or the block with your text"),
     ("C", "global note on the whole plan"),
     ("X", "clear the block's notes"),
-    ("L", "every note: go to, edit or delete one"),
+    ("L", "notes on blocks: go to, edit or delete one"),
     ("D", "next block that changed since the last round (+)"),
     ("drag", "select a passage; c, x and r then act on it"),
     ("S", "send the review with a verdict"),
