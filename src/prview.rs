@@ -3044,7 +3044,9 @@ fn events(
         if which == Events::Comments && quoted(event).is_none() {
             continue;
         }
-        let rail = if focus == Some(index) { bold } else { dim };
+        let picked = focus == Some(index);
+        let accent = Style::default().fg(BLUE).add_modifier(Modifier::BOLD);
+        let rail = if picked { accent } else { dim };
         let when = Span::styled(pr::ago(&event.at, now), dim);
         let actor = Span::styled(event.actor.clone(), bold);
         let (glyph, color, what, body): (&str, Color, Vec<Span<'static>>, Option<String>) =
@@ -3111,18 +3113,33 @@ fn events(
                     None,
                 ),
             };
-        let mut left = vec![Span::styled(
-            format!("{glyph}  "),
-            Style::default().fg(color),
-        )];
-        left.extend(what);
-        lines.push(spread(left, vec![when], width));
+        // The picked comment stands out: a pointer for its glyph, a thick
+        // blue rail down its body, and a reminder of what enter does.
+        let (left, right) = if picked {
+            let mut left = vec![Span::styled("▶  ", accent)];
+            left.extend(what);
+            let right = vec![
+                Span::styled("enter replies", accent),
+                Span::styled(" · ", dim),
+                when,
+            ];
+            (left, right)
+        } else {
+            let mut left = vec![Span::styled(
+                format!("{glyph}  "),
+                Style::default().fg(color),
+            )];
+            left.extend(what);
+            (left, vec![when])
+        };
+        lines.push(spread(left, right, width));
         if let Some(body) = body.map(|b| pr::visible(&b)).filter(|b| !b.is_empty()) {
             let rendered = markdown(&body, (width as u16).saturating_sub(indent), indent);
             let total = rendered.len();
             let shown = if expanded { total } else { total.min(EXCERPT) };
             lines.extend(rendered.into_iter().take(shown).map(|mut line| {
-                line.spans.insert(0, Span::styled("│", rail));
+                line.spans
+                    .insert(0, Span::styled(if picked { "┃" } else { "│" }, rail));
                 line.spans[1] = Span::styled(
                     line.spans[1].content.chars().skip(1).collect::<String>(),
                     line.spans[1].style,
@@ -3263,9 +3280,15 @@ mod tests {
                 headline: "fix it".into(),
             },
         });
-        let (lines, starts) = comments(&d, 60, now, Some(1));
+        let (lines, starts) = comments(&d, 60, now, None);
         let shown = texts(&lines);
         assert!(shown[0].starts_with("◆  bot commented"), "{shown:?}");
+        // Picked, it's pointed at, its rail is thick, and enter is named.
+        let (picked, _) = comments(&d, 60, now, Some(1));
+        let picked = texts(&picked);
+        assert!(picked[0].starts_with("▶  bot commented"), "{picked:?}");
+        assert!(picked[0].contains("enter replies"), "{picked:?}");
+        assert!(picked[1].starts_with('┃'), "{picked:?}");
         assert!(shown.iter().any(|l| l.contains("line 30")));
         assert!(
             !shown
@@ -3301,6 +3324,32 @@ mod tests {
         assert_eq!(issue.step(1, true), Step::Tab(Tab::Summary));
         issue.pick(1);
         assert_eq!(issue.tab, Tab::Comments, "picking stays on Comments");
+    }
+
+    #[test]
+    fn replying_quotes_only_the_picked_comment() {
+        let mut d = detail(State::Open);
+        d.timeline.push(pr::Event {
+            at: "2026-11-12T04:00:00Z".into(),
+            actor: "ana".into(),
+            kind: EventKind::Comment {
+                body: "Second thought".into(),
+            },
+        });
+        let pr = PrRef {
+            repo: "o/r".into(),
+            number: 1,
+        };
+        let mut page = Page::new(pr, Kind::Pull, Load::Ready(d));
+        page.show(Tab::Comments);
+        page.pick(1);
+        assert_eq!(page.focus, Some(2));
+        page.reply();
+        let Mode::Compose { text, reply, .. } = &page.mode else {
+            panic!("expected the composer");
+        };
+        assert_eq!(text.iter().collect::<String>(), "> Second thought\n\n");
+        assert_eq!(reply.as_deref(), Some("ana"));
     }
 
     #[test]
