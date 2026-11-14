@@ -1057,7 +1057,7 @@ fn animation(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Animation> {
 
 /// A picture's pixels: any format the image crate reads, or an SVG drawn at
 /// its own size.
-fn decode(bytes: &[u8]) -> Option<RgbaImage> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<RgbaImage> {
     if let Ok(image) = image::load_from_memory(bytes) {
         return Some(image.to_rgba8());
     }

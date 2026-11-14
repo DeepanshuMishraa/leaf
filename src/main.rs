@@ -28,6 +28,7 @@ mod mono;
 mod news;
 mod pdf;
 mod picker;
+mod picture;
 mod place;
 mod planblocks;
 mod planview;
@@ -67,7 +68,7 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
+const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
        leaf pr [number | owner/repo#number | url]   your open pull requests and issues, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
@@ -133,8 +134,11 @@ fn load(target: &str) -> Result<Doc, String> {
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(Path::new(target)).map_err(|e| e.to_string());
     }
+    if picture::is_picture(Path::new(target)) {
+        return picture::open(Path::new(target)).map_err(|e| e.to_string());
+    }
     Err(format!(
-        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), pictures (.png, .jpg, .gif, .webp, .svg, .heic and more) and web pages (http:// or https:// URLs)."
     ))
 }
 

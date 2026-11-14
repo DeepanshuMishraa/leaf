@@ -20,7 +20,7 @@ crossterm = "0.29"
 dither-ratatui = "0.1.0"
 dom_smoothie = "0.18"
 htmd = "0.5"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga", "pnm", "qoi", "hdr", "exr", "dds", "ff"] }
 libc = "0.2"
 mupdf = { version = "0.8", default-features = false, features = ["base14-fonts", "system-fonts", "epub", "svg"] }
 mupdf-sys = { version = "0.8.0", default-features = false, features = ["epub", "svg"] }

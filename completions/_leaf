@@ -50,7 +50,7 @@ _leaf() {
 
   case $subcommand in
     open)
-      _arguments '*:document:_files -g "(#i)*.(pdf|epub|md|markdown)"'
+      _arguments '*:document:_files -g "(#i)*.(pdf|epub|md|markdown|png|jpg|jpeg|gif|webp|svg|bmp|tif|tiff|heic|heif|avif)"'
       ;;
     diff)
       _leaf_diff
