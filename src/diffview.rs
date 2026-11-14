@@ -129,8 +129,8 @@ pub struct Options {
     pub store: Option<Store>,
     /// Store failures are reported after the terminal is restored.
     pub failure: Rc<RefCell<Option<String>>>,
-    /// Opened as a pull request's Code tab: `1`, `2` and `←` go back to its
-    /// other tabs, and `h`/`l` scroll sideways.
+    /// Opened as a pull request's Code tab: `1`, `2`, `4`, `←` and `→` go to
+    /// its other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
     pub layout: Layout,
 }
@@ -170,9 +170,10 @@ impl Default for Options {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Leave {
     Quit,
-    /// For a pull request's Code tab: to its Summary or Timeline.
+    /// For a pull request's Code tab: to its Summary, Timeline or Checks.
     Summary,
     Timeline,
+    Checks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1176,7 +1177,7 @@ impl App {
             KeyCode::Char('o') => self.other_side(),
             KeyCode::Char('i') => self.toggle_layout(),
             KeyCode::Char('r') => self.reload(),
-            KeyCode::Char('1') | KeyCode::Tab if self.tabs => {
+            KeyCode::Char('1') if self.tabs => {
                 self.leave = Leave::Summary;
                 self.quit = true;
             }
@@ -1184,7 +1185,11 @@ impl App {
                 self.leave = Leave::Timeline;
                 self.quit = true;
             }
-            KeyCode::Char('3') | KeyCode::Right if self.tabs => {}
+            KeyCode::Char('4') | KeyCode::Right | KeyCode::Tab if self.tabs => {
+                self.leave = Leave::Checks;
+                self.quit = true;
+            }
+            KeyCode::Char('3') if self.tabs => {}
             KeyCode::Char('h') | KeyCode::Left => {
                 self.left = self.left.saturating_sub(4);
             }
@@ -2119,7 +2124,7 @@ impl App {
         }
         let (added, removed) = totals(diff);
         let stats = if self.tabs {
-            format!("1 summary · 2 timeline   +{added} −{removed} ")
+            format!("1 summary · 2 timeline · 4 checks   +{added} −{removed} ")
         } else {
             format!("+{added} −{removed} ")
         };
@@ -3179,7 +3184,7 @@ diff --git a/b.rs b/b.rs
         let mut app = App::new(loaded(PATCH), as_code_tab());
         press(&mut app, KeyCode::Tab);
         assert!(app.quit);
-        assert_eq!(app.leave, Leave::Summary, "tab goes on, round to Summary");
+        assert_eq!(app.leave, Leave::Checks, "tab goes on to Checks");
 
         let mut app = App::new(loaded(PATCH), as_code_tab());
         press(&mut app, KeyCode::BackTab);

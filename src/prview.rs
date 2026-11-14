@@ -5,10 +5,13 @@
 //! request has a Summary (status, branch, reviewers, checks that need you,
 //! the description with its images and videos) and a Timeline (commits,
 //! comments, reviews); Code hands the diff, fetched once per head commit, to
-//! the reviewer. Text drags to select and is copied when let go. It can be
-//! merged, closed, reopened, marked ready, approved and commented on.
+//! the reviewer; Checks lists every check by workflow, shows a failed job's
+//! log, and runs failed jobs again. While checks run, the page reads itself
+//! again. Text drags to select and is copied when let go. It can be merged,
+//! closed, reopened, marked ready, approved and commented on.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write as _};
 use std::sync::LazyLock;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -48,6 +51,7 @@ const GREEN: Color = Color::Indexed(2);
 const RED: Color = Color::Indexed(1);
 const YELLOW: Color = Color::Indexed(3);
 const PURPLE: Color = Color::Indexed(5);
+const BLUE: Color = Color::Indexed(4);
 /// Width of the label column in the summary.
 const LABEL: usize = 11;
 /// The widest the page gets; past this, lines are too long to read comfortably.
@@ -60,6 +64,10 @@ const WHEEL_ROWS: usize = 3;
 const FRESH: Duration = Duration::from_secs(30);
 /// How long the list's selection rests before that pull request is fetched.
 const SETTLE: Duration = Duration::from_millis(150);
+/// How often a pull request with running checks is read again.
+const POLL: Duration = Duration::from_secs(20);
+/// How often a running job's steps are read again while they're shown.
+const JOB_POLL: Duration = Duration::from_secs(5);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// The keys the page's footer offers, in the order they're dropped to fit.
 const KEYS: [(&str, &str); 8] = [
@@ -71,6 +79,24 @@ const KEYS: [(&str, &str); 8] = [
     ("o", "browser"),
     ("?", "keys"),
     ("q", "back"),
+];
+/// The footer's keys on the Checks tab.
+const CHECK_KEYS: [(&str, &str); 7] = [
+    ("←→", "tabs"),
+    ("↑↓", "pick"),
+    ("enter", "steps and log"),
+    ("r", "re-run"),
+    ("o", "open"),
+    ("?", "keys"),
+    ("q", "back"),
+];
+/// The footer's keys over a job's log.
+const LOG_KEYS: [(&str, &str); 5] = [
+    ("↑↓", "pick"),
+    ("e", "open all groups"),
+    ("r", "re-run"),
+    ("o", "on GitHub"),
+    ("esc", "back"),
 ];
 
 /// The spinner's frame now.
@@ -97,12 +123,15 @@ enum Msg {
     Acted(PrRef, Result<String, String>),
     /// The patch fetched for a head commit.
     Patched(PrRef, String, Result<String, String>),
+    /// An Actions job's steps and log.
+    Logged(u64, Result<pr::JobLog, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Summary,
     Timeline,
+    Checks,
 }
 
 /// What a click in the tab row asks for.
@@ -111,12 +140,15 @@ enum TabHit {
     Summary,
     Timeline,
     Code,
+    Checks,
 }
 
 enum Mode {
     Normal,
     /// Picking how to merge.
     Merge,
+    /// Picking which jobs to run again: each choice's key and action.
+    Rerun(Vec<(char, Action)>),
     Confirm(Action),
     Compose {
         text: Vec<char>,
@@ -273,6 +305,10 @@ fn point_in(area: Rect, scroll: usize, column: u16, row: u16) -> Point {
     )
 }
 
+/// What a body was laid out for: width, tab, expanded, media generation, and
+/// on the Checks tab, a stamp of what it shows.
+type BodyKey = (u16, Tab, bool, u64, u64);
+
 /// A tab's lines, and the figures drawn over them.
 struct Body {
     lines: Vec<Line<'static>>,
@@ -294,8 +330,7 @@ struct Page {
     expanded: bool,
     selection: Option<Selection>,
     dragging: bool,
-    /// The body laid out for (width, tab, expanded, media generation).
-    cache: Option<((u16, Tab, bool, u64), Body)>,
+    cache: Option<(BodyKey, Body)>,
     /// Where the body was drawn last, for the mouse.
     body_area: Rect,
     /// The pinned header's lines and where they were drawn: selectable
@@ -305,6 +340,30 @@ struct Page {
     tab_hits: Vec<(Rect, TabHit)>,
     /// Where the header shows the pull request's number; a click copies it.
     number_hit: Option<Rect>,
+    /// The check picked on the Checks tab, in the order it lists them.
+    check: usize,
+    /// Scroll the picked check, or the log's last error, into view on the next draw.
+    follow: bool,
+    /// The body lines the Checks tab drew each check on, and its index.
+    check_rows: Vec<(usize, usize)>,
+    /// The Actions job whose steps and log the Checks tab shows instead of the list.
+    log: Option<u64>,
+    /// The step or group picked in the job, and those opened.
+    pick: Fold,
+    open_steps: HashSet<usize>,
+    open_groups: HashSet<(usize, usize)>,
+    /// Whether the job's failed or running step was opened once it arrived.
+    log_init: bool,
+    /// Scroll to the opened step's last error on the next draw.
+    jump: bool,
+    /// The body line each step's and shown group's header is on, and the
+    /// line of each step's last error.
+    fold_rows: Vec<(usize, Fold)>,
+    step_errors: HashMap<usize, usize>,
+    /// When the shown job was last read.
+    log_polled: Instant,
+    /// When the page last asked again for running checks.
+    polled: Instant,
 }
 
 impl Page {
@@ -327,6 +386,19 @@ impl Page {
             header_area: Rect::default(),
             tab_hits: Vec::new(),
             number_hit: None,
+            check: 0,
+            follow: false,
+            check_rows: Vec::new(),
+            log: None,
+            pick: Fold::Step(0),
+            open_steps: HashSet::new(),
+            open_groups: HashSet::new(),
+            log_init: false,
+            jump: false,
+            fold_rows: Vec::new(),
+            step_errors: HashMap::new(),
+            log_polled: Instant::now(),
+            polled: Instant::now(),
         }
     }
 
@@ -335,7 +407,33 @@ impl Page {
             self.tab = tab;
             self.scroll = 0;
             self.selection = None;
+            self.follow = true;
         }
+    }
+
+    /// Opens a step or group, or closes it.
+    fn toggle(&mut self, fold: Fold) {
+        match fold {
+            Fold::Step(step) => {
+                if !self.open_steps.remove(&step) {
+                    self.open_steps.insert(step);
+                }
+            }
+            Fold::Group(step, group) => {
+                if !self.open_groups.remove(&(step, group)) {
+                    self.open_groups.insert((step, group));
+                }
+            }
+        }
+    }
+
+    /// The check picked on the Checks tab.
+    fn picked_check(&self) -> Option<&pr::Check> {
+        let Load::Ready(detail) = &self.detail else {
+            return None;
+        };
+        let index = *check_order(&detail.checks).get(self.check)?;
+        detail.checks.get(index)
     }
 
     fn head(&self) -> String {
@@ -374,6 +472,30 @@ impl Page {
     }
 }
 
+/// A row of a job that opens and closes: a step, or a group in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Fold {
+    Step(usize),
+    Group(usize, usize),
+}
+
+impl Fold {
+    fn step(self) -> usize {
+        match self {
+            Fold::Step(step) | Fold::Group(step, _) => step,
+        }
+    }
+}
+
+/// Actions jobs' steps and logs, by job id.
+#[derive(Default)]
+struct Logs {
+    jobs: HashMap<u64, Load<pr::JobLog>>,
+    inflight: HashSet<u64>,
+    /// Bumped whenever a job arrives, so the Checks tab is laid out again.
+    generation: u64,
+}
+
 struct App {
     tx: Sender<Msg>,
     /// The theme and the UI setting, followed while the view is open.
@@ -397,6 +519,7 @@ struct App {
     /// Each pull request's patch, and the head commit it's of.
     patches: HashMap<PrRef, (String, String)>,
     patching: HashSet<PrRef>,
+    logs: Logs,
     gallery: Gallery,
     now: i64,
 }
@@ -428,6 +551,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
         prefetched: HashSet::new(),
         patches: HashMap::new(),
         patching: HashSet::new(),
+        logs: Logs::default(),
         gallery,
         now: pr::now(),
     };
@@ -573,12 +697,86 @@ impl App {
             Action::Draft => "Converting to draft…".to_owned(),
             Action::Approve => "Approving…".to_owned(),
             Action::Comment(_) => "Posting comment…".to_owned(),
+            Action::Rerun { scope, .. } => format!("{}…", scope.label()),
         });
+        // The job shown is replaced by a new attempt; the list shows it running.
+        if matches!(action, Action::Rerun { .. }) {
+            page.log = None;
+            page.follow = true;
+        }
         let (tx, pr) = (self.tx.clone(), page.pr.clone());
         std::thread::spawn(move || {
             let result = pr::perform(&pr, &action).map_err(|e| e.to_string());
             let _ = tx.send(Msg::Acted(pr, result));
         });
+    }
+
+    /// Shows the picked check's steps and log, reading them unless they're here.
+    fn open_log(&mut self) {
+        let Some(page) = &mut self.page else { return };
+        let Some(check) = page.picked_check() else {
+            return;
+        };
+        let Some(job) = check.job_id else {
+            page.toast = Some(format!(
+                "{} isn't a GitHub Actions job, so its log is on its own site. o opens it",
+                check.label()
+            ));
+            return;
+        };
+        page.log = Some(job);
+        page.pick = Fold::Step(0);
+        page.open_steps.clear();
+        page.open_groups.clear();
+        page.log_init = false;
+        page.scroll = 0;
+        page.selection = None;
+        let settled = matches!(self.logs.jobs.get(&job), Some(Load::Ready(log)) if log.settled());
+        if !settled {
+            self.read_job(job);
+        }
+    }
+
+    /// Reads a job's steps and log, keeping what's shown of it meanwhile.
+    fn read_job(&mut self, job: u64) {
+        let Some(page) = &mut self.page else { return };
+        page.log_polled = Instant::now();
+        if !self.logs.inflight.insert(job) {
+            return;
+        }
+        if !matches!(self.logs.jobs.get(&job), Some(Load::Ready(_))) {
+            self.logs.jobs.insert(job, Load::Loading);
+        }
+        let (tx, repo) = (self.tx.clone(), page.pr.repo.clone());
+        std::thread::spawn(move || {
+            let result = pr::job_log(&repo, job).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Logged(job, result));
+        });
+    }
+
+    /// Reads the shown pull request again every `POLL` while its checks run.
+    fn poll_checks(&mut self) {
+        let Some(page) = &mut self.page else { return };
+        let Load::Ready(detail) = &page.detail else {
+            return;
+        };
+        let running = pr::any_running(&detail.checks);
+        let read = self
+            .details
+            .get(&page.pr)
+            .is_none_or(|(_, at)| at.elapsed() >= POLL);
+        let job = page.log.filter(|job| {
+            matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.done)
+                && page.log_polled.elapsed() >= JOB_POLL
+        });
+        if running && read && page.polled.elapsed() >= POLL {
+            page.polled = Instant::now();
+            let pr = page.pr.clone();
+            self.fetch(pr, true);
+        }
+        if let Some(job) = job {
+            self.read_job(job);
+        }
     }
 
     /// The Code tab: the reviewer at once when the patch is here, else when it lands.
@@ -625,11 +823,38 @@ impl App {
                             let head = detail.head_sha.clone();
                             self.want_patch(&pr, &head);
                         }
+                        let mut rejob = None;
                         if let Some(page) = self.page.as_mut().filter(|p| p.pr == pr) {
+                            // A refresh can reorder the checks; the picked one stays picked.
+                            let picked = page.picked_check().map(pr::Check::label);
+                            if let Some(at) = picked.and_then(|label| {
+                                check_order(&detail.checks)
+                                    .iter()
+                                    .position(|&i| detail.checks[i].label() == label)
+                            }) {
+                                page.check = at;
+                            }
                             page.detail = Load::Ready(detail.clone());
                             page.cache = None;
+                            // The status and the log describe the same run of the job.
+                            if let Some(shown) = page.log {
+                                let now = job_after_refresh(page.picked_check());
+                                if now != Some(shown) {
+                                    page.log = now;
+                                    page.log_init = false;
+                                    page.open_steps.clear();
+                                    page.open_groups.clear();
+                                    page.pick = Fold::Step(0);
+                                    page.scroll = 0;
+                                    page.follow = true;
+                                    rejob = now;
+                                }
+                            }
                         }
                         self.details.insert(pr, (detail, Instant::now()));
+                        if let Some(job) = rejob {
+                            self.read_job(job);
+                        }
                     }
                     Err(e) => {
                         if let Some(page) = self.page.as_mut().filter(|p| p.pr == pr) {
@@ -652,6 +877,26 @@ impl App {
                     });
                 }
                 self.fetch(pr, true);
+            }
+            Msg::Logged(job, result) => {
+                self.logs.inflight.remove(&job);
+                self.logs.generation += 1;
+                match result {
+                    Ok(log) => {
+                        self.logs.jobs.insert(job, Load::Ready(log));
+                    }
+                    // A failed refresh keeps what was shown.
+                    Err(e) => match self.logs.jobs.get(&job) {
+                        Some(Load::Ready(_)) => {
+                            if let Some(page) = self.page.as_mut().filter(|p| p.log == Some(job)) {
+                                page.toast = Some(e);
+                            }
+                        }
+                        _ => {
+                            self.logs.jobs.insert(job, Load::Failed(e));
+                        }
+                    },
+                }
             }
             Msg::Patched(pr, head, result) => {
                 self.patching.remove(&pr);
@@ -707,6 +952,7 @@ impl App {
             match &result {
                 Ok(Leave::Summary) => page.show(Tab::Summary),
                 Ok(Leave::Timeline) => page.show(Tab::Timeline),
+                Ok(Leave::Checks) => page.show(Tab::Checks),
                 Ok(Leave::Quit) | Err(_) => {}
             }
             page.toast = match (result, failure.borrow().as_ref()) {
@@ -727,6 +973,9 @@ impl App {
                     || page.code
                     || self.inflight.contains(&page.pr)
                     || (page.tab == Tab::Summary && self.gallery.loading())
+                    || page
+                        .log
+                        .is_some_and(|job| self.logs.inflight.contains(&job))
             }
             None => self
                 .list
@@ -751,6 +1000,7 @@ impl App {
                 page.toast = Some(failed);
             }
             self.prefetch();
+            self.poll_checks();
             self.now = pr::now();
             // Following the theme reads a reply from stdin, so only with no key waiting.
             let idle = !event::poll(Duration::ZERO)?;
@@ -811,6 +1061,7 @@ impl App {
                         TabHit::Summary => page.show(Tab::Summary),
                         TabHit::Timeline => page.show(Tab::Timeline),
                         TabHit::Code => return self.open_code(terminal),
+                        TabHit::Checks => page.show(Tab::Checks),
                     }
                     return Ok(());
                 }
@@ -826,6 +1077,24 @@ impl App {
                 }
                 let point = page.point(mouse.column, mouse.row);
                 let line = page.body_line(point);
+                // A click on a check picks it.
+                if page.tab == Tab::Checks
+                    && page.log.is_none()
+                    && let Some(&(_, index)) =
+                        line.and_then(|line| page.check_rows.iter().find(|(row, _)| *row == line))
+                {
+                    page.check = index;
+                }
+                // A click on a step opens or closes it.
+                if page.tab == Tab::Checks
+                    && page.log.is_some()
+                    && let Some(&(_, fold)) =
+                        line.and_then(|line| page.fold_rows.iter().find(|(row, _)| *row == line))
+                {
+                    page.pick = fold;
+                    page.toggle(fold);
+                    return Ok(());
+                }
                 // A click on a video (or its label below) plays it here, or
                 // stops it; a click on an image shows it full size in the browser.
                 let figure = page.cache.as_ref().zip(line).and_then(|((_, body), line)| {
@@ -1061,6 +1330,16 @@ impl App {
                 };
                 return Ok(true);
             }
+            Mode::Rerun(choices) => {
+                page.mode = match key.code {
+                    KeyCode::Char(c) => match choices.iter().find(|(key, _)| *key == c) {
+                        Some((_, action)) => Mode::Confirm(action.clone()),
+                        None => Mode::Normal,
+                    },
+                    _ => Mode::Normal,
+                };
+                return Ok(true);
+            }
             Mode::Confirm(action) => {
                 if matches!(key.code, KeyCode::Enter | KeyCode::Char('y')) {
                     let action = action.clone();
@@ -1108,6 +1387,86 @@ impl App {
         }
 
         let half = terminal.size().map(|s| s.height as usize / 2).unwrap_or(10);
+        if page.tab == Tab::Checks {
+            let count = detail.map_or(0, |d| d.checks.len());
+            let at = page.fold_rows.iter().position(|(_, f)| *f == page.pick);
+            let fold = |index: usize| page.fold_rows.get(index).map(|(_, f)| *f);
+            match key.code {
+                // Escape lets go of a selection first; q and backspace go back at once.
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace
+                    if page.log.is_some()
+                        && (key.code != KeyCode::Esc || page.selection.is_none()) =>
+                {
+                    page.selection = None;
+                    page.log = None;
+                    page.scroll = 0;
+                    page.follow = true;
+                    return Ok(true);
+                }
+                KeyCode::Char('j') | KeyCode::Down if page.log.is_some() => {
+                    let next = at.map_or(0, |at| at + 1);
+                    page.pick = fold(next).unwrap_or(page.pick);
+                    page.follow = true;
+                    return Ok(true);
+                }
+                KeyCode::Char('k') | KeyCode::Up if page.log.is_some() => {
+                    let next = at.map_or(0, |at| at.saturating_sub(1));
+                    page.pick = fold(next).unwrap_or(page.pick);
+                    page.follow = true;
+                    return Ok(true);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') if page.log.is_some() => {
+                    page.toggle(page.pick);
+                    page.follow = true;
+                    return Ok(true);
+                }
+                KeyCode::Char('j') | KeyCode::Down if page.log.is_none() => {
+                    page.check = (page.check + 1).min(count.saturating_sub(1));
+                    page.follow = true;
+                    return Ok(true);
+                }
+                KeyCode::Char('k') | KeyCode::Up if page.log.is_none() => {
+                    page.check = page.check.saturating_sub(1);
+                    page.follow = true;
+                    return Ok(true);
+                }
+                KeyCode::Enter if page.log.is_none() => {
+                    self.open_log();
+                    return Ok(true);
+                }
+                KeyCode::Char('R') if page.log.is_some() => {
+                    if let Some(job) = page.log {
+                        self.read_job(job);
+                    }
+                    return Ok(true);
+                }
+                KeyCode::Char('o') => {
+                    if let Some(url) = page.picked_check().and_then(|c| c.url.clone()) {
+                        page.toast = Some(match prmedia::open(&url) {
+                            Ok(()) => "Opened it in the browser".to_owned(),
+                            Err(e) => format!("Couldn't open {url} ({e})"),
+                        });
+                        return Ok(true);
+                    }
+                }
+                // On this tab, r re-runs jobs rather than marking the pull request ready.
+                KeyCode::Char('r') => {
+                    page.toast = Some(match (page.busy.is_some(), detail) {
+                        (true, _) => "Wait for the last action to finish".to_owned(),
+                        (false, None) => "Still loading".to_owned(),
+                        (false, Some(detail)) => match reruns(detail, page.picked_check()) {
+                            Ok(choices) => {
+                                page.mode = Mode::Rerun(choices);
+                                return Ok(true);
+                            }
+                            Err(why) => why,
+                        },
+                    });
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
         match key.code {
             // Escape lets go of a selection before it leaves.
             KeyCode::Esc if self.gallery.any_playing() => self.gallery.stop(),
@@ -1128,17 +1487,30 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
-            // Tab cycles Summary → Timeline → Code; shift-tab goes the other way.
-            KeyCode::Tab if page.tab == Tab::Summary => page.show(Tab::Timeline),
-            KeyCode::BackTab if page.tab == Tab::Timeline => page.show(Tab::Summary),
-            KeyCode::Tab | KeyCode::BackTab => self.open_code(terminal)?,
+            // Tab cycles Summary, Timeline, Code, Checks; shift-tab goes the other way.
+            KeyCode::Tab => match page.tab {
+                Tab::Summary => page.show(Tab::Timeline),
+                Tab::Timeline => self.open_code(terminal)?,
+                Tab::Checks => page.show(Tab::Summary),
+            },
+            KeyCode::BackTab => match page.tab {
+                Tab::Summary => page.show(Tab::Checks),
+                Tab::Timeline => page.show(Tab::Summary),
+                Tab::Checks => self.open_code(terminal)?,
+            },
             KeyCode::Char('1') => page.show(Tab::Summary),
             KeyCode::Char('2') => page.show(Tab::Timeline),
-            KeyCode::Left | KeyCode::Char('h') => page.show(Tab::Summary),
-            KeyCode::Right | KeyCode::Char('l') if page.tab == Tab::Summary => {
-                page.show(Tab::Timeline)
-            }
-            KeyCode::Right | KeyCode::Char('l' | '3') => self.open_code(terminal)?,
+            KeyCode::Char('3') => self.open_code(terminal)?,
+            KeyCode::Char('4') => page.show(Tab::Checks),
+            KeyCode::Left | KeyCode::Char('h') => match page.tab {
+                Tab::Summary | Tab::Timeline => page.show(Tab::Summary),
+                Tab::Checks => self.open_code(terminal)?,
+            },
+            KeyCode::Right | KeyCode::Char('l') => match page.tab {
+                Tab::Summary => page.show(Tab::Timeline),
+                Tab::Timeline => self.open_code(terminal)?,
+                Tab::Checks => {}
+            },
             KeyCode::Char('e') => {
                 page.expanded = !page.expanded;
                 page.cache = None;
@@ -1199,7 +1571,7 @@ impl App {
         let ink = self.look.ink();
         if let Some(page) = &mut self.page {
             let refreshing = self.inflight.contains(&page.pr);
-            draw_page(f, page, &mut self.gallery, now, refreshing, ink);
+            draw_page(f, page, &mut self.gallery, &self.logs, now, refreshing, ink);
         } else if let Some(list) = &mut self.list {
             draw_list(f, list, now, ink);
         }
@@ -1263,6 +1635,81 @@ fn available(detail: &Detail, key: char) -> Result<Next, String> {
         'a' => Err(state()),
         _ => Err(String::new()),
     }
+}
+
+/// The job to show once the pull request is read again: the picked check's
+/// job as it is now, since a push or a re-run replaces it with a new one.
+fn job_after_refresh(check: Option<&pr::Check>) -> Option<u64> {
+    check.and_then(|c| c.job_id)
+}
+
+/// What GitHub lets you re-run for the picked check, with the keys that
+/// pick each, or why there's nothing.
+fn reruns(detail: &Detail, check: Option<&pr::Check>) -> Result<Vec<(char, Action)>, String> {
+    let Some(check) = check else {
+        return Err("No check is picked".to_owned());
+    };
+    let Some(run) = check.run_id else {
+        return Err(format!(
+            "{} isn't a GitHub Actions job, so it can't be re-run from here",
+            check.label()
+        ));
+    };
+    if !detail.can_write {
+        return Err(format!("You don't have write access to {}", detail.pr.repo));
+    }
+    let in_run = |c: &&pr::Check| c.run_id == Some(run);
+    if detail
+        .checks
+        .iter()
+        .filter(in_run)
+        .any(|c| c.status == CheckStatus::Running)
+    {
+        return Err(format!(
+            "{} is still running; GitHub re-runs a run once it's done",
+            check.workflow
+        ));
+    }
+    let workflow = if check.workflow.is_empty() {
+        check.name.clone()
+    } else {
+        check.workflow.clone()
+    };
+    let mut choices = Vec::new();
+    if detail
+        .checks
+        .iter()
+        .filter(in_run)
+        .any(|c| c.status == CheckStatus::Failed)
+    {
+        choices.push((
+            'f',
+            Action::Rerun {
+                run,
+                scope: pr::Rerun::Failed,
+                name: workflow.clone(),
+            },
+        ));
+    }
+    if let Some(job) = check.job_id {
+        choices.push((
+            'j',
+            Action::Rerun {
+                run,
+                scope: pr::Rerun::Job(job),
+                name: check.name.clone(),
+            },
+        ));
+    }
+    choices.push((
+        'a',
+        Action::Rerun {
+            run,
+            scope: pr::Rerun::All,
+            name: workflow,
+        },
+    ));
+    Ok(choices)
 }
 
 fn copy(text: &str) {
@@ -1604,6 +2051,7 @@ fn draw_page(
     f: &mut Frame,
     page: &mut Page,
     gallery: &mut Gallery,
+    logs: &Logs,
     now: i64,
     refreshing: bool,
     ink: Option<art::Ink>,
@@ -1709,6 +2157,7 @@ fn draw_page(
         ("Summary", TabHit::Summary, page.tab == Tab::Summary),
         ("Timeline", TabHit::Timeline, page.tab == Tab::Timeline),
         ("Code", TabHit::Code, false),
+        ("Checks", TabHit::Checks, page.tab == Tab::Checks),
     ] {
         let text = if hit == TabHit::Code && page.code {
             format!("{} Code", spinner())
@@ -1756,16 +2205,109 @@ fn draw_page(
         .saturating_sub(body_top + footer_height + 1)
         .max(1);
     page.body_area = Rect::new(x, body_top, width, body_height);
-    let key = (width, page.tab, page.expanded, gallery.generation);
+    let job = page.log.and_then(|job| logs.jobs.get(&job));
+    // A job's failed steps open as it arrives, or the running one while it runs.
+    if let (false, Some(Load::Ready(log))) = (page.log_init, job) {
+        page.log_init = true;
+        page.open_steps = (0..log.steps.len())
+            .filter(|&i| log.steps[i].status == CheckStatus::Failed)
+            .collect();
+        if page.open_steps.is_empty()
+            && let Some(running) = log
+                .steps
+                .iter()
+                .position(|s| s.status == CheckStatus::Running && !s.queued)
+        {
+            page.open_steps.insert(running);
+        }
+        page.pick = Fold::Step(page.open_steps.iter().copied().min().unwrap_or(0));
+        page.jump = true;
+    }
+    let stamp = match page.tab {
+        Tab::Checks => {
+            let mut hasher = DefaultHasher::new();
+            (page.check, page.log, page.pick, logs.generation).hash(&mut hasher);
+            let mut open: Vec<_> = page.open_steps.iter().collect();
+            open.sort();
+            open.hash(&mut hasher);
+            let mut groups: Vec<_> = page.open_groups.iter().collect();
+            groups.sort();
+            groups.hash(&mut hasher);
+            // Running checks count their seconds.
+            if pr::any_running(&detail.checks) {
+                now.hash(&mut hasher);
+            }
+            hasher.finish()
+        }
+        _ => 0,
+    };
+    let key = (width, page.tab, page.expanded, gallery.generation, stamp);
     if page.cache.as_ref().is_none_or(|(k, _)| *k != key) {
+        page.check = page.check.min(detail.checks.len().saturating_sub(1));
         let body = match page.tab {
             Tab::Summary => summary(detail, w, gallery),
             Tab::Timeline => Body {
                 lines: timeline(detail, w, now, page.expanded),
                 figures: Vec::new(),
             },
+            Tab::Checks => match page.log {
+                Some(_) => {
+                    let view = job_view(page.picked_check(), job, page, w, now);
+                    page.fold_rows = view.rows;
+                    page.step_errors = view.errors;
+                    Body {
+                        lines: view.lines,
+                        figures: Vec::new(),
+                    }
+                }
+                None => {
+                    let (lines, rows) = checks_tab(detail, page.check, w, now);
+                    page.check_rows = rows;
+                    Body {
+                        lines,
+                        figures: Vec::new(),
+                    }
+                }
+            },
         };
         page.cache = Some((key, body));
+    }
+    if page.tab == Tab::Checks && page.log.is_some() {
+        let rows = body_height as usize;
+        let header = page
+            .fold_rows
+            .iter()
+            .find(|(_, fold)| *fold == page.pick)
+            .map(|(row, _)| *row);
+        // A job opens on its failed step, scrolled to its last error with the output before it.
+        if let Some(header) = header.filter(|_| page.jump) {
+            page.jump = false;
+            page.follow = false;
+            page.scroll = header.saturating_sub(1);
+            if let Some(&error) = page.step_errors.get(&page.pick.step())
+                && error + 3 > page.scroll + rows
+            {
+                page.scroll = (error + 3).saturating_sub(rows);
+            }
+        }
+        if let Some(header) = header.filter(|_| std::mem::take(&mut page.follow)) {
+            page.scroll = page.scroll.min(header.saturating_sub(1));
+            if header >= page.scroll + rows {
+                page.scroll = header + 1 - rows;
+            }
+        }
+    }
+    // Keep the picked check, and its workflow's heading above it, in view.
+    if std::mem::take(&mut page.follow)
+        && page.tab == Tab::Checks
+        && page.log.is_none()
+        && let Some(&(row, _)) = page.check_rows.iter().find(|(_, i)| *i == page.check)
+    {
+        let rows = body_height as usize;
+        page.scroll = page.scroll.min(row.saturating_sub(2));
+        if row >= page.scroll + rows {
+            page.scroll = row + 1 - rows;
+        }
     }
     let Some((_, body)) = page.cache.as_ref() else {
         return;
@@ -1885,6 +2427,17 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
             );
             return;
         }
+        Mode::Rerun(choices) => {
+            let mut spans = Vec::new();
+            for (key, action) in choices {
+                if let Action::Rerun { scope, .. } = action {
+                    spans.push(Span::styled(format!("{key} "), accent));
+                    spans.push(Span::styled(format!("{}   ", scope.label()), dim));
+                }
+            }
+            spans.push(Span::styled("esc cancel", dim));
+            Line::from(spans)
+        }
         Mode::Merge => {
             let mut spans = vec![Span::styled(format!("Merge into {base}   "), accent)];
             for method in &methods {
@@ -1905,6 +2458,11 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 Action::Approve => format!("Approve #{}?", page.pr.number),
                 Action::Ready => format!("Mark #{} ready for review?", page.pr.number),
                 Action::Comment(_) => "Post the comment?".to_owned(),
+                Action::Rerun { scope, name, .. } => match scope {
+                    pr::Rerun::Failed => format!("Re-run failed jobs in {name}?"),
+                    pr::Rerun::Job(_) => format!("Re-run {name}?"),
+                    pr::Rerun::All => format!("Re-run all jobs in {name}?"),
+                },
             };
             Line::from(vec![
                 Span::styled(question, accent),
@@ -1921,6 +2479,14 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 format!("{} Loading the diff…", spinner()),
                 dim,
             )),
+            _ if page.tab == Tab::Checks && page.log.is_some() => {
+                let mut keys = LOG_KEYS;
+                if page.expanded {
+                    keys[1].1 = "close all groups";
+                }
+                keys_line(&keys, width as usize)
+            }
+            _ if page.tab == Tab::Checks => keys_line(&CHECK_KEYS, width as usize),
             _ => keys_line(&KEYS, width as usize),
         },
     };
@@ -1929,19 +2495,20 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
 
 fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
     let keys = [
-        ("←→, tab", "Summary, Timeline, Code"),
-        ("1, 2, 3", "the same tabs"),
+        ("←→, tab", "Summary, Timeline, Code, Checks"),
+        ("1, 2, 3, 4", "the same tabs"),
+        ("↑↓, enter", "Checks: a job's steps and log"),
         ("j/k, ctrl+d/u", "scroll a line, half a screen"),
         ("space/b, g/G", "a screen, top and bottom"),
         ("drag", "select text; it's copied"),
         ("click", "a picture opens it, a video plays"),
-        ("e", "expand or cut short long comments"),
+        ("e", "long comments, or a job's groups"),
         ("m", "merge: squash, merge commit or rebase"),
         ("x", "close, or reopen a closed one"),
-        ("r", "mark ready, or convert to draft"),
+        ("r", "ready or draft; on Checks, re-run"),
         ("a", "approve"),
         ("c", "comment"),
-        ("o", "open on GitHub"),
+        ("o", "open on GitHub, or the picked check"),
         ("y, Y, n", "copy the checkout command, link, number"),
         ("click #", "the number in the header copies it"),
         ("R", "reload"),
@@ -2085,7 +2652,7 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
                 "",
                 vec![
                     Span::styled(format!("{glyph} "), Style::default().fg(color)),
-                    Span::raw(clip(&check.name, width.saturating_sub(LABEL + 2))),
+                    Span::raw(clip(&check.label(), width.saturating_sub(LABEL + 2))),
                 ],
             ));
         }
@@ -2108,6 +2675,486 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
             })
             .collect(),
     }
+}
+
+/// How bad a check is, to list the worst first.
+fn rank(status: CheckStatus) -> u8 {
+    match status {
+        CheckStatus::Failed => 0,
+        CheckStatus::Running => 1,
+        CheckStatus::Passed => 2,
+        CheckStatus::Skipped => 3,
+    }
+}
+
+/// The checks grouped by workflow, each group's worst first, and the worst
+/// groups first, with status contexts last: as indices into `checks`.
+fn check_groups(checks: &[pr::Check]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, check) in checks.iter().enumerate() {
+        match groups.iter_mut().find(|(name, _)| *name == check.workflow) {
+            Some((_, members)) => members.push(index),
+            None => groups.push((check.workflow.clone(), vec![index])),
+        }
+    }
+    for (_, members) in &mut groups {
+        members.sort_by_key(|&i| (rank(checks[i].status), checks[i].name.to_lowercase()));
+    }
+    groups.sort_by_key(|(name, members)| {
+        (
+            name.is_empty(),
+            members.first().map_or(u8::MAX, |&i| rank(checks[i].status)),
+            name.to_lowercase(),
+        )
+    });
+    groups
+}
+
+/// Every check in the order the Checks tab lists them.
+fn check_order(checks: &[pr::Check]) -> Vec<usize> {
+    check_groups(checks)
+        .into_iter()
+        .flat_map(|(_, members)| members)
+        .collect()
+}
+
+/// The Checks tab: each workflow's checks under its name, with how long each
+/// took, and the body rows each check is on.
+fn checks_tab(
+    detail: &Detail,
+    picked: usize,
+    width: usize,
+    now: i64,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    let dim = Style::default().fg(DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    if detail.checks.is_empty() {
+        return (
+            vec![Line::from(Span::styled(
+                "No checks ran on this pull request.",
+                dim,
+            ))],
+            Vec::new(),
+        );
+    }
+    let mut lines = Vec::new();
+    let mut rows = Vec::new();
+    let mut index = 0;
+    for (workflow, members) in check_groups(&detail.checks) {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let title = if workflow.is_empty() {
+            "Other checks".to_owned()
+        } else {
+            workflow
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                clip(&title.to_uppercase(), width),
+                dim.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", members.len()), dim),
+        ]));
+        lines.push(Line::default());
+        for member in members {
+            let check = &detail.checks[member];
+            let on = index == picked;
+            let (glyph, color) = check_glyph(check.status);
+            let took = check.elapsed(now).map(pr::duration).unwrap_or_default();
+            rows.push((lines.len(), index));
+            lines.push(spread(
+                vec![
+                    Span::styled(if on { "▌ " } else { "  " }, bold),
+                    Span::styled(format!("{glyph}  "), Style::default().fg(color)),
+                    Span::styled(check.name.clone(), if on { bold } else { Style::default() }),
+                ],
+                vec![Span::styled(took, dim)],
+                width,
+            ));
+            index += 1;
+        }
+    }
+    (lines, rows)
+}
+
+/// A job's steps and log as the Checks tab lays them out.
+struct JobView {
+    lines: Vec<Line<'static>>,
+    /// The line each step's and shown group's header is on.
+    rows: Vec<(usize, Fold)>,
+    /// Each step's last error line.
+    errors: HashMap<usize, usize>,
+}
+
+/// An Actions job like GitHub shows it: its steps, each opened to its log
+/// with line numbers, groups folded until `e`, and the log's own colors.
+fn job_view(
+    check: Option<&pr::Check>,
+    job: Option<&Load<pr::JobLog>>,
+    page: &Page,
+    width: usize,
+    now: i64,
+) -> JobView {
+    let dim = Style::default().fg(DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut view = JobView {
+        lines: Vec::new(),
+        rows: Vec::new(),
+        errors: HashMap::new(),
+    };
+    let lines = &mut view.lines;
+    if let Some(check) = check {
+        let (glyph, color) = check_glyph(check.status);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{glyph}  "), Style::default().fg(color)),
+            Span::styled(clip(&check.name, width.saturating_sub(3)), bold),
+        ]));
+        let took = check.elapsed(now).map(pr::duration);
+        let state = match (check.status, took) {
+            (CheckStatus::Failed, Some(t)) => format!("failed after {t}"),
+            (CheckStatus::Passed, Some(t)) => format!("succeeded in {t}"),
+            (CheckStatus::Running, Some(t)) => format!("running for {t}"),
+            (CheckStatus::Failed, None) => "failed".to_owned(),
+            (CheckStatus::Passed, None) => "succeeded".to_owned(),
+            (CheckStatus::Running, None) => "waiting".to_owned(),
+            (CheckStatus::Skipped, _) => "skipped".to_owned(),
+        };
+        let about = if check.workflow.is_empty() {
+            state
+        } else {
+            format!("{} · {state}", check.workflow)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("   {}", clip(&about, width.saturating_sub(3))),
+            dim,
+        )));
+        lines.push(Line::default());
+    }
+    let log = match job {
+        None | Some(Load::Loading) => {
+            lines.push(Line::from(vec![
+                Span::raw(format!("{}  ", spinner())),
+                Span::styled("Loading the job's steps", dim),
+            ]));
+            return view;
+        }
+        Some(Load::Failed(e)) => {
+            lines.extend(wrap(e, width).into_iter().map(Line::from));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "R tries again, o opens it on GitHub",
+                dim,
+            )));
+            return view;
+        }
+        Some(Load::Ready(log)) => log,
+    };
+    if log.steps.is_empty() {
+        let note = match check.map(|c| c.status) {
+            Some(CheckStatus::Skipped) => "This job was skipped, so it has no steps.",
+            _ if !log.done => "Waiting for a runner.",
+            _ => "This job has no steps.",
+        };
+        lines.push(Line::from(Span::styled(note, dim)));
+        return view;
+    }
+    for (index, step) in log.steps.iter().enumerate() {
+        let picked = page.pick == Fold::Step(index);
+        let open = page.open_steps.contains(&index);
+        let (glyph, color) = if step.queued {
+            ("○", DIM)
+        } else {
+            check_glyph(step.status)
+        };
+        let took = match step.status {
+            CheckStatus::Skipped => String::new(),
+            _ => step.elapsed(now).map(pr::duration).unwrap_or_default(),
+        };
+        if open && index > 0 {
+            lines.push(Line::default());
+        }
+        view.rows.push((lines.len(), Fold::Step(index)));
+        lines.push(spread(
+            vec![
+                Span::styled(if picked { "▌ " } else { "  " }, bold),
+                Span::styled(if open { "▾ " } else { "▸ " }, dim),
+                Span::styled(format!("{glyph}  "), Style::default().fg(color)),
+                Span::styled(
+                    step.name.clone(),
+                    if picked {
+                        bold
+                    } else if step.status == CheckStatus::Skipped || step.queued {
+                        dim
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ],
+            vec![Span::styled(took, dim)],
+            width,
+        ));
+        if !open {
+            continue;
+        }
+        if step.items.is_empty() {
+            let note = if !log.done {
+                "The log appears here once the job finishes. o follows it live on GitHub."
+            } else if let Some(missing) = &log.missing {
+                missing.as_str()
+            } else {
+                "No output."
+            };
+            lines.push(Line::from(Span::styled(format!("      {note}"), dim)));
+            lines.push(Line::default());
+            continue;
+        }
+        let digits = (step.earlier + step.lines()).max(1).to_string().len();
+        let mut number = step.earlier;
+        if step.earlier > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "      … {} earlier lines · o opens the full log",
+                    step.earlier
+                ),
+                dim,
+            )));
+        }
+        let push = |lines: &mut Vec<Line<'static>>,
+                    number: usize,
+                    indent: usize,
+                    picked: bool,
+                    spans: Vec<Span<'static>>| {
+            let gutter = 4 + digits + 2 + indent;
+            let rows = wrap_spans(
+                spans,
+                width.saturating_sub(gutter).max(1),
+                width.saturating_sub(gutter + 2).max(1),
+            );
+            for (row, part) in rows.into_iter().enumerate() {
+                let gutter = if row == 0 && picked {
+                    let gutter = format!("  {number:>digits$}  {}", " ".repeat(indent));
+                    lines.push(Line::from(
+                        [Span::styled("▌ ", bold), Span::styled(gutter, dim)]
+                            .into_iter()
+                            .chain(part)
+                            .collect::<Vec<_>>(),
+                    ));
+                    continue;
+                } else if row == 0 {
+                    format!("    {number:>digits$}  {}", " ".repeat(indent))
+                } else {
+                    // Wrapped rows hang under the text, past the number.
+                    " ".repeat(4 + digits + 2 + indent + 2)
+                };
+                let mut spans = vec![Span::styled(gutter, dim)];
+                spans.extend(part);
+                lines.push(Line::from(spans));
+            }
+        };
+        for (at, item) in step.items.iter().enumerate() {
+            match item {
+                pr::LogItem::Line(line) => {
+                    number += 1;
+                    if line.kind == pr::LineKind::Error {
+                        view.errors.insert(index, lines.len());
+                    }
+                    push(lines, number, 0, false, log_spans(line));
+                }
+                pr::LogItem::Group {
+                    title,
+                    lines: group,
+                } => {
+                    number += 1;
+                    let fold = Fold::Group(index, at);
+                    // `e` turns every group the other way.
+                    let shown = page.expanded != page.open_groups.contains(&(index, at));
+                    let picked = page.pick == fold;
+                    let mut spans = ansi_spans(title, if picked { bold } else { Style::default() });
+                    if shown {
+                        spans.insert(0, Span::styled("▾ ", dim));
+                    } else {
+                        spans.insert(0, Span::styled("▸ ", dim));
+                        if !group.is_empty() {
+                            spans.push(Span::styled(format!(" · {} lines", group.len()), dim));
+                        }
+                    }
+                    view.rows.push((lines.len(), fold));
+                    push(lines, number, 0, picked, spans);
+                    for line in group {
+                        number += 1;
+                        if shown {
+                            if line.kind == pr::LineKind::Error {
+                                view.errors.insert(index, lines.len());
+                            }
+                            push(lines, number, 2, false, log_spans(line));
+                        }
+                    }
+                }
+            }
+        }
+        lines.push(Line::default());
+    }
+    if !log.done {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Still running: the steps update every few seconds.",
+            dim,
+        )));
+    }
+    view
+}
+
+/// A log line in its kind's look, with its own colors.
+fn log_spans(line: &pr::LogLine) -> Vec<Span<'static>> {
+    let (label, style) = match line.kind {
+        pr::LineKind::Error => (Some("Error: "), Style::default().fg(RED)),
+        pr::LineKind::Warning => (Some("Warning: "), Style::default().fg(YELLOW)),
+        pr::LineKind::Notice => (Some("Notice: "), Style::default()),
+        pr::LineKind::Debug => (None, Style::default().fg(DIM)),
+        pr::LineKind::Command => (None, Style::default().fg(BLUE)),
+        pr::LineKind::Plain => (None, Style::default()),
+    };
+    let mut spans = Vec::new();
+    if let Some(label) = label {
+        spans.push(Span::styled(label, style.add_modifier(Modifier::BOLD)));
+    }
+    spans.extend(ansi_spans(&line.text, style));
+    spans
+}
+
+/// `text` as spans styled by its color escapes, over `base`; other escapes go.
+fn ansi_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut style = base;
+    let mut run = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next_if_eq(&'[').is_some() {
+                let mut params = String::new();
+                let mut end = None;
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        end = Some(c);
+                        break;
+                    }
+                    params.push(c);
+                }
+                if end == Some('m') {
+                    if !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), style));
+                    }
+                    style = sgr(&params, style, base);
+                }
+            }
+            continue;
+        }
+        match c {
+            '\t' => run.push_str("    "),
+            c if c.is_control() => {}
+            c => run.push(c),
+        }
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style));
+    }
+    spans
+}
+
+/// `style` after one color escape's parameters; backgrounds are left out,
+/// since they fight the page's.
+fn sgr(params: &str, mut style: Style, base: Style) -> Style {
+    let codes: Vec<u16> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => style = base,
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            code @ 30..=37 => style.fg = Some(Color::Indexed((code - 30) as u8)),
+            code @ 90..=97 => style.fg = Some(Color::Indexed((code - 90 + 8) as u8)),
+            39 => style.fg = base.fg,
+            code @ (38 | 48) => {
+                let color = match codes.get(i + 1) {
+                    Some(5) => {
+                        let color = codes.get(i + 2).map(|&n| Color::Indexed(n as u8));
+                        i += 2;
+                        color
+                    }
+                    Some(2) => {
+                        let channel = |at: usize| codes.get(at).map(|&n| n as u8);
+                        let color = channel(i + 2)
+                            .zip(channel(i + 3))
+                            .zip(channel(i + 4))
+                            .map(|((r, g), b)| Color::Rgb(r, g, b));
+                        i += 4;
+                        color
+                    }
+                    _ => None,
+                };
+                if code == 38 && color.is_some() {
+                    style.fg = color;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    style
+}
+
+/// Spans wrapped to `first` columns, then `rest` for the rows after, at
+/// spaces where a row has one, else anywhere.
+fn wrap_spans(spans: Vec<Span<'static>>, first: usize, rest: usize) -> Vec<Vec<Span<'static>>> {
+    let mut width = first.max(1);
+    let chars: Vec<char> = spans.iter().flat_map(|s| s.content.chars()).collect();
+    let cell = |c: char| c.width().unwrap_or(0);
+    let mut breaks = HashSet::new();
+    let (mut start, mut used, mut space) = (0, 0, None);
+    let mut i = 0;
+    while i < chars.len() {
+        let w = cell(chars[i]);
+        if used + w > width && i > start {
+            let at = space.filter(|&s| s > start).map_or(i, |s| s + 1);
+            breaks.insert(at);
+            width = rest.max(1);
+            start = at;
+            space = None;
+            used = chars[start..i].iter().map(|&c| cell(c)).sum();
+            continue;
+        }
+        if chars[i] == ' ' {
+            space = Some(i);
+        }
+        used += w;
+        i += 1;
+    }
+    let (mut rows, mut row) = (Vec::new(), Vec::new());
+    let mut index = 0;
+    for span in spans {
+        let mut run = String::new();
+        for c in span.content.chars() {
+            if breaks.contains(&index) {
+                if !run.is_empty() {
+                    row.push(Span::styled(std::mem::take(&mut run), span.style));
+                }
+                rows.push(std::mem::take(&mut row));
+            }
+            run.push(c);
+            index += 1;
+        }
+        if !run.is_empty() {
+            row.push(Span::styled(run, span.style));
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 /// The description laid out by the reader's markdown, with room held for its
@@ -2347,6 +3394,68 @@ fn markdown(text: &str, width: u16, indent: u16) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_job_log_fits_a_narrow_pane() {
+        let steps = vec![pr::Step {
+            name: "Run tests".into(),
+            status: CheckStatus::Failed,
+            queued: false,
+            started: String::new(),
+            completed: String::new(),
+            items: (0..120)
+                .map(|n| {
+                    pr::LogItem::Line(pr::LogLine {
+                        text: format!("line {n} with words that need wrapping"),
+                        kind: pr::LineKind::Plain,
+                    })
+                })
+                .collect(),
+            earlier: 0,
+        }];
+        let job = Load::Ready(pr::JobLog {
+            steps,
+            done: true,
+            missing: None,
+        });
+        let mut page = Page::new(
+            PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            Load::Loading,
+        );
+        page.open_steps.insert(0);
+        for width in [12, 16, 24, 40] {
+            let view = job_view(None, Some(&job), &page, width, 0);
+            for line in &view.lines {
+                assert!(
+                    line.width() <= width,
+                    "{width} columns: {:?} is {} wide",
+                    plain(line),
+                    line.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refresh_follows_the_picked_check_to_its_new_job() {
+        let check = |job_id| pr::Check {
+            name: "test".into(),
+            workflow: "CI".into(),
+            status: CheckStatus::Running,
+            url: None,
+            started: String::new(),
+            completed: String::new(),
+            run_id: Some(1),
+            job_id,
+        };
+        assert_eq!(job_after_refresh(Some(&check(Some(10)))), Some(10));
+        assert_eq!(job_after_refresh(Some(&check(Some(11)))), Some(11));
+        assert_eq!(job_after_refresh(Some(&check(None))), None);
+        assert_eq!(job_after_refresh(None), None);
+    }
+
     use super::*;
     use crate::pr::{Check, MergeMethod, Reviewer};
 
@@ -2374,13 +3483,23 @@ mod tests {
             checks: vec![
                 Check {
                     name: "CodeRabbit".into(),
+                    workflow: String::new(),
                     status: CheckStatus::Passed,
                     url: None,
+                    started: String::new(),
+                    completed: String::new(),
+                    run_id: None,
+                    job_id: None,
                 },
                 Check {
-                    name: "CI / test".into(),
+                    name: "test".into(),
+                    workflow: "CI".into(),
                     status: CheckStatus::Failed,
                     url: None,
+                    started: String::new(),
+                    completed: String::new(),
+                    run_id: Some(12),
+                    job_id: Some(34),
                 },
             ],
             mergeability: Mergeability::Ready,
@@ -2533,7 +3652,7 @@ mod tests {
             Load::Loading,
         );
         page.cache = Some((
-            (80, Tab::Summary, false, 0),
+            (80, Tab::Summary, false, 0, 0),
             Body {
                 lines: vec![
                     Line::from(vec![Span::raw("hello "), Span::raw("world")]),
@@ -2575,7 +3694,7 @@ mod tests {
         page.header_area = Rect::new(4, 0, 60, 3);
         page.body_area = Rect::new(4, 4, 60, 10);
         page.cache = Some((
-            (60, Tab::Summary, false, 0),
+            (60, Tab::Summary, false, 0, 0),
             Body {
                 lines: vec![
                     Line::from("Status  Ready to merge"),
