@@ -63,6 +63,8 @@ const KEPT_PAGES: usize = 4;
 const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
+/// How often a watched file is checked; a change shows once it holds for one check.
+const WATCH_TICK: Duration = Duration::from_millis(250);
 /// How often the word read aloud is checked: fast enough that the mark
 /// keeps up with the voice at 4×.
 const NARRATION_TICK: Duration = Duration::from_millis(15);
@@ -321,6 +323,9 @@ pub struct ViewerOptions {
     pub speech: Backend,
     /// Path or URL this document was opened from, when leaf knows it.
     pub source: Option<String>,
+    /// A markdown file to read again whenever it changes, with its stamp from
+    /// before it was first read.
+    pub watch: Option<(std::path::PathBuf, Option<Stamp>)>,
 }
 
 impl Default for ViewerOptions {
@@ -344,8 +349,25 @@ impl Default for ViewerOptions {
             on_speed: Box::new(|_| {}),
             speech: Backend::Edge,
             source: None,
+            watch: None,
         }
     }
+}
+
+struct Watch {
+    path: std::path::PathBuf,
+    loaded: Option<Stamp>,
+    seen: Option<Stamp>,
+    checked: Instant,
+}
+
+/// A file's modification time and size. The size catches edits that land
+/// within one tick of a coarse clock, such as FAT's two seconds.
+pub type Stamp = (std::time::SystemTime, u64);
+
+pub fn stamp(path: &std::path::Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 pub struct App {
@@ -416,6 +438,7 @@ pub struct App {
     /// Whether the screen keeps the word being read aloud in view. Scrolling
     /// away lets it go; it picks up again once the word is back on screen.
     follow: bool,
+    watch: Option<Watch>,
     quit: bool,
 }
 
@@ -481,6 +504,12 @@ impl App {
                 stroke: stroke.clone(),
             })
             .collect();
+        let watch = options.watch.take().map(|(path, loaded)| Watch {
+            path,
+            loaded,
+            seen: loaded,
+            checked: Instant::now(),
+        });
         let narrator = Narrator::new(
             options.voice.clone(),
             options.speed,
@@ -532,8 +561,42 @@ impl App {
             reported_scroll: None,
             copy: None,
             search: None,
+            watch,
             quit: false,
         }
+    }
+
+    /// Reads the watched file again once a change to it has settled.
+    fn reload(&mut self) -> bool {
+        let Some(watch) = &mut self.watch else {
+            return false;
+        };
+        if watch.checked.elapsed() < WATCH_TICK {
+            return false;
+        }
+        watch.checked = Instant::now();
+        let now = stamp(&watch.path);
+        let settled = now == watch.seen;
+        watch.seen = now;
+        if !settled || now.is_none() || now == watch.loaded {
+            return false;
+        }
+        let Ok(doc) = crate::markdown::open(&watch.path) else {
+            return false;
+        };
+        watch.loaded = now;
+        if self.narrator.active() {
+            self.narrator.stop();
+            self.notice = Some("the file changed, so reading aloud stopped".into());
+        }
+        self.hold_anchor();
+        self.doc = doc;
+        self.laid.clear();
+        self.retain_protocols(|_| false);
+        self.pixels.clear();
+        self.selection = None;
+        self.search = None;
+        true
     }
 
     fn pages(&self) -> usize {
@@ -3169,6 +3232,9 @@ impl App {
         let mut quiet = false;
         loop {
             self.receive_images();
+            if self.reload() {
+                quiet = false;
+            }
             self.advance_search(SEARCH_SLICE);
             let narrated = self.narrate();
             // Listening counts as reading.
@@ -3215,6 +3281,10 @@ impl App {
             };
             // Wakes in time to follow the theme and the UI setting.
             let due = self.look.due();
+            let due = match self.watch {
+                Some(_) => due.min(WATCH_TICK),
+                None => due,
+            };
             let wait = Some(wait.map_or(due, |wait| wait.min(due)));
             quiet = false;
             if let Some(wait) = wait
