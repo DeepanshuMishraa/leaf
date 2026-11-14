@@ -411,6 +411,38 @@ impl Page {
         }
     }
 
+    /// Shows the pull request read again, and returns the job to read when
+    /// the open log's check now runs as another job.
+    fn refreshed(&mut self, detail: Detail) -> Option<u64> {
+        // A refresh can reorder the checks; the picked one stays picked.
+        let picked = self.picked_check().map(pr::Check::label);
+        let found = picked.and_then(|label| {
+            check_order(&detail.checks)
+                .iter()
+                .position(|&i| detail.checks[i].label() == label)
+        });
+        if let Some(at) = found {
+            self.check = at;
+        }
+        self.detail = Load::Ready(detail);
+        self.cache = None;
+        // The status and the log describe the same run of the job; a check
+        // that's gone closes its log rather than handing it to another.
+        let shown = self.log?;
+        let now = found.and_then(|_| job_after_refresh(self.picked_check()));
+        if now == Some(shown) {
+            return None;
+        }
+        self.log = now;
+        self.log_init = false;
+        self.open_steps.clear();
+        self.open_groups.clear();
+        self.pick = Fold::Step(0);
+        self.scroll = 0;
+        self.follow = true;
+        now
+    }
+
     /// Opens a step or group, or closes it.
     fn toggle(&mut self, fold: Fold) {
         match fold {
@@ -823,34 +855,11 @@ impl App {
                             let head = detail.head_sha.clone();
                             self.want_patch(&pr, &head);
                         }
-                        let mut rejob = None;
-                        if let Some(page) = self.page.as_mut().filter(|p| p.pr == pr) {
-                            // A refresh can reorder the checks; the picked one stays picked.
-                            let picked = page.picked_check().map(pr::Check::label);
-                            if let Some(at) = picked.and_then(|label| {
-                                check_order(&detail.checks)
-                                    .iter()
-                                    .position(|&i| detail.checks[i].label() == label)
-                            }) {
-                                page.check = at;
-                            }
-                            page.detail = Load::Ready(detail.clone());
-                            page.cache = None;
-                            // The status and the log describe the same run of the job.
-                            if let Some(shown) = page.log {
-                                let now = job_after_refresh(page.picked_check());
-                                if now != Some(shown) {
-                                    page.log = now;
-                                    page.log_init = false;
-                                    page.open_steps.clear();
-                                    page.open_groups.clear();
-                                    page.pick = Fold::Step(0);
-                                    page.scroll = 0;
-                                    page.follow = true;
-                                    rejob = now;
-                                }
-                            }
-                        }
+                        let rejob = self
+                            .page
+                            .as_mut()
+                            .filter(|p| p.pr == pr)
+                            .and_then(|page| page.refreshed(detail.clone()));
                         self.details.insert(pr, (detail, Instant::now()));
                         if let Some(job) = rejob {
                             self.read_job(job);
@@ -2206,21 +2215,17 @@ fn draw_page(
         .max(1);
     page.body_area = Rect::new(x, body_top, width, body_height);
     let job = page.log.and_then(|job| logs.jobs.get(&job));
-    // A job's failed steps open as it arrives, or the running one while it runs.
     if let (false, Some(Load::Ready(log))) = (page.log_init, job) {
+        let (steps, groups, pick) = job_opening(log);
+        page.open_steps = steps;
+        // With `e` on, every group is open already; one in the set would close.
+        page.open_groups = if page.expanded {
+            HashSet::new()
+        } else {
+            groups
+        };
+        page.pick = pick;
         page.log_init = true;
-        page.open_steps = (0..log.steps.len())
-            .filter(|&i| log.steps[i].status == CheckStatus::Failed)
-            .collect();
-        if page.open_steps.is_empty()
-            && let Some(running) = log
-                .steps
-                .iter()
-                .position(|s| s.status == CheckStatus::Running && !s.queued)
-        {
-            page.open_steps.insert(running);
-        }
-        page.pick = Fold::Step(page.open_steps.iter().copied().min().unwrap_or(0));
         page.jump = true;
     }
     let stamp = match page.tab {
@@ -2776,6 +2781,44 @@ fn checks_tab(
         }
     }
     (lines, rows)
+}
+
+/// What a job opens with as it arrives: its failed steps, or the running one
+/// while it runs; the groups opened; and the step picked.
+fn job_opening(log: &pr::JobLog) -> (HashSet<usize>, HashSet<(usize, usize)>, Fold) {
+    let mut steps: HashSet<usize> = (0..log.steps.len())
+        .filter(|&i| log.steps[i].status == CheckStatus::Failed)
+        .collect();
+    if steps.is_empty()
+        && let Some(running) = log
+            .steps
+            .iter()
+            .position(|s| s.status == CheckStatus::Running && !s.queued)
+    {
+        steps.insert(running);
+    }
+    // A failed step's last error is what it opens on, so a group holding it opens too.
+    let mut groups = HashSet::new();
+    for &index in &steps {
+        let last =
+            log.steps[index]
+                .items
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(at, item)| match item {
+                    pr::LogItem::Line(line) => (line.kind == pr::LineKind::Error).then_some(None),
+                    pr::LogItem::Group { lines, .. } => lines
+                        .iter()
+                        .any(|l| l.kind == pr::LineKind::Error)
+                        .then_some(Some(at)),
+                });
+        if let Some(Some(at)) = last {
+            groups.insert((index, at));
+        }
+    }
+    let pick = Fold::Step(steps.iter().copied().min().unwrap_or(0));
+    (steps, groups, pick)
 }
 
 /// A job's steps and log as the Checks tab lays them out.
@@ -3394,6 +3437,74 @@ fn markdown(text: &str, width: u16, indent: u16) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refresh_closes_the_log_when_its_check_is_gone() {
+        let mut page = Page::new(
+            PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            Load::Ready(detail(State::Open)),
+        );
+        assert_eq!(
+            page.picked_check().map(|c| c.label()),
+            Some("CI / test".into())
+        );
+        page.log = Some(34);
+        let mut next = detail(State::Open);
+        next.checks.retain(|c| c.name != "test");
+        next.checks.push(pr::Check {
+            name: "lint".into(),
+            workflow: "CI".into(),
+            status: CheckStatus::Failed,
+            url: None,
+            started: String::new(),
+            completed: String::new(),
+            run_id: Some(12),
+            job_id: Some(99),
+        });
+        assert_eq!(page.refreshed(next), None);
+        assert_eq!(
+            page.log, None,
+            "the log doesn't move to another check's job"
+        );
+    }
+
+    #[test]
+    fn a_failed_step_opens_the_group_its_last_error_is_in() {
+        let line = |text: &str, kind| pr::LogLine {
+            text: text.into(),
+            kind,
+        };
+        let log = pr::JobLog {
+            steps: vec![pr::Step {
+                name: "Run tests".into(),
+                status: CheckStatus::Failed,
+                queued: false,
+                started: String::new(),
+                completed: String::new(),
+                items: vec![
+                    pr::LogItem::Line(line("starting", pr::LineKind::Plain)),
+                    pr::LogItem::Group {
+                        title: "Run cargo test".into(),
+                        lines: vec![
+                            line("running 3 tests", pr::LineKind::Plain),
+                            line("test failed", pr::LineKind::Error),
+                        ],
+                    },
+                    pr::LogItem::Line(line("done", pr::LineKind::Plain)),
+                ],
+                earlier: 0,
+            }],
+            done: true,
+            missing: None,
+        };
+        let (steps, groups, pick) = job_opening(&log);
+        assert_eq!(steps, HashSet::from([0]));
+        assert_eq!(groups, HashSet::from([(0, 1)]));
+        assert_eq!(pick, Fold::Step(0));
+    }
+
     #[test]
     fn a_job_log_fits_a_narrow_pane() {
         let steps = vec![pr::Step {
