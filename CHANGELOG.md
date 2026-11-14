@@ -4,6 +4,10 @@ After an update, leaf shows the current version's notes once, over whatever
 it opens first. Each release needs a `## <version>` section with one line
 per change, starting with `- `.
 
+## Unreleased
+
+- Pull requests have a Checks tab: every check by workflow with its duration, any Actions job's steps and log, and GitHub's re-runs: failed jobs, one job, or all jobs. The page refreshes while checks run.
+
 ## 0.15.2
 
 - A calmer home screen: a greeting, today's reading time, the search and your documents, without the heat map, meters or fills.

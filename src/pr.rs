@@ -191,9 +191,334 @@ pub enum CheckStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
+    /// The job, or the status context's name.
     pub name: String,
+    /// The Actions workflow the job is in; empty for status contexts.
+    pub workflow: String,
     pub status: CheckStatus,
     pub url: Option<String>,
+    pub started: String,
+    pub completed: String,
+    /// The Actions run and job, read from the details link.
+    pub run_id: Option<u64>,
+    pub job_id: Option<u64>,
+}
+
+impl Check {
+    /// The workflow and the job, as GitHub names a check.
+    pub fn label(&self) -> String {
+        if self.workflow.is_empty() || self.workflow == self.name {
+            self.name.clone()
+        } else {
+            format!("{} / {}", self.workflow, self.name)
+        }
+    }
+
+    /// How long it ran, or has been running, in seconds.
+    pub fn elapsed(&self, now: i64) -> Option<i64> {
+        // A queued check's start is GitHub's zero date.
+        let started = seconds(&self.started).filter(|s| *s > 0)?;
+        let end = match self.status {
+            CheckStatus::Running => now,
+            _ => seconds(&self.completed)?,
+        };
+        (end >= started).then_some(end - started)
+    }
+}
+
+/// A duration shortly: `45s`, `3m 12s`, `1h 4m`.
+pub fn duration(seconds: i64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3_600, seconds % 3_600 / 60),
+    }
+}
+
+/// The run and job ids in an Actions details link such as
+/// `https://github.com/o/r/actions/runs/12/job/34`.
+fn actions_ids(url: &str) -> (Option<u64>, Option<u64>) {
+    let after = |marker: &str| {
+        let rest = &url[url.find(marker)? + marker.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    (after("/actions/runs/"), after("/job/"))
+}
+
+/// What the runner marked a log line as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    Plain,
+    /// A command the step ran, which the runner echoes.
+    Command,
+    Warning,
+    Error,
+    Notice,
+    Debug,
+}
+
+/// One line of a job's log, without its timestamp; colors stay in as escapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine {
+    pub text: String,
+    pub kind: LineKind,
+}
+
+/// A line, or a group of them the runner folds under a title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogItem {
+    Line(LogLine),
+    Group { title: String, lines: Vec<LogLine> },
+}
+
+/// One step of an Actions job, with its share of the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub name: String,
+    pub status: CheckStatus,
+    /// Waiting for the steps before it.
+    pub queued: bool,
+    pub started: String,
+    pub completed: String,
+    pub items: Vec<LogItem>,
+    /// Lines left out before `items`, past `STEP_LINES`.
+    pub earlier: usize,
+}
+
+impl Step {
+    pub fn elapsed(&self, now: i64) -> Option<i64> {
+        let started = seconds(&self.started).filter(|s| *s > 0)?;
+        let end = match self.status {
+            CheckStatus::Running => now,
+            _ => seconds(&self.completed)?,
+        };
+        (end >= started).then_some(end - started)
+    }
+
+    pub fn lines(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| match item {
+                LogItem::Line(_) => 1,
+                LogItem::Group { lines, .. } => lines.len() + 1,
+            })
+            .sum()
+    }
+}
+
+/// An Actions job's steps, and its log split among them once it's done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobLog {
+    pub steps: Vec<Step>,
+    /// Whether the job finished; GitHub has its log only then.
+    pub done: bool,
+    /// Why there's no log, when the steps were read but the log wasn't.
+    pub missing: Option<String>,
+}
+
+impl JobLog {
+    /// Whether this is the job's final log, so it needn't be read again.
+    pub fn settled(&self) -> bool {
+        self.done && self.missing.is_none()
+    }
+}
+
+/// Whether any check is still running, whatever else failed.
+pub fn any_running(checks: &[Check]) -> bool {
+    checks.iter().any(|c| c.status == CheckStatus::Running)
+}
+
+/// How many of a step's last lines are kept; the error is nearly always at the end.
+const STEP_LINES: usize = 5_000;
+
+/// Reads an Actions job's steps and, once it's done, its log.
+pub fn job_log(repo: &str, job: u64) -> Result<JobLog, PrFailed> {
+    let json = gh_json(&["api", &format!("repos/{repo}/actions/jobs/{job}")])?;
+    let done = text(&json, "status") == "completed";
+    let mut steps: Vec<Step> = array(&json, "steps").iter().map(parse_step).collect();
+    let mut missing = None;
+    if done && !steps.is_empty() {
+        match gh(&["api", &format!("repos/{repo}/actions/jobs/{job}/logs")]) {
+            Ok(log) => split_log(&log, &mut steps),
+            Err(e) => missing = Some(format!("Couldn't read this job's log: {e}")),
+        }
+    }
+    Ok(JobLog {
+        steps,
+        done,
+        missing,
+    })
+}
+
+fn parse_step(step: &Value) -> Step {
+    let status = match text(step, "status").as_str() {
+        "completed" => match text(step, "conclusion").as_str() {
+            "success" | "neutral" => CheckStatus::Passed,
+            "skipped" => CheckStatus::Skipped,
+            _ => CheckStatus::Failed,
+        },
+        _ => CheckStatus::Running,
+    };
+    let queued = matches!(
+        text(step, "status").as_str(),
+        "queued" | "pending" | "waiting"
+    );
+    Step {
+        name: text(step, "name"),
+        status,
+        queued,
+        started: text(step, "started_at"),
+        completed: text(step, "completed_at"),
+        items: Vec::new(),
+        earlier: 0,
+    }
+}
+
+/// The kinds of step the runner opens with a line of its own.
+#[derive(Clone, Copy)]
+enum Opens {
+    Run,
+    Post,
+    Complete,
+}
+
+/// Deals a job's log out to its steps. Lines carry fractional timestamps and
+/// steps whole seconds, so a line stays with a step through its last second.
+fn split_log(log: &str, steps: &mut [Step]) {
+    let ends: Vec<Option<i64>> = steps
+        .iter()
+        .map(|s| match s.status {
+            CheckStatus::Running => None,
+            _ => seconds(&s.completed),
+        })
+        .collect();
+    let starts: Vec<Option<i64>> = steps.iter().map(|s| seconds(&s.started)).collect();
+    let ran = |i: usize| steps[i].status != CheckStatus::Skipped;
+    let mut at = (0..steps.len()).find(|&i| ran(i)).unwrap_or(0);
+    // Whether the step at `at` has begun its own work, so the next start is another step's.
+    let mut begun = false;
+    let mut open: Option<(String, Vec<LogLine>)> = None;
+    let mut dealt: Vec<Vec<LogItem>> = vec![Vec::new(); steps.len()];
+    for raw in log.lines() {
+        let raw = raw.trim_start_matches('\u{feff}');
+        let (time, message) = match raw.split_once(' ') {
+            Some((stamp, rest)) if seconds(stamp).is_some() => (seconds(stamp), rest),
+            _ if seconds(raw).is_some() => (seconds(raw), ""),
+            _ => (None, raw),
+        };
+        let message = message.trim_end();
+        // The runner opens steps with the same lines; they place a step's
+        // first lines better than whole-second step times can.
+        let name = steps[at].name.as_str();
+        let start = if message.starts_with("##[group]Run ") && (begun || name == "Set up job") {
+            Some(Opens::Run)
+        } else if message == "Post job cleanup." && (begun || !name.starts_with("Post ")) {
+            Some(Opens::Post)
+        } else if message == "Cleaning up orphan processes" {
+            Some(Opens::Complete)
+        } else {
+            None
+        };
+        let next = match start {
+            Some(opens) => (at + 1..steps.len()).find(|&i| {
+                let name = steps[i].name.as_str();
+                ran(i)
+                    && match opens {
+                        // A composite action runs several groups in one step,
+                        // so a group only opens a step that has begun by then.
+                        Opens::Run => {
+                            name != "Set up job"
+                                && starts[i].is_none_or(|start| time.is_none_or(|t| t >= start))
+                        }
+                        Opens::Post => name.starts_with("Post "),
+                        Opens::Complete => name == "Complete job",
+                    }
+            }),
+            None => time.and_then(|time| {
+                let past = ends[at].is_some_and(|end| time > end);
+                (at + 1..steps.len()).find(|&i| ran(i)).filter(|_| past)
+            }),
+        };
+        if let Some(next) = next {
+            if let Some((title, lines)) = open.take() {
+                dealt[at].push(LogItem::Group { title, lines });
+            }
+            at = next;
+            begun = false;
+        }
+        if message.starts_with("##[group]Run ") || message == "Post job cleanup." {
+            begun = true;
+        }
+        if let Some(title) = message.strip_prefix("##[group]") {
+            if let Some((title, lines)) = open.take() {
+                dealt[at].push(LogItem::Group { title, lines });
+            }
+            open = Some((title.to_owned(), Vec::new()));
+            continue;
+        }
+        if message.starts_with("##[endgroup]") {
+            if let Some((title, lines)) = open.take() {
+                dealt[at].push(LogItem::Group { title, lines });
+            }
+            continue;
+        }
+        let line = log_line(message);
+        match &mut open {
+            Some((_, lines)) => lines.push(line),
+            None => dealt[at].push(LogItem::Line(line)),
+        }
+    }
+    if let Some((title, lines)) = open.take() {
+        dealt[at].push(LogItem::Group { title, lines });
+    }
+    for (step, items) in steps.iter_mut().zip(dealt) {
+        step.items = items;
+        let mut over = step.lines().saturating_sub(STEP_LINES);
+        while over > 0 && !step.items.is_empty() {
+            let cut = match &mut step.items[0] {
+                // A group too long to drop whole loses its oldest lines, keeping its title and end.
+                LogItem::Group { lines, .. } if lines.len() >= over => {
+                    lines.drain(..over);
+                    over
+                }
+                LogItem::Group { lines, .. } => {
+                    let size = lines.len() + 1;
+                    step.items.remove(0);
+                    size
+                }
+                LogItem::Line(_) => {
+                    step.items.remove(0);
+                    1
+                }
+            };
+            step.earlier += cut;
+            over -= cut;
+        }
+    }
+}
+
+fn log_line(message: &str) -> LogLine {
+    let marked = [
+        ("##[error]", LineKind::Error),
+        ("##[warning]", LineKind::Warning),
+        ("##[notice]", LineKind::Notice),
+        ("##[debug]", LineKind::Debug),
+        ("##[command]", LineKind::Command),
+        ("[command]", LineKind::Command),
+    ];
+    for (marker, kind) in marked {
+        if let Some(text) = message.strip_prefix(marker) {
+            return LogLine {
+                text: text.to_owned(),
+                kind,
+            };
+        }
+    }
+    LogLine {
+        text: message.to_owned(),
+        kind: LineKind::Plain,
+    }
 }
 
 /// What the checks add up to, as T3 Code words it.
@@ -359,6 +684,32 @@ pub enum Action {
     Draft,
     Approve,
     Comment(String),
+    /// Runs jobs of an Actions run again.
+    Rerun {
+        run: u64,
+        scope: Rerun,
+        /// The workflow, or for `Rerun::Job` the job, as the footer names it.
+        name: String,
+    },
+}
+
+/// Which of a run's jobs to run again, as GitHub offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rerun {
+    Failed,
+    Job(u64),
+    All,
+}
+
+impl Rerun {
+    /// GitHub's words for it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Rerun::Failed => "Re-run failed jobs",
+            Rerun::Job(_) => "Re-run this job",
+            Rerun::All => "Re-run all jobs",
+        }
+    }
 }
 
 impl Action {
@@ -372,6 +723,17 @@ impl Action {
             Action::Draft => ("ready", vec!["--undo".to_owned()]),
             Action::Approve => ("review", vec!["--approve".to_owned()]),
             Action::Comment(body) => ("comment", vec!["--body".to_owned(), body.clone()]),
+            Action::Rerun { run, scope, .. } => {
+                let run = run.to_string();
+                let args: Vec<&str> = match scope {
+                    Rerun::Failed => vec!["run", "rerun", &run, "--failed"],
+                    Rerun::Job(job) => return rerun_job(*job, &pr.repo),
+                    Rerun::All => vec!["run", "rerun", &run],
+                };
+                let mut args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+                args.extend(["-R".to_owned(), pr.repo.clone()]);
+                return args;
+            }
         };
         let mut args = vec![
             "pr".to_owned(),
@@ -395,8 +757,19 @@ impl Action {
             Action::Draft => format!("{label} is a draft again"),
             Action::Approve => format!("Approved {label}"),
             Action::Comment(_) => format!("Commented on {label}"),
+            Action::Rerun { scope, name, .. } => match scope {
+                Rerun::Failed => format!("Re-running failed jobs in {name}"),
+                Rerun::Job(_) => format!("Re-running {name}"),
+                Rerun::All => format!("Re-running all jobs in {name}"),
+            },
         }
     }
+}
+
+fn rerun_job(job: u64, repo: &str) -> Vec<String> {
+    ["run", "rerun", "--job", &job.to_string(), "-R", repo]
+        .map(str::to_owned)
+        .to_vec()
 }
 
 fn gh(args: &[&str]) -> Result<String, PrFailed> {
@@ -893,19 +1266,19 @@ fn parse_detail(pr: PrRef, page: &Value, settings: Option<&Value>, inline: &Valu
 }
 
 fn parse_check(check: &Value) -> Check {
-    let (name, url) = match text(check, "__typename").as_str() {
-        "StatusContext" => (text(check, "context"), text(check, "targetUrl")),
-        _ => {
-            let workflow = text(check, "workflowName");
-            let name = text(check, "name");
-            let name = if workflow.is_empty() || workflow == name {
-                name
-            } else {
-                format!("{workflow} / {name}")
-            };
-            (name, text(check, "detailsUrl"))
-        }
+    let (name, workflow, url) = match text(check, "__typename").as_str() {
+        "StatusContext" => (
+            text(check, "context"),
+            String::new(),
+            text(check, "targetUrl"),
+        ),
+        _ => (
+            text(check, "name"),
+            text(check, "workflowName"),
+            text(check, "detailsUrl"),
+        ),
     };
+    let (run_id, job_id) = actions_ids(&url);
     let status = match text(check, "__typename").as_str() {
         "StatusContext" => match text(check, "state").as_str() {
             "SUCCESS" => CheckStatus::Passed,
@@ -922,8 +1295,13 @@ fn parse_check(check: &Value) -> Check {
     };
     Check {
         name,
+        workflow,
         status,
         url: (!url.is_empty()).then_some(url),
+        started: text(check, "startedAt"),
+        completed: text(check, "completedAt"),
+        run_id,
+        job_id,
     }
 }
 
@@ -1183,12 +1561,132 @@ mod tests {
         assert_eq!(ago("", now), "");
     }
 
+    fn check(status: CheckStatus) -> Check {
+        Check {
+            name: "ci".into(),
+            workflow: String::new(),
+            status,
+            url: None,
+            started: String::new(),
+            completed: String::new(),
+            run_id: None,
+            job_id: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_check_doesnt_hide_one_still_running() {
+        assert!(any_running(&[
+            check(CheckStatus::Failed),
+            check(CheckStatus::Running)
+        ]));
+        assert!(!any_running(&[
+            check(CheckStatus::Failed),
+            check(CheckStatus::Passed)
+        ]));
+    }
+
+    #[test]
+    fn a_log_that_failed_to_download_is_read_again() {
+        let log = |missing: Option<&str>| JobLog {
+            steps: Vec::new(),
+            done: true,
+            missing: missing.map(str::to_owned),
+        };
+        assert!(log(None).settled());
+        assert!(!log(Some("HTTP 502")).settled());
+    }
+
+    #[test]
+    fn a_composite_steps_own_run_groups_stay_in_it() {
+        let step = |name: &str, started: &str, completed: &str| {
+            parse_step(&serde_json::json!({
+                "name": name, "status": "completed", "conclusion": "success",
+                "started_at": started, "completed_at": completed,
+            }))
+        };
+        let mut steps = vec![
+            step("Set up job", "2026-11-13T16:00:00Z", "2026-11-13T16:00:01Z"),
+            step(
+                "Set up toolchain",
+                "2026-11-13T16:00:01Z",
+                "2026-11-13T16:00:20Z",
+            ),
+            step("Run tests", "2026-11-13T16:00:20Z", "2026-11-13T16:00:40Z"),
+        ];
+        let log = [
+            "2026-11-13T16:00:00.5Z Current runner version",
+            "2026-11-13T16:00:01.2Z ##[group]Run ./.github/actions/setup",
+            "2026-11-13T16:00:01.3Z ##[endgroup]",
+            "2026-11-13T16:00:05.0Z ##[group]Run rustup toolchain install",
+            "2026-11-13T16:00:05.1Z ##[endgroup]",
+            "2026-11-13T16:00:06.0Z ##[error]toolchain not found",
+            "2026-11-13T16:00:21.0Z ##[group]Run cargo test",
+            "2026-11-13T16:00:21.1Z ##[endgroup]",
+        ]
+        .join("\n");
+        split_log(&log, &mut steps);
+        let titles = |step: &Step| -> Vec<String> {
+            step.items
+                .iter()
+                .map(|item| match item {
+                    LogItem::Group { title, .. } => title.clone(),
+                    LogItem::Line(line) => line.text.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            titles(&steps[1]),
+            [
+                "Run ./.github/actions/setup",
+                "Run rustup toolchain install",
+                "toolchain not found"
+            ]
+        );
+        assert_eq!(titles(&steps[2]), ["Run cargo test"]);
+    }
+
+    #[test]
+    fn a_group_longer_than_the_limit_keeps_its_end() {
+        let mut steps = vec![parse_step(&serde_json::json!({
+            "name": "Run tests", "status": "completed", "conclusion": "failure",
+            "started_at": "2026-11-13T16:00:00Z", "completed_at": "2026-11-13T16:00:59Z",
+        }))];
+        let mut log = String::from("2026-11-13T16:00:01.0Z ##[group]Run cargo test\n");
+        for n in 0..STEP_LINES + 10 {
+            log.push_str(&format!("2026-11-13T16:00:02.0Z line {n}\n"));
+        }
+        log.push_str("2026-11-13T16:00:03.0Z ##[error]test failed\n");
+        log.push_str("2026-11-13T16:00:03.1Z ##[endgroup]\n");
+        split_log(&log, &mut steps);
+        let step = &steps[0];
+        assert_eq!(step.lines(), STEP_LINES);
+        assert_eq!(step.earlier, 12);
+        let Some(LogItem::Group { title, lines }) = step.items.first() else {
+            panic!("the group is gone: {:?}", step.items.first());
+        };
+        assert_eq!(title, "Run cargo test");
+        assert_eq!(lines.first().map(|l| l.text.as_str()), Some("line 12"));
+        assert_eq!(
+            lines.last(),
+            Some(&LogLine {
+                text: "test failed".into(),
+                kind: LineKind::Error
+            })
+        );
+    }
+
     #[test]
     fn checks_add_up_like_t3_code_says_them() {
         let check = |status| Check {
             name: "ci".into(),
+            workflow: String::new(),
             status,
             url: None,
+            started: String::new(),
+            completed: String::new(),
+            run_id: None,
+            job_id: None,
         };
         assert_eq!(describe_checks(&[]), "No checks");
         assert_eq!(
@@ -1264,7 +1762,7 @@ mod tests {
             ]
         );
         assert_eq!(detail.checks[0].status, CheckStatus::Passed);
-        assert_eq!(detail.checks[1].name, "CI / test");
+        assert_eq!(detail.checks[1].label(), "CI / test");
         assert_eq!(detail.checks[1].status, CheckStatus::Running);
         assert_eq!(detail.mergeability, Mergeability::Blocked);
         assert_eq!(detail.methods, [MergeMethod::Squash, MergeMethod::Rebase]);
