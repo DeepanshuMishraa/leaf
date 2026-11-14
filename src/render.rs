@@ -254,13 +254,17 @@ impl Builder {
         if only_images {
             self.emit(Node::Figures(images));
         } else if inlines.iter().any(|r| !r.text.trim().is_empty()) {
-            let inlines = inlines
-                .into_iter()
-                .map(|r| Run {
-                    text: r.text.replace(IMAGE_MARK, ""),
-                    style: r.style,
-                })
-                .collect();
+            let inlines = if images.is_empty() {
+                inlines
+            } else {
+                inlines
+                    .into_iter()
+                    .map(|r| Run {
+                        text: r.text.replace(IMAGE_MARK, ""),
+                        style: r.style,
+                    })
+                    .collect()
+            };
             self.emit(Node::Paragraph(inlines));
         }
     }
@@ -612,30 +616,33 @@ impl Ctx<'_> {
     }
 
     /// Characters of inline runs, recorded in the page text.
+    /// Same as `record` on the runs' joined text, without joining it.
     fn cells(&mut self, runs: &[Run]) -> Vec<Cell> {
-        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
-        let start = self.record(&text);
-        let mut cells = Vec::new();
-        let mut i = start;
+        let bytes: usize = runs.iter().map(|r| r.text.len()).sum();
+        let mut cells = Vec::with_capacity(bytes);
+        self.laid.text.reserve(bytes + 1);
         for run in runs {
             for c in run.text.chars() {
-                cells.push((c, run.style, Some(i)));
-                i += 1;
+                cells.push((c, run.style, Some(self.laid.text.len())));
+                self.laid.text.push(c);
             }
         }
+        self.laid.text.push('\n');
         cells
     }
 
     /// Lays out cells in rows `width` wide from column `x`.
     fn flow(&mut self, cells: &[Cell], x: u16, width: u16, align: Align, wrap: Wrap) {
         for line in wrap_cells(cells, width, wrap) {
-            let line_width: u16 = line.iter().map(|c| char_width(c.0)).sum();
             let x = match align {
                 Align::Left => x,
-                Align::Center => x + width.saturating_sub(line_width) / 2,
+                Align::Center => {
+                    let line_width: u16 = line.iter().map(|c| char_width(c.0)).sum();
+                    x + width.saturating_sub(line_width) / 2
+                }
             };
             self.laid.rows.push(Row {
-                segs: segs(&line, x),
+                segs: segs(line, x),
             });
         }
     }
@@ -753,8 +760,8 @@ impl Ctx<'_> {
                 })
                 .collect();
             line_start += cells.len() + 1;
-            let wrapped = if cells.is_empty() {
-                vec![Vec::new()]
+            let wrapped: Vec<&[Cell]> = if cells.is_empty() {
+                vec![&[]]
             } else {
                 wrap_cells(&cells, width.saturating_sub(2).max(1), Wrap::Char)
             };
@@ -765,7 +772,7 @@ impl Ctx<'_> {
                     style: Style::default().fg(DIM),
                     offset: None,
                 }];
-                row_segs.extend(segs(&part, x + 2));
+                row_segs.extend(segs(part, x + 2));
                 self.laid.rows.push(Row { segs: row_segs });
             }
         }
@@ -934,7 +941,7 @@ impl Ctx<'_> {
             if r > 0 {
                 self.laid.rows.push(rule("├", "┼", "┤"));
             }
-            let wrapped: Vec<Vec<Vec<Cell>>> = row
+            let wrapped: Vec<Vec<&[Cell]>> = row
                 .iter()
                 .zip(&widths)
                 .map(|(cell, w)| wrap_cells(cell, *w, Wrap::Word))
@@ -1049,7 +1056,10 @@ fn spaced_above(node: &Node) -> bool {
 }
 
 fn char_width(c: char) -> u16 {
-    if c == '\n' {
+    // Printable ASCII, nearly every character laid out, is one column.
+    if matches!(c, ' '..='~') {
+        1
+    } else if c == '\n' {
         0
     } else {
         c.width().unwrap_or(0) as u16
@@ -1067,27 +1077,32 @@ fn line_width(cells: &[Cell]) -> u16 {
 /// Breaks cells into lines at most `width` wide: at spaces for `Word`
 /// (breaking a word only when it alone is too wide), anywhere for `Char`.
 /// Newlines always break. Spaces at a break are dropped.
-fn wrap_cells(cells: &[Cell], width: u16, wrap: Wrap) -> Vec<Vec<Cell>> {
+///
+/// Each line is a run of consecutive cells (a break only ever drops the
+/// spaces at its own edge), so lines borrow from `cells` rather than copy them.
+fn wrap_cells(cells: &[Cell], width: u16, wrap: Wrap) -> Vec<&[Cell]> {
     let width = width.max(1);
-    let mut lines: Vec<Vec<Cell>> = Vec::new();
+    let mut lines: Vec<&[Cell]> = Vec::new();
     for hard in cells.split(|c| c.0 == '\n') {
-        let mut line: Vec<Cell> = Vec::new();
+        // The line in progress is `hard[start..end]`, `used` columns wide.
+        let mut start = 0;
+        let mut end = 0;
         let mut used: u16 = 0;
         match wrap {
             Wrap::Char => {
-                for &cell in hard {
+                for (i, cell) in hard.iter().enumerate() {
                     let w = char_width(cell.0);
-                    if used + w > width && !line.is_empty() {
-                        lines.push(std::mem::take(&mut line));
+                    if used + w > width && end > start {
+                        lines.push(&hard[start..end]);
+                        start = i;
                         used = 0;
                     }
-                    line.push(cell);
+                    end = i + 1;
                     used += w;
                 }
             }
             Wrap::Word => {
-                // Words with the spaces before them.
-                let mut words: Vec<(&[Cell], &[Cell])> = Vec::new();
+                // Each word with the spaces before it.
                 let mut i = 0;
                 while i < hard.len() {
                     let space_start = i;
@@ -1098,63 +1113,79 @@ fn wrap_cells(cells: &[Cell], width: u16, wrap: Wrap) -> Vec<Vec<Cell>> {
                     while i < hard.len() && hard[i].0 != ' ' {
                         i += 1;
                     }
-                    words.push((&hard[space_start..word_start], &hard[word_start..i]));
-                }
-                for (space, word) in words {
+                    let (space, word) = (&hard[space_start..word_start], &hard[word_start..i]);
                     let space_w: u16 = space.iter().map(|c| char_width(c.0)).sum();
                     let word_w: u16 = word.iter().map(|c| char_width(c.0)).sum();
-                    if !line.is_empty() && used + space_w + word_w > width {
-                        lines.push(std::mem::take(&mut line));
+                    if end > start && used + space_w + word_w > width {
+                        lines.push(&hard[start..end]);
+                        start = word_start;
+                        end = word_start;
                         used = 0;
-                    } else if !line.is_empty() {
-                        line.extend_from_slice(space);
+                    } else if end > start {
+                        end = word_start;
                         used += space_w;
+                    } else {
+                        // Spaces opening a line are dropped.
+                        start = word_start;
+                        end = word_start;
                     }
                     if word_w > width {
-                        for &cell in word {
-                            let w = char_width(cell.0);
-                            if used + w > width && !line.is_empty() {
-                                lines.push(std::mem::take(&mut line));
+                        for j in word_start..i {
+                            let w = char_width(hard[j].0);
+                            if used + w > width && end > start {
+                                lines.push(&hard[start..end]);
+                                start = j;
                                 used = 0;
                             }
-                            line.push(cell);
+                            end = j + 1;
                             used += w;
                         }
                     } else {
-                        line.extend_from_slice(word);
+                        end = i;
                         used += word_w;
                     }
                 }
             }
         }
-        lines.push(line);
+        lines.push(&hard[start..end]);
     }
     lines
 }
 
 /// Groups a line's cells into same-styled segments starting at column `x`.
+/// A segment runs while the style holds and the page-text offsets stay
+/// consecutive (or absent).
 fn segs(line: &[Cell], x: u16) -> Vec<Seg> {
     let mut out: Vec<Seg> = Vec::new();
     let mut col = x;
-    let mut prev: Option<(Style, Option<usize>)> = None;
-    for &(c, style, offset) in line {
-        let continues = match (prev, out.last()) {
-            (Some((s, Some(o))), Some(_)) => s == style && offset == Some(o + 1),
-            (Some((s, None)), Some(_)) => s == style && offset.is_none(),
-            _ => false,
-        };
-        if continues {
-            out.last_mut().expect("a segment exists").text.push(c);
-        } else {
-            out.push(Seg {
-                x: col,
-                text: c.to_string(),
-                style,
-                offset,
-            });
+    let mut i = 0;
+    while i < line.len() {
+        let (_, style, offset) = line[i];
+        let mut j = i + 1;
+        while j < line.len() {
+            let (_, s, o) = line[j];
+            let continues = match line[j - 1].2 {
+                Some(prev) => s == style && o == Some(prev + 1),
+                None => s == style && o.is_none(),
+            };
+            if !continues {
+                break;
+            }
+            j += 1;
         }
-        prev = Some((style, offset));
-        col += char_width(c);
+        let seg_x = col;
+        let mut text = String::with_capacity(j - i);
+        for &(c, _, _) in &line[i..j] {
+            text.push(c);
+            col += char_width(c);
+        }
+        out.push(Seg {
+            x: seg_x,
+            text,
+            style,
+            offset,
+        });
+        i = j;
     }
     out
 }
@@ -1390,5 +1421,94 @@ mod tests {
             }]
         );
         assert_eq!(laid.rows.len(), 1 + 5 + 1);
+    }
+
+    fn plain_cells(text: &str) -> Vec<Cell> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| (c, Style::default(), Some(i)))
+            .collect()
+    }
+
+    fn wrapped(text: &str, width: u16, wrap: Wrap) -> Vec<String> {
+        wrap_cells(&plain_cells(text), width, wrap)
+            .iter()
+            .map(|line| line.iter().map(|c| c.0).collect())
+            .collect()
+    }
+
+    #[test]
+    fn word_wrap_drops_spaces_at_breaks_and_keeps_them_between_words() {
+        assert_eq!(
+            wrapped("  one  two three", 8, Wrap::Word),
+            vec!["one  two", "three"]
+        );
+        // Spaces that end a line still fit on it; ones that don't open an empty line.
+        assert_eq!(wrapped("one ", 4, Wrap::Word), vec!["one "]);
+        assert_eq!(wrapped("one  ", 4, Wrap::Word), vec!["one", ""]);
+        assert_eq!(wrapped("a\n\nb", 9, Wrap::Word), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn word_wrap_breaks_only_a_word_too_wide_for_a_line() {
+        assert_eq!(
+            wrapped("to abcdefghij ok", 4, Wrap::Word),
+            vec!["to", "abcd", "efgh", "ij", "ok"]
+        );
+        // Wide characters take two columns.
+        assert_eq!(wrapped("漢字 漢字", 5, Wrap::Word), vec!["漢字", "漢字"]);
+        assert_eq!(wrapped("漢字漢", 5, Wrap::Word), vec!["漢字", "漢"]);
+    }
+
+    #[test]
+    fn char_wrap_breaks_anywhere_and_keeps_every_character() {
+        assert_eq!(wrapped("ab cd ef", 3, Wrap::Char), vec!["ab ", "cd ", "ef"]);
+        assert_eq!(wrapped("", 3, Wrap::Char), vec![""]);
+    }
+
+    #[test]
+    fn wrapped_lines_keep_their_cells_offsets() {
+        let cells = plain_cells("one two three");
+        let lines = wrap_cells(&cells, 7, Wrap::Word);
+        let starts: Vec<Option<usize>> = lines.iter().map(|l| l[0].2).collect();
+        assert_eq!(starts, vec![Some(0), Some(8)]);
+    }
+
+    #[test]
+    fn segments_split_on_style_offset_gaps_and_decorations() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let line: Vec<Cell> = vec![
+            ('a', Style::default(), Some(0)),
+            ('b', Style::default(), Some(1)),
+            ('c', bold, Some(2)),
+            ('d', bold, Some(5)),
+            ('漢', bold, Some(6)),
+            ('-', bold, None),
+            ('-', bold, None),
+            ('e', bold, Some(7)),
+        ];
+        let got: Vec<(u16, String, Option<usize>)> = segs(&line, 3)
+            .into_iter()
+            .map(|s| (s.x, s.text, s.offset))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (3, "ab".into(), Some(0)),
+                (5, "c".into(), Some(2)),
+                (6, "d漢".into(), Some(5)),
+                (9, "--".into(), None),
+                (11, "e".into(), Some(7)),
+            ]
+        );
+        assert_eq!(segs(&[], 0), vec![]);
+    }
+
+    #[test]
+    fn an_image_inside_text_leaves_no_mark_in_the_page_text() {
+        let laid = layout("see ![a](x.png) here", 40, (8, 16), &no_images);
+        let text: String = laid.text.iter().collect();
+        assert_eq!(text, "see  here\n");
+        assert!(laid.figures.is_empty());
     }
 }
