@@ -101,7 +101,7 @@ Local diffs need a Git repository. A patch file and a GitHub pull request, commi
 
 Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. `i` switches to one column, removed lines above added ones as `git diff` shows them, with both line numbers; `leaf diff --inline` opens that way. Comments and the changed-word highlighting work the same in both. Added and removed lines are tinted, with the changed words picked out. The tints follow the terminal's light or dark theme and switch with it while the diff is open in Rex (or another terminal that answers the `CSI ? 996 n` color-scheme query); other terminals are matched by their background color once. `LEAF_THEME=light` or `LEAF_THEME=dark` sets it outright.
 
-Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `v` enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `@` (or `ctrl+enter`) asks the agent pane about the range, or the current line: type the question and press enter. `C` comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
+Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens the changed-file picker (type to filter the paths, `enter` opens one), `[`/`]` steps between files, `g/G` first/last. `V` (or `v`) enters visual mode and moving extends the selection; `esc` leaves visual mode and drops the range. `@` (or `ctrl+enter`) asks the agent pane about the range, or the current line: type the question and press enter. `c` (or `C`) comments on the range, or on the current line when there is no selection. Type the comment and press enter to save it; `alt+enter` adds a line, `ctrl+enter` sends it to an agent pane open in Rex, `ctrl+g` posts it to GitHub, and `esc` cancels. `m` lists saved comments to jump to, resend, delete or post; `y` copies a prompt for any agent and `Y` copies every comment. `leaf comments --json` prints every saved comment with its diff key, file, side, line range, body and state for scripts and agents.
 
 The message names the file, the side, and the line range, and includes the hunk around that range, then the comment. It is sent, not left sitting in the agent's input. An agent pane is found from `LEAF_AGENT_PANE`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini`, `grok`, `pi` or another known agent. With no Rex session or no agent, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
@@ -153,13 +153,14 @@ Config files are merged, never replaced, and the first change to a JSON file kee
 
 ### Plans
 
-`leaf plan plan.md` splits a Markdown plan into numbered blocks: each heading with the paragraphs under it, each list item, code block, table and quote. Move between blocks with `j/k` (`J/K` jump to blocks with notes), then:
+`leaf plan plan.md` splits a Markdown plan into numbered blocks: each heading with everything under it, up to the next heading. Text before the first heading, or after a `---` rule, is a block of its own. `j/k` move line by line, `]`/`[` jump between blocks and `J/K` jump to blocks with notes. Then:
 
-- `c` comments on the block
-- `x` marks it for removal (press it again to keep the block)
-- `r` replaces it with your text, starting from the block's own
+- `c` comments on the cursor's line. `V` starts a selection, `j/k` extend it inside the block, and `c` comments on the selected lines.
+- `B` comments on the whole block.
+- `x` removes the selection, or marks the whole block for removal (press it again to keep the block).
+- `r` replaces the selection or the block with your text, starting from its own.
 
-Drag over text to do the same to just that passage. `C` writes a global note on the whole plan, `L` lists every note to jump to, edit or delete, and `X` clears a block's notes. `S` sends the review: `a` approve, `n` approve with notes, `c` request changes.
+Dragging over text selects a passage the same way. `C` writes a global note on the whole plan, `L` lists every note to jump to, edit or delete, and `X` clears a block's notes. `S` sends the review: `a` approve, `n` approve with notes, `c` request changes.
 
 Notes you haven't sent are kept and come back next time. A note on a block that has since been rewritten is dropped, and leaf tells you. Each new version of a plan is a round. From the second round on, blocks that changed are marked `+`, the header counts the changed and removed blocks, and `D` steps through what changed.
 
@@ -167,11 +168,11 @@ Notes you haven't sent are kept and come back next time. A note on a block that 
 
 `leaf review` takes the same sources as `leaf diff` (`--staged`, `--branch`, a range, a patch or a GitHub link). It opens on an overview of every changed file, with its size, its notes and whether you've viewed it. `enter` opens a file, and `tab` comes back to the overview. Past the last file, `]` comes back too. Notes go on three levels:
 
-- lines: `C` on the cursor line or a `v` selection
+- lines: `c` on the cursor line, or press `V` to select lines with `j/k`, then `c`
 - a whole file: `F`, or `c` in the overview
 - the whole change: `M`, or `C` in the overview
 
-`V` marks a file viewed. The mark clears if the file changes. `S` sends the draft line comments and the notes as one review, grouped by file in diff order, with each line comment's hunk. Plain `leaf diff` has the overview, the notes and `S` as well, and sends the review straight to the agent pane.
+`w` marks a file viewed. The mark clears if the file changes. `S` sends the draft line comments and the notes as one review, grouped by file in diff order, with each line comment's hunk. Plain `leaf diff` has the overview, the notes and `S` as well, and sends the review straight to the agent pane.
 
 ### Who opens it
 

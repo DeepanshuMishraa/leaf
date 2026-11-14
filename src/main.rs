@@ -92,7 +92,7 @@ Diff options:
   --patch <file>     a .diff or .patch file
   --inline           one column, removed lines above added ones (i switches)
 
-Diff keys: j/k move, v visual, C comment, m comments, f files, y copy, o other
+Diff keys: j/k move, V visual, c comment, m comments, f files, y copy, o other
 side, i split/inline, r reload, ? keys, q quit
 
 Pull request keys: tab summary/timeline, 3 code, m merge, x close/reopen, r ready/draft,

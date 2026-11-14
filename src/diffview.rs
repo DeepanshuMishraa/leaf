@@ -1210,7 +1210,7 @@ impl App {
             KeyCode::Char('q') => self.ask_quit(),
             KeyCode::Char('F') => self.edit_file_note(None),
             KeyCode::Char('M') => self.edit_global_note(),
-            KeyCode::Char('V') => self.toggle_viewed(None),
+            KeyCode::Char('w') => self.toggle_viewed(None),
             KeyCode::Char('S') => self.open_verdict(),
             KeyCode::Char('O') => self.show_overview(),
             KeyCode::Tab if !self.tabs => self.show_overview(),
@@ -1242,8 +1242,8 @@ impl App {
             KeyCode::Char(']') | KeyCode::Char('n') => self.next_file(true),
             KeyCode::Char('[') | KeyCode::Char('N') => self.next_file(false),
             KeyCode::Char('f') => self.show_files(),
-            KeyCode::Char('v') => self.toggle_selection(),
-            KeyCode::Char('C') => self.compose(Purpose::Comment),
+            KeyCode::Char('v' | 'V') => self.toggle_selection(),
+            KeyCode::Char('c' | 'C') => self.compose(Purpose::Comment),
             KeyCode::Char('@') => self.compose(Purpose::Ask),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.compose(Purpose::Ask)
@@ -2172,7 +2172,7 @@ impl App {
                 &[
                     ("enter", "open"),
                     ("c", "note"),
-                    ("V", "viewed"),
+                    ("w", "viewed"),
                     ("S", "send"),
                     ("C", "whole change"),
                     ("?", "keys"),
@@ -2239,7 +2239,7 @@ impl App {
                 "selected · "
             };
             let unit = if lines == 1 { "line" } else { "lines" };
-            left.push_str(&format!("  {mode}{lines} {unit} · C comment"));
+            left.push_str(&format!("  {mode}{lines} {unit} · c comment"));
         }
         let (added, removed) = totals(diff);
         let unsent = self.unsent();
@@ -3129,8 +3129,8 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ("g G  Home End", "first or last line"),
         ("[ ]  N n", "previous or next file"),
         ("f", "files: filter by path, open one"),
-        ("v", "visual mode; move to select, esc clears"),
-        ("C", "comment on the line or selection"),
+        ("V v", "visual mode; move to select, esc clears"),
+        ("c C", "comment on the line or selection"),
         (
             "@  ^enter",
             "ask the agent about the line or selection (⇧⌘A in Rex)",
@@ -3142,7 +3142,7 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ),
         ("F", "note on this whole file"),
         ("M", "global note on the whole change"),
-        ("V", "mark this file viewed (again: not viewed)"),
+        ("w", "mark this file viewed (again: not viewed)"),
         ("S", "send drafts and notes as one review, with a verdict"),
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
@@ -3308,7 +3308,7 @@ impl App {
                 None => self.edit_global_note(),
             },
             KeyCode::Char('C') | KeyCode::Char('M') => self.edit_global_note(),
-            KeyCode::Char('V') => {
+            KeyCode::Char('w' | 'V') => {
                 if let Some(file) = self.overview_file() {
                     self.toggle_viewed(Some(file));
                 }

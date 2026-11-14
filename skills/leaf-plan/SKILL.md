@@ -5,7 +5,7 @@ description: Hand a written plan, spec or design to the person for review in lea
 
 # leaf-plan: get a plan reviewed
 
-1. Write the plan to a Markdown file, such as `docs/plans/<topic>.md`. Use headings for phases and list items for steps. Each heading section, list item, code block and table becomes one block the person can comment on, so one idea per item makes the review sharper. Don't also paste the plan into chat.
+1. Write the plan to a Markdown file, such as `docs/plans/<topic>.md`. Use headings for phases and list items for steps. Each heading and everything under it, up to the next heading, becomes one block. The person can comment on a whole block, a single line or a range of lines, so keep each section to one phase and each line to one step. Don't also paste the plan into chat.
 2. Run:
 
    ```bash
@@ -35,9 +35,17 @@ Global: Split the migration into its own step.
 
 That logs people out mid-session.
 
-## 2. Block 9 (line 30): remove
+## 2. Block 4, lines 15-16: comment
+> Store the hash, not the token
+> Expire after 30 days
+
+Make the expiry configurable.
+
+## 3. Block 6 (lines 30-41): remove
 ...
 ```
+
+A note with `(lines …)` after the heading is on the whole block. One with `, line N` or `, lines N-M` is on just those lines, quoted below it.
 
 - **approved**: carry on with the plan as written.
 - **approved with notes**: carry on, and apply every numbered item as you go.

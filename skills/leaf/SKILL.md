@@ -50,8 +50,8 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 
 **Diff:**
 - `j/k` move, `[`/`]` files, `f` file picker, `tab` overview of every file.
-- `v` visual select, `C` comment on lines, `F` note on the file, `M` global note.
-- `m` lists comments, `V` marks a file viewed, `S` sends everything as one review.
+- `V` or `v` selects lines, `c` comments on the line or selection, `F` note on the file, `M` global note.
+- `m` lists comments, `w` marks a file viewed, `S` sends everything as one review.
 - `@` asks the agent about the lines, `ctrl+enter` sends one comment now.
 - `i` switches split and inline, `o` the other side, `r` reloads, `?` keys.
 
@@ -61,7 +61,8 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 - `o` opens it on GitHub, `?` keys, `q` goes back to the list.
 
 **Plan review:**
-- `j/k` blocks, `c` comment, `x` remove, `r` replace, `C` global note.
+- `j/k` lines, `]`/`[` blocks, `V` selects lines, `c` comments on the line or selection, `B` on the whole block.
+- `x` remove, `r` replace (the selection, else the block), `C` global note.
 - `L` lists notes, `S` sends with a verdict.
 
 ## Things to know

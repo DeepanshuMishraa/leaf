@@ -26,8 +26,6 @@ use crate::review::{Notes, Outcome, PlanEdit, PlanNote, PlanTarget, Review, Verd
 const MAX_TEXT_WIDTH: u16 = 80;
 /// Block numbers and the bar marking the block under the cursor.
 const GUTTER: u16 = 6;
-/// How many blocks ctrl+d and ctrl+u move.
-const HALF_STEP: usize = 5;
 const WHEEL_STEP: usize = 3;
 const ACCENT: Color = Color::Blue;
 const SELECTION: Color = Color::Indexed(8);
@@ -146,6 +144,12 @@ struct App {
     notes: Vec<PlanNote>,
     global: Option<String>,
     focus: Focus,
+    /// The laid-out row of the focused block the cursor is on; unused on the
+    /// global row.
+    row: usize,
+    /// In visual mode, the row of the focused block the selection started
+    /// on. Moving extends `selection` from it, inside that block.
+    visual: Option<usize>,
     scroll: usize,
     /// Rows of plan on screen, as last drawn.
     view_height: usize,
@@ -182,6 +186,8 @@ impl App {
             notes: Vec::new(),
             global: None,
             focus,
+            row: 0,
+            visual: None,
             scroll: 0,
             view_height: 1,
             shown: Vec::new(),
@@ -208,6 +214,8 @@ impl App {
         if let Some(draft) = plan.draft.as_deref() {
             app.restore(draft);
         }
+        // Laid out now so the cursor can move by lines before the first draw.
+        app.lay_out(MAX_TEXT_WIDTH);
         app
     }
 
@@ -316,6 +324,127 @@ impl App {
                 laid
             })
             .collect();
+        // Rows move with the width, so the cursor goes to a row that exists
+        // and a visual selection ends.
+        if self.visual.take().is_some() {
+            self.selection = None;
+        }
+        if let Focus::Block(block) = self.focus {
+            let rows = self.text_rows(block);
+            if !rows.contains(&self.row) {
+                self.row = rows
+                    .iter()
+                    .rev()
+                    .find(|row| **row <= self.row)
+                    .or(rows.first())
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    /// The rows of block `block` that hold text, top to bottom.
+    fn text_rows(&self, block: usize) -> Vec<usize> {
+        let Some(laid) = self.laid.get(block) else {
+            return Vec::new();
+        };
+        laid.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.segs.iter().any(|seg| seg.offset.is_some()))
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    /// Every row with text in the plan, as (block, row), top to bottom. A
+    /// block with no text gets its first row, so the cursor can still land on it.
+    fn lines(&self) -> Vec<(usize, usize)> {
+        (0..self.blocks.len())
+            .flat_map(|block| {
+                let rows = self.text_rows(block);
+                if rows.is_empty() {
+                    vec![(block, 0)]
+                } else {
+                    rows.into_iter().map(|row| (block, row)).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// The character range of block `block`'s text drawn on rows `from`
+    /// through `to`, either way round.
+    fn row_span(&self, block: usize, from: usize, to: usize) -> Option<(usize, usize)> {
+        let laid = self.laid.get(block)?;
+        let (first, last) = (from.min(to), from.max(to));
+        laid.rows
+            .get(first..=last.min(laid.rows.len().checked_sub(1)?))?
+            .iter()
+            .flat_map(|row| &row.segs)
+            .filter_map(|seg| {
+                seg.offset
+                    .map(|start| (start, start + seg.text.chars().count()))
+            })
+            .reduce(|(s1, e1), (s2, e2)| (s1.min(s2), e1.max(e2)))
+    }
+
+    /// Selects rows `from` through `to` of block `block`.
+    fn select_rows(&mut self, block: usize, from: usize, to: usize) {
+        self.selection = self
+            .row_span(block, from, to)
+            .map(|(start, end)| Selection { block, start, end });
+    }
+
+    /// `j`/`k`: the next or previous line, crossing into the next block or
+    /// up to the global row. In visual mode the cursor stays in its block
+    /// and the selection follows it.
+    fn move_line(&mut self, by: isize) {
+        if let (Some(anchor), Focus::Block(block)) = (self.visual, self.focus) {
+            let rows = self.text_rows(block);
+            if let Some(last) = rows.len().checked_sub(1) {
+                let at = rows.iter().position(|row| *row >= self.row).unwrap_or(0);
+                self.row = rows[at.saturating_add_signed(by).min(last)];
+                self.select_rows(block, anchor, self.row);
+            }
+            self.follow();
+            return;
+        }
+        let lines = self.lines();
+        let here = match self.focus {
+            Focus::Global => -1,
+            Focus::Block(block) => lines
+                .iter()
+                .position(|line| *line >= (block, self.row))
+                .unwrap_or(0) as isize,
+        };
+        let to = (here + by).clamp(-1, lines.len() as isize - 1);
+        match usize::try_from(to).ok().and_then(|at| lines.get(at)) {
+            Some((block, row)) => {
+                self.focus = Focus::Block(*block);
+                self.row = *row;
+            }
+            None => self.focus = Focus::Global,
+        }
+        self.follow();
+    }
+
+    /// `V`: starts selecting lines from the cursor's, or stops.
+    fn toggle_visual(&mut self) {
+        if self.visual.take().is_some() {
+            self.selection = None;
+            return;
+        }
+        let Focus::Block(block) = self.focus else {
+            self.toast = Some("move to a block to select its lines".into());
+            return;
+        };
+        self.visual = Some(self.row);
+        self.select_rows(block, self.row, self.row);
+    }
+
+    /// Ends visual mode and lets go of the selection.
+    fn clear_selection(&mut self) {
+        self.visual = None;
+        self.selection = None;
     }
 
     fn note_count(&self) -> usize {
@@ -390,10 +519,24 @@ impl App {
         (first.unwrap_or(0), last.unwrap_or(0))
     }
 
-    /// Scrolls so the focused block is on screen, its top first.
+    /// Scrolls so the cursor's line (or the global row) is on screen.
     fn follow(&mut self) {
         let rows = self.rows();
-        let (first, last) = self.focus_rows(&rows);
+        let (first, last) = match self.focus {
+            Focus::Block(block) => {
+                let at = rows
+                    .iter()
+                    .position(|row| {
+                        *row == Row::Text {
+                            block,
+                            row: self.row,
+                        }
+                    })
+                    .unwrap_or(0);
+                (at, at)
+            }
+            Focus::Global => self.focus_rows(&rows),
+        };
         let height = self.view_height.max(1);
         if first < self.scroll {
             self.scroll = first;
@@ -416,6 +559,10 @@ impl App {
             Focus::Global
         } else {
             Focus::Block(index as usize)
+        };
+        self.row = match self.focus {
+            Focus::Block(block) => self.text_rows(block).first().copied().unwrap_or(0),
+            Focus::Global => 0,
         };
         self.follow();
     }
@@ -445,18 +592,23 @@ impl App {
         let total = self.rows().len();
         let max = total.saturating_sub(self.view_height.max(1));
         self.scroll = self.scroll.saturating_add_signed(rows).min(max);
-        // The cursor goes to the first block that starts on screen.
-        let rows = self.rows();
-        if let Some(focus) = rows
-            .iter()
-            .enumerate()
+        // The cursor goes to the first line on screen.
+        let found = self
+            .rows()
+            .into_iter()
             .skip(self.scroll)
-            .find(|(at, row)| {
-                matches!(row, Row::Text { row: 0, .. } | Row::GlobalTitle) && *at >= self.scroll
-            })
-            .and_then(|(_, row)| row.focus())
-        {
-            self.focus = focus;
+            .find(|row| match row {
+                Row::Text { block, row } => self.text_rows(*block).contains(row),
+                Row::GlobalTitle => true,
+                _ => false,
+            });
+        match found {
+            Some(Row::Text { block, row }) => {
+                self.focus = Focus::Block(block);
+                self.row = row;
+            }
+            Some(_) => self.focus = Focus::Global,
+            None => {}
         }
     }
 
@@ -474,11 +626,42 @@ impl App {
         }
     }
 
+    /// The selection, or else the line under the cursor, as a note target.
+    fn line_target(&self) -> Option<PlanTarget> {
+        if self.selection.is_some() {
+            return self.target_here();
+        }
+        let Focus::Block(block) = self.focus else {
+            return None;
+        };
+        let line = self
+            .row_span(block, self.row, self.row)
+            .map(|(start, end)| self.selected_text(Selection { block, start, end }))
+            .filter(|text| !text.trim().is_empty());
+        Some(match line {
+            Some(line) => self.passage_target(block, &line),
+            None => self.block_target(block),
+        })
+    }
+
+    /// `c`: a comment on the selection or the cursor's line.
     fn compose_comment(&mut self) {
-        let Some(target) = self.target_here() else {
+        let Some(target) = self.line_target() else {
             return self.compose_global();
         };
-        self.selection = None;
+        self.compose_comment_on(target);
+    }
+
+    /// `B`: a comment on the whole block under the cursor.
+    fn compose_block_comment(&mut self) {
+        match self.focus {
+            Focus::Block(block) => self.compose_comment_on(self.block_target(block)),
+            Focus::Global => self.compose_global(),
+        }
+    }
+
+    fn compose_comment_on(&mut self, target: PlanTarget) {
+        self.clear_selection();
         self.composer = Some(Composer {
             writing: Writing::Comment {
                 target,
@@ -493,7 +676,7 @@ impl App {
             self.toast = Some("move to a block, or select a passage, to replace it".into());
             return;
         };
-        self.selection = None;
+        self.clear_selection();
         // An earlier replacement of the same thing is edited, not doubled.
         let editing = self
             .notes
@@ -645,6 +828,7 @@ impl App {
 
     /// `x`: removes the selected passage, or marks (and unmarks) the block.
     fn remove_here(&mut self) {
+        self.visual = None;
         if let Some(selection) = self.selection.take() {
             let quote = self.selected_text(selection);
             if !quote.trim().is_empty() {
@@ -819,22 +1003,37 @@ impl App {
             Focus::Block(block) => Some(block),
             Focus::Global => None,
         };
-        // Moving the cursor lets go of a selection.
-        if matches!(
+        // Moving by lines extends a visual selection and lets go of any other;
+        // jumping lets go of both.
+        let moves_line = matches!(
             key.code,
-            KeyCode::Char('j' | 'k' | 'J' | 'K' | 'g' | 'G') | KeyCode::Down | KeyCode::Up
-        ) {
-            self.selection = None;
+            KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
+        ) || (ctrl && matches!(key.code, KeyCode::Char('d' | 'u')));
+        let jumps = matches!(
+            key.code,
+            KeyCode::Char('J' | 'K' | 'g' | 'G' | '[' | ']' | '{' | '}' | 'D')
+                | KeyCode::Home
+                | KeyCode::End
+        );
+        if jumps || (moves_line && self.visual.is_none()) {
+            self.clear_selection();
         }
+        let half = (self.view_height / 2).max(1) as isize;
         match key.code {
-            KeyCode::Esc if self.selection.is_some() => self.selection = None,
+            KeyCode::Esc if self.selection.is_some() || self.visual.is_some() => {
+                self.clear_selection()
+            }
             KeyCode::Char('c') if ctrl => self.outcome = Some(Outcome::Closed),
-            KeyCode::Char('j') | KeyCode::Down => self.step(1),
-            KeyCode::Char('k') | KeyCode::Up => self.step(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.move_line(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_line(-1),
+            KeyCode::Char(']' | '}') => self.step(1),
+            KeyCode::Char('[' | '{') => self.step(-1),
             KeyCode::Char('J') => self.step_noted(true),
             KeyCode::Char('K') => self.step_noted(false),
-            KeyCode::Char('d') if ctrl => self.step(HALF_STEP as isize),
-            KeyCode::Char('u') if ctrl => self.step(-(HALF_STEP as isize)),
+            KeyCode::Char('d') if ctrl => self.move_line(half),
+            KeyCode::Char('u') if ctrl => self.move_line(-half),
+            KeyCode::Char('V' | 'v') => self.toggle_visual(),
+            KeyCode::Char('B') => self.compose_block_comment(),
             KeyCode::Char(' ') | KeyCode::PageDown => {
                 self.scroll_by(self.view_height.saturating_sub(2) as isize)
             }
@@ -922,7 +1121,7 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_STEP as isize)),
             _ if self.composer.is_some() || self.dialog != Dialog::None => {}
             MouseEventKind::Down(MouseButton::Left) => {
-                self.selection = None;
+                self.clear_selection();
                 self.drag = None;
                 let Some(row) = self.row_at(mouse.row) else {
                     return;
@@ -930,7 +1129,11 @@ impl App {
                 if let Some(focus) = row.focus() {
                     self.focus = focus;
                 }
+                if let Row::Note { block, .. } = row {
+                    self.row = self.text_rows(block).first().copied().unwrap_or(0);
+                }
                 if let Row::Text { block, row } = row {
+                    self.row = row;
                     self.drag = self
                         .offset_at(block, row, mouse.column)
                         .map(|offset| (block, offset));
@@ -1133,9 +1336,17 @@ impl App {
         for (y, row) in (area.y..area.bottom()).zip(rows.iter().skip(self.scroll)) {
             self.shown.push((y, *row));
             let focused = row.focus() == Some(self.focus);
+            // The cursor's line gets the full bar; the rest of its block a thin one.
+            let cursor = match (*row, self.focus) {
+                (Row::Text { row, .. }, Focus::Block(_)) => focused && row == self.row,
+                (_, Focus::Global) => focused,
+                _ => false,
+            };
             let buf = f.buffer_mut();
-            if focused {
+            if cursor {
                 buf.set_string(left + GUTTER - 2, y, "▌", Style::default().fg(ACCENT));
+            } else if focused {
+                buf.set_string(left + GUTTER - 2, y, "▏", Style::default().fg(ACCENT));
             }
             match *row {
                 Row::GlobalTitle => {
@@ -1283,9 +1494,9 @@ impl App {
                     ]
                 } else {
                     &[
-                        ("c", "comment"),
-                        ("x", "remove"),
-                        ("r", "replace"),
+                        ("c", "comment line"),
+                        ("V", "select lines"),
+                        ("B", "comment block"),
                         ("S", "send"),
                         ("C", "whole plan"),
                         ("L", "notes"),
@@ -1377,6 +1588,16 @@ fn target_text(target: &PlanTarget) -> &str {
 fn target_label(target: &PlanTarget) -> String {
     match target {
         PlanTarget::Block { index, .. } => format!("block {index}"),
+        PlanTarget::Passage {
+            block,
+            lines: Some((first, last)),
+            ..
+        } if first == last => format!("line {first} in block {block}"),
+        PlanTarget::Passage {
+            block,
+            lines: Some((first, last)),
+            ..
+        } => format!("lines {first}-{last} in block {block}"),
         PlanTarget::Passage { block, .. } => format!("a passage in block {block}"),
     }
 }
@@ -1489,14 +1710,20 @@ fn popup(f: &mut Frame, area: Rect, lines: Vec<Line>, width: u16) {
 }
 
 const KEYS: &[(&str, &str)] = &[
-    ("j/k ↓/↑", "next or previous block"),
+    ("j/k ↓/↑", "next or previous line"),
+    ("] [  } {", "next or previous block"),
     ("J/K", "next or previous block with notes"),
     ("g/G", "global note, last block"),
-    ("ctrl+d/u", "five blocks down or up"),
+    ("ctrl+d/u", "half a screen down or up"),
     ("space/b", "a screen down or up"),
-    ("c, enter", "comment on the block"),
-    ("x", "mark the block for removal (again: keep it)"),
-    ("r", "replace the block with your text"),
+    ("V, v", "select lines; j/k extend, esc clears"),
+    ("c, enter", "comment on the line or the selection"),
+    ("B", "comment on the whole block"),
+    (
+        "x",
+        "remove the selection, or mark the block (again: keep it)",
+    ),
+    ("r", "replace the selection or the block with your text"),
     ("C", "global note on the whole plan"),
     ("X", "clear the block's notes"),
     ("L", "every note: go to, edit or delete one"),
@@ -1575,8 +1802,12 @@ mod tests {
 
 Move sessions to tokens.
 
+## Steps
+
 - Add the tokens table
 - Backfill it
+
+## Schema
 
 ```sql
 create table tokens (id int);
@@ -1662,12 +1893,83 @@ create table tokens (id int);
         mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), x + 7, y);
         mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x + 7, y);
         press(&mut app, KeyCode::Char('x'));
-        assert!(!app.removed(2));
+        assert!(!app.removed(1));
         assert_eq!(app.notes.len(), 1);
         assert!(matches!(
             &app.notes[0].target,
-            PlanTarget::Passage { quote, block: 3, lines: Some((6, 6)) } if quote == "Backfill"
+            PlanTarget::Passage { quote, block: 2, lines: Some((8, 8)) } if quote == "Backfill"
         ));
+    }
+
+    #[test]
+    fn c_comments_on_the_cursor_line() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.focus, Focus::Block(1));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "Use a migration");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.notes[0].target,
+            PlanTarget::Passage { quote, block: 2, lines: Some((7, 7)) }
+                if quote.contains("Add the tokens table")
+        ));
+        press(&mut app, KeyCode::Char('S'));
+        press(&mut app, KeyCode::Char('c'));
+        let text = sent(&app);
+        assert!(text.contains("Block 2, line 7: comment"), "{text}");
+        assert!(text.contains("Use a migration"), "{text}");
+    }
+
+    #[test]
+    fn v_selects_lines_inside_the_block_and_c_comments_on_them() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char('V'));
+        assert!(app.visual.is_some());
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        // The selection stops at the block's last line.
+        assert_eq!(app.focus, Focus::Block(1));
+        let screen = draw(&mut app, 90, 30);
+        assert!(screen.contains("c comment"), "{screen}");
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.composer.as_ref().is_some_and(|c| matches!(
+            &c.writing,
+            Writing::Comment {
+                target: PlanTarget::Passage {
+                    lines: Some((5, 8)),
+                    ..
+                },
+                ..
+            }
+        )));
+        type_text(&mut app, "split these");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.visual, None);
+        assert_eq!(app.selection, None);
+        assert!(matches!(
+            &app.notes[0].target,
+            PlanTarget::Passage {
+                block: 2,
+                lines: Some((5, 8)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn esc_leaves_visual_mode() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('V'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.selection.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.visual, None);
+        assert_eq!(app.selection, None);
+        assert_eq!(app.outcome, None);
     }
 
     #[test]
@@ -1722,7 +2024,7 @@ create table tokens (id int);
     #[test]
     fn a_note_whose_block_changed_is_dropped_and_sending_clears_the_draft() {
         let (mut first, saved) = saving(PLAN, None);
-        press(&mut first, KeyCode::Char('j'));
+        // On block 1's first line; j then goes to block 2.
         press(&mut first, KeyCode::Char('c'));
         type_text(&mut first, "keep");
         press(&mut first, KeyCode::Enter);
@@ -1784,7 +2086,7 @@ create table tokens (id int);
         let screen = draw(&mut app, 90, 30);
         assert!(screen.contains("Review plan · plan.md"), "{screen}");
         assert!(screen.contains("Whole plan"), "{screen}");
-        for number in ["  1", "  2", "  3", "  4"] {
+        for number in ["  1", "  2", "  3"] {
             assert!(
                 screen
                     .lines()
@@ -1792,16 +2094,16 @@ create table tokens (id int);
             );
         }
         assert!(screen.contains("Move sessions to tokens."));
-        assert!(screen.contains("4 blocks"));
+        assert!(screen.contains("3 blocks"));
     }
 
     #[test]
     fn a_comment_on_a_block_is_sent_with_the_verdict() {
         let mut app = app();
         draw(&mut app, 90, 30);
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char(']'));
         assert_eq!(app.focus, Focus::Block(1));
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('B'));
         type_text(&mut app, "Use a migration");
         press(&mut app, KeyCode::Enter);
         let screen = draw(&mut app, 90, 30);
@@ -1813,7 +2115,11 @@ create table tokens (id int);
             text.starts_with("# Review of plan.md: changes requested"),
             "{text}"
         );
-        assert!(text.contains("## 1. Block 2, \"Auth\" (line 5): comment\n> - Add the tokens table\n\nUse a migration\n"), "{text}");
+        assert!(
+            text.contains("## 1. Block 2, \"Auth > Steps\" (lines 5-8): comment\n> ## Steps\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nUse a migration\n"), "{text}");
     }
 
     #[test]
@@ -1862,16 +2168,16 @@ create table tokens (id int);
     fn x_marks_a_block_for_removal_and_again_keeps_it() {
         let mut app = app();
         press(&mut app, KeyCode::Char('G'));
-        assert_eq!(app.focus, Focus::Block(3));
+        assert_eq!(app.focus, Focus::Block(2));
         press(&mut app, KeyCode::Char('x'));
-        assert!(app.removed(3));
+        assert!(app.removed(2));
         press(&mut app, KeyCode::Char('x'));
-        assert!(!app.removed(3));
+        assert!(!app.removed(2));
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('S'));
         press(&mut app, KeyCode::Char('c'));
         assert!(
-            sent(&app).contains("(lines 8-10): remove"),
+            sent(&app).contains("(lines 10-14): remove"),
             "{}",
             sent(&app)
         );
@@ -1938,7 +2244,7 @@ create table tokens (id int);
     #[test]
     fn a_later_round_marks_what_changed_and_d_steps_through_it() {
         let previous =
-            PLAN.replace("- Backfill it", "- Backfill everything") + "\nA gone paragraph.\n";
+            PLAN.replace("- Backfill it", "- Backfill everything") + "\n---\n\nA gone paragraph.\n";
         let mut app = App::new(Plan {
             subject: "plan.md".into(),
             source: PLAN.into(),
@@ -1948,7 +2254,8 @@ create table tokens (id int);
             save: Box::new(|_| {}),
         });
         assert!(!app.changed(0));
-        assert!(app.changed(2));
+        assert!(app.changed(1));
+        assert!(!app.changed(2));
         assert_eq!(app.changed_count(), 1);
         assert_eq!(app.dropped_blocks, 2);
         let screen = draw(&mut app, 90, 30);
@@ -1960,11 +2267,11 @@ create table tokens (id int);
             screen.contains("1 changed · 2 gone · D next change"),
             "{screen}"
         );
-        assert!(screen.contains("  3+"), "{screen}");
+        assert!(screen.contains("  2+"), "{screen}");
         press(&mut app, KeyCode::Char('D'));
-        assert_eq!(app.focus, Focus::Block(2));
+        assert_eq!(app.focus, Focus::Block(1));
         press(&mut app, KeyCode::Char('D'));
-        assert_eq!(app.focus, Focus::Block(2));
+        assert_eq!(app.focus, Focus::Block(1));
     }
 
     #[test]
@@ -1985,9 +2292,12 @@ create table tokens (id int);
         assert_eq!(app.focus, Focus::Global);
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.focus, Focus::Global);
-        for _ in 0..10 {
+        for _ in 0..20 {
             press(&mut app, KeyCode::Char('j'));
         }
-        assert_eq!(app.focus, Focus::Block(3));
+        assert_eq!(app.focus, Focus::Block(2));
+        let last = app.row;
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.row, last);
     }
 }

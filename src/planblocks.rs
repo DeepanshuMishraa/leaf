@@ -147,17 +147,19 @@ fn source_lines(source: &str, lines: (usize, usize)) -> String {
         .join("\n")
 }
 
-/// The plan's blocks in order. Every line of content is in exactly one block;
-/// front matter, rules and blank lines are in none.
+/// The plan's blocks in order: each heading with everything under it up to
+/// the next heading or rule, and the content before the first heading (or
+/// between a rule and a heading) as a block of its own. Every line of content
+/// is in exactly one block; front matter, rules and blank lines are in none.
 pub fn blocks(source: &str) -> Vec<Block> {
     let lines = Lines::new(source);
     let mut out: Vec<Block> = Vec::new();
     let mut path: Vec<(HeadingLevel, String)> = Vec::new();
-    // A section takes the paragraphs straight after its heading.
-    let mut open_section = false;
+    // Whether the last block takes what comes next.
+    let mut open = false;
     for (piece, range) in pieces(source) {
         let span = lines.span(source, &range);
-        match piece {
+        let kind = match piece {
             Piece::Heading(level, text) => {
                 while path.last().is_some_and(|(last, _)| *last >= level) {
                     path.pop();
@@ -170,23 +172,20 @@ pub fn blocks(source: &str) -> Vec<Block> {
                     kind: BlockKind::Section,
                     text: String::new(),
                 });
-                open_section = true;
+                open = true;
+                continue;
             }
-            Piece::Paragraph if open_section => {
-                if let Some(section) = out.last_mut() {
-                    section.lines.1 = span.1;
-                }
+            Piece::Rule => {
+                open = false;
+                continue;
             }
-            Piece::Paragraph => out.push(Block {
-                index: 0,
-                lines: span,
-                heading: heading_of(&path),
-                kind: BlockKind::Paragraph,
-                text: String::new(),
-            }),
-            Piece::Rule => open_section = false,
-            Piece::Other(kind) => {
-                open_section = false;
+            Piece::Paragraph => BlockKind::Paragraph,
+            Piece::Other(kind) => kind,
+        };
+        match out.last_mut() {
+            Some(last) if open => last.lines.1 = span.1,
+            _ => {
+                open = true;
                 out.push(Block {
                     index: 0,
                     lines: span,
@@ -292,30 +291,39 @@ Loose closing paragraph.
     }
 
     #[test]
-    fn a_plan_splits_into_sections_items_and_standalone_blocks() {
+    fn a_plan_splits_into_a_block_per_heading_and_one_after_a_rule() {
         let blocks = blocks(PLAN);
         assert_eq!(
             kinds(&blocks),
             vec![
                 (BlockKind::Section, (5, 8)),
-                (BlockKind::Section, (10, 10)),
-                (BlockKind::Item, (12, 12)),
-                (BlockKind::Item, (13, 14)),
-                (BlockKind::Code, (16, 18)),
-                (BlockKind::Table, (20, 22)),
-                (BlockKind::Quote, (24, 24)),
+                (BlockKind::Section, (10, 24)),
                 (BlockKind::Paragraph, (28, 28)),
             ]
         );
         assert_eq!(
             blocks.iter().map(|b| b.index).collect::<Vec<_>>(),
-            (1..=8).collect::<Vec<_>>()
+            vec![1, 2, 3]
         );
         assert_eq!(
             blocks[0].text,
             "# Auth rework\n\nWe move sessions to tokens.\nTwo steps."
         );
-        assert_eq!(blocks[3].text, "- Backfill it\n  - in batches of **500**");
+        assert!(
+            blocks[1]
+                .text
+                .starts_with("## Phase 1\n\n- Add the `tokens` table\n")
+        );
+        assert!(blocks[1].text.ends_with("> Ask the security team first."));
+    }
+
+    #[test]
+    fn content_before_the_first_heading_is_one_block() {
+        let blocks = blocks("Intro line.\n\n- one\n- two\n\n# Then\n\nmore\n");
+        assert_eq!(
+            kinds(&blocks),
+            vec![(BlockKind::Paragraph, (1, 4)), (BlockKind::Section, (6, 8))]
+        );
     }
 
     #[test]
