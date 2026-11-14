@@ -6,14 +6,17 @@ per change, starting with `- `.
 
 ## 0.16.0
 
-- Review your agent's plans: `leaf plan plan.md` shows a plan block by block. Comment on, remove or replace a block or a passage, add a note on the whole plan, then send one review with a verdict.
-- Review your agent's changes: `leaf review` starts from an overview of every changed file. Note lines, a whole file or the whole change, mark files viewed, and send one review.
+- Review your agent's plans: `leaf plan plan.md` shows a plan block by block and line by line. `V` selects lines, `c` comments on them or on the cursor line, `B` the whole block, `x`/`r` remove or replace the selection or the block, `C` adds a note on the whole plan, and `S` sends one review with a verdict.
+- Review your agent's changes: `leaf review` starts from an overview of every changed file. `V` selects lines to comment on with `c`, `F` notes a whole file, `M` the whole change, `w` marks a file viewed, and `S` sends one review.
 - Agents can ask for a review themselves. In Rex, tmux or Herdr the review opens beside the agent, and your verdict comes back to it as its next message.
 - `leaf hook install` sets up Claude Code, Codex, Antigravity, Grok Build, Cursor, Pi and OpenCode to hand you their plans before they build.
 - `leaf skills install` teaches agents to use leaf.
 - A resubmitted plan marks the blocks that changed since you last reviewed it, and `D` steps through them.
 - `leaf diff` has the overview (`tab`), file and whole-change notes, and `S` to send everything as one review.
 - Asking an agent about a selection (`@`) works in tmux and Herdr as well as Rex.
+- `leaf pr` has two tabs, pull requests and issues, each one list newest first; a colored dot and the legend say whose it is — green yours, blue yours in someone else's repository, yellow someone else's in yours, grey the rest.
+- Issues open in leaf now: read the summary and timeline, comment, reply to a comment quoting it, open the issue on GitHub, close it as completed or not planned, and reopen it.
+- Open a picture file on its own: leaf reads PNG, JPEG, GIF, WebP, SVG, HEIC and more, and `i` switches it between its own colors and the theme's.
 
 ## 0.15.2
 
