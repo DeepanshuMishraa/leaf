@@ -759,7 +759,10 @@ pub fn cached_viewer() -> Option<String> {
 }
 
 /// One GraphQL search: much faster than `gh search prs`, which goes through REST.
-const SEARCH: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest { number title isDraft updatedAt mergedAt author { login } repository { nameWithOwner } } ... on Issue { number title updatedAt closedAt stateReason author { login } repository { nameWithOwner } } } } }";
+const SEARCH: &str = "query($q: String!, $after: String) { search(query: $q, type: ISSUE, first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { number title isDraft updatedAt mergedAt author { login } repository { nameWithOwner } } ... on Issue { number title updatedAt closedAt stateReason author { login } repository { nameWithOwner } } } } }";
+
+/// How many pages of 100 a done search reads. Open searches read one.
+const DONE_PAGES: usize = 3;
 
 /// The pull requests or issues one search finds, newest first: open ones, or
 /// merged and closed ones. The answer is cached, so the list shows at once
@@ -769,20 +772,69 @@ pub fn search(source: &Source, status: Status) -> Result<Vec<Entry>, PrFailed> {
         return Err(PrFailed::NoGh);
     }
     let query = source.query(status)?;
-    let json = gh_json(&[
-        "api",
-        "graphql",
-        "-f",
-        &format!("query={SEARCH}"),
-        "-f",
-        &format!("q={query}"),
-    ])?;
-    let nodes = json
-        .pointer("/data/search/nodes")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let pages = match status {
+        Status::Open => 1,
+        Status::Done => DONE_PAGES,
+    };
+    let mut nodes = Vec::new();
+    let mut after: Option<String> = None;
+    let mut more = false;
+    for _ in 0..pages {
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={SEARCH}"),
+            "-f".to_owned(),
+            format!("q={query}"),
+        ];
+        if let Some(cursor) = &after {
+            args.extend(["-f".to_owned(), format!("after={cursor}")]);
+        }
+        let json = gh_json(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let search = json.pointer("/data/search").cloned().unwrap_or(Value::Null);
+        nodes.extend(array(&search, "nodes").iter().cloned());
+        more = search
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        after = search
+            .pointer("/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if !more || after.is_none() {
+            break;
+        }
+    }
+    let nodes = match status {
+        Status::Done if more => complete_since(nodes),
+        _ => nodes,
+    };
+    let nodes = Value::Array(nodes);
     store(&source.cache_key(status), &nodes.to_string());
     Ok(parse_search(&nodes))
+}
+
+/// A done search cut off, by most recently updated, keeps only the rows that
+/// ended after the last row read was updated. A row can't end after its last
+/// update, so every row that ended after then was read, and the list has no
+/// gaps by end time; an older row could have a newer one missing above it.
+fn complete_since(nodes: Vec<Value>) -> Vec<Value> {
+    let Some(cutoff) = nodes
+        .iter()
+        .filter_map(|node| seconds(node.get("updatedAt")?.as_str()?))
+        .min()
+    else {
+        return nodes;
+    };
+    nodes
+        .into_iter()
+        .filter(|node| {
+            ended(node)
+                .and_then(|ended| seconds(&ended.at))
+                .is_none_or(|at| at >= cutoff)
+        })
+        .collect()
 }
 
 /// What `search` found last time, if it has run before.
@@ -1531,6 +1583,23 @@ mod tests {
             Source::Reviewing.cache_key(Status::Open),
             Source::Reviewing.cache_key(Status::Done)
         );
+    }
+
+    #[test]
+    fn a_cut_off_done_search_keeps_only_rows_with_nothing_missing_above() {
+        let node = |number: u64, updated: &str, merged: &str| serde_json::json!({"number": number, "updatedAt": updated, "mergedAt": merged});
+        let kept = complete_since(vec![
+            node(1, "2026-11-10T00:00:00Z", "2026-11-09T00:00:00Z"),
+            // Updated lately, merged long ago: a row merged between the two
+            // could have been cut off, so this one goes.
+            node(2, "2026-11-08T00:00:00Z", "2026-01-01T00:00:00Z"),
+            node(3, "2026-11-05T00:00:00Z", "2026-11-05T00:00:00Z"),
+        ]);
+        let numbers: Vec<u64> = kept
+            .iter()
+            .filter_map(|n| n.get("number")?.as_u64())
+            .collect();
+        assert_eq!(numbers, [1, 3]);
     }
 
     #[test]

@@ -64,6 +64,8 @@ const WHEEL_ROWS: usize = 3;
 const FRESH: Duration = Duration::from_secs(30);
 /// How long the list's selection rests before that pull request is fetched.
 const SETTLE: Duration = Duration::from_millis(150);
+/// Beside a picked comment's time, when there's room.
+const REPLY_HINT: &str = "enter replies";
 /// The list's note while an `R` is still being answered.
 const RELOADING: &str = "Already reloading";
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -3114,15 +3116,23 @@ fn events(
                 ),
             };
         // The picked comment stands out: a pointer for its glyph, a thick
-        // blue rail down its body, and a reminder of what enter does.
+        // blue rail down its body, and a reminder of what enter does, but
+        // only when that fits without cutting the header's own words.
         let (left, right) = if picked {
             let mut left = vec![Span::styled("▶  ", accent)];
             left.extend(what);
-            let right = vec![
-                Span::styled("enter replies", accent),
-                Span::styled(" · ", dim),
-                when,
-            ];
+            let hint = [Span::styled(REPLY_HINT, accent), Span::styled(" · ", dim)];
+            let needed: usize = left
+                .iter()
+                .chain(&hint)
+                .chain(std::iter::once(&when))
+                .map(|s| s.content.width())
+                .sum();
+            let right = if needed < width {
+                hint.into_iter().chain(std::iter::once(when)).collect()
+            } else {
+                vec![when]
+            };
             (left, right)
         } else {
             let mut left = vec![Span::styled(
@@ -3289,6 +3299,11 @@ mod tests {
         assert!(picked[0].starts_with("▶  bot commented"), "{picked:?}");
         assert!(picked[0].contains("enter replies"), "{picked:?}");
         assert!(picked[1].starts_with('┃'), "{picked:?}");
+        // Too narrow for the hint, the header keeps its own words whole.
+        let (narrow, _) = comments(&d, 24, now, Some(1));
+        let narrow = texts(&narrow);
+        assert!(narrow[0].starts_with("▶  bot commented"), "{narrow:?}");
+        assert!(!narrow[0].contains("enter"), "{narrow:?}");
         assert!(shown.iter().any(|l| l.contains("line 30")));
         assert!(
             !shown

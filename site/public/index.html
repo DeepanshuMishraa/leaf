@@ -678,37 +678,37 @@
       fetch(`https://api.github.com/repos/${owner}/${repo}/${path}`)
         .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`GitHub API ${path}: ${res.status}`))))
         .then((data) => (Array.isArray(data) ? data : Promise.reject(new Error(`GitHub API ${path}: not a list`))));
-    Promise.allSettled([api("contributors?per_page=100"), api("commits?per_page=100")])
-      .then(([contributors, commits]) => {
-        if (contributors.status === "rejected" && commits.status === "rejected") throw contributors.reason;
-        const people = [
-          ...(contributors.status === "fulfilled" ? contributors.value : []),
-          ...(commits.status === "fulfilled" ? commits.value.map((c) => c.author).filter(Boolean) : []),
-        ];
-        const seen = new Set();
-        const list = $("people");
-        for (const person of people) {
-          if (typeof person.login !== "string" || skip(person)) continue;
-          const key = person.login.toLowerCase();
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const li = document.createElement("li");
-          const a = document.createElement("a");
-          a.href = `https://github.com/${person.login}`;
-          a.dataset.login = person.login;
-          a.setAttribute("aria-label", `@${person.login} on GitHub`);
-          const img = document.createElement("img");
-          img.src = `https://avatars.githubusercontent.com/${encodeURIComponent(person.login)}?s=104`;
-          img.width = img.height = 52;
-          img.loading = "lazy";
-          img.alt = person.login;
-          a.append(img);
-          li.append(a);
-          list.append(li);
-        }
-        if (list.children.length) $("contributors").hidden = false;
-      })
-      .catch((err) => console.warn("Contributors unavailable; the section stays hidden.", err));
+    // Each answer is shown as it lands, so one stalled request can't hide
+    // the other's people.
+    const seen = new Set();
+    const list = $("people");
+    const show = (people) => {
+      for (const person of people) {
+        if (typeof person.login !== "string" || skip(person)) continue;
+        const key = person.login.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = `https://github.com/${person.login}`;
+        a.dataset.login = person.login;
+        a.setAttribute("aria-label", `@${person.login} on GitHub`);
+        const img = document.createElement("img");
+        img.src = `https://avatars.githubusercontent.com/${encodeURIComponent(person.login)}?s=104`;
+        img.width = img.height = 52;
+        img.loading = "lazy";
+        img.alt = person.login;
+        a.append(img);
+        li.append(a);
+        list.append(li);
+      }
+      if (list.children.length) $("contributors").hidden = false;
+    };
+    const warn = (err) => console.warn("Some contributors unavailable; any found still show.", err);
+    api("contributors?per_page=100").then(show).catch(warn);
+    api("commits?per_page=100")
+      .then((commits) => show(commits.map((c) => c.author).filter(Boolean)))
+      .catch(warn);
   }
 
   // curl or brew: every install box follows the last pick.

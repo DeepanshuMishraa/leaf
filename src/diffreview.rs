@@ -305,6 +305,14 @@ diff --git a/src/z.rs b/src/z.rs
 ";
 
     #[test]
+    fn fingerprints_are_pinned_so_saved_viewed_marks_survive_a_rebuild() {
+        // Saved with viewed marks: a change here clears everyone's marks, so
+        // it should be on purpose.
+        let diff = Diff::parse(PATCH.to_owned());
+        assert_eq!(fingerprint(&diff, 0), 3_140_891_063_064_969_379);
+    }
+
+    #[test]
     fn a_new_revision_of_a_binary_or_mode_change_has_a_new_fingerprint() {
         let binary = |index: &str| {
             Diff::parse(format!(
