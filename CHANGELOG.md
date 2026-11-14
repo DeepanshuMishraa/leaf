@@ -18,6 +18,7 @@ per change, starting with `- `.
 - Issues open in leaf now: read the summary and timeline, comment, reply to a comment quoting it, open the issue on GitHub, close it as completed or not planned, and reopen it.
 - Pull requests and issues have a Comments tab: every comment and review in full, `j`/`k` to pick one, `enter` to reply quoting it, `c` to comment.
 - `R` in the `leaf pr` list reloads both tabs now rather than waiting.
+- `tab` in the `leaf pr` list shows merged pull requests and closed issues, grouped by when they ended, with a twelve-week sparkline; `←/→` switch between pull requests and issues.
 - Open a picture file on its own: leaf reads PNG, JPEG, GIF, WebP, SVG, HEIC and more, and `i` switches it between its own colors and the theme's.
 
 ## 0.15.2

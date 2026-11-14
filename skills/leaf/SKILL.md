@@ -23,7 +23,7 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 |---|---|
 | `leaf open <file or url>`, or just `leaf <file>` | A PDF, EPUB or Markdown file, or a web article. It reopens where the person left off. |
 | `leaf diff` | Unstaged changes. `--staged`, `--branch` (this branch against its base), `--base <ref>`, a range such as `main...HEAD`, a path, a `.patch` file or a GitHub PR, commit or compare link. `--inline` uses one column. |
-| `leaf pr` | The person's open pull requests and issues. `leaf pr 12`, `leaf pr owner/repo#12` or a PR link opens one, with Summary, Timeline, Comments and Code tabs. `R` in the list reloads it. |
+| `leaf pr` | The person's open pull requests and issues. `leaf pr 12`, `leaf pr owner/repo#12` or a PR link opens one, with Summary, Timeline, Comments and Code tabs. In the list, `←/→` switch pull requests and issues, `tab` switches open and merged/closed, `R` reloads. |
 | `leaf plan <plan.md>` | Plan review, block by block. |
 | `leaf review [diff source]` | Code review, file by file. |
 | `leaf comments --json` | Every saved diff comment as JSON: key, file, side, line range, body, and state (`draft`, `agent`, `github`). |

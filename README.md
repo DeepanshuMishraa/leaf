@@ -107,7 +107,11 @@ The message names the file, the side, and the line range, and includes the hunk 
 
 ## Pull requests and issues
 
-`leaf pr` lists the open pull requests and issues that concern you, in two tabs; `tab` or `←/→` switches. **Pull requests** holds yours across GitHub, the ones in repositories you own, the ones waiting on your review, and this repository's. **Issues** holds the ones you opened and the ones opened in repositories you own. Each tab is one list, newest first, and each row's dot says whose it is: green is yours in your own repository, blue is yours in someone else's, yellow is someone else's in yours, and grey is the rest. The legend beside the tabs names the colors on screen. Type to filter by title, repository, number or author. `enter` opens either one here in leaf. Name a pull request to open it directly:
+`leaf pr` lists the pull requests and issues that concern you, in two tabs; `←/→` switches. **Pull requests** holds yours across GitHub, the ones in repositories you own, the ones waiting on your review, and this repository's. **Issues** holds the ones you opened and the ones opened in repositories you own. Each tab is one list, newest first, and each row's dot says whose it is: green is yours in your own repository, blue is yours in someone else's, yellow is someone else's in yours, and grey is the rest. The legend beside the filter names the colors on screen.
+
+`tab` flips each tab between **Open** and **Merged** (pull requests) or **Closed** (issues); the switch at the top right shows which, and a click flips it too. The done lists are grouped by when each one ended (Today, Yesterday, This week, This month, This year, Older), newest first. A purple `◆` is merged, a purple `✓` closed as completed, a grey `⊘` closed as not planned, and the author's name keeps its color. A sparkline beside the filter counts how many were merged or closed in each of the last twelve weeks. Done lists show what was found last time and are asked again the first time you open them in a run.
+
+Type to filter by title, repository, number or author. `enter` opens either one here in leaf. Name a pull request to open it directly:
 
 ```sh
 leaf pr                                  # pick from your open pull requests and issues
