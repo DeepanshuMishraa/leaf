@@ -69,7 +69,7 @@ use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
-       leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
+       leaf pr [number | owner/repo#number | url]   your open pull requests and issues, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf skills install | uninstall | status   teach coding agents to use leaf
@@ -592,7 +592,7 @@ fn diff_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `leaf pr`: lists your open pull requests, or opens the one named.
+/// `leaf pr`: lists your open pull requests and issues, or opens the pull request named.
 fn pr_command(args: &[String]) -> ExitCode {
     let here = pr::current_repo();
     let start = match args {

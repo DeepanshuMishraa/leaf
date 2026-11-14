@@ -10,7 +10,7 @@ complete -c leaf -n '__fish_seen_subcommand_from diff' -s r -l range -x -d 'Revi
 complete -c leaf -n '__fish_seen_subcommand_from diff' -l patch -r -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -s i -l inline -d 'One column, removed lines above added ones'
 complete -c leaf -n '__fish_seen_subcommand_from diff' -a '(__fish_complete_suffix .diff .patch)' -d 'Diff or patch file'
-complete -c leaf -n __fish_use_subcommand -a pr -d 'Read and act on your pull requests'
+complete -c leaf -n __fish_use_subcommand -a pr -d 'Your pull requests and issues'
 complete -c leaf -n __fish_use_subcommand -a plan -d 'Review a plan block by block and send a verdict'
 complete -c leaf -n '__fish_seen_subcommand_from plan' -a '(__fish_complete_suffix .md .markdown)'
 complete -c leaf -n '__fish_seen_subcommand_from plan review' -l wait -d 'Block until the review is sent and print it'

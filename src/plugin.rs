@@ -36,7 +36,7 @@ pub fn install() -> Result<String, String> {
     }
     let reloaded = spinner::step("Reloading Rex", |_| rex(&["config", "reload"])).is_ok();
     Ok(format!(
-        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Pull Requests lists this branch's pull request, this repository's and yours.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
+        "Leaf is in Rex's command palette{}. Press cmd+shift+p and type Leaf.\n  Leaf: Open Document… browses for a file, like Go to Directory, and reads it beside you.\n  Leaf: Review Diff, Review Staged Changes and Review This Branch open the diff viewer.\n  Leaf: Pull Requests & Issues lists your open pull requests and issues, newest first.\n  Leaf: Choose Agent… picks the installed agent that questions go to.\nWhile a document is open, the palette also offers Ask Agent About Selection, Read Aloud,\nChange Voice… and the other reading actions.\nIn a session on a remote host, leaf is installed there with cargo the first time.",
         if reloaded {
             ""
         } else {

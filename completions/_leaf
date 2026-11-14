@@ -24,7 +24,7 @@ _leaf() {
   commands=(
     'open:Read a PDF, markdown file or web page'
     'diff:Review a diff'
-    'pr:Read and act on your pull requests'
+    'pr:Your pull requests and issues'
     'plan:Review a plan block by block and send a verdict'
     'review:Review changes file by file and send a verdict'
     'skills:Install the leaf skills for coding agents'

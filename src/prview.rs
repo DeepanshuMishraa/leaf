@@ -1,6 +1,9 @@
-//! `leaf pr`: the open pull requests that concern you, and one read in full.
+//! `leaf pr`: the open pull requests and issues that concern you, and a pull
+//! request read in full.
 //!
-//! The list shows the last run's answers at once and refreshes behind them;
+//! The list has two tabs, Pull requests and Issues, each one list newest
+//! first, its rows colored by whose they are and where. It shows the last
+//! run's answers at once and refreshes behind them;
 //! the row under the cursor is read ahead, so opening it is instant. A pull
 //! request has a Summary (status, branch, reviewers, checks that need you,
 //! the description with its images and videos) and a Timeline (commits,
@@ -36,8 +39,8 @@ use crate::look::Look;
 use crate::news::News;
 use crate::popover::{self, Edit};
 use crate::pr::{
-    self, Action, CheckStatus, Detail, Entry, EventKind, Group, Mergeability, PrRef, Source, State,
-    Verdict,
+    self, Action, CheckStatus, Detail, Entry, EventKind, Kind, Mergeability, PrRef, Relation,
+    Source, State, Verdict,
 };
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
@@ -48,6 +51,7 @@ const GREEN: Color = Color::Indexed(2);
 const RED: Color = Color::Indexed(1);
 const YELLOW: Color = Color::Indexed(3);
 const PURPLE: Color = Color::Indexed(5);
+const BLUE: Color = Color::Indexed(4);
 /// Width of the label column in the summary.
 const LABEL: usize = 11;
 /// The widest the page gets; past this, lines are too long to read comfortably.
@@ -93,6 +97,8 @@ enum Load<T> {
 
 enum Msg {
     Searched(usize, Result<Vec<Entry>, String>),
+    /// Your GitHub login, which colors the list's rows.
+    Me(String),
     Viewed(PrRef, Box<Result<Detail, String>>),
     Acted(PrRef, Result<String, String>),
     /// The patch fetched for a head commit.
@@ -131,7 +137,7 @@ enum Fetch {
     Failed(String),
 }
 
-/// One heading of the list: what it found last, and whether it's asking again.
+/// One search behind the list: what it found last, and whether it's asking again.
 struct Slot {
     source: Source,
     entries: Option<Vec<Entry>>,
@@ -139,7 +145,13 @@ struct Slot {
 }
 
 struct List {
+    /// The tab shown.
+    kind: Kind,
     slots: Vec<Slot>,
+    /// Your login, once known; until then rows aren't colored.
+    me: Option<String>,
+    /// Where each tab's label was drawn, for clicks.
+    tab_hits: Vec<(Rect, Kind)>,
     typed: String,
     selected: usize,
     /// The selected pull request and when it was picked, to fetch it once it rests there.
@@ -149,8 +161,9 @@ struct List {
     /// The pull request a press on the picked row landed on, which opens on
     /// release unless the mouse was dragged or the list changed under it.
     pressed: Option<PrRef>,
-    /// What ctrl+y or a drag copied, shown in the footer until the next key.
-    copied: Option<String>,
+    /// What ctrl+y or a drag copied, or what opening an issue said, shown in
+    /// the footer until the next key.
+    note: Option<String>,
     /// The rows' lines as drawn last, and where, so a drag can select their text.
     shown: Vec<Line<'static>>,
     shown_area: Rect,
@@ -160,55 +173,60 @@ struct List {
 }
 
 impl List {
-    fn entries(&self) -> Vec<(String, Vec<Entry>)> {
-        let groups = pr::dedupe(
-            self.slots
-                .iter()
-                .filter_map(|slot| {
-                    Some(Group {
-                        title: slot.source.title(),
-                        entries: slot.entries.clone()?,
-                    })
-                })
-                .collect(),
-        );
+    /// The searches behind a tab.
+    fn slots_of(&self, kind: Kind) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().filter(move |s| s.source.kind() == kind)
+    }
+
+    /// Everything a tab found, each once, newest first.
+    fn all(&self, kind: Kind) -> Vec<Entry> {
+        pr::merge(self.slots_of(kind).filter_map(|s| s.entries.clone()))
+    }
+
+    /// The shown tab's rows that match the filter.
+    fn entries(&self) -> Vec<Entry> {
         let filter = self.typed.to_lowercase();
-        groups
+        self.all(self.kind)
             .into_iter()
-            .map(|group| {
-                let entries = group
-                    .entries
-                    .into_iter()
-                    .filter(|e| {
-                        filter.is_empty()
-                            || e.title.to_lowercase().contains(&filter)
-                            || e.pr.label().to_lowercase().contains(&filter)
-                            || e.author.to_lowercase().contains(&filter)
-                    })
-                    .collect();
-                (group.title, entries)
+            .filter(|e| {
+                filter.is_empty()
+                    || e.title.to_lowercase().contains(&filter)
+                    || e.pr.label().to_lowercase().contains(&filter)
+                    || e.author.to_lowercase().contains(&filter)
             })
             .collect()
     }
 
     fn picked(&self) -> Option<PrRef> {
-        self.entries()
-            .into_iter()
-            .flat_map(|(_, list)| list)
-            .nth(self.selected)
-            .map(|e| e.pr)
+        self.entries().into_iter().nth(self.selected).map(|e| e.pr)
     }
 
     fn count(&self) -> usize {
-        self.entries().iter().map(|(_, e)| e.len()).sum()
+        self.entries().len()
+    }
+
+    fn relation(&self, entry: &Entry) -> Relation {
+        self.me
+            .as_deref()
+            .map_or(Relation::Other, |me| Relation::of(entry, me))
+    }
+
+    fn show(&mut self, kind: Kind) {
+        if self.kind != kind {
+            self.kind = kind;
+            self.selected = 0;
+            self.resting = None;
+            self.pressed = None;
+        }
     }
 
     fn loading(&self) -> bool {
-        self.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading))
+        self.slots_of(self.kind)
+            .any(|s| matches!(s.fetch, Fetch::Loading))
     }
 
     fn failure(&self) -> Option<String> {
-        self.slots.iter().find_map(|s| match &s.fetch {
+        self.slots_of(self.kind).find_map(|s| match &s.fetch {
             Fetch::Failed(e) => Some(e.clone()),
             _ => None,
         })
@@ -443,8 +461,14 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
 }
 
 impl App {
-    /// Shows the list from the last run's answers and asks every heading again, all at once.
+    /// Shows the list from the last run's answers and asks every search again, all at once.
     fn open_list(&mut self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(me) = pr::viewer() {
+                let _ = tx.send(Msg::Me(me));
+            }
+        });
         let slots = pr::sources(self.here.as_deref(), self.branch.as_deref())
             .into_iter()
             .enumerate()
@@ -462,13 +486,16 @@ impl App {
             })
             .collect();
         self.list = Some(List {
+            kind: Kind::Pull,
             slots,
+            me: pr::cached_viewer(),
+            tab_hits: Vec::new(),
             typed: String::new(),
             selected: 0,
             resting: None,
             hits: Vec::new(),
             pressed: None,
-            copied: None,
+            note: None,
             shown: Vec::new(),
             shown_area: Rect::default(),
             selection: None,
@@ -548,6 +575,9 @@ impl App {
             return;
         }
         let Some(list) = &mut self.list else { return };
+        if list.kind != Kind::Pull {
+            return;
+        }
         let Some(picked) = list.picked() else { return };
         match &list.resting {
             Some((pr, at)) if *pr == picked => {
@@ -613,6 +643,11 @@ impl App {
                         }
                         Err(e) => slot.fetch = Fetch::Failed(e),
                     }
+                }
+            }
+            Msg::Me(me) => {
+                if let Some(list) = &mut self.list {
+                    list.me = Some(me);
                 }
             }
             Msg::Viewed(pr, result) => {
@@ -904,10 +939,33 @@ impl App {
         Ok(())
     }
 
+    /// Opens a row: a pull request here, an issue in the browser.
+    fn choose(&mut self, pr: PrRef) {
+        let Some(list) = &mut self.list else { return };
+        match list.kind {
+            Kind::Pull => self.open_page(pr),
+            Kind::Issue => {
+                list.note = Some(match pr::open_issue(&pr) {
+                    Ok(()) => format!("Opened {} in the browser", pr.label()),
+                    Err(e) => e.to_string(),
+                });
+            }
+        }
+    }
+
     fn list_mouse(&mut self, mouse: MouseEvent) {
         let Some(list) = &mut self.list else { return };
         let last = list.count().saturating_sub(1);
         let point = point_in(list.shown_area, 0, mouse.column, mouse.row);
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && let Some(&(_, kind)) = list.tab_hits.iter().find(|(rect, _)| {
+                mouse.row == rect.y && (rect.x..rect.x + rect.width).contains(&mouse.column)
+            })
+        {
+            list.selection = None;
+            list.show(kind);
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => {
                 list.selection = None;
@@ -955,7 +1013,7 @@ impl App {
                             let text = s.text(&list.shown);
                             if !text.is_empty() {
                                 copy(&text);
-                                list.copied =
+                                list.note =
                                     Some(format!("Copied {} characters", text.chars().count()));
                             }
                         }
@@ -966,7 +1024,7 @@ impl App {
                 if let Some(pr) = list.pressed.take()
                     && list.picked().as_ref() == Some(&pr)
                 {
-                    self.open_page(pr);
+                    self.choose(pr);
                 }
             }
             _ => {}
@@ -983,15 +1041,23 @@ impl App {
         };
         let rows = list.count();
         let picked = list.picked();
-        list.copied = None;
+        list.note = None;
         list.selection = None;
         match key.code {
+            // Two tabs, so any of these flips between them.
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                list.show(match list.kind {
+                    Kind::Pull => Kind::Issue,
+                    Kind::Issue => Kind::Pull,
+                });
+                return Ok(true);
+            }
             // Letters filter the list, so copying the number takes ctrl.
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(pr) = &picked {
                     let number = format!("#{}", pr.number);
                     copy(&number);
-                    list.copied = Some(format!("Copied {number}"));
+                    list.note = Some(format!("Copied {number}"));
                 }
                 return Ok(true);
             }
@@ -1019,7 +1085,7 @@ impl App {
             Edit::Quit => return Ok(false),
             Edit::Choose => {
                 if let Some(pr) = picked {
-                    self.open_page(pr);
+                    self.choose(pr);
                 }
             }
             Edit::Complete | Edit::Typed | Edit::Moved | Edit::Nothing => {}
@@ -1299,8 +1365,18 @@ fn verdict_glyph(verdict: Verdict) -> (&'static str, Color) {
     }
 }
 
-/// The list: a title, a filter, then each heading's pull requests on two
-/// lines, title above and who and when below, in one centered column.
+fn relation_color(relation: Relation) -> Color {
+    match relation {
+        Relation::Yours => GREEN,
+        Relation::Outgoing => BLUE,
+        Relation::Incoming => YELLOW,
+        Relation::Other => DIM,
+    }
+}
+
+/// The list: the tabs and a legend, a filter, then the shown tab's rows
+/// newest first on two lines, title above and who and when below, in one
+/// centered column.
 fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     let area = f.area();
     let (x, width) = column(area);
@@ -1308,24 +1384,56 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let entries = list.entries();
-    let total: usize = entries.iter().map(|(_, e)| e.len()).sum();
+    let total = entries.len();
     list.selected = list.selected.min(total.saturating_sub(1));
 
-    // The title row, and how many there are or that they're being asked for.
-    let status = if list.loading() {
-        format!("{}  updating", spinner())
-    } else if total > 0 {
-        format!("{total} open")
-    } else {
-        String::new()
-    };
+    // The tabs, each with how many it has, and a spinner while asking again.
+    let row = area.y + 1;
+    let mut tabs = Vec::new();
+    list.tab_hits.clear();
+    let mut at = x;
+    for kind in [Kind::Pull, Kind::Issue] {
+        let on = kind == list.kind;
+        let label = kind.title();
+        let count = list.all(kind).len();
+        let width = label.width() as u16;
+        list.tab_hits.push((Rect::new(at, row, width, 1), kind));
+        tabs.push(Span::styled(label, if on { bold } else { dim }));
+        let count = if count > 0 {
+            format!(" {count}")
+        } else {
+            String::new()
+        };
+        at += width + count.width() as u16 + 4;
+        tabs.push(Span::styled(count, dim));
+        tabs.push(Span::raw("    "));
+    }
+    if list.loading() {
+        tabs.push(Span::styled(spinner().to_string(), dim));
+    }
+    // What each color means, for the colors on screen.
+    let mut legend = Vec::new();
+    if list.me.is_some() {
+        for relation in Relation::ALL {
+            if entries.iter().any(|e| list.relation(e) == relation) {
+                if !legend.is_empty() {
+                    legend.push(Span::raw("   "));
+                }
+                legend.push(Span::styled(
+                    "● ",
+                    Style::default().fg(relation_color(relation)),
+                ));
+                legend.push(Span::styled(relation.label(), dim));
+            }
+        }
+    }
+    let used: usize = tabs.iter().chain(&legend).map(|s| s.content.width()).sum();
+    if used >= w {
+        legend.clear();
+    }
     f.render_widget(
-        Paragraph::new(spread(
-            vec![Span::styled("Pull requests", bold)],
-            vec![Span::styled(status, dim)],
-            w,
-        )),
-        Rect::new(x, area.y + 1, width, 1),
+        Paragraph::new(spread(tabs, legend, w)),
+        Rect::new(x, row, width, 1),
     );
     let field = if list.typed.is_empty() {
         Line::from(vec![
@@ -1349,12 +1457,13 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     if total == 0 {
         list.shown.clear();
         list.selection = None;
+        let what = list.kind.title().to_lowercase();
         let text = if list.loading() {
-            format!("{}  Loading your pull requests", spinner())
+            format!("{}  Loading your {what}", spinner())
         } else if let Some(e) = list.failure().filter(|_| list.typed.is_empty()) {
             e
         } else if list.typed.is_empty() {
-            "No open pull requests concern you.".to_owned()
+            format!("No open {what} concern you.")
         } else {
             format!("Nothing matches “{}”.", list.typed)
         };
@@ -1370,58 +1479,40 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     } else {
         // Every line of the list, and the row index each belongs to.
         let mut lines: Vec<(Line<'static>, Option<usize>)> = Vec::new();
-        let mut index = 0;
-        for (title, group) in entries.iter().filter(|(_, e)| !e.is_empty()) {
-            if !lines.is_empty() {
-                lines.push((Line::default(), None));
+        for (index, entry) in entries.iter().enumerate() {
+            let picked = index == list.selected;
+            let bar = if picked { "▌ " } else { "  " };
+            let glyph = if entry.draft { "○" } else { "●" };
+            let color = relation_color(list.relation(entry));
+            let name = entry.pr.repo.rsplit('/').next().unwrap_or(&entry.pr.repo);
+            lines.push((
+                spread(
+                    vec![
+                        Span::styled(bar, bold),
+                        Span::styled(format!("{glyph}  "), Style::default().fg(color)),
+                        Span::styled(
+                            entry.title.clone(),
+                            if picked { bold } else { Style::default() },
+                        ),
+                    ],
+                    vec![Span::styled(format!("{name} #{}", entry.pr.number), dim)],
+                    w,
+                ),
+                Some(index),
+            ));
+            let mut about = format!("{} · {}", entry.author, pr::ago(&entry.updated, now));
+            if entry.draft {
+                about.push_str(" · draft");
             }
             lines.push((
-                Line::from(vec![
-                    Span::styled(title.to_uppercase(), dim.add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {}", group.len()), dim),
-                ]),
-                None,
+                Line::from(vec![Span::raw("     "), Span::styled(about, dim)]),
+                Some(index),
             ));
-            lines.push((Line::default(), None));
-            for entry in group {
-                let picked = index == list.selected;
-                let bar = if picked { "▌ " } else { "  " };
-                let (glyph, color) = if entry.draft {
-                    ("○", DIM)
-                } else {
-                    ("●", GREEN)
-                };
-                let name = entry.pr.repo.rsplit('/').next().unwrap_or(&entry.pr.repo);
-                lines.push((
-                    spread(
-                        vec![
-                            Span::styled(bar, bold),
-                            Span::styled(format!("{glyph}  "), Style::default().fg(color)),
-                            Span::styled(
-                                entry.title.clone(),
-                                if picked { bold } else { Style::default() },
-                            ),
-                        ],
-                        vec![Span::styled(format!("{name} #{}", entry.pr.number), dim)],
-                        w,
-                    ),
-                    Some(index),
-                ));
-                let mut about = format!("{} · {}", entry.author, pr::ago(&entry.updated, now));
-                if entry.draft {
-                    about.push_str(" · draft");
-                }
-                lines.push((
-                    Line::from(vec![Span::raw("     "), Span::styled(about, dim)]),
-                    Some(index),
-                ));
-                index += 1;
-            }
         }
-        // Scroll so the picked row and its heading stay in view.
+        // Scroll so the picked row stays in view.
         let first_of = |wanted: usize| lines.iter().position(|(_, i)| *i == Some(wanted));
         let at = first_of(list.selected).unwrap_or(0);
-        let skip = (at + 2).saturating_sub(room).min(at.saturating_sub(2));
+        let skip = (at + 2).saturating_sub(room).min(at);
         list.hits.clear();
         let mut shown = Vec::new();
         for (y, (line, owner)) in lines.into_iter().skip(skip).take(room).enumerate() {
@@ -1449,13 +1540,20 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         f.render_widget(Paragraph::new(drawn), list.shown_area);
     }
 
-    let footer = match (list.failure(), &list.copied) {
-        (_, Some(copied)) => Line::from(Span::styled(clip(copied, w), dim)),
+    let footer = match (list.failure(), &list.note) {
+        (_, Some(note)) => Line::from(Span::styled(clip(note, w), dim)),
         (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
         _ => keys_line(
             &[
                 ("↑↓", "move"),
-                ("enter", "open"),
+                (
+                    "enter",
+                    match list.kind {
+                        Kind::Pull => "open",
+                        Kind::Issue => "browser",
+                    },
+                ),
+                ("tab", "switch"),
                 ("type", "filter"),
                 ("^y", "copy #"),
                 ("esc", "quit"),
@@ -2477,7 +2575,7 @@ mod tests {
     }
 
     #[test]
-    fn the_list_shows_each_pull_request_once_and_filters() {
+    fn the_list_shows_each_row_once_per_tab_and_filters() {
         let entry = |number, title: &str| Entry {
             pr: PrRef {
                 repo: "o/r".into(),
@@ -2485,13 +2583,14 @@ mod tests {
             },
             title: title.into(),
             author: "me".into(),
-            updated: "2026-11-12T04:00:00Z".into(),
+            updated: format!("2026-11-12T04:0{number}:00Z"),
             draft: false,
         };
         let mut list = List {
+            kind: Kind::Pull,
             slots: vec![
                 Slot {
-                    source: Source::Yours,
+                    source: Source::Authored(Kind::Pull),
                     entries: Some(vec![entry(1, "fix quotes"), entry(2, "add pr")]),
                     fetch: Fetch::Done,
                 },
@@ -2501,26 +2600,35 @@ mod tests {
                     fetch: Fetch::Loading,
                 },
                 Slot {
-                    source: Source::Owned,
-                    entries: None,
-                    fetch: Fetch::Loading,
+                    source: Source::Authored(Kind::Issue),
+                    entries: Some(vec![entry(3, "crash on open")]),
+                    fetch: Fetch::Done,
                 },
             ],
+            me: Some("me".into()),
+            tab_hits: Vec::new(),
             typed: String::new(),
             selected: 0,
             resting: None,
             hits: Vec::new(),
             pressed: None,
-            copied: None,
+            note: None,
             shown: Vec::new(),
             shown_area: Rect::default(),
             selection: None,
             dragging: false,
         };
         assert_eq!(list.count(), 2);
+        // Newest first, across searches.
+        assert_eq!(list.picked().map(|pr| pr.number), Some(2));
         assert!(list.loading());
         list.typed = "quotes".into();
         assert_eq!(list.picked().map(|pr| pr.number), Some(1));
+        list.typed.clear();
+        list.show(Kind::Issue);
+        assert_eq!(list.count(), 1);
+        assert!(!list.loading());
+        assert_eq!(list.picked().map(|pr| pr.number), Some(3));
     }
 
     #[test]

@@ -122,13 +122,6 @@ pub struct Entry {
     pub draft: bool,
 }
 
-/// Pull requests listed under one heading.
-#[derive(Debug, Clone)]
-pub struct Group {
-    pub title: String,
-    pub entries: Vec<Entry>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Open,
@@ -481,24 +474,51 @@ fn github_repo(url: &str) -> Option<String> {
     }
 }
 
-/// Where one heading of the list gets its pull requests.
+/// What the list shows: pull requests or issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Pull,
+    Issue,
+}
+
+impl Kind {
+    pub fn title(self) -> &'static str {
+        match self {
+            Kind::Pull => "Pull requests",
+            Kind::Issue => "Issues",
+        }
+    }
+
+    fn qualifier(self) -> &'static str {
+        match self {
+            Kind::Pull => "is:pr",
+            Kind::Issue => "is:issue",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Kind::Pull => "pr",
+            Kind::Issue => "issue",
+        }
+    }
+}
+
+/// One search the list is made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Branch { repo: String, branch: String },
     Repo(String),
-    Yours,
+    Authored(Kind),
     Reviewing,
-    Owned,
+    Owned(Kind),
 }
 
 impl Source {
-    pub fn title(&self) -> String {
+    pub fn kind(&self) -> Kind {
         match self {
-            Source::Branch { .. } => "This branch".to_owned(),
-            Source::Repo(repo) => repo.clone(),
-            Source::Yours => "Yours".to_owned(),
-            Source::Reviewing => "Review requested".to_owned(),
-            Source::Owned => "In your repositories".to_owned(),
+            Source::Branch { .. } | Source::Repo(_) | Source::Reviewing => Kind::Pull,
+            Source::Authored(kind) | Source::Owned(kind) => *kind,
         }
     }
 
@@ -506,27 +526,31 @@ impl Source {
         let filter = match self {
             Source::Branch { repo, branch } => format!("repo:{repo} head:{branch}"),
             Source::Repo(repo) => format!("repo:{repo}"),
-            Source::Yours => "author:@me".to_owned(),
+            Source::Authored(_) => "author:@me".to_owned(),
             Source::Reviewing => "review-requested:@me".to_owned(),
-            Source::Owned => format!("user:{}", viewer()?),
+            Source::Owned(_) => format!("user:{}", viewer()?),
         };
-        Ok(format!("is:pr is:open archived:false {filter}"))
+        Ok(format!(
+            "{} is:open archived:false {filter}",
+            self.kind().qualifier()
+        ))
     }
 
     fn cache_key(&self) -> String {
         match self {
             Source::Branch { repo, branch } => format!("list-branch-{repo}-{branch}"),
             Source::Repo(repo) => format!("list-repo-{repo}"),
-            Source::Yours => "list-yours".to_owned(),
+            Source::Authored(kind) => format!("list-authored-{}", kind.key()),
             Source::Reviewing => "list-reviewing".to_owned(),
-            Source::Owned => "list-owned".to_owned(),
+            Source::Owned(kind) => format!("list-owned-{}", kind.key()),
         }
     }
 }
 
-/// The list's headings, in order: this branch's pull request, this
-/// repository's, yours, those waiting on your review, then the rest in
-/// repositories you own. A default branch has no pull request of its own.
+/// The searches behind each tab. Pull requests: this branch's (a default
+/// branch has none of its own), this repository's, yours, those waiting on
+/// your review, and those in repositories you own. Issues: yours, and those in
+/// repositories you own.
 pub fn sources(here: Option<&str>, branch: Option<&str>) -> Vec<Source> {
     let mut out = Vec::new();
     if let Some(repo) = here {
@@ -538,24 +562,80 @@ pub fn sources(here: Option<&str>, branch: Option<&str>) -> Vec<Source> {
         }
         out.push(Source::Repo(repo.to_owned()));
     }
-    out.extend([Source::Yours, Source::Reviewing, Source::Owned]);
+    out.extend([
+        Source::Authored(Kind::Pull),
+        Source::Reviewing,
+        Source::Owned(Kind::Pull),
+        Source::Authored(Kind::Issue),
+        Source::Owned(Kind::Issue),
+    ]);
     out
 }
 
-/// Your GitHub login: from gh's own config, which needs no request, or else asked.
-fn viewer() -> Result<String, PrFailed> {
-    if let Ok(login) = gh(&["config", "get", "user", "-h", "github.com"])
-        && !login.is_empty()
-    {
-        return Ok(login);
+/// How a row concerns you, which picks its color in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Relation {
+    /// Yours, in your own repository.
+    Yours,
+    /// Yours, in someone else's repository.
+    Outgoing,
+    /// Someone else's, in your repository.
+    Incoming,
+    /// Someone else's, elsewhere: this repository's, or waiting on your review.
+    Other,
+}
+
+impl Relation {
+    pub const ALL: [Relation; 4] = [
+        Relation::Yours,
+        Relation::Outgoing,
+        Relation::Incoming,
+        Relation::Other,
+    ];
+
+    pub fn of(entry: &Entry, me: &str) -> Self {
+        let owner = entry.pr.repo.split('/').next().unwrap_or_default();
+        match (
+            entry.author.eq_ignore_ascii_case(me),
+            owner.eq_ignore_ascii_case(me),
+        ) {
+            (true, true) => Relation::Yours,
+            (true, false) => Relation::Outgoing,
+            (false, true) => Relation::Incoming,
+            (false, false) => Relation::Other,
+        }
     }
-    gh(&["api", "user", "-q", ".login"])
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Relation::Yours => "yours",
+            Relation::Outgoing => "to others",
+            Relation::Incoming => "from others",
+            Relation::Other => "other",
+        }
+    }
+}
+
+/// Your GitHub login: from gh's own config, which needs no request, or else
+/// asked. Kept, so the list can color its rows at once next time.
+pub fn viewer() -> Result<String, PrFailed> {
+    let login = match gh(&["config", "get", "user", "-h", "github.com"]) {
+        Ok(login) if !login.is_empty() => login,
+        _ => gh(&["api", "user", "-q", ".login"])?,
+    };
+    store("viewer", &login);
+    Ok(login)
+}
+
+/// The login `viewer` found last time.
+pub fn cached_viewer() -> Option<String> {
+    load("viewer").filter(|login| !login.is_empty())
 }
 
 /// One GraphQL search: much faster than `gh search prs`, which goes through REST.
-const SEARCH: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest { number title isDraft updatedAt author { login } repository { nameWithOwner } } } } }";
+const SEARCH: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 100) { nodes { ... on PullRequest { number title isDraft updatedAt author { login } repository { nameWithOwner } } ... on Issue { number title updatedAt author { login } repository { nameWithOwner } } } } }";
 
-/// The open pull requests one heading lists, newest first. The answer is
+/// The open pull requests or issues one search finds, newest first. The answer is
 /// cached, so the list shows at once next time while it's asked again.
 pub fn search(source: &Source) -> Result<Vec<Entry>, PrFailed> {
     if !*GH {
@@ -584,19 +664,16 @@ pub fn cached_search(source: &Source) -> Option<Vec<Entry>> {
     Some(parse_search(&nodes))
 }
 
-/// Keeps each pull request under the first heading it appears in, newest first.
-pub fn dedupe(groups: Vec<Group>) -> Vec<Group> {
+/// One list from several searches: each row once, newest first.
+pub fn merge(lists: impl IntoIterator<Item = Vec<Entry>>) -> Vec<Entry> {
     let mut seen = std::collections::HashSet::new();
-    groups
+    let mut out: Vec<Entry> = lists
         .into_iter()
-        .map(|mut group| {
-            group.entries.retain(|entry| seen.insert(entry.pr.clone()));
-            group
-                .entries
-                .sort_by_key(|entry| std::cmp::Reverse(seconds(&entry.updated)));
-            group
-        })
-        .collect()
+        .flatten()
+        .filter(|entry| seen.insert(entry.pr.clone()))
+        .collect();
+    out.sort_by_key(|entry| std::cmp::Reverse(seconds(&entry.updated)));
+    out
 }
 
 fn text(value: &Value, key: &str) -> String {
@@ -1036,6 +1113,12 @@ pub fn open_in_browser(pr: &PrRef) -> Result<(), PrFailed> {
     gh(&["pr", "view", &number, "-R", &pr.repo, "--web"]).map(|_| ())
 }
 
+/// Opens an issue's page in the browser; leaf has no issue page of its own.
+pub fn open_issue(issue: &PrRef) -> Result<(), PrFailed> {
+    let number = issue.number.to_string();
+    gh(&["issue", "view", &number, "-R", &issue.repo, "--web"]).map(|_| ())
+}
+
 /// Seconds since 1970 for an ISO 8601 UTC time such as `2026-11-12T04:29:54Z`.
 pub fn seconds(iso: &str) -> Option<i64> {
     let bytes = iso.as_bytes();
@@ -1135,16 +1218,25 @@ mod tests {
                     branch: "fix/q".into()
                 },
                 Source::Repo("o/r".into()),
-                Source::Yours,
+                Source::Authored(Kind::Pull),
                 Source::Reviewing,
-                Source::Owned,
+                Source::Owned(Kind::Pull),
+                Source::Authored(Kind::Issue),
+                Source::Owned(Kind::Issue),
             ]
         );
         assert_eq!(
             sources(Some("o/r"), Some("main"))[0],
             Source::Repo("o/r".into())
         );
-        assert_eq!(sources(None, Some("fix/q"))[0], Source::Yours);
+        assert_eq!(
+            sources(None, Some("fix/q"))[0],
+            Source::Authored(Kind::Pull)
+        );
+        assert_eq!(
+            Source::Authored(Kind::Issue).query().unwrap(),
+            "is:issue is:open archived:false author:@me"
+        );
         assert_eq!(
             Source::Branch {
                 repo: "o/r".into(),
@@ -1318,19 +1410,30 @@ mod tests {
             updated: updated.into(),
             draft: false,
         };
-        let groups = dedupe(vec![
-            Group {
-                title: "Yours".into(),
-                entries: vec![e(1, "2026-01-01T00:00:00Z"), e(2, "2026-02-01T00:00:00Z")],
-            },
-            Group {
-                title: "Review".into(),
-                entries: vec![e(2, "2026-02-01T00:00:00Z"), e(3, "2026-03-01T00:00:00Z")],
-            },
+        let merged = merge([
+            vec![e(1, "2026-01-01T00:00:00Z"), e(2, "2026-02-01T00:00:00Z")],
+            vec![e(2, "2026-02-01T00:00:00Z"), e(3, "2026-03-01T00:00:00Z")],
         ]);
-        let numbers = |g: &Group| g.entries.iter().map(|e| e.pr.number).collect::<Vec<_>>();
-        assert_eq!(numbers(&groups[0]), [2, 1]);
-        assert_eq!(numbers(&groups[1]), [3]);
+        let numbers: Vec<_> = merged.iter().map(|e| e.pr.number).collect();
+        assert_eq!(numbers, [3, 2, 1]);
+    }
+
+    #[test]
+    fn rows_are_colored_by_whose_they_are_and_where() {
+        let e = |repo: &str, author: &str| Entry {
+            pr: PrRef {
+                repo: repo.into(),
+                number: 1,
+            },
+            title: String::new(),
+            author: author.into(),
+            updated: String::new(),
+            draft: false,
+        };
+        assert_eq!(Relation::of(&e("Me/leaf", "me"), "me"), Relation::Yours);
+        assert_eq!(Relation::of(&e("o/r", "me"), "me"), Relation::Outgoing);
+        assert_eq!(Relation::of(&e("me/leaf", "ann"), "me"), Relation::Incoming);
+        assert_eq!(Relation::of(&e("o/r", "ann"), "me"), Relation::Other);
     }
 
     #[test]

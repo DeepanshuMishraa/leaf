@@ -289,19 +289,19 @@ function M.setup(opts)
 
   rex.action{
     name = "leaf_pr",
-    title = "Leaf: Pull Requests",
-    description = "This branch's pull request, this repository's, and yours across GitHub,"
-      .. " in this pane. Pick one to read its summary, timeline and diff, then merge,"
+    title = "Leaf: Pull Requests & Issues",
+    description = "Your open pull requests and issues across GitHub, newest first, in this"
+      .. " pane. Pick a pull request to read its summary, timeline and diff, then merge,"
       .. " close, approve or comment.",
     category = "Leaf",
-    keywords = "leaf pr pull request github review merge squash rebase checks timeline branch",
+    keywords = "leaf pr pull request issue issues github review merge squash rebase checks timeline branch",
     args = { target = "string?" },
     run = function(ctx, args)
       local target = args.target
       if target ~= nil and target ~= "" then
         place(ctx, "pr", "pr", target)
       else
-        place(ctx, "pull requests", "pr")
+        place(ctx, "pull requests & issues", "pr")
       end
     end,
   }
