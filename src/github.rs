@@ -578,6 +578,10 @@ fn gitlab_diff(resource: &Resource) -> Result<String, GithubFailed> {
     let refused = match gitlab_token(&resource.host) {
         Some(_) => match gitlab_api_diff(resource) {
             Ok(patch) => return Ok(patch),
+            // A patch GitLab said was cut short stays cut short: the page
+            // routes don't say whether theirs is whole, so falling through to
+            // one would only make an incomplete answer look complete.
+            Err(e @ GithubFailed::Partial { .. }) => return Err(said_so(e, &[], &said)),
             Err(e) => Some(e),
         },
         None => None,
