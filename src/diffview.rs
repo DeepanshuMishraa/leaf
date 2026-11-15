@@ -131,7 +131,7 @@ pub struct Options {
     pub store: Option<Store>,
     /// Store failures are reported after the terminal is restored.
     pub failure: Rc<RefCell<Option<String>>>,
-    /// Opened as a pull request's Code tab: `1`, `2`, `3` and `←` go back to its
+    /// Opened as a pull request's Code tab: `1`, `2`, `3` and `5` go to its
     /// other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
     pub layout: Layout,
@@ -175,10 +175,11 @@ impl Default for Options {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Leave {
     Quit,
-    /// For a pull request's Code tab: to its Summary, Timeline or Comments.
+    /// For a pull request's Code tab: to its Summary, Timeline, Comments or Checks.
     Summary,
     Timeline,
     Comments,
+    Checks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1275,7 +1276,7 @@ impl App {
             KeyCode::Char('o') => self.other_side(),
             KeyCode::Char('i') => self.toggle_layout(),
             KeyCode::Char('r') => self.reload(),
-            KeyCode::Char('1') | KeyCode::Tab if self.tabs => {
+            KeyCode::Char('1') if self.tabs => {
                 self.leave = Leave::Summary;
                 self.quit = true;
             }
@@ -1287,7 +1288,11 @@ impl App {
                 self.leave = Leave::Comments;
                 self.quit = true;
             }
-            KeyCode::Char('4') | KeyCode::Right if self.tabs => {}
+            KeyCode::Char('4') if self.tabs => {}
+            KeyCode::Char('5') | KeyCode::Right | KeyCode::Tab if self.tabs => {
+                self.leave = Leave::Checks;
+                self.quit = true;
+            }
             KeyCode::Char('h') | KeyCode::Left => {
                 self.left = self.left.saturating_sub(4);
             }
@@ -2282,7 +2287,7 @@ impl App {
             String::new()
         };
         let stats = if self.tabs {
-            format!("{review}1 summary · 2 timeline   +{added} −{removed} ")
+            format!("{review}1 summary · 2 timeline · 3 comments · 5 checks   +{added} −{removed} ")
         } else {
             format!("{review}+{added} −{removed} ")
         };
@@ -3848,7 +3853,7 @@ diff --git a/b.rs b/b.rs
         let mut app = App::new(loaded(PATCH), as_code_tab());
         press(&mut app, KeyCode::Tab);
         assert!(app.quit);
-        assert_eq!(app.leave, Leave::Summary, "tab goes on, round to Summary");
+        assert_eq!(app.leave, Leave::Checks, "tab goes on to Checks");
 
         let mut app = App::new(loaded(PATCH), as_code_tab());
         press(&mut app, KeyCode::BackTab);

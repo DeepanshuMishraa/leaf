@@ -20,6 +20,8 @@ per change, starting with `- `.
 - `R` in the `leaf pr` list reloads both tabs now rather than waiting.
 - `tab` in the `leaf pr` list shows merged pull requests and closed issues, grouped by when they ended, with a twelve-week sparkline; `←/→` switch between pull requests and issues.
 - Open a picture file on its own: leaf reads PNG, JPEG, GIF, WebP, SVG, HEIC and more, turns photos upright by their EXIF orientation, and `i` switches it between its own colors and the theme's.
+- Pull requests have a Checks tab: every check by workflow with its duration, any Actions job's steps and log, and GitHub's re-runs: failed jobs, one job, or all jobs. The page refreshes while checks run.
+- A markdown file that changes on disk is read again in place while you have it open.
 
 ## 0.15.2
 

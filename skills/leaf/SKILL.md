@@ -23,7 +23,7 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 |---|---|
 | `leaf open <file or url>`, or just `leaf <file>` | A PDF, EPUB or Markdown file, or a web article. It reopens where the person left off. |
 | `leaf diff` | Unstaged changes. `--staged`, `--branch` (this branch against its base), `--base <ref>`, a range such as `main...HEAD`, a path, a `.patch` file or a GitHub PR, commit or compare link. `--inline` uses one column. |
-| `leaf pr` | The person's open pull requests and issues. `leaf pr 12`, `leaf pr owner/repo#12` or a PR link opens one, with Summary, Timeline and Comments tabs, plus Code for a pull request. In the list, `←/→` switch pull requests and issues, `tab` switches open and merged/closed, `R` reloads. |
+| `leaf pr` | The person's open pull requests and issues. `leaf pr 12`, `leaf pr owner/repo#12` or a PR link opens one, with Summary, Timeline and Comments tabs, plus Code and Checks for a pull request. In the list, `←/→` switch pull requests and issues, `tab` switches open and merged/closed, `R` reloads. |
 | `leaf plan <plan.md>` | Plan review, block by block. |
 | `leaf review [diff source]` | Code review, file by file. |
 | `leaf comments --json` | Every saved diff comment as JSON: key, file, side, line range, body, and state (`draft`, `agent`, `github`). |
@@ -56,9 +56,9 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 - `i` switches split and inline, `o` the other side, `r` reloads, `?` keys.
 
 **Pull request:**
-- `tab` or `1`–`4` switch Summary, Timeline, Comments and Code.
+- `tab` or `1`–`5` switch Summary, Timeline, Comments, Code and Checks.
 - On Comments, `j/k` pick a comment and `enter` replies quoting it.
-- `m` merges, `a` approves, `c` comments, `x` closes or reopens, `r` toggles draft.
+- `m` merges, `a` approves, `c` comments, `x` closes or reopens, `r` toggles draft; on Checks, `j/k` pick a check, `enter` opens its job and `r` re-runs jobs.
 - `o` opens it on GitHub, `?` keys, `q` goes back to the list.
 
 **Plan review:**

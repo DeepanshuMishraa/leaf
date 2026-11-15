@@ -98,6 +98,36 @@ fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
 /// The id of the `index`th diagram in a document.
 const DIAGRAM: &str = "mermaid-";
 
+thread_local! {
+    /// Diagrams drawn for the last document, by source, so a reload only starts
+    /// the JavaScript runtime for diagrams that changed.
+    static DRAWN: RefCell<HashMap<String, Option<Diagram>>> = RefCell::default();
+}
+
+fn cached(
+    sources: &[String],
+    draw: impl FnOnce(&[String]) -> Vec<Option<Diagram>>,
+) -> Vec<Option<Diagram>> {
+    DRAWN.with_borrow_mut(|drawn| {
+        let mut missing: Vec<String> = Vec::new();
+        for source in sources {
+            if !drawn.contains_key(source) && !missing.contains(source) {
+                missing.push(source.clone());
+            }
+        }
+        if !missing.is_empty() {
+            let fresh = draw(&missing);
+            drawn.extend(missing.into_iter().zip(fresh));
+        }
+        let found = sources
+            .iter()
+            .map(|source| drawn.get(source).cloned().flatten())
+            .collect();
+        drawn.retain(|source, _| sources.contains(source));
+        found
+    })
+}
+
 /// Replaces each ```mermaid block that can be drawn with a figure of the
 /// drawing. Returns the markdown and the diagrams, by index.
 fn diagrams(
@@ -254,7 +284,7 @@ pub fn from_url(title: String, text: &str, url: &Url) -> Doc {
 
 fn document(title: String, text: &str, base: Base) -> Doc {
     let (markdown, images) = localize(&FRONT_MATTER.replace(text, ""), base);
-    let (markdown, diagrams) = diagrams(&markdown, mermaid::render);
+    let (markdown, diagrams) = diagrams(&markdown, |sources| cached(sources, mermaid::render));
     Doc {
         title,
         page_count: None,
@@ -324,6 +354,28 @@ mod tests {
 
     /// Runs `examples/mermaid.md` through the real runtime and rasterizer.
     /// Skipped when neither bun nor node is installed.
+    #[test]
+    fn unchanged_diagrams_are_not_drawn_again() {
+        let svg = r#"<svg width="10" height="5"></svg>"#;
+        let mut asked: Vec<Vec<String>> = Vec::new();
+        let mut draw = |sources: &[String]| {
+            asked.push(sources.to_vec());
+            sources.iter().map(|_| Diagram::new(svg)).collect()
+        };
+        let first = cached(&["a".into(), "b".into()], &mut draw);
+        let second = cached(&["a".into(), "c".into(), "a".into()], &mut draw);
+        let third = cached(&["a".into(), "c".into()], &mut draw);
+        assert_eq!(asked, vec![vec!["a", "b"], vec!["c"]]);
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .chain(&third)
+                .all(Option::is_some)
+        );
+        assert_eq!(second.len(), 3);
+    }
+
     #[test]
     fn sample_diagrams_draw_and_rasterize() {
         let runtime = ["bun", "node"].iter().any(|r| {

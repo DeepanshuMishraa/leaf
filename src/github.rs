@@ -575,16 +575,8 @@ fn first_line(text: &str) -> &str {
 }
 
 fn json_head_sha(json: &str) -> Option<String> {
-    let head = json.find("\"head\"")?;
-    json_string_after(&json[head..], "sha")
-}
-
-fn json_string_after(text: &str, key: &str) -> Option<String> {
-    let quoted = format!("\"{key}\"");
-    let at = text.find(&quoted)?;
-    let rest = &text[at + quoted.len()..];
-    let colon = rest.find(':')?;
-    parse_json_string(rest[colon + 1..].trim_start())
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.get("head")?.get("sha")?.as_str().map(str::to_owned)
 }
 
 fn json_number_after(text: &str, key: &str) -> Option<u64> {
@@ -598,34 +590,6 @@ fn json_number_after(text: &str, key: &str) -> Option<u64> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     digits.parse().ok()
-}
-
-fn parse_json_string(text: &str) -> Option<String> {
-    let mut chars = text.strip_prefix('"')?.chars();
-    let mut out = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'b' => out.push('\u{8}'),
-                'f' => out.push('\u{c}'),
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'u' => {
-                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
-                    let value = u32::from_str_radix(&hex, 16).ok()?;
-                    out.push(char::from_u32(value)?);
-                }
-                other => out.push(other),
-            },
-            c => out.push(c),
-        }
-    }
-    None
 }
 
 pub(crate) fn json_escape(text: &str) -> String {
@@ -753,6 +717,21 @@ mod tests {
         let pulls = r#"[{"number":42,"title":"x"},{"number":7}]"#;
         assert_eq!(json_number_after(pulls, "number"), Some(42));
         assert_eq!(json_number_after("[]", "number"), None);
+    }
+
+    #[test]
+    fn pull_head_sha_does_not_read_other_objects() {
+        for json in [
+            r#"{"head":null,"base":{"sha":"base"}}"#,
+            r#"{"head":{},"base":{"sha":"base"}}"#,
+            r#"{"base":{"sha":"base"}}"#,
+            r#"{"head":{"sha":42}}"#,
+            r#"{"head":{"sha":"truncated"}"#,
+        ] {
+            assert_eq!(json_head_sha(json), None, "{json}");
+        }
+        let json = r#"{"head":{"repo":{"sha":"nested"},"sha":"correct"}}"#;
+        assert_eq!(json_head_sha(json).as_deref(), Some("correct"));
     }
 
     #[test]

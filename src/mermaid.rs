@@ -61,6 +61,7 @@ pub(crate) static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|
     Arc::new(fonts)
 });
 
+#[derive(Clone)]
 pub struct Diagram {
     svg: String,
     /// Pixel size Pele laid the diagram out at.
