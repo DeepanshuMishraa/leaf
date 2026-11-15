@@ -1098,7 +1098,7 @@ fn synth_untracked(root: &Path, path: &str, patch: &mut String) {
 }
 
 /// Quotes a path the way Git does when it contains awkward bytes.
-fn quote_path(path: &str) -> String {
+pub(crate) fn quote_path(path: &str) -> String {
     if !path
         .chars()
         .any(|c| c.is_control() || c == '"' || c == '\\' || c.is_whitespace())

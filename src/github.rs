@@ -2,6 +2,7 @@
 //! comparisons. Either forge's diff is read the same way; commenting and every
 //! other write are still GitHub's alone.
 
+use std::fmt::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
@@ -170,6 +171,16 @@ pub enum GithubFailed {
         "Leaf opens {forge} diffs to read, and posting a comment to {forge} isn't supported yet. Post it on the merge request in your browser."
     )]
     Unsupported { forge: &'static str },
+    #[error(
+        "{forge} sent only part of the patch ({detail}), so leaf stopped rather than show a review that is missing files. {advice}"
+    )]
+    Partial {
+        forge: &'static str,
+        detail: String,
+        advice: &'static str,
+    },
+    #[error("{cause}")]
+    Folded { cause: String },
     #[error(
         "GitHub rejected the comment: {detail} Check that the line is still part of the pull request, then try again."
     )]
@@ -501,7 +512,7 @@ fn github_diff(resource: &Resource) -> Result<String, GithubFailed> {
     http_get(&resource.diff_url(), "application/vnd.github.v3.diff").map_err(|e| match gh_error {
         Some(gh) => GithubFailed::Network {
             forge: Forge::GitHub.title(),
-            cause: format!("{}; gh said: {gh}", inner_cause(&e)),
+            cause: format!("{}; gh said: {gh}", short_cause(&e)),
         },
         None => e,
     })
@@ -542,41 +553,343 @@ fn glab_command(
 /// serves, with `GITLAB_TOKEN` when the project is private. Both print the
 /// same patch; the first is the one that already knows your sign-in.
 fn gitlab_diff(resource: &Resource) -> Result<String, GithubFailed> {
-    let mut glab_error = None;
+    let mut said: Vec<(&str, String)> = Vec::new();
     if let Some(args) = glab_command(resource, *GLAB, &configured_gitlab_hosts()) {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         match glab_in(&args) {
             Ok(patch) if patch.trim().is_empty() || patch.starts_with("diff --git") => {
                 return Ok(patch);
             }
-            Ok(other) => {
-                glab_error = Some(format!(
-                    "glab returned something that isn't a diff: {}",
+            Ok(other) => said.push((
+                "glab",
+                format!(
+                    "it returned something that isn't a diff: {}",
                     first_line(&other)
-                ));
-            }
-            Err(e) => glab_error = Some(e.to_string()),
+                ),
+            )),
+            Err(e) => said.push(("glab", short_cause(&e))),
         }
     }
 
+    // A token is only ever offered to a host that names itself GitLab or that
+    // `GITLAB_HOST` names, and it is spent on the API: the web routes that
+    // serve a patch refuse a personal access token, answering with the sign-in
+    // page, so a private project is read here instead.
+    let refused = match gitlab_token(&resource.host) {
+        Some(_) => match gitlab_api_diff(resource) {
+            Ok(patch) => return Ok(patch),
+            // A patch GitLab said was cut short stays cut short: the page
+            // routes don't say whether theirs is whole, so falling through to
+            // one would only make an incomplete answer look complete.
+            Err(e @ GithubFailed::Partial { .. }) => return Err(said_so(e, &[], &said)),
+            Err(e) => Some(e),
+        },
+        None => None,
+    };
+
     let url = resource.diff_url();
-    let patch = http_get_forge(&url, "text/plain", Forge::GitLab, &resource.host).map_err(|e| {
-        match glab_error {
-            Some(glab) => GithubFailed::Network {
-                forge: Forge::GitLab.title(),
-                cause: format!("{}; glab said: {glab}", inner_cause(&e)),
-            },
-            None => e,
+    let page =
+        http_get_forge(&url, "text/plain", Forge::GitLab, &resource.host).and_then(|patch| {
+            // GitLab answers a project it won't show with a page rather than an
+            // error, and a token doesn't change that: the sign-in page comes back.
+            if patch.trim().is_empty() || patch.starts_with("diff --git") {
+                Ok(patch)
+            } else {
+                Err(GithubFailed::NotDiff {
+                    forge: Forge::GitLab.title(),
+                    url,
+                })
+            }
+        });
+
+    match (refused, page) {
+        // With a token the API is the one that knows why, so it leads.
+        (Some(api), Err(page)) => Err(said_so(api, &[("the page", page)], &said)),
+        (Some(_), Ok(patch)) => Ok(patch),
+        (None, Err(page)) => Err(said_so(page, &[], &said)),
+        (None, Ok(patch)) => Ok(patch),
+    }
+}
+
+/// The API request that carries `resource`'s patch, and what it answers with:
+/// a merge request's raw patch is text, and every other page is JSON.
+fn gitlab_api_request(resource: &Resource) -> (String, &'static str) {
+    let project = encode(resource.project());
+    let base = format!("https://{}/api/v4/projects/{project}", resource.host);
+    match &resource.page {
+        Page::Pull { number, .. } => (
+            format!("{base}/merge_requests/{number}/raw_diffs"),
+            "text/plain",
+        ),
+        Page::Commit { sha, .. } => (
+            format!("{base}/repository/commits/{sha}/diff"),
+            "application/json",
+        ),
+        Page::Compare {
+            base: from,
+            head: to,
+            ..
+        } => (
+            format!(
+                "{base}/repository/compare?from={}&to={}",
+                encode(from),
+                encode(to)
+            ),
+            "application/json",
+        ),
+    }
+}
+
+/// The patch GitLab's API serves for `resource`, which is the only way in when
+/// the project is private and no `glab` is signed in to it.
+fn gitlab_api_diff(resource: &Resource) -> Result<String, GithubFailed> {
+    let (url, accept) = gitlab_api_request(resource);
+    match http_get_forge(&url, accept, Forge::GitLab, &resource.host) {
+        // GitLab 16.9 gave a merge request's raw patch a route of its own;
+        // before that, the list of changes says the same in JSON.
+        Err(GithubFailed::Http { status: 404, .. }) if accept == "text/plain" => {
+            let project = encode(resource.project());
+            let base = format!("https://{}/api/v4/projects/{project}", resource.host);
+            let Page::Pull { number, .. } = &resource.page else {
+                return Err(GithubFailed::NotDiff {
+                    forge: Forge::GitLab.title(),
+                    url,
+                });
+            };
+            let url = format!("{base}/merge_requests/{number}/changes");
+            gitlab_diff_json(&url, resource)
         }
+        Ok(patch) if accept == "text/plain" => Ok(patch),
+        Ok(body) => patch_from_json(&body, &url, matches!(resource.page, Page::Pull { .. })),
+        Err(e) => Err(e),
+    }
+}
+
+/// A patch rebuilt from the JSON that lists a page's changed files, which is
+/// how the API answers every page but a merge request.
+fn gitlab_diff_json(url: &str, resource: &Resource) -> Result<String, GithubFailed> {
+    let body = http_get_forge(url, "application/json", Forge::GitLab, &resource.host)?;
+    patch_from_json(&body, url, matches!(resource.page, Page::Pull { .. }))
+}
+
+/// A patch from the JSON the API answered with, or a refusal to read it as
+/// one: an error page can come back as a 200 too.
+fn patch_from_json(body: &str, url: &str, merge_request: bool) -> Result<String, GithubFailed> {
+    let Changed { changes, cut } = changes_of(body).ok_or_else(|| GithubFailed::NotDiff {
+        forge: Forge::GitLab.title(),
+        url: url.to_owned(),
     })?;
-    // GitLab answers a project it won't show with a page rather than an error.
-    if !patch.trim().is_empty() && !patch.starts_with("diff --git") {
-        return Err(GithubFailed::NotDiff {
+    // A review of part of a patch is worse than none: what isn't shown is
+    // indistinguishable from what isn't there.
+    if let Some(detail) = cut {
+        return Err(GithubFailed::Partial {
             forge: Forge::GitLab.title(),
-            url,
+            detail,
+            // `glab` has no command for a commit or a comparison, so naming it
+            // would send the reader at something that can't help.
+            advice: if merge_request {
+                "Open it on the page in your browser, or install `glab` and sign in to that host."
+            } else {
+                "Open it on the page in your browser."
+            },
         });
     }
-    Ok(patch)
+    Ok(patch_from_changes(&changes))
+}
+
+/// The changed files out of whichever shape GitLab answered in: a commit's
+/// diff is the list itself, a comparison's is under `diffs`, and a merge
+/// request's under `changes`.
+///
+/// A big page comes back cut: GitLab caps a merge request at 1000 changed
+/// files and says so with `overflow`, and a comparison that runs out of time
+/// says `compare_timeout`. Reading either as complete would show a review
+/// with files quietly missing, so what the answer admits is passed on.
+fn changes_of(body: &str) -> Option<Changed> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let flag = |key: &str| value.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let sent = value
+        .get("changes")
+        .or_else(|| value.get("diffs"))
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len);
+    let cut = if flag("compare_timeout") {
+        // A comparison that runs out of time doesn't say how many files it
+        // would have listed, only that it stopped early.
+        Some(format!(
+            "it stopped after {sent}, with more it didn't reach"
+        ))
+    } else if flag("overflow") {
+        // Past the cap `changes_count` is the string `1000+`.
+        let total = match value.get("changes_count").and_then(|v| v.as_str()) {
+            Some(count) if count.ends_with('+') => format!("at least {count} files"),
+            Some(count) => format!("{count} files"),
+            None => "a page too big to send whole".to_owned(),
+        };
+        Some(format!("it sent {sent} of {total}"))
+    } else {
+        None
+    };
+    let changes = if let Some(list) = value.as_array() {
+        list.clone()
+    } else {
+        ["changes", "diffs"]
+            .into_iter()
+            .find_map(|key| value.get(key)?.as_array().cloned())?
+    };
+    Some(Changed { changes, cut })
+}
+
+/// The changed files an answer listed, and what it admitted was left out.
+struct Changed {
+    changes: Vec<serde_json::Value>,
+    cut: Option<String>,
+}
+
+/// A patch built the way Git writes one, from the files the API listed. The
+/// hunks are already a patch minus its headers, so only those are written.
+fn patch_from_changes(changes: &[serde_json::Value]) -> String {
+    let mut patch = String::new();
+    for change in changes {
+        let text = |key: &str| {
+            change
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+        };
+        let flag = |key: &str| {
+            change
+                .get(key)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
+        let old = text("old_path");
+        let new = text("new_path");
+        let added = flag("new_file");
+        let deleted = flag("deleted_file");
+        let _ = writeln!(
+            patch,
+            "diff --git {} {}",
+            crate::diff::quote_path(&format!("a/{old}")),
+            crate::diff::quote_path(&format!("b/{new}"))
+        );
+        let mode = |key: &str| {
+            let mode = text(key);
+            if mode.is_empty() {
+                "100644".to_owned()
+            } else {
+                mode.to_owned()
+            }
+        };
+        if added {
+            let _ = writeln!(patch, "new file mode {}", mode("b_mode"));
+        } else if deleted {
+            let _ = writeln!(patch, "deleted file mode {}", mode("a_mode"));
+        } else {
+            // A file made executable changes no lines at all: the two modes
+            // are the whole change, and without them it reads as an untouched
+            // file. Git writes them before the rename for the same reason.
+            let (before, after) = (text("a_mode"), text("b_mode"));
+            if !before.is_empty() && !after.is_empty() && before != after {
+                let _ = writeln!(patch, "old mode {before}");
+                let _ = writeln!(patch, "new mode {after}");
+            }
+            if flag("renamed_file") {
+                let _ = writeln!(patch, "rename from {old}");
+                let _ = writeln!(patch, "rename to {new}");
+            }
+        }
+        let _ = writeln!(
+            patch,
+            "--- {}",
+            if added {
+                "/dev/null".to_owned()
+            } else {
+                crate::diff::quote_path(&format!("a/{old}"))
+            }
+        );
+        let _ = writeln!(
+            patch,
+            "+++ {}",
+            if deleted {
+                "/dev/null".to_owned()
+            } else {
+                crate::diff::quote_path(&format!("b/{new}"))
+            }
+        );
+        let diff = text("diff");
+        if diff.trim().is_empty() {
+            // A rename or a mode change carries its whole meaning in the lines
+            // above. Anything else emptied here is a file GitLab couldn't show,
+            // and it says so rather than look untouched.
+            let moved =
+                flag("renamed_file") || (text("a_mode") != text("b_mode") && !added && !deleted);
+            if !moved {
+                let why = if flag("too_large") {
+                    "leaf: too large for GitLab to send its changes"
+                } else {
+                    "leaf: GitLab sent no changes for this file"
+                };
+                let _ = writeln!(patch, "{why}");
+            }
+        } else {
+            patch.push_str(diff);
+            if !diff.ends_with('\n') {
+                patch.push('\n');
+            }
+        }
+    }
+    patch
+}
+
+/// Percent-encodes a project's path or a ref, `/` included: GitLab wants the
+/// project as one segment, `group%2Fproject`.
+fn encode(text: &str) -> String {
+    url::form_urlencoded::byte_serialize(text.as_bytes()).collect()
+}
+
+/// Folds what the other routes said into the failure that ended the attempt,
+/// so one message carries every place the patch was looked for. The failure
+/// keeps its kind: an HTTP status mustn't come back as a connection problem
+/// with advice about cables.
+fn said_so(
+    failed: GithubFailed,
+    others: &[(&str, GithubFailed)],
+    said: &[(&str, String)],
+) -> GithubFailed {
+    let mut tail = String::new();
+    for (who, other) in others {
+        tail.push_str(&format!("; {who} said: {}", short_cause(other)));
+    }
+    for (who, other) in said {
+        tail.push_str(&format!("; {who} said: {other}"));
+    }
+    if tail.is_empty() {
+        return failed;
+    }
+    match failed {
+        GithubFailed::Http {
+            forge,
+            status,
+            what,
+            hint,
+        } => GithubFailed::Http {
+            forge,
+            status,
+            what,
+            hint: format!("{hint}{tail}"),
+        },
+        GithubFailed::Network { forge, cause } => GithubFailed::Network {
+            forge,
+            cause: format!("{cause}{tail}"),
+        },
+        // Everything else has no place to put a tail, so it is carried whole:
+        // dropping what the other routes said is how a `glab` failure turns
+        // into an unrelated complaint about the page.
+        other => GithubFailed::Folded {
+            cause: format!("{}{tail}", short_cause(&other)),
+        },
+    }
 }
 
 struct Target {
@@ -928,7 +1241,7 @@ fn hint(status: u16, forge: Forge) -> String {
     let auth = match forge {
         Forge::GitHub => "Run `gh auth login`, or set GH_TOKEN",
         Forge::GitLab => {
-            "Set GITLAB_TOKEN to a personal access token with `read_api` (and GITLAB_HOST to a self-hosted instance's name)"
+            "Set GITLAB_TOKEN to a personal access token with `read_api` -- and GITLAB_HOST to a self-hosted instance's name -- or check the one that's set"
         }
     };
     match status {
@@ -967,14 +1280,13 @@ fn gitlab_token(host: &str) -> Option<String> {
     is_gitlab_host(host, &configured_gitlab_hosts()).then_some(token)
 }
 
-/// What a failure said, without the forge it already named, so that folding it
-/// into another message doesn't say "Could not reach GitLab" twice.
-fn inner_cause(failed: &GithubFailed) -> String {
+/// What a failure said, without the forge it already named and without the
+/// advice: a message that folds this in carries one piece of advice already,
+/// and repeating it reads as two different instructions.
+fn short_cause(failed: &GithubFailed) -> String {
     match failed {
         GithubFailed::Network { cause, .. } => cause.clone(),
-        GithubFailed::Http {
-            status, what, hint, ..
-        } => format!("HTTP {status} while {what}. {hint}"),
+        GithubFailed::Http { status, what, .. } => format!("HTTP {status} while {what}"),
         other => other.to_string(),
     }
 }
@@ -1429,27 +1741,229 @@ mod tests {
             forge: Forge::GitLab.title(),
             cause: "io: timeout".to_owned(),
         };
-        assert_eq!(inner_cause(&inner), "io: timeout");
+        assert_eq!(short_cause(&inner), "io: timeout");
         let http = GithubFailed::Http {
             forge: Forge::GitLab.title(),
             status: 403,
             what: "fetching the diff".to_owned(),
             hint: "Set GITLAB_TOKEN".to_owned(),
         };
-        // The token hint is what makes a private project openable, so it
-        // survives being folded in.
+        // No advice travels in a folded cause: the failure that ends the
+        // attempt carries one, and two would read as two instructions.
+        assert_eq!(short_cause(&http), "HTTP 403 while fetching the diff");
+        // Folding keeps the kind of failure, so an HTTP status never comes back
+        // as a connection problem with advice about cables.
+        let said = [("glab", "it failed".to_owned())];
+        let folded = said_so(http, &[], &said);
+        match &folded {
+            GithubFailed::Http { hint, .. } => {
+                assert_eq!(hint, "Set GITLAB_TOKEN; glab said: it failed");
+            }
+            other => panic!("expected an HTTP failure, got {other}"),
+        }
+        // Two routes that both failed are both named, and the failure that
+        // knows why leads.
+        let folded = said_so(
+            GithubFailed::Http {
+                forge: Forge::GitLab.title(),
+                status: 401,
+                what: "fetching the diff".to_owned(),
+                hint: "Check the token".to_owned(),
+            },
+            &[(
+                "the page",
+                GithubFailed::Http {
+                    forge: Forge::GitLab.title(),
+                    status: 404,
+                    what: "fetching the diff".to_owned(),
+                    hint: "".to_owned(),
+                },
+            )],
+            &said,
+        );
         assert_eq!(
-            inner_cause(&http),
-            "HTTP 403 while fetching the diff. Set GITLAB_TOKEN"
+            folded.to_string(),
+            "GitLab returned HTTP 401 while fetching the diff. Check the token; the page said: HTTP 404 while fetching the diff; glab said: it failed"
+        );
+        // A failure with no room for a tail keeps what the other routes said
+        // instead of dropping it: a `glab` failure must not turn into an
+        // unrelated complaint about the page.
+        let not_diff = GithubFailed::NotDiff {
+            forge: Forge::GitLab.title(),
+            url: "https://gitlab.com/a/b/-/merge_requests/1".to_owned(),
+        };
+        let folded = said_so(not_diff, &[], &said);
+        assert!(matches!(folded, GithubFailed::Folded { .. }));
+        assert!(folded.to_string().ends_with("glab said: it failed"));
+
+        // Nothing folded means the failure is handed back untouched.
+        assert_eq!(
+            said_so(
+                GithubFailed::Network {
+                    forge: Forge::GitLab.title(),
+                    cause: "io: timeout".to_owned(),
+                },
+                &[],
+                &[],
+            )
+            .to_string(),
+            "Could not reach GitLab (io: timeout). Check your connection and the link, then try again."
         );
         // Anything else keeps its own message.
         assert_eq!(
-            inner_cause(&GithubFailed::NotDiff {
+            short_cause(&GithubFailed::NotDiff {
                 forge: Forge::GitLab.title(),
                 url: "https://gitlab.com/a/b/-/merge_requests/1".to_owned(),
             }),
             "GitLab returned a page rather than a diff for https://gitlab.com/a/b/-/merge_requests/1. The project may be private, or the link may name something other than a merge request, a commit or a comparison."
         );
+    }
+
+    #[test]
+    fn a_token_is_spent_on_the_api_path_of_each_page() {
+        let mr = gitlab("code.example.com", pull("g/p", 7)).unwrap();
+        assert_eq!(
+            gitlab_api_request(&mr),
+            (
+                "https://code.example.com/api/v4/projects/g%2Fp/merge_requests/7/raw_diffs"
+                    .to_owned(),
+                "text/plain"
+            )
+        );
+        let commit = gitlab(
+            "code.example.com",
+            Page::Commit {
+                project: "g/p".into(),
+                sha: "abcdef1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gitlab_api_request(&commit).0,
+            "https://code.example.com/api/v4/projects/g%2Fp/repository/commits/abcdef1/diff"
+        );
+        // A ref keeps its slashes encoded, so a branch named `feature/x` is one
+        // value and not two path segments.
+        let compare = gitlab(
+            "code.example.com",
+            Page::Compare {
+                project: "g/p".into(),
+                base: "main".into(),
+                head: "feature/x".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gitlab_api_request(&compare).0,
+            "https://code.example.com/api/v4/projects/g%2Fp/repository/compare?from=main&to=feature%2Fx"
+        );
+    }
+
+    #[test]
+    fn a_patch_is_rebuilt_from_the_changes_gitlab_lists() {
+        // The API answers a commit with the list itself, a comparison under
+        // `diffs`, and a merge request under `changes`.
+        let drawn = r#"{"changes":[{"old_path":"a/x.txt","new_path":"a/x.txt","new_file":false,"deleted_file":false,"renamed_file":false,"a_mode":"100644","b_mode":"100644","diff":"@@ -1,2 +1,2 @@\n one\n-two\n+three"}]}"#;
+        let changes = changes_of(drawn)
+            .expect("a merge request's changes")
+            .changes;
+        let patch = patch_from_changes(&changes);
+        assert_eq!(
+            patch,
+            "diff --git a/a/x.txt b/a/x.txt\n--- a/a/x.txt\n+++ b/a/x.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n"
+        );
+        // Read as a diff, that patch is one file with one added and one removed
+        // line, which is what makes the side-by-side view work.
+        let parsed = crate::diff::Diff::parse(patch);
+        assert_eq!(parsed.files().len(), 1);
+        assert_eq!(parsed.files()[0].added, 1);
+        assert_eq!(parsed.files()[0].removed, 1);
+
+        let list = r#"[{"old_path":"gone.md","new_path":"gone.md","deleted_file":true,"a_mode":"100644","diff":"@@ -1,1 +0,0 @@\n-bye"},{"old_path":"new.md","new_path":"new.md","new_file":true,"b_mode":"100644","diff":"@@ -0,0 +1,1 @@\n+hello"}]"#;
+        let patch = patch_from_changes(&changes_of(list).expect("a commit's diff").changes);
+        assert!(patch.contains("diff --git a/gone.md b/gone.md\ndeleted file mode 100644\n--- a/gone.md\n+++ /dev/null\n"));
+        assert!(patch.contains(
+            "diff --git a/new.md b/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/new.md\n"
+        ));
+
+        // A rename says so, and carries no hunks; a file GitLab sent nothing
+        // for says that instead of looking unchanged.
+        let renamed = r#"[{"old_path":"was.md","new_path":"is.md","renamed_file":true,"diff":""}]"#;
+        let patch = patch_from_changes(&changes_of(renamed).expect("a renamed file").changes);
+        assert_eq!(
+            patch,
+            "diff --git a/was.md b/is.md\nrename from was.md\nrename to is.md\n--- a/was.md\n+++ b/is.md\n"
+        );
+        let empty = r#"[{"old_path":"logo.png","new_path":"logo.png","diff":""}]"#;
+        let patch = patch_from_changes(&changes_of(empty).expect("a file with no text").changes);
+        assert!(patch.contains("leaf: GitLab sent no changes for this file"));
+
+        // A path with a space is quoted the way git quotes one, or the header
+        // would end the path at the space.
+        let spaced =
+            r#"[{"old_path":"a b/x.txt","new_path":"a b/x.txt","diff":"@@ -1,1 +1,1 @@\n-a\n+b"}]"#;
+        let patch = patch_from_changes(&changes_of(spaced).expect("a path with a space").changes);
+        assert!(patch.starts_with("diff --git \"a/a b/x.txt\" \"b/a b/x.txt\"\n"));
+        assert_eq!(crate::diff::Diff::parse(patch).files().len(), 1);
+
+        // A file made executable changes no lines, so its two modes are the
+        // whole change and have to survive.
+        let chmod = r#"[{"old_path":"run.sh","new_path":"run.sh","a_mode":"100644","b_mode":"100755","diff":""}]"#;
+        let patch = patch_from_changes(&changes_of(chmod).expect("a chmod").changes);
+        assert_eq!(
+            patch,
+            "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n--- a/run.sh\n+++ b/run.sh\n"
+        );
+        // A rename that also changes the mode says both.
+        let both = r#"[{"old_path":"was.sh","new_path":"is.sh","a_mode":"100644","b_mode":"100755","renamed_file":true,"diff":""}]"#;
+        let patch = patch_from_changes(&changes_of(both).expect("a rename and a chmod").changes);
+        assert!(
+            patch.contains(
+                "old mode 100644\nnew mode 100755\nrename from was.sh\nrename to is.sh\n"
+            )
+        );
+
+        // A page GitLab cuts short is refused rather than shown as whole: a
+        // review that is missing files looks exactly like one that isn't.
+        let capped = r#"{"changes":[],"overflow":true,"changes_count":"1000+"}"#;
+        let changed = changes_of(capped).expect("an overflowed merge request");
+        assert_eq!(
+            changed.cut.as_deref(),
+            Some("it sent 0 of at least 1000+ files")
+        );
+        let timed_out = r#"{"diffs":[],"compare_timeout":true}"#;
+        assert_eq!(
+            changes_of(timed_out)
+                .expect("a comparison that timed out")
+                .cut
+                .as_deref(),
+            Some("it stopped after 0, with more it didn't reach")
+        );
+        let whole = r#"{"changes":[],"overflow":false,"changes_count":"3"}"#;
+        assert!(changes_of(whole).expect("a whole page").cut.is_none());
+        match patch_from_json(
+            capped,
+            "https://gitlab.com/a/b/-/merge_requests/1/changes",
+            true,
+        ) {
+            Err(GithubFailed::Partial { detail, advice, .. }) => {
+                assert_eq!(detail, "it sent 0 of at least 1000+ files");
+                // `glab` has no commit or comparison command, so only a merge
+                // request is pointed at it.
+                assert!(advice.contains("glab"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        match patch_from_json(timed_out, "https://gitlab.com/a/b/-/compare/x...y", false) {
+            Err(GithubFailed::Partial { advice, .. }) => {
+                assert!(!advice.contains("glab"), "advice named glab: {advice}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // An error page is not a list of changes, however it arrived.
+        assert!(changes_of("<html>Not Found</html>").is_none());
+        assert!(changes_of(r#"{"message":"404 Ref Not Found"}"#).is_none());
     }
 
     #[test]
