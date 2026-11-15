@@ -29,7 +29,7 @@ use crate::agent::{self, Agent, AgentFailed};
 use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
 use crate::art;
 use crate::article;
-use crate::doc::{Doc, ImageRef};
+use crate::doc::{Doc, ImageRef, WATCH_TICK, Watch};
 use crate::edge;
 use crate::find::Query;
 use crate::highlight::{self, Highlight};
@@ -63,8 +63,6 @@ const KEPT_PAGES: usize = 4;
 const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
-/// How often a watched file is checked; a change shows once it holds for one check.
-const WATCH_TICK: Duration = Duration::from_millis(250);
 /// How often the word read aloud is checked: fast enough that the mark
 /// keeps up with the voice at 4×.
 const NARRATION_TICK: Duration = Duration::from_millis(15);
@@ -297,7 +295,7 @@ pub struct ViewerOptions {
     pub image_mode: ImageMode,
     pub highlights: Vec<Highlight>,
     /// Hears each page the reader settles on (1-based).
-    pub on_page: Box<dyn FnMut(usize)>,
+    pub on_page: Box<dyn FnMut(Progress)>,
     /// For documents without pages, where reading resumes: a place in the page text.
     pub start_anchor: Option<usize>,
     /// Hears the place in a document without pages as each percent goes by, and on quitting.
@@ -323,9 +321,7 @@ pub struct ViewerOptions {
     pub speech: Backend,
     /// Path or URL this document was opened from, when leaf knows it.
     pub source: Option<String>,
-    /// A markdown file to read again whenever it changes, with its stamp from
-    /// before it was first read.
-    pub watch: Option<(std::path::PathBuf, Option<Stamp>)>,
+    pub watch: Option<Watch>,
 }
 
 impl Default for ViewerOptions {
@@ -354,29 +350,13 @@ impl Default for ViewerOptions {
     }
 }
 
-struct Watch {
-    path: std::path::PathBuf,
-    loaded: Option<Stamp>,
-    seen: Option<Stamp>,
-    checked: Instant,
-}
-
-/// A file's modification time and size. The size catches edits that land
-/// within one tick of a coarse clock, such as FAT's two seconds.
-pub type Stamp = (std::time::SystemTime, u64);
-
-pub fn stamp(path: &std::path::Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
-}
-
 pub struct App {
     doc: Doc,
     options: ViewerOptions,
     picker: Picker,
     /// Column width pages are laid out at.
     width: u16,
-    laid: HashMap<usize, Rc<Laid>>,
+    laid: HashMap<usize, (Rc<Laid>, bool)>,
     mode: Mode,
     /// The page being read: in paged mode the one shown, when scrolling the one at the top.
     current: usize,
@@ -428,7 +408,7 @@ pub struct App {
     /// The text column on screen, and what each of its rows shows, as last drawn.
     column: Rect,
     screen: Vec<Option<ScreenRow>>,
-    reported: Option<usize>,
+    reported: Option<Progress>,
     /// A place in a page-less document to scroll to at the next draw, once its layout is known.
     anchor: Option<usize>,
     reported_scroll: Option<Scroll>,
@@ -504,12 +484,7 @@ impl App {
                 stroke: stroke.clone(),
             })
             .collect();
-        let watch = options.watch.take().map(|(path, loaded)| Watch {
-            path,
-            loaded,
-            seen: loaded,
-            checked: Instant::now(),
-        });
+        let watch = options.watch.take();
         let narrator = Narrator::new(
             options.voice.clone(),
             options.speed,
@@ -568,29 +543,26 @@ impl App {
 
     /// Reads the watched file again once a change to it has settled.
     fn reload(&mut self) -> bool {
-        let Some(watch) = &mut self.watch else {
-            return false;
-        };
-        if watch.checked.elapsed() < WATCH_TICK {
-            return false;
-        }
-        watch.checked = Instant::now();
-        let now = stamp(&watch.path);
-        let settled = now == watch.seen;
-        watch.seen = now;
-        if !settled || now.is_none() || now == watch.loaded {
+        if self.selection.is_some()
+            || !matches!(self.dialog, Dialog::None)
+            || !matches!(self.drag, Drag::Idle)
+        {
             return false;
         }
-        let Ok(doc) = crate::markdown::open(&watch.path) else {
+        let Some(doc) = self
+            .watch
+            .as_mut()
+            .and_then(|watch| watch.document(crate::load_file))
+        else {
             return false;
         };
-        watch.loaded = now;
         if self.narrator.active() {
             self.narrator.stop();
             self.notice = Some("the file changed, so reading aloud stopped".into());
         }
         self.hold_anchor();
         self.doc = doc;
+        self.current = self.current.min(self.last());
         self.laid.clear();
         self.retain_protocols(|_| false);
         self.pixels.clear();
@@ -618,7 +590,7 @@ impl App {
     }
 
     fn laid(&mut self, page: usize) -> Rc<Laid> {
-        if let Some(laid) = self.laid.get(&page) {
+        if let Some((laid, _)) = self.laid.get(&page) {
             return laid.clone();
         }
         let markdown = self.doc.source.page(page);
@@ -630,7 +602,7 @@ impl App {
             (font.width, font.height),
             &sizes,
         ));
-        self.laid.insert(page, laid.clone());
+        self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
     }
 
@@ -650,7 +622,8 @@ impl App {
     }
 
     fn blank(&mut self, page: usize) -> bool {
-        self.doc.source.page(page).is_empty()
+        self.laid(page);
+        self.laid[&page].1
     }
 
     fn view(&self) -> usize {
@@ -882,13 +855,13 @@ impl App {
     }
 
     fn report_page(&mut self) {
-        if self.doc.page_count.is_none() {
+        let Some(count) = self.doc.page_count else {
             return self.report_scroll(false);
-        }
-        let page = self.reading() + 1;
-        if self.reported != Some(page) {
-            self.reported = Some(page);
-            (self.options.on_page)(page);
+        };
+        let progress = Progress::of(self.reading() + 1, count);
+        if self.reported != Some(progress) {
+            self.reported = Some(progress);
+            (self.options.on_page)(progress);
         }
     }
 
@@ -3552,6 +3525,116 @@ mod tests {
     }
 
     #[test]
+    fn a_live_picture_uses_its_own_loader() {
+        let path =
+            std::env::temp_dir().join(format!("leaf-picture-live-{}.png", std::process::id()));
+        RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let options = ViewerOptions {
+            watch: Some(Watch::new(path.clone())),
+            ..ViewerOptions::default()
+        };
+        let mut screen = Screen::new(
+            crate::load(path.to_str().unwrap()).unwrap(),
+            80,
+            20,
+            options,
+        );
+        assert_eq!(screen.app.doc.source.image_size("0"), Some((2, 2)));
+        RgbaImage::from_pixel(8, 4, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        std::thread::sleep(WATCH_TICK);
+        assert!(!screen.app.reload());
+        std::thread::sleep(WATCH_TICK);
+        assert!(screen.app.reload());
+        assert_eq!(screen.app.doc.source.image_size("0"), Some((8, 4)));
+        screen.draw();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn review_fix_cached_frames_do_not_reread_page_text() {
+        struct Counted {
+            text: Rc<str>,
+            reads: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::doc::Source for Counted {
+            fn page(&self, _: usize) -> Rc<str> {
+                self.reads.set(self.reads.get() + 1);
+                self.text.clone()
+            }
+
+            fn image_size(&self, _: &str) -> Option<(u32, u32)> {
+                None
+            }
+
+            fn decode(&self, _: &str, _: u32) -> Option<RgbaImage> {
+                None
+            }
+        }
+
+        for text in ["", "A cached page\n\nAnother paragraph."] {
+            let reads = Rc::new(std::cell::Cell::new(0));
+            let doc = Doc {
+                title: "Counted book".into(),
+                page_count: Some(1),
+                source: Box::new(Counted {
+                    text: text.into(),
+                    reads: reads.clone(),
+                }),
+            };
+            let mut screen = Screen::new(doc, 120, 30, ViewerOptions::default());
+            let frame = screen.draw();
+            assert!(frame.contains(if text.is_empty() {
+                "blank page"
+            } else {
+                "A cached page"
+            }));
+            assert_eq!(reads.get(), 1, "cached frames reread the source page");
+            screen.draw();
+            assert_eq!(reads.get(), 1);
+            screen.app.laid.clear();
+            screen.draw();
+            assert_eq!(reads.get(), 2, "invalidated layout must reread once");
+        }
+    }
+
+    #[test]
+    fn review_fix_progress_reports_changed_page_count_without_navigation() {
+        let pages = Rc::new(RefCell::new(Vec::new()));
+        let heard = pages.clone();
+        let options = ViewerOptions {
+            on_page: Box::new(move |page| heard.borrow_mut().push(page)),
+            ..ViewerOptions::default()
+        };
+        let mut screen = Screen::new(book(&["Alpha"]), 120, 30, options);
+        assert_eq!(pages.borrow().len(), 1);
+        screen.app.doc = book(&["Alpha", "Bravo"]);
+        screen.app.laid.clear();
+        screen.draw();
+        assert_eq!(
+            pages.borrow().len(),
+            2,
+            "replacement count was not reported"
+        );
+        assert_eq!(
+            *pages.borrow(),
+            vec![Progress::of(1, 1), Progress::of(1, 2)]
+        );
+        screen.press(KeyCode::Right);
+        assert_eq!(pages.borrow().last(), Some(&Progress::of(2, 2)));
+        screen.draw();
+        assert_eq!(
+            pages.borrow().len(),
+            3,
+            "unchanged progress was reported twice"
+        );
+    }
+
+    #[test]
     fn a_figure_that_cant_be_decoded_is_tried_once_while_on_screen() {
         let tries = Rc::new(std::cell::Cell::new(0));
         let doc = Doc {
@@ -3618,7 +3701,10 @@ mod tests {
         let mut s = Screen::new(book(&["Alpha", "Bravo", "Charlie"]), 120, 30, options);
         assert!(s.draw().contains("Bravo"));
         s.press(KeyCode::Char('l'));
-        assert_eq!(*pages.borrow(), vec![2, 3]);
+        assert_eq!(
+            *pages.borrow(),
+            vec![Progress::of(2, 3), Progress::of(3, 3)]
+        );
     }
 
     #[test]

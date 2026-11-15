@@ -65,7 +65,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use doc::Doc;
-use progress::{Progress, Store};
+use progress::Store;
 use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
@@ -117,27 +117,29 @@ fn load(target: &str) -> Result<Doc, String> {
     if is_url(target) {
         return article::open(target).map_err(|e| e.to_string());
     }
-    let lower = target.to_ascii_lowercase();
-    if lower.ends_with(".epub") {
-        // mupdf lays out the whole book to count its pages, which takes seconds for a long one.
-        let terminal = std::io::stderr().is_terminal();
-        if terminal {
-            eprint!("Laying out {target}…");
-        }
-        let doc = pdf::open(Path::new(target)).map_err(|e| e.to_string());
-        if terminal {
-            eprint!("\r\x1b[K");
-        }
-        return doc;
+    let progress =
+        target.to_ascii_lowercase().ends_with(".epub") && std::io::stderr().is_terminal();
+    if progress {
+        eprint!("Laying out {target}…");
     }
-    if lower.ends_with(".pdf") {
-        return pdf::open(Path::new(target)).map_err(|e| e.to_string());
+    let doc = load_file(Path::new(target));
+    if progress {
+        eprint!("\r\x1b[K");
+    }
+    doc
+}
+
+fn load_file(path: &Path) -> Result<Doc, String> {
+    let target = path.to_string_lossy();
+    let lower = target.to_ascii_lowercase();
+    if lower.ends_with(".pdf") || lower.ends_with(".epub") {
+        return pdf::open(path).map_err(|e| e.to_string());
     }
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
-        return markdown::open(Path::new(target)).map_err(|e| e.to_string());
+        return markdown::open(path).map_err(|e| e.to_string());
     }
-    if picture::is_picture(Path::new(target)) {
-        return picture::open(Path::new(target)).map_err(|e| e.to_string());
+    if picture::is_picture(path) {
+        return picture::open(path).map_err(|e| e.to_string());
     }
     Err(format!(
         "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
@@ -249,9 +251,8 @@ fn resume(
         Box::new(move |bookmarks| record(store.borrow_mut().save_bookmarks(&key, bookmarks)))
     };
     match page_count {
-        Some(count) => {
-            options.on_page =
-                Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count))))
+        Some(_) => {
+            options.on_page = Box::new(move |progress| record(store.borrow().save(&key, progress)))
         }
         None => {
             options.on_scroll =
@@ -548,7 +549,7 @@ fn agents_command() -> ExitCode {
 
 fn open(target: &str) -> ExitCode {
     std::thread::spawn(syntax::warm);
-    let stamp = viewer::stamp(Path::new(target));
+    let watch = (!is_url(target)).then(|| doc::Watch::new(PathBuf::from(target)));
     let doc = match load(target) {
         Ok(doc) => doc,
         Err(message) => {
@@ -558,10 +559,7 @@ fn open(target: &str) -> ExitCode {
     };
     let failure = Rc::new(RefCell::new(None));
     let mut options = resume(target, doc.page_count, &failure);
-    let lower = target.to_ascii_lowercase();
-    if !is_url(target) && (lower.ends_with(".md") || lower.ends_with(".markdown")) {
-        options.watch = Some((PathBuf::from(target), stamp));
-    }
+    options.watch = watch;
     let result = viewer::run(doc, options);
     if let Some(message) = failure.borrow().as_ref() {
         eprintln!("leaf: {message}");

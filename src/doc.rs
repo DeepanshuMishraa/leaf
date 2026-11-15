@@ -1,12 +1,118 @@
 //! A readable document: markdown pages plus the images they reference.
 
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 use image::RgbaImage;
 
 use crate::mono::Rgb;
 
 const IMAGE_SCHEME: &str = "leaf-image:";
+pub const WATCH_TICK: Duration = Duration::from_millis(250);
+const RETRY: Duration = Duration::from_secs(5);
+
+type Stamp = (SystemTime, u64);
+
+pub struct Watch {
+    path: PathBuf,
+    loaded: Option<Stamp>,
+    seen: Option<Stamp>,
+    checked: Instant,
+    failed: Option<(Stamp, Instant)>,
+    pending: Option<(Stamp, crate::pdf::Loading)>,
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+impl Watch {
+    pub fn new(path: PathBuf) -> Self {
+        let loaded = stamp(&path);
+        Self {
+            path,
+            loaded,
+            seen: loaded,
+            checked: Instant::now(),
+            failed: None,
+            pending: None,
+        }
+    }
+
+    fn changed(&mut self) -> Option<Stamp> {
+        if self.checked.elapsed() < WATCH_TICK {
+            return None;
+        }
+        self.checked = Instant::now();
+        let now = stamp(&self.path);
+        let settled = now == self.seen;
+        self.seen = now;
+        if !settled || now.is_none() || now == self.loaded {
+            return None;
+        }
+        if self
+            .failed
+            .is_some_and(|(at, failed)| Some(at) == now && failed.elapsed() < RETRY)
+        {
+            return None;
+        }
+        now
+    }
+
+    pub fn read<T, E>(&mut self, load: impl FnOnce(&Path) -> Result<T, E>) -> Option<T> {
+        let at = self.changed()?;
+        let value = match load(&self.path) {
+            Ok(value) => value,
+            Err(_) => {
+                self.failed = Some((at, Instant::now()));
+                return None;
+            }
+        };
+        if stamp(&self.path) != Some(at) {
+            return None;
+        }
+        self.loaded = Some(at);
+        self.failed = None;
+        Some(value)
+    }
+
+    pub fn document(&mut self, load: fn(&Path) -> Result<Doc, String>) -> Option<Doc> {
+        let paged = self
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("epub")
+            });
+        if !paged {
+            return self.read(load);
+        }
+        if let Some((at, loading)) = &self.pending {
+            let result = loading.poll()?;
+            let at = *at;
+            self.pending = None;
+            if stamp(&self.path) != Some(at) {
+                return None;
+            }
+            return match result {
+                Ok(doc) => {
+                    self.loaded = Some(at);
+                    self.failed = None;
+                    Some(doc)
+                }
+                Err(_) => {
+                    self.failed = Some((at, Instant::now()));
+                    None
+                }
+            };
+        }
+        let at = self.changed()?;
+        self.pending = Some((at, crate::pdf::Loading::open(self.path.clone())));
+        None
+    }
+}
 
 /// Where a markdown image href points.
 pub enum ImageRef<'a> {
@@ -83,5 +189,165 @@ impl Source for Whole {
     }
     fn decode(&self, _id: &str, _width: u32) -> Option<RgbaImage> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watched_files_settle_and_failed_reads_retry() {
+        let path = std::env::temp_dir().join(format!("leaf-watch-{}", std::process::id()));
+        std::fs::write(&path, "old").unwrap();
+        let mut watch = Watch::new(path.clone());
+        std::fs::write(&path, "new text").unwrap();
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|_| Err::<String, _>("busy")).is_none());
+        watch.failed.as_mut().unwrap().1 -= RETRY;
+        watch.checked -= WATCH_TICK;
+        assert_eq!(
+            watch.read(|path| std::fs::read_to_string(path)).as_deref(),
+            Some("new text")
+        );
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        std::fs::remove_file(&path).unwrap();
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        std::fs::write(&path, "recreated").unwrap();
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        watch.checked -= WATCH_TICK;
+        assert_eq!(
+            watch.read(|path| std::fs::read_to_string(path)).as_deref(),
+            Some("recreated")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_reloads_do_not_parse_every_tick() {
+        let path = std::env::temp_dir().join(format!("leaf-watch-failure-{}", std::process::id()));
+        std::fs::write(&path, "old").unwrap();
+        let mut watch = Watch::new(path.clone());
+        std::fs::write(&path, "broken file").unwrap();
+        let mut attempts = 0;
+        for _ in 0..4 {
+            watch.checked -= WATCH_TICK;
+            watch.read(|_| {
+                attempts += 1;
+                Err::<(), _>(())
+            });
+        }
+        assert_eq!(attempts, 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn finish_document(watch: &mut Watch) -> Option<Doc> {
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut result = None;
+        while watch.pending.is_some() && Instant::now() < until {
+            result = watch.document(crate::load_file).or(result);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            watch.pending.is_none(),
+            "the document loader did not finish"
+        );
+        result
+    }
+
+    #[test]
+    fn paged_reloads_commit_only_successful_current_versions() {
+        let path =
+            std::env::temp_dir().join(format!("leaf-watch-paged-{}.epub", std::process::id()));
+        let sample = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sample.epub"));
+        std::fs::copy(sample, &path).unwrap();
+        let mut watch = Watch::new(path.clone());
+        let original = watch.loaded;
+        std::fs::write(&path, "broken epub").unwrap();
+        for _ in 0..2 {
+            watch.checked -= WATCH_TICK;
+            assert!(watch.document(crate::load_file).is_none());
+        }
+        assert!(watch.pending.is_some());
+        assert_eq!(watch.loaded, original);
+        assert!(finish_document(&mut watch).is_none());
+        assert_eq!(watch.loaded, original);
+        assert!(watch.failed.is_some());
+        watch.checked -= WATCH_TICK;
+        assert!(watch.document(crate::load_file).is_none());
+        assert!(
+            watch.pending.is_none(),
+            "failed versions wait before retrying"
+        );
+
+        std::fs::copy(sample, &path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(42))
+            .unwrap();
+        for _ in 0..2 {
+            watch.checked -= WATCH_TICK;
+            assert!(watch.document(crate::load_file).is_none());
+        }
+        let doc = finish_document(&mut watch).expect("the replacement opens");
+        assert_eq!(doc.title, "Test Book");
+        assert!(doc.source.page(0).contains("Chapter One"));
+        assert_eq!(watch.loaded, stamp(&path));
+        assert!(watch.failed.is_none());
+        drop(doc);
+
+        let accepted = watch.loaded;
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(43))
+            .unwrap();
+        for _ in 0..2 {
+            watch.checked -= WATCH_TICK;
+            assert!(watch.document(crate::load_file).is_none());
+        }
+        assert!(watch.pending.is_some());
+        let newer = path.with_extension("new.epub");
+        std::fs::write(&newer, "newer version").unwrap();
+        std::fs::rename(&newer, &path).unwrap();
+        assert!(
+            finish_document(&mut watch).is_none(),
+            "obsolete results stay hidden"
+        );
+        assert_eq!(watch.loaded, accepted);
+        assert!(
+            watch.failed.is_none(),
+            "obsolete failures do not delay newer files"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_during_loading_is_not_acknowledged() {
+        let path = std::env::temp_dir().join(format!("leaf-watch-race-{}", std::process::id()));
+        std::fs::write(&path, "old").unwrap();
+        let mut watch = Watch::new(path.clone());
+        std::fs::write(&path, "first edit").unwrap();
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        watch.checked -= WATCH_TICK;
+        assert!(
+            watch
+                .read(|path| {
+                    std::fs::write(path, "another longer edit")?;
+                    Ok::<_, std::io::Error>("first edit")
+                })
+                .is_none()
+        );
+        watch.checked -= WATCH_TICK;
+        assert!(watch.read(|path| std::fs::read_to_string(path)).is_none());
+        watch.checked -= WATCH_TICK;
+        assert_eq!(
+            watch.read(|path| std::fs::read_to_string(path)).as_deref(),
+            Some("another longer edit")
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

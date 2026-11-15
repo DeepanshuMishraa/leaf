@@ -2,7 +2,6 @@
 //! block or on the whole plan, and a verdict that sends them all at once.
 
 use std::io;
-use std::time::Duration;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -17,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Frame_, BorderType, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::doc::{WATCH_TICK, Watch};
 use crate::hue::Hue;
 use crate::planblocks::{self, Block};
 use crate::render::{self, DIM, Laid};
@@ -39,6 +39,7 @@ pub struct Plan {
     /// Shown in the header and the review: the plan's path, usually.
     pub subject: String,
     pub source: String,
+    pub watch: Option<Watch>,
     /// The plan's round, from the second submission on.
     pub round: Option<u32>,
     /// The plan as the round before submitted it, to show what changed.
@@ -140,6 +141,8 @@ fn no_images(_: &str) -> Option<(u32, u32)> {
 
 struct App {
     subject: String,
+    source: String,
+    pending: Option<(String, Vec<Block>)>,
     round: Option<u32>,
     blocks: Vec<Block>,
     /// The blocks the round before had, when there was one: a block whose
@@ -174,6 +177,7 @@ struct App {
     /// The text column's left edge, as last drawn, for clicks.
     text_x: u16,
     save: SaveDraft,
+    watch: Option<Watch>,
 }
 
 impl App {
@@ -186,6 +190,8 @@ impl App {
         };
         let mut app = App {
             subject: plan.subject,
+            source: plan.source,
+            pending: None,
             round: plan.round,
             before: None,
             dropped_blocks: 0,
@@ -208,6 +214,7 @@ impl App {
             drag: None,
             text_x: 0,
             save: plan.save,
+            watch: plan.watch,
         };
         if let Some(previous) = plan.previous.as_deref() {
             let mut before: std::collections::HashMap<String, usize> =
@@ -314,6 +321,92 @@ impl App {
         if dropped > 0 {
             self.persist();
         }
+    }
+
+    fn reload(&mut self) {
+        if self.outcome.is_some()
+            || self.composer.is_some()
+            || self.dialog != Dialog::None
+            || self.selection.is_some()
+            || self.visual.is_some()
+            || self.drag.is_some()
+        {
+            return;
+        }
+        let source = self
+            .watch
+            .as_mut()
+            .and_then(|watch| watch.read(crate::margin::read_plan));
+        let changed = source.is_some();
+        if let Some(source) = source {
+            let blocks = planblocks::blocks(&source);
+            self.pending = Some((source, blocks));
+        }
+        let Some((source, blocks)) = self.pending.take() else {
+            return;
+        };
+        if blocks == self.blocks {
+            self.source = source;
+            return;
+        }
+        let blocked = self.notes.iter().any(|note| {
+            self.blocks.get(block_of(&note.target)).is_none_or(|old| {
+                self.blocks
+                    .iter()
+                    .filter(|block| block.text == old.text)
+                    .count()
+                    != 1
+                    || blocks.iter().filter(|block| block.text == old.text).count() != 1
+            })
+        });
+        if blocked {
+            self.pending = Some((source, blocks));
+            if changed {
+                self.toast = Some(
+                    "Plan changed; send or clear notes on rewritten or ambiguous blocks to refresh"
+                        .into(),
+                );
+            }
+            return;
+        }
+        self.source = source;
+        let draft = self.draft_json();
+        if let Focus::Block(at) = self.focus {
+            self.focus = if blocks.is_empty() {
+                Focus::Global
+            } else {
+                Focus::Block(
+                    self.blocks
+                        .get(at)
+                        .and_then(|old| blocks.iter().position(|block| block.text == old.text))
+                        .unwrap_or(at.min(blocks.len() - 1)),
+                )
+            };
+        }
+        self.blocks = blocks;
+        self.notes.clear();
+        self.global = None;
+        if let Some(draft) = draft {
+            let toast = self.toast.take();
+            self.restore(&draft);
+            self.toast = toast;
+            self.persist();
+        }
+        self.dropped_blocks = self.before.as_ref().map_or(0, |before| {
+            before
+                .iter()
+                .map(|(text, count)| {
+                    count.saturating_sub(
+                        self.blocks
+                            .iter()
+                            .filter(|block| &block.text == text)
+                            .count(),
+                    )
+                })
+                .sum()
+        });
+        self.laid.clear();
+        self.lay_out(self.laid_width);
     }
 
     fn persist(&mut self) {
@@ -1818,7 +1911,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 }
 
 /// Opens the plan for review and says how it was left.
-pub fn run(plan: Plan) -> io::Result<Outcome> {
+pub fn run(plan: Plan) -> io::Result<(Outcome, String)> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -1840,16 +1933,17 @@ pub fn run(plan: Plan) -> io::Result<Outcome> {
         crossterm::event::DisableBracketedPaste
     );
     ratatui::restore();
-    result.map(|()| app.outcome.unwrap_or(Outcome::Closed))
+    result.map(|()| (app.outcome.unwrap_or(Outcome::Closed), app.source))
 }
 
 fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
     loop {
+        app.reload();
         terminal.draw(|f| app.draw(f))?;
         if app.outcome.is_some() {
             return Ok(());
         }
-        if !event::poll(Duration::from_millis(500))? {
+        if !event::poll(WATCH_TICK)? {
             continue;
         }
         match event::read()? {
@@ -1889,6 +1983,7 @@ create table tokens (id int);
         App::new(Plan {
             subject: "plan.md".into(),
             source: PLAN.into(),
+            watch: None,
             round: None,
             previous: None,
             draft: None,
@@ -1903,6 +1998,7 @@ create table tokens (id int);
         let app = App::new(Plan {
             subject: "plan.md".into(),
             source: source.into(),
+            watch: None,
             round: None,
             previous: None,
             draft,
@@ -2087,6 +2183,7 @@ create table tokens (id int);
             App::new(Plan {
                 subject: "plan.md".into(),
                 source: source.into(),
+                watch: None,
                 round: Some(2),
                 previous: Some(previous.into()),
                 draft: None,
@@ -2381,6 +2478,7 @@ create table tokens (id int);
         let mut app = App::new(Plan {
             subject: "plan.md".into(),
             source: PLAN.into(),
+            watch: None,
             round: Some(2),
             previous: Some(previous),
             draft: None,
@@ -2416,6 +2514,203 @@ create table tokens (id int);
                 .as_deref()
                 .is_some_and(|t| t.contains("first round"))
         );
+    }
+
+    #[test]
+    fn a_live_plan_preserves_notes_and_waits_for_the_composer() {
+        let path = std::env::temp_dir().join(format!("leaf-plan-live-{}.md", std::process::id()));
+        std::fs::write(&path, PLAN).unwrap();
+        let mut app = app();
+        app.watch = Some(Watch::new(path.clone()));
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('B'));
+        type_text(&mut app, "Keep this schema");
+        press(&mut app, KeyCode::Enter);
+        let noted = app.blocks[2].text.clone();
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "Still writing");
+        std::fs::write(&path, format!("# Before\n\nNew section.\n\n{PLAN}")).unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert_eq!(app.blocks.len(), 3);
+        assert_eq!(app.composer.as_ref().unwrap().text, "Still writing");
+        press(&mut app, KeyCode::Enter);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert_eq!(app.blocks.len(), 4);
+        assert_eq!(app.focus, Focus::Block(3));
+        assert_eq!(app.global.as_deref(), Some("Still writing"));
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.blocks[block_of(&app.notes[0].target)].text, noted);
+        assert!(
+            matches!(&app.notes[0].edit, PlanEdit::Comment(text) if text == "Keep this schema")
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "# Before\n\nNew section.\n\n{}",
+                PLAN.replace("tokens", "accounts")
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert_eq!(
+            app.notes.len(),
+            1,
+            "rewritten blocks cannot discard saved notes"
+        );
+        assert_eq!(
+            app.blocks[3].text, noted,
+            "keep the reviewed snapshot until its notes are resolved"
+        );
+        press(&mut app, KeyCode::Char('X'));
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert!(app.blocks[3].text.contains("accounts"));
+        std::fs::write(&path, "").unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert_eq!(app.blocks.len(), 4);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn review_fix_live_reorder_persists_moved_note_through_blocked_update() {
+        let source = "# A\n\nAlpha.\n\n# B\n\nBeta.\n";
+        let reordered = "# B\n\nBeta.\n\n# A\n\nAlpha.\n";
+        let ambiguous = "# A\n\nAlpha.\n\n# A\n\nAlpha.\n";
+        let path = std::env::temp_dir().join(format!(
+            "leaf-plan-review-fix-draft-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, source).unwrap();
+        let (mut app, saved) = saving(source, None);
+        app.watch = Some(Watch::new(path.clone()));
+        press(&mut app, KeyCode::Char('B'));
+        type_text(&mut app, "Only this A");
+        press(&mut app, KeyCode::Enter);
+        std::fs::write(&path, reordered).unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert_eq!(app.source, reordered);
+        assert_eq!(block_of(&app.notes[0].target), 1);
+        let refreshed: serde_json::Value =
+            serde_json::from_str(saved.borrow().as_deref().unwrap()).unwrap();
+        std::fs::write(&path, ambiguous).unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert!(app.pending.is_some());
+        assert_eq!(app.source, reordered);
+        assert_eq!(block_of(&app.notes[0].target), 1);
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.outcome, Some(Outcome::Closed));
+        let (reopened, _) = saving(ambiguous, saved.borrow().clone());
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(reopened.notes.len(), 1);
+        assert_eq!(
+            reopened.notes[0].edit,
+            PlanEdit::Comment("Only this A".into())
+        );
+        assert_eq!(
+            (
+                refreshed["notes"][0]["index"].as_u64(),
+                block_of(&reopened.notes[0].target)
+            ),
+            (Some(1), 1),
+            "the refreshed draft and reopened note must retain the moved A's index"
+        );
+    }
+
+    #[test]
+    fn review_fix_live_restore_preserves_existing_toast() {
+        let path = std::env::temp_dir().join(format!(
+            "leaf-plan-review-fix-toast-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, PLAN).unwrap();
+        let (mut app, _) = saving(PLAN, None);
+        app.watch = Some(Watch::new(path.clone()));
+        press(&mut app, KeyCode::Char('B'));
+        type_text(&mut app, "Keep this note");
+        press(&mut app, KeyCode::Enter);
+        let toast = app.toast.clone();
+        assert!(toast.is_some());
+        std::fs::write(&path, format!("# Before\n\nNew section.\n\n{PLAN}")).unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(app.blocks.len(), 4);
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(block_of(&app.notes[0].target), 1);
+        assert_eq!(
+            app.notes[0].edit,
+            PlanEdit::Comment("Keep this note".into())
+        );
+        assert_eq!(app.toast, toast);
+    }
+
+    #[test]
+    fn review_fix_live_restore_does_not_create_startup_toast() {
+        let path = std::env::temp_dir().join(format!(
+            "leaf-plan-review-fix-no-toast-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, PLAN).unwrap();
+        let (mut app, _) = saving(PLAN, None);
+        app.watch = Some(Watch::new(path.clone()));
+        press(&mut app, KeyCode::Char('B'));
+        type_text(&mut app, "Keep this note");
+        press(&mut app, KeyCode::Enter);
+        app.toast = None;
+        std::fs::write(&path, format!("# Before\n\nNew section.\n\n{PLAN}")).unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(app.blocks.len(), 4);
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(block_of(&app.notes[0].target), 1);
+        assert_eq!(
+            app.notes[0].edit,
+            PlanEdit::Comment("Keep this note".into())
+        );
+        assert_eq!(app.toast, None);
+    }
+
+    #[test]
+    fn a_rewritten_duplicate_cannot_take_another_blocks_notes() {
+        let source = "# Plan\n\nIntro.\n\n## Same\n\nDo it.\n\n## Same\n\nDo it.\n";
+        let path =
+            std::env::temp_dir().join(format!("leaf-plan-duplicate-{}.md", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let (mut app, _) = saving(source, None);
+        app.watch = Some(Watch::new(path.clone()));
+        app.focus = Focus::Block(1);
+        press(&mut app, KeyCode::Char('B'));
+        type_text(&mut app, "Only this occurrence");
+        press(&mut app, KeyCode::Enter);
+        std::fs::write(&path, source.replacen("Do it.", "Changed.", 1)).unwrap();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        std::thread::sleep(WATCH_TICK);
+        app.reload();
+        assert!(app.blocks[1].text.contains("Do it."));
+        assert_eq!(block_of(&app.notes[0].target), 1);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

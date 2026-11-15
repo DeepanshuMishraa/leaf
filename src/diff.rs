@@ -126,6 +126,10 @@ impl Diff {
         }
     }
 
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.patch == other.patch
+    }
+
     pub fn rows(&self) -> &[Row] {
         &self.rows
     }
@@ -1164,6 +1168,14 @@ pub struct Request {
 }
 
 impl Request {
+    pub fn refresh_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if matches!(self.origin, Origin::Github { .. }) {
+            10
+        } else {
+            1
+        })
+    }
+
     pub fn label(&self) -> String {
         self.origin.label()
     }

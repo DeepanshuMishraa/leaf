@@ -10,7 +10,7 @@
 //! comments, reviews); Comments holds the comments and reviews alone, to pick
 //! and reply to; Code hands the diff, fetched once per head commit, to the
 //! reviewer; Checks lists every check by workflow, shows a failed job's log,
-//! and runs failed jobs again. While checks run, the page reads itself again.
+//! and runs failed jobs again. Visible lists and pages refresh every ten seconds.
 //! An issue has the same Summary, Timeline and Comments tabs. Text drags to
 //! select and is copied when let go. It can be merged, closed, reopened,
 //! marked ready, approved and commented on.
@@ -73,8 +73,8 @@ const SETTLE: Duration = Duration::from_millis(150);
 const REPLY_HINT: &str = "enter replies";
 /// The list's note while an `R` is still being answered.
 const RELOADING: &str = "Already reloading";
-/// How often a pull request with running checks is read again.
-const POLL: Duration = Duration::from_secs(20);
+/// How often the visible list or detail is read again.
+const POLL: Duration = Duration::from_secs(10);
 /// How often a running job's steps are read again while they're shown.
 const JOB_POLL: Duration = Duration::from_secs(5);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -216,6 +216,7 @@ struct Slot {
     status: Status,
     entries: Option<Vec<Entry>>,
     fetch: Fetch,
+    background: bool,
 }
 
 /// What a click in the list's tab row asks for.
@@ -252,6 +253,8 @@ struct List {
     /// Text dragged over in `shown`.
     selection: Option<Selection>,
     dragging: bool,
+    polled: Instant,
+    pending: Vec<(usize, Vec<Entry>)>,
 }
 
 impl List {
@@ -321,6 +324,80 @@ impl List {
     fn loading(&self) -> bool {
         self.slots_of(self.kind)
             .any(|s| matches!(s.fetch, Fetch::Loading))
+    }
+
+    fn reload(&mut self, shown_only: bool) -> Vec<(usize, Source, Status)> {
+        self.polled = Instant::now();
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, slot)| {
+                if shown_only {
+                    slot.status == self.status && slot.source.kind() == self.kind
+                } else {
+                    slot.status == self.status || !matches!(slot.fetch, Fetch::Idle)
+                }
+            })
+            .map(|(index, slot)| {
+                slot.fetch = Fetch::Loading;
+                slot.background = shown_only;
+                (index, slot.source.clone(), slot.status)
+            })
+            .collect()
+    }
+
+    fn poll(&mut self) -> Vec<(usize, Source, Status)> {
+        if self.dragging || self.selection.is_some() || !self.typed.is_empty() {
+            return Vec::new();
+        }
+        for (index, entries) in std::mem::take(&mut self.pending) {
+            self.replace_entries(index, entries);
+        }
+        if self.polled.elapsed() < POLL || self.loading() {
+            return Vec::new();
+        }
+        self.reload(true)
+    }
+
+    fn searched(&mut self, index: usize, result: Result<Vec<Entry>, String>) {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        match result {
+            Ok(entries) => {
+                slot.fetch = Fetch::Done;
+                self.pending.retain(|(at, _)| *at != index);
+                if self.dragging
+                    || self.selection.is_some()
+                    || (slot.background && !self.typed.is_empty())
+                {
+                    self.pending.push((index, entries));
+                } else {
+                    self.replace_entries(index, entries);
+                }
+            }
+            Err(error) => slot.fetch = Fetch::Failed(error),
+        }
+        if !self
+            .slots
+            .iter()
+            .any(|slot| matches!(slot.fetch, Fetch::Loading))
+            && self.note.as_deref() == Some(RELOADING)
+        {
+            self.note = None;
+        }
+    }
+
+    fn replace_entries(&mut self, index: usize, entries: Vec<Entry>) {
+        let picked = self.picked();
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.entries = Some(entries);
+        }
+        let entries = self.entries();
+        self.selected = picked
+            .and_then(|pr| entries.iter().position(|entry| entry.pr == pr))
+            .unwrap_or(self.selected)
+            .min(entries.len().saturating_sub(1));
     }
 
     fn failure(&self) -> Option<String> {
@@ -403,6 +480,7 @@ struct Page {
     pr: PrRef,
     kind: Kind,
     detail: Load<Detail>,
+    pending: Option<Detail>,
     tab: Tab,
     /// The timeline event picked to reply to, by its index.
     focus: Option<usize>,
@@ -453,7 +531,7 @@ struct Page {
     step_errors: HashMap<usize, usize>,
     /// When the shown job was last read.
     log_polled: Instant,
-    /// When the page last asked again for running checks.
+    /// When the page last asked again, including failed attempts.
     polled: Instant,
 }
 
@@ -463,6 +541,7 @@ impl Page {
             pr,
             kind,
             detail,
+            pending: None,
             tab: Tab::Summary,
             focus: None,
             starts: Vec::new(),
@@ -601,9 +680,46 @@ impl Page {
         };
     }
 
+    fn refreshable(&self) -> bool {
+        matches!(self.mode, Mode::Normal)
+            && self.selection.is_none()
+            && !self.dragging
+            && self.busy.is_none()
+    }
+
     /// Shows the pull request read again, and returns the job to read when
     /// the open log's check now runs as another job.
     fn refreshed(&mut self, detail: Detail) -> Option<u64> {
+        if matches!(self.detail, Load::Ready(_)) && !self.refreshable() {
+            self.pending = Some(detail);
+            return None;
+        }
+        self.pending = None;
+        let focus = match &self.detail {
+            Load::Ready(old) => self.focus.and_then(|at| {
+                let event = old.timeline.get(at)?;
+                (old.timeline
+                    .iter()
+                    .filter(|other| event.same_identity(other))
+                    .count()
+                    == 1)
+                    .then_some(event)
+            }),
+            _ => None,
+        };
+        let focus = focus.and_then(|event| {
+            let mut matches = detail
+                .timeline
+                .iter()
+                .enumerate()
+                .filter(|(_, next)| event.same_identity(next));
+            let (at, _) = matches.next()?;
+            matches.next().is_none().then_some(at)
+        });
+        if focus != self.focus {
+            self.reveal = focus.is_some();
+        }
+        self.focus = focus;
         // A refresh can reorder the checks; the picked one stays picked.
         let picked = self.picked_check().map(pr::Check::label);
         let found = picked.and_then(|label| {
@@ -809,6 +925,7 @@ impl App {
                     source: source.clone(),
                     status,
                     fetch: Fetch::Idle,
+                    background: false,
                 })
             })
             .collect();
@@ -828,6 +945,8 @@ impl App {
             shown_area: Rect::default(),
             selection: None,
             dragging: false,
+            polled: Instant::now(),
+            pending: Vec::new(),
         });
         self.ask_shown();
     }
@@ -882,17 +1001,7 @@ impl App {
             list.note = Some(RELOADING.to_owned());
             return;
         }
-        let shown = list.status;
-        let asks: Vec<(usize, Source, Status)> = list
-            .slots
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, s)| s.status == shown || !matches!(s.fetch, Fetch::Idle))
-            .map(|(index, slot)| {
-                slot.fetch = Fetch::Loading;
-                (index, slot.source.clone(), slot.status)
-            })
-            .collect();
+        let asks = list.reload(false);
         // The tab row's spinner shows it's asking.
         self.prefetched.clear();
         for (index, source, status) in asks {
@@ -1058,22 +1167,35 @@ impl App {
         });
     }
 
-    /// Reads the shown pull request again every `POLL` while its checks run.
-    fn poll_checks(&mut self) {
-        let Some(page) = &mut self.page else { return };
-        let Load::Ready(detail) = &page.detail else {
+    fn poll(&mut self) {
+        let Some(page) = &mut self.page else {
+            if let Some(list) = &mut self.list {
+                let asks = list.poll();
+                for (index, source, status) in asks {
+                    self.search(index, &source, status);
+                }
+            }
             return;
         };
-        let running = pr::any_running(&detail.checks);
+        if !page.refreshable() || !matches!(page.detail, Load::Ready(_)) {
+            return;
+        }
+        let rejob = page
+            .pending
+            .take()
+            .and_then(|detail| page.refreshed(detail));
         let read = self
             .details
             .get(&page.pr)
             .is_none_or(|(_, at)| at.elapsed() >= POLL);
-        let job = page.log.filter(|job| {
-            matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.done)
-                && page.log_polled.elapsed() >= JOB_POLL
+        let job = rejob.or_else(|| {
+            page.log.filter(|job| {
+                page.tab == Tab::Checks
+                    && matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.done)
+                    && page.log_polled.elapsed() >= JOB_POLL
+            })
         });
-        if running && read && page.polled.elapsed() >= POLL {
+        if read && page.polled.elapsed() >= POLL {
             page.polled = Instant::now();
             let (pr, kind) = (page.pr.clone(), page.kind);
             self.fetch(pr, kind, true);
@@ -1111,24 +1233,8 @@ impl App {
     fn receive(&mut self, msg: Msg, terminal: &mut DefaultTerminal) -> io::Result<()> {
         match msg {
             Msg::Searched(index, result) => {
-                if let Some(slot) = self.list.as_mut().and_then(|l| l.slots.get_mut(index)) {
-                    match result {
-                        Ok(entries) => {
-                            slot.entries = Some(entries);
-                            slot.fetch = Fetch::Done;
-                        }
-                        Err(e) => slot.fetch = Fetch::Failed(e),
-                    }
-                }
-                // "Already reloading" is about the searches now answered, so
-                // the keys come back once the last one is.
-                if let Some(list) = self
-                    .list
-                    .as_mut()
-                    .filter(|l| !l.slots.iter().any(|s| matches!(s.fetch, Fetch::Loading)))
-                    && list.note.as_deref() == Some(RELOADING)
-                {
-                    list.note = None;
+                if let Some(list) = &mut self.list {
+                    list.searched(index, result);
                 }
             }
             Msg::Me(me) => {
@@ -1301,7 +1407,7 @@ impl App {
                 page.toast = Some(failed);
             }
             self.prefetch();
-            self.poll_checks();
+            self.poll();
             self.now = pr::now();
             // Following the theme reads a reply from stdin, so only with no key waiting.
             let idle = !event::poll(Duration::ZERO)?;
@@ -4484,11 +4590,13 @@ mod tests {
             media: Default::default(),
             timeline: vec![
                 pr::Event {
+                    id: None,
                     at: "2026-11-12T03:00:00Z".into(),
                     actor: "marcos".into(),
                     kind: EventKind::Opened,
                 },
                 pr::Event {
+                    id: None,
                     at: "2026-11-12T03:30:00Z".into(),
                     actor: "bot".into(),
                     kind: EventKind::Comment {
@@ -4497,6 +4605,269 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn app_with_page(mut detail: Detail) -> App {
+        detail.media.clear();
+        let (tx, rx) = mpsc::channel();
+        let page = Page::new(detail.pr.clone(), detail.kind, Load::Ready(detail.clone()));
+        App {
+            tx,
+            rx,
+            look: Look::detect(),
+            news: None,
+            clock: usage::Clock::start(),
+            here: None,
+            branch: None,
+            list: None,
+            page: Some(page),
+            details: HashMap::from([(detail.pr.clone(), (detail, Instant::now()))]),
+            inflight: HashSet::new(),
+            prefetched: HashSet::new(),
+            patches: HashMap::new(),
+            patching: HashSet::new(),
+            logs: Logs::default(),
+            gallery: Gallery::plain(),
+            now: 0,
+        }
+    }
+
+    #[test]
+    fn live_refresh_polls_ready_prs_and_issues_every_ten_seconds() {
+        for kind in [Kind::Pull, Kind::Issue] {
+            let mut next = detail(State::Open);
+            next.kind = kind;
+            next.checks.clear();
+            let mut app = app_with_page(next);
+            let before = Instant::now() - Duration::from_secs(11);
+            let page = app.page.as_mut().unwrap();
+            page.polled = before;
+            let pr = page.pr.clone();
+            app.details.get_mut(&pr).unwrap().1 = before;
+            app.inflight.insert(pr);
+            app.poll();
+            let asked = app.page.as_ref().unwrap().polled;
+            assert!(
+                asked > before,
+                "ready {kind:?} wasn't polled after ten seconds"
+            );
+            app.poll();
+            assert_eq!(app.page.as_ref().unwrap().polled, asked);
+        }
+    }
+
+    #[test]
+    fn live_refresh_waits_for_page_interaction_to_finish() {
+        for blocked in 0..5 {
+            let mut next = detail(State::Open);
+            next.checks[0].status = CheckStatus::Running;
+            let mut app = app_with_page(next);
+            let before = Instant::now() - Duration::from_secs(21);
+            let page = app.page.as_mut().unwrap();
+            page.polled = before;
+            match blocked {
+                0 => {
+                    page.mode = Mode::Compose {
+                        text: "draft".chars().collect(),
+                        cursor: 5,
+                        reply: None,
+                    }
+                }
+                1 => page.mode = Mode::Help,
+                2 => {
+                    page.selection = Some(Selection {
+                        anchor: (0, 0),
+                        head: (0, 2),
+                    })
+                }
+                3 => page.dragging = true,
+                _ => page.busy = Some("Posting comment…".into()),
+            }
+            let pr = page.pr.clone();
+            app.details.get_mut(&pr).unwrap().1 = before;
+            app.inflight.insert(pr);
+            app.poll();
+            assert_eq!(
+                app.page.as_ref().unwrap().polled,
+                before,
+                "interaction {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_refresh_defers_arrivals_and_preserves_the_reply_target() {
+        for composing in [true, false] {
+            let mut app = app_with_page(detail(State::Open));
+            let page = app.page.as_mut().unwrap();
+            page.show(Tab::Comments);
+            if composing {
+                page.reply();
+            } else {
+                page.selection = Some(Selection {
+                    anchor: (0, 0),
+                    head: (0, 2),
+                });
+            }
+            let mut next = detail(State::Open);
+            next.title = "updated".into();
+            next.timeline.insert(1, next.timeline[0].clone());
+            page.refreshed(next);
+            let Load::Ready(shown) = &page.detail else {
+                panic!("expected detail")
+            };
+            assert_ne!(shown.title, "updated");
+            assert_eq!(page.focus, Some(1));
+            if composing {
+                assert!(
+                    matches!(&page.mode, Mode::Compose { reply: Some(actor), .. } if actor == "bot")
+                );
+            }
+            page.mode = Mode::Normal;
+            page.selection = None;
+            app.poll();
+            let page = app.page.as_ref().unwrap();
+            assert!(page.pending.is_none());
+            assert_eq!(page.focus, Some(2));
+            let Load::Ready(shown) = &page.detail else {
+                panic!("expected detail")
+            };
+            assert_eq!(shown.title, "updated");
+            assert_eq!(shown.timeline[page.focus.unwrap()].actor, "bot");
+        }
+    }
+
+    #[test]
+    fn live_refresh_keeps_edited_reply_targets_when_timeline_reorders() {
+        for (before, after) in [
+            (
+                EventKind::Comment {
+                    body: "before".into(),
+                },
+                EventKind::Comment {
+                    body: "after".into(),
+                },
+            ),
+            (
+                EventKind::Review {
+                    verdict: Verdict::Commented,
+                    body: "before".into(),
+                },
+                EventKind::Review {
+                    verdict: Verdict::Dismissed,
+                    body: "after".into(),
+                },
+            ),
+            (
+                EventKind::Inline {
+                    path: "src/pr.rs".into(),
+                    body: "before".into(),
+                },
+                EventKind::Inline {
+                    path: "src/pr.rs".into(),
+                    body: "after".into(),
+                },
+            ),
+        ] {
+            for id in [None, Some("reply-id")] {
+                let mut old = detail(State::Open);
+                old.timeline[1].id = id.map(str::to_owned);
+                old.timeline[1].kind = before.clone();
+                let mut next = old.clone();
+                next.timeline[1].kind = after.clone();
+                next.timeline.swap(0, 1);
+                let mut page = Page::new(old.pr.clone(), old.kind, Load::Ready(old));
+                page.show(Tab::Comments);
+                page.refreshed(next);
+                assert_eq!(
+                    page.focus,
+                    Some(0),
+                    "an edit must not clear the reply target"
+                );
+                page.reply();
+                let Mode::Compose { text, reply, .. } = &page.mode else {
+                    panic!("expected the composer");
+                };
+                assert_eq!(text.iter().collect::<String>(), "> after\n\n");
+                assert_eq!(reply.as_deref(), Some("bot"));
+            }
+        }
+    }
+
+    #[test]
+    fn live_refresh_uses_ids_for_colliding_comments_and_drops_deleted_targets() {
+        for kind in [Kind::Pull, Kind::Issue] {
+            let mut old = detail(State::Open);
+            old.kind = kind;
+            old.timeline[1].id = Some("IC_picked".into());
+            let mut other = old.timeline[1].clone();
+            other.id = Some("IC_other".into());
+            old.timeline.push(other);
+            let mut next = old.clone();
+            next.timeline.swap(1, 2);
+            next.timeline[2].kind = EventKind::Comment {
+                body: "edited".into(),
+            };
+            let mut page = Page::new(old.pr.clone(), kind, Load::Ready(old));
+            page.show(Tab::Comments);
+            page.refreshed(next.clone());
+            assert_eq!(page.focus, Some(2));
+            next.timeline.remove(2);
+            page.refreshed(next);
+            assert_eq!(
+                page.focus, None,
+                "must not switch to the other comment's ID"
+            );
+        }
+    }
+
+    #[test]
+    fn live_refresh_drops_ambiguous_reply_targets() {
+        for duplicate_before in [true, false] {
+            let mut old = detail(State::Open);
+            if duplicate_before {
+                old.timeline.push(old.timeline[1].clone());
+            }
+            let mut next = old.clone();
+            if duplicate_before {
+                next.timeline.remove(1);
+            } else {
+                next.timeline.push(next.timeline[1].clone());
+            }
+            let mut page = Page::new(old.pr.clone(), old.kind, Load::Ready(old));
+            page.show(Tab::Comments);
+            page.refreshed(next);
+            assert_eq!(page.focus, None, "ambiguous before: {duplicate_before}");
+        }
+    }
+
+    #[test]
+    fn live_refresh_keeps_the_five_second_poll_for_shown_running_logs() {
+        let mut app = app_with_page(detail(State::Open));
+        let before = Instant::now() - Duration::from_secs(6);
+        let page = app.page.as_mut().unwrap();
+        page.tab = Tab::Checks;
+        page.log = Some(34);
+        page.log_polled = before;
+        app.logs.jobs.insert(
+            34,
+            Load::Ready(pr::JobLog {
+                steps: Vec::new(),
+                done: false,
+                missing: None,
+            }),
+        );
+        app.logs.inflight.insert(34);
+        app.poll();
+        let asked = app.page.as_ref().unwrap().log_polled;
+        assert!(asked > before);
+        app.poll();
+        assert_eq!(app.page.as_ref().unwrap().log_polled, asked);
+        let page = app.page.as_mut().unwrap();
+        page.tab = Tab::Summary;
+        page.log_polled = before;
+        app.poll();
+        assert_eq!(app.page.as_ref().unwrap().log_polled, before);
     }
 
     fn texts(lines: &[Line]) -> Vec<String> {
@@ -4511,6 +4882,7 @@ mod tests {
         let now = pr::seconds("2026-11-12T04:30:00Z").unwrap();
         let mut d = detail(State::Open);
         d.timeline.push(pr::Event {
+            id: None,
             at: "2026-11-12T04:00:00Z".into(),
             actor: "ana".into(),
             kind: EventKind::Commit {
@@ -4576,6 +4948,7 @@ mod tests {
     fn replying_quotes_only_the_picked_comment() {
         let mut d = detail(State::Open);
         d.timeline.push(pr::Event {
+            id: None,
             at: "2026-11-12T04:00:00Z".into(),
             actor: "ana".into(),
             kind: EventKind::Comment {
@@ -4682,24 +5055,28 @@ mod tests {
                 status: Status::Open,
                 entries: Some(vec![entry(1, "fix quotes"), entry(2, "add pr")]),
                 fetch: Fetch::Done,
+                background: false,
             },
             Slot {
                 source: Source::Reviewing,
                 status: Status::Open,
                 entries: Some(vec![entry(2, "add pr")]),
                 fetch: Fetch::Loading,
+                background: false,
             },
             Slot {
                 source: Source::Authored(Kind::Issue),
                 status: Status::Open,
                 entries: Some(vec![entry(3, "crash on open")]),
                 fetch: Fetch::Done,
+                background: false,
             },
             Slot {
                 source: Source::Authored(Kind::Issue),
                 status: Status::Done,
                 entries: Some(vec![entry(4, "old crash"), entry(5, "older crash")]),
                 fetch: Fetch::Idle,
+                background: false,
             },
         ]);
         assert_eq!(list.count(), 2);
@@ -4738,7 +5115,180 @@ mod tests {
             shown_area: Rect::default(),
             selection: None,
             dragging: false,
+            polled: Instant::now(),
+            pending: Vec::new(),
         }
+    }
+
+    fn live_rows() -> Vec<Slot> {
+        [Status::Open, Status::Done]
+            .into_iter()
+            .flat_map(|status| {
+                [
+                    Source::Authored(Kind::Pull),
+                    Source::Reviewing,
+                    Source::Authored(Kind::Issue),
+                ]
+                .into_iter()
+                .map(move |source| Slot {
+                    source,
+                    status,
+                    entries: Some(vec![live_row(1), live_row(2)]),
+                    fetch: Fetch::Done,
+                    background: false,
+                })
+            })
+            .collect()
+    }
+
+    fn live_row(number: u64) -> Entry {
+        Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number,
+            },
+            title: format!("row {number}"),
+            author: "me".into(),
+            updated: format!("2026-11-12T04:0{number}:00Z"),
+            draft: false,
+            ended: None,
+        }
+    }
+
+    #[test]
+    fn live_refresh_polls_only_shown_list_searches_and_throttles_failures() {
+        for kind in [Kind::Pull, Kind::Issue] {
+            for status in [Status::Open, Status::Done] {
+                let mut list = list_of(live_rows());
+                list.kind = kind;
+                list.status = status;
+                let picked = list.picked();
+                let before = Instant::now() - Duration::from_secs(11);
+                list.polled = before;
+                let asks = list.poll();
+                assert_eq!(asks.len(), if kind == Kind::Pull { 2 } else { 1 });
+                assert!(list.polled > before);
+                assert_eq!(list.picked(), picked);
+                for slot in &list.slots {
+                    assert_eq!(
+                        matches!(slot.fetch, Fetch::Loading),
+                        slot.source.kind() == kind && slot.status == status
+                    );
+                }
+                for (index, source, asked_status) in asks {
+                    assert_eq!(source.kind(), kind);
+                    assert_eq!(asked_status, status);
+                    list.searched(index, Err("offline".into()));
+                }
+                assert_eq!(list.picked(), picked);
+                assert_eq!(list.count(), 2);
+                assert!(list.poll().is_empty());
+                list.polled = Instant::now() - Duration::from_secs(9);
+                assert!(list.poll().is_empty());
+                list.polled = before;
+                assert!(!list.poll().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn live_refresh_skips_filtered_or_selected_lists_and_hidden_lists() {
+        for blocked in 0..3 {
+            let mut list = list_of(live_rows());
+            let before = Instant::now() - Duration::from_secs(11);
+            list.polled = before;
+            match blocked {
+                0 => list.typed = "row".into(),
+                1 => list.dragging = true,
+                _ => {
+                    list.selection = Some(Selection {
+                        anchor: (0, 0),
+                        head: (0, 2),
+                    })
+                }
+            }
+            assert!(list.poll().is_empty());
+            assert_eq!(list.polled, before);
+        }
+        let mut app = app_with_page(detail(State::Open));
+        let mut list = list_of(live_rows());
+        let before = Instant::now() - Duration::from_secs(11);
+        list.polled = before;
+        app.list = Some(list);
+        app.poll();
+        let list = app.list.as_ref().unwrap();
+        assert_eq!(list.polled, before);
+        assert!(!list.loading());
+    }
+
+    #[test]
+    fn live_refresh_keeps_rows_while_filtering() {
+        let mut list = list_of(vec![live_rows().remove(0)]);
+        list.polled -= POLL;
+        assert_eq!(list.poll().len(), 1);
+        list.typed = "row".into();
+        list.searched(0, Ok(vec![live_row(1), live_row(2), live_row(3)]));
+        assert_eq!(list.count(), 2);
+        assert!(list.poll().is_empty());
+        assert_eq!(list.count(), 2);
+        list.typed.clear();
+        assert!(list.poll().is_empty());
+        assert_eq!(list.count(), 3);
+        list.typed = "row".into();
+        list.reload(false);
+        list.searched(0, Ok(vec![live_row(1), live_row(2)]));
+        assert_eq!(
+            list.count(),
+            2,
+            "manual reload still updates filtered results"
+        );
+    }
+
+    #[test]
+    fn live_refresh_keeps_picked_identity_when_rows_reorder_after_a_drag() {
+        let mut list = list_of(vec![live_rows().remove(0)]);
+        let picked = list.picked();
+        list.dragging = true;
+        list.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 2),
+        });
+        list.slots[0].fetch = Fetch::Loading;
+        list.searched(0, Ok(vec![live_row(1), live_row(2), live_row(3)]));
+        assert!(
+            !list.loading(),
+            "arrival clears inflight state even while deferred"
+        );
+        assert_eq!(list.count(), 2);
+        assert_eq!(list.picked(), picked);
+        list.dragging = false;
+        assert!(list.poll().is_empty());
+        assert_eq!(list.count(), 2);
+        list.selection = None;
+        assert!(list.poll().is_empty());
+        assert_eq!(list.count(), 3);
+        assert_eq!(list.picked(), picked);
+        assert_eq!(list.selected, 1);
+        assert!(list.pending.is_empty());
+        list.searched(0, Ok(vec![live_row(1), live_row(2)]));
+        assert_eq!(list.selected, 0);
+        assert_eq!(list.picked(), picked);
+    }
+
+    #[test]
+    fn live_refresh_preserves_manual_reload_scope() {
+        let mut list = list_of(live_rows());
+        list.slots[3].fetch = Fetch::Idle;
+        list.slots[4].fetch = Fetch::Failed("offline".into());
+        list.slots[5].fetch = Fetch::Idle;
+        let asks = list.reload(false);
+        assert_eq!(
+            asks.iter().map(|(index, _, _)| *index).collect::<Vec<_>>(),
+            [0, 1, 2, 4]
+        );
+        assert!(matches!(list.slots[3].fetch, Fetch::Idle));
+        assert!(matches!(list.slots[5].fetch, Fetch::Idle));
+        assert_eq!(list.count(), 2);
     }
 
     #[test]
@@ -4764,6 +5314,7 @@ mod tests {
                 done(3, "old work", Ending::Merged, "2026-08-01T09:00:00Z"),
             ]),
             fetch: Fetch::Done,
+            background: false,
         }]);
         list.status = Status::Done;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))

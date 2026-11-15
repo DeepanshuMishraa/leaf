@@ -222,6 +222,23 @@ pub fn fingerprint(diff: &Diff, file: usize) -> u64 {
     hasher.finish()
 }
 
+pub fn keeps_comments(old: &Diff, new: &Diff, comments: &[SavedComment]) -> bool {
+    let print = |diff: &Diff, path: &str| {
+        diff.files()
+            .iter()
+            .position(|file| {
+                file.old_path.as_deref() == Some(path) || file.new_path.as_deref() == Some(path)
+            })
+            .map(|file| fingerprint(diff, file))
+    };
+    comments.iter().all(|saved| {
+        let path = &saved.comment.anchor.file;
+        print(old, path)
+            .zip(print(new, path))
+            .is_some_and(|(old, new)| old == new)
+    })
+}
+
 /// How many lines around a commented range the agent sees.
 const HUNK_PAD: usize = 8;
 

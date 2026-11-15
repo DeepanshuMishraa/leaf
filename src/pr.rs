@@ -733,9 +733,36 @@ pub enum EventKind {
 /// Something that happened on the pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
+    pub id: Option<String>,
     pub at: String,
     pub actor: String,
     pub kind: EventKind,
+}
+
+impl Event {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        if std::mem::discriminant(&self.kind) != std::mem::discriminant(&other.kind) {
+            return false;
+        }
+        match (&self.id, &other.id) {
+            (Some(id), Some(other)) => id == other,
+            (None, None) => {
+                !self.at.is_empty()
+                    && self.at == other.at
+                    && self.actor == other.actor
+                    && match (&self.kind, &other.kind) {
+                        (EventKind::Inline { path, .. }, EventKind::Inline { path: other, .. }) => {
+                            path == other
+                        }
+                        (EventKind::Commit { sha, .. }, EventKind::Commit { sha: other, .. }) => {
+                            sha == other
+                        }
+                        _ => true,
+                    }
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A pull request or issue read in full. An issue leaves the branch, size,
@@ -1701,6 +1728,7 @@ fn parse_check(check: &Value) -> Check {
 
 fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: State) -> Vec<Event> {
     let mut events = vec![Event {
+        id: None,
         at: created.to_owned(),
         actor: author.to_owned(),
         kind: EventKind::Opened,
@@ -1716,6 +1744,7 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
             .unwrap_or_default();
         let sha = text(commit, "oid");
         events.push(Event {
+            id: (!sha.is_empty()).then(|| sha.clone()),
             at: text(commit, "committedDate"),
             actor,
             kind: EventKind::Commit {
@@ -1726,6 +1755,7 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
     }
     for comment in array(page, "comments") {
         events.push(Event {
+            id: Some(text(comment, "id")).filter(|id| !id.is_empty()),
             at: text(comment, "createdAt"),
             actor: login(comment, "author"),
             kind: EventKind::Comment {
@@ -1743,6 +1773,7 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
             continue;
         }
         events.push(Event {
+            id: Some(text(review, "id")).filter(|id| !id.is_empty()),
             at: text(review, "submittedAt"),
             actor: login(review, "author"),
             kind: EventKind::Review { verdict, body },
@@ -1750,6 +1781,10 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
     }
     for comment in inline.as_array().map(Vec::as_slice).unwrap_or_default() {
         events.push(Event {
+            id: comment
+                .get("id")
+                .and_then(Value::as_u64)
+                .map(|id| id.to_string()),
             at: text(comment, "created_at"),
             actor: login(comment, "user"),
             kind: EventKind::Inline {
@@ -1760,11 +1795,13 @@ fn timeline(page: &Value, inline: &Value, author: &str, created: &str, state: St
     }
     match state {
         State::Merged => events.push(Event {
+            id: None,
             at: text(page, "mergedAt"),
             actor: String::new(),
             kind: EventKind::Merged,
         }),
         State::Closed | State::Completed | State::NotPlanned => events.push(Event {
+            id: None,
             at: text(page, "closedAt"),
             actor: String::new(),
             kind: EventKind::Closed,
@@ -2194,10 +2231,10 @@ mod tests {
             "reviewRequests": [{"login": "bob"}, {"name": "core"}],
             "latestReviews": [{"author": {"login": "ann"}, "state": "APPROVED"}],
             "reviews": [
-                {"author": {"login": "ann"}, "state": "APPROVED", "body": "", "submittedAt": "2026-11-12T01:00:00Z"},
+                {"id": "PRR_review", "author": {"login": "ann"}, "state": "APPROVED", "body": "", "submittedAt": "2026-11-12T01:00:00Z"},
                 {"author": {"login": "bot"}, "state": "COMMENTED", "body": "<!-- hidden -->", "submittedAt": "2026-11-12T01:00:00Z"}
             ],
-            "comments": [{"author": {"login": "cy"}, "body": "nice", "createdAt": "2026-11-11T23:00:00Z"}],
+            "comments": [{"id": "IC_comment", "author": {"login": "cy"}, "body": "nice", "createdAt": "2026-11-11T23:00:00Z"}],
             "commits": [{"oid": "a93cd2543365", "messageHeadline": "fix: quotes", "committedDate": "2026-11-11T22:30:00Z", "authors": [{"login": "marcos"}]}],
             "statusCheckRollup": [
                 {"__typename": "StatusContext", "context": "CodeRabbit", "state": "SUCCESS", "targetUrl": ""},
@@ -2206,7 +2243,7 @@ mod tests {
             "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED"
         });
         let settings = json!({"squashMergeAllowed": true, "mergeCommitAllowed": false, "rebaseMergeAllowed": true, "viewerPermission": "READ"});
-        let inline = json!([{"user": {"login": "dee"}, "path": "src/find.rs", "body": "why?", "created_at": "2026-11-12T02:00:00Z"}]);
+        let inline = json!([{"id": 42, "user": {"login": "dee"}, "path": "src/find.rs", "body": "why?", "created_at": "2026-11-12T02:00:00Z"}]);
         let pr = PrRef {
             repo: "o/r".into(),
             number: 7,
@@ -2251,6 +2288,21 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["opened", "commit", "comment", "review", "inline"]);
+        let ids: Vec<_> = detail
+            .timeline
+            .iter()
+            .map(|event| event.id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                None,
+                Some("a93cd2543365"),
+                Some("IC_comment"),
+                Some("PRR_review"),
+                Some("42")
+            ]
+        );
     }
 
     #[test]
@@ -2414,13 +2466,14 @@ mod tests {
                 "closedAt": "2026-11-03T00:00:00Z",
                 "assignees": [{"login": "me"}],
                 "labels": [{"name": "bug"}],
-                "comments": [{"author": {"login": "me"}, "body": "Can't reproduce", "createdAt": "2026-11-02T00:00:00Z"}]
+                "comments": [{"id": "IC_issue", "author": {"login": "me"}, "body": "Can't reproduce", "createdAt": "2026-11-02T00:00:00Z"}]
             }),
         );
         assert_eq!(detail.kind, Kind::Issue);
         assert_eq!(detail.state, State::NotPlanned);
         assert_eq!(detail.assignees, ["me"]);
         assert_eq!(detail.labels, ["bug"]);
+        assert_eq!(detail.timeline[1].id.as_deref(), Some("IC_issue"));
         let kinds: Vec<_> = detail.timeline.iter().map(|e| &e.kind).collect();
         assert_eq!(
             kinds,
