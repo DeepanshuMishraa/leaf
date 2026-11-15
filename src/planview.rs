@@ -2583,7 +2583,9 @@ create table tokens (id int);
     #[test]
     fn review_fix_live_reorder_persists_moved_note_through_blocked_update() {
         let source = "# A\n\nAlpha.\n\n# B\n\nBeta.\n";
-        let reordered = "# B\n\nBeta.\n\n# A\n\nAlpha.\n";
+        // Keep this rewrite a different length so the watcher notices it even
+        // on filesystems whose modification timestamps have coarse precision.
+        let reordered = "# B\n\nBeta.\n\n# A\n\nAlpha.\n\n";
         let ambiguous = "# A\n\nAlpha.\n\n# A\n\nAlpha.\n";
         let path = std::env::temp_dir().join(format!(
             "leaf-plan-review-fix-draft-{}.md",
