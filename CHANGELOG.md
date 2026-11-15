@@ -6,6 +6,7 @@ per change, starting with `- `.
 
 ## Unreleased
 
+- GitLab merge request, commit and comparison links open in `leaf diff`, on gitlab.com and on self-hosted instances, including ones whose host doesn't say `gitlab`: `GITLAB_HOST` names those, for opening a repository's remotes and for the `GITLAB_TOKEN` a private project needs. A merge request's patch is asked of `glab` first when it's installed and signed in, and of the page itself otherwise; the token is sent only to a host that names itself GitLab or that `GITLAB_HOST` names. Comments are still posted to GitHub only.
 - Plans and local documents reload in place after file changes settle. Refresh waits while you write or select text.
 - When an annotated plan block changes or has duplicate matches, Leaf keeps the reviewed snapshot until you send or clear its notes.
 - Saved notes follow moved blocks when you reopen the plan.

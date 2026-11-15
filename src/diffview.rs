@@ -802,6 +802,7 @@ impl App {
                 }
                 Err(TryRecvError::Disconnected) => Some(Done::Post {
                     result: Err(github::GithubFailed::Network {
+                        forge: github::Forge::GitHub.title(),
                         cause: "the poster stopped before returning an answer".to_owned(),
                     }),
                     index,

@@ -1201,7 +1201,7 @@ impl Request {
         Loaded {
             diff: Diff::parse(patch),
             title: format!("leaf diff · {label}"),
-            key: format!("diff:github:{}", resource.key()),
+            key: format!("diff:{}:{}", resource.forge.name(), resource.key()),
             label,
             request: self.clone(),
             github: Some(resource),

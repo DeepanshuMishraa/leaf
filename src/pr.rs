@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 
-use crate::github::Resource;
+use crate::github::{self, Forge, Page, Resource};
 
 static GH: LazyLock<bool> = LazyLock::new(|| {
     Command::new("gh")
@@ -35,9 +35,17 @@ pub enum PrFailed {
     )]
     BadTarget { target: String },
     #[error(
-        "#{number} needs a repository, and this folder isn't a GitHub repository. Use owner/repo#{number} or the pull request's link."
+        "#{number} needs a repository, and this folder isn't a GitHub repository. Use owner/repo#{number} or the pull request's link. In a self-hosted GitLab on a name without `gitlab` in it, set GITLAB_HOST to that name."
     )]
     NoRepo { number: u64 },
+    #[error(
+        "This is a GitLab merge request, and `leaf pr` lists GitHub pull requests only. Open its diff with `leaf diff {url}`, or merge requests in your browser."
+    )]
+    GitLab { url: String },
+    #[error(
+        "This folder is a GitLab repository ({project}), and `leaf pr` lists GitHub pull requests only. Open a merge request's diff with `leaf diff <merge request link>`."
+    )]
+    GitLabRepo { project: String },
 }
 
 /// One pull request: the repository (`owner/name`) and its number.
@@ -55,14 +63,16 @@ impl PrRef {
         let bad = || PrFailed::BadTarget {
             target: target.to_owned(),
         };
-        if let Some(Resource::Pull {
-            owner,
-            repo,
-            number,
-        }) = Resource::parse_url(target)
+        if let Some(resource) = Resource::parse_url(target)
+            && let Page::Pull { project, number } = resource.page
         {
+            if resource.forge != Forge::GitHub {
+                return Err(PrFailed::GitLab {
+                    url: target.to_owned(),
+                });
+            }
             return Ok(PrRef {
-                repo: format!("{owner}/{repo}"),
+                repo: project,
                 number,
             });
         }
@@ -103,12 +113,10 @@ impl PrRef {
     }
 
     pub fn resource(&self) -> Resource {
-        let (owner, repo) = self.repo.split_once('/').unwrap_or(("", &self.repo));
-        Resource::Pull {
-            owner: owner.to_owned(),
-            repo: repo.to_owned(),
+        Resource::github(Page::Pull {
+            project: self.repo.clone(),
             number: self.number,
-        }
+        })
     }
 
     pub fn checkout(&self) -> String {
@@ -954,12 +962,14 @@ fn git(args: &[&str]) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
-/// The GitHub repository (`owner/name`) of the current folder, read from its
-/// remotes without asking GitHub: `upstream` first, so a fork lists its parent.
-pub fn current_repo() -> Option<String> {
-    ["upstream", "origin"]
-        .into_iter()
-        .find_map(|remote| github_repo(&git(&["remote", "get-url", remote])?))
+/// The forge and repository (`owner/name`, or a GitLab project) of the
+/// current folder, read from its remotes without asking either forge:
+/// `upstream` first, so a fork lists its parent.
+pub fn current_forge_repo() -> Option<(Forge, String)> {
+    ["upstream", "origin"].into_iter().find_map(|remote| {
+        let (forge, project) = forge_repo(&git(&["remote", "get-url", remote])?)?;
+        Some((forge, project))
+    })
 }
 
 /// The branch checked out here, if any.
@@ -967,26 +977,33 @@ pub fn current_branch() -> Option<String> {
     git(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|branch| branch != "HEAD")
 }
 
-/// `owner/name` from a GitHub remote URL, over SSH or HTTPS.
-fn github_repo(url: &str) -> Option<String> {
-    let rest = [
-        "git@github.com:",
-        "ssh://git@github.com/",
-        "https://github.com/",
-        "http://github.com/",
-        "git://github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| url.strip_prefix(prefix))?;
-    let rest = rest.trim_end_matches('/');
-    let rest = rest.strip_suffix(".git").unwrap_or(rest);
-    let mut parts = rest.split('/');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty() => {
-            Some(format!("{owner}/{name}"))
+/// The forge and project path a remote URL names, over SSH or HTTPS, with the
+/// project as deep as its groups are.
+fn forge_repo(url: &str) -> Option<(Forge, String)> {
+    let (host, path) = match url.split_once("://") {
+        // scheme://[user@]host[:port]/path
+        Some((_, rest)) => {
+            let (authority, path) = rest.split_once('/')?;
+            (authority.rsplit('@').next()?, path)
         }
-        _ => None,
-    }
+        // git@host:path
+        None => {
+            let (authority, path) = url.split_once(':')?;
+            (authority.rsplit('@').next()?, path)
+        }
+    };
+    let forge = github::forge_of(host)?;
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<&str> = path.split('/').collect();
+    // A GitHub project is exactly `owner/name`; a GitLab one nests as deep as
+    // its groups do.
+    let whole = parts.iter().all(|part| !part.is_empty())
+        && match forge {
+            Forge::GitHub => parts.len() == 2,
+            Forge::GitLab => parts.len() >= 2,
+        };
+    whole.then(|| (forge, parts.join("/")))
 }
 
 /// What the list shows: pull requests or issues.
@@ -1927,17 +1944,57 @@ mod tests {
     }
 
     #[test]
-    fn remotes_name_their_github_repository() {
+    fn a_gitlab_merge_request_is_sent_to_leaf_diff() {
+        let url = "https://gitlab.com/a/b/-/merge_requests/9";
+        assert!(matches!(
+            PrRef::parse(url, None),
+            Err(PrFailed::GitLab { .. })
+        ));
+    }
+
+    #[test]
+    fn remotes_name_their_forge_and_project() {
         for url in [
             "git@github.com:o/r.git",
             "https://github.com/o/r",
             "https://github.com/o/r.git/",
             "ssh://git@github.com/o/r.git",
         ] {
-            assert_eq!(github_repo(url).as_deref(), Some("o/r"), "{url}");
+            assert_eq!(
+                forge_repo(url),
+                Some((Forge::GitHub, "o/r".to_owned())),
+                "{url}"
+            );
         }
-        assert_eq!(github_repo("git@gitlab.com:o/r.git"), None);
-        assert_eq!(github_repo("https://github.com/o"), None);
+        // GitLab nests a project under its groups, and says so in its host.
+        assert_eq!(
+            forge_repo("git@gitlab.com:o/r.git"),
+            Some((Forge::GitLab, "o/r".to_owned()))
+        );
+        assert_eq!(
+            forge_repo("git@gitlab.example.com:group/team/project.git"),
+            Some((Forge::GitLab, "group/team/project".to_owned()))
+        );
+        assert_eq!(forge_repo("https://example.com/o/r.git"), None);
+        assert_eq!(forge_repo("https://github.com/o"), None);
+        // A GitHub project has two segments, so a page below one isn't one.
+        assert_eq!(forge_repo("https://github.com/o/r/tree/main"), None);
+    }
+
+    #[test]
+    fn a_remote_with_a_port_or_a_password_still_names_its_project() {
+        assert_eq!(
+            forge_repo("ssh://git@gitlab.example.com:2222/group/project.git"),
+            Some((Forge::GitLab, "group/project".to_owned()))
+        );
+        assert_eq!(
+            forge_repo("https://user:secret@gitlab.example.com/o/r.git"),
+            Some((Forge::GitLab, "o/r".to_owned()))
+        );
+        assert_eq!(
+            forge_repo("git://github.com/o/r.git"),
+            Some((Forge::GitHub, "o/r".to_owned()))
+        );
     }
 
     #[test]
