@@ -437,7 +437,10 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 }
                 TagEnd::CodeBlock => {
                     if let Some((lang, code)) = b.code.take() {
-                        let text = code.strip_suffix('\n').unwrap_or(&code).to_owned();
+                        let text = code
+                            .strip_suffix('\n')
+                            .unwrap_or(&code)
+                            .replace('\t', "    ");
                         b.emit(Node::Code { lang, text });
                     }
                 }
@@ -1290,6 +1293,17 @@ mod tests {
             draw("```\na = 1\n  b\n```", 20),
             vec!["┃ a = 1", "┃   b", ""]
         );
+    }
+
+    #[test]
+    fn tabs_in_code_keep_their_indentation() {
+        assert_eq!(
+            draw("```\n\tif x {\n\t\ty();\n\t}\n```", 30),
+            vec!["┃     if x {", "┃         y();", "┃     }", ""]
+        );
+        let laid = layout("```\n\ta\n```", 40, (8, 16), &no_images);
+        let text: String = laid.text.iter().collect();
+        assert_eq!(text, "    a\n");
     }
 
     fn seg_style(markdown: &str, needle: &str) -> Option<Style> {
