@@ -84,6 +84,9 @@ pub struct File {
     pub binary: bool,
     /// A short note for the heading, such as `new file` or `mode changed`.
     pub note: Option<String>,
+    /// The header's `index` and mode lines: what tells one revision of a
+    /// binary or mode-only change from another, when there are no rows.
+    pub identity: String,
 }
 
 impl File {
@@ -184,27 +187,45 @@ impl Diff {
             .or(Some(file.header_row))
     }
 
-    /// The row for a line on one side of a file, when the diff still has it.
+    /// The row a line is at, when it's still in the diff. Unlike `row_for`,
+    /// there's no fallback: a line that left the diff has no row.
+    pub fn exact_row(&self, file: &str, side: Side, line: u32) -> Option<usize> {
+        let index = self.files.iter().position(|f| match side {
+            Side::Old => f.old_path.as_deref() == Some(file),
+            Side::New => f.new_path.as_deref() == Some(file),
+        })?;
+        self.row_in(index, side, line)
+    }
+
+    fn row_in(&self, index: usize, side: Side, line: u32) -> Option<usize> {
+        let f = &self.files[index];
+        for hunk in &f.hunks {
+            for row in hunk.first..hunk.end {
+                let r = self.rows[row];
+                let number = match side {
+                    Side::Old => r.old,
+                    Side::New => r.new,
+                };
+                if number == line {
+                    return Some(row);
+                }
+            }
+        }
+        None
+    }
+
+    /// The row for a line on one side of a file. A line that left the diff
+    /// lands on its file's first content row, and a path from another
+    /// revision on a file with the same name.
     pub fn row_for(&self, file: &str, side: Side, line: u32) -> Option<usize> {
         let wanted = self.files.iter().position(|f| match side {
             Side::Old => f.old_path.as_deref() == Some(file),
             Side::New => f.new_path.as_deref() == Some(file),
         });
         if let Some(index) = wanted {
-            let f = &self.files[index];
-            for hunk in &f.hunks {
-                for row in hunk.first..hunk.end {
-                    let r = self.rows[row];
-                    let number = match side {
-                        Side::Old => r.old,
-                        Side::New => r.new,
-                    };
-                    if number == line {
-                        return Some(row);
-                    }
-                }
-            }
-            return self.first_content(index);
+            return self
+                .row_in(index, side, line)
+                .or_else(|| self.first_content(index));
         }
         // A path may have come from another revision; land on a file with the
         // same tail rather than nowhere.
@@ -412,6 +433,7 @@ impl<'a> Builder<'a> {
             self.note("deleted");
         } else if text.starts_with("old mode ") || text.starts_with("new mode ") {
             self.note("mode changed");
+            self.identity(text);
         } else if text.starts_with("Binary files ") || text.starts_with("GIT binary patch") {
             if let Some(file) = self.file {
                 self.files[file].binary = true;
@@ -420,11 +442,21 @@ impl<'a> Builder<'a> {
             self.meta(start, len);
         } else if text.starts_with("leaf: ") {
             self.meta(start, len);
-        } else if text.starts_with("index ")
-            || text.starts_with("similarity index ")
-            || text.starts_with("dissimilarity index ")
+        } else if text.starts_with("index ") {
+            // Plumbing that adds nothing for a reader, but tells revisions
+            // apart.
+            self.identity(text);
+        } else if text.starts_with("similarity index ") || text.starts_with("dissimilarity index ")
         {
             // Plumbing that adds nothing for a reader.
+        }
+    }
+
+    fn identity(&mut self, text: &str) {
+        if let Some(file) = self.file {
+            let identity = &mut self.files[file].identity;
+            identity.push_str(text);
+            identity.push('\n');
         }
     }
 
@@ -439,6 +471,7 @@ impl<'a> Builder<'a> {
             removed: 0,
             binary: false,
             note: None,
+            identity: String::new(),
         });
         self.rows.push(Row {
             start: start as u32,
@@ -1015,7 +1048,16 @@ fn synth_untracked(root: &Path, path: &str, patch: &mut String) {
     let new = quote_path(&format!("b/{path}"));
     let _ = writeln!(patch, "diff --git {old} {new}");
     let _ = writeln!(patch, "new file mode 100644");
+    // Git leaves untracked files unhashed, so leaf stamps a binary or
+    // too-large one itself, and a viewed mark then lapses when it changes:
+    // by its content, or for a file too large to read, its size and time.
     if metadata.len() > MAX_UNTRACKED_BYTES {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |at| at.as_nanos());
+        let _ = writeln!(patch, "index 0000000..{:x}-{modified:x}", metadata.len());
         let _ = writeln!(
             patch,
             "leaf: {} MB file, too large to show",
@@ -1027,6 +1069,11 @@ fn synth_untracked(root: &Path, path: &str, patch: &mut String) {
         return;
     };
     if bytes.iter().take(SNIFF_BYTES).any(|byte| *byte == 0) {
+        let _ = writeln!(
+            patch,
+            "index 0000000..{:016x}",
+            crate::plugin::fnv1a_bytes(&bytes)
+        );
         let _ = writeln!(patch, "Binary files {old} and {new} differ");
         return;
     }

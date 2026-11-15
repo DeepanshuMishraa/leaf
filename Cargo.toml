@@ -1,6 +1,6 @@
 [package]
 name = "leaf-reader"
-version = "0.15.2"
+version = "0.16.0"
 edition = "2024"
 description = "Read PDFs, markdown files and web articles in the terminal"
 license = "MIT"
@@ -20,7 +20,7 @@ crossterm = "0.29"
 dither-ratatui = "0.1.0"
 dom_smoothie = "0.18"
 htmd = "0.5"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga", "pnm", "qoi", "hdr", "exr", "dds", "ff"] }
 libc = "0.2"
 mupdf = { version = "0.8", default-features = false, features = ["base14-fonts", "system-fonts", "epub", "svg"] }
 mupdf-sys = { version = "0.8.0", default-features = false, features = ["epub", "svg"] }
@@ -31,7 +31,7 @@ regex = "1"
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha2 = "0.11.1"
 symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }
 thiserror = "2"

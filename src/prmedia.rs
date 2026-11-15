@@ -1057,8 +1057,8 @@ fn animation(bytes: &[u8], budget: &Arc<AtomicUsize>) -> Option<Animation> {
 
 /// A picture's pixels: any format the image crate reads, or an SVG drawn at
 /// its own size.
-fn decode(bytes: &[u8]) -> Option<RgbaImage> {
-    if let Ok(image) = image::load_from_memory(bytes) {
+pub(crate) fn decode(bytes: &[u8]) -> Option<RgbaImage> {
+    if let Some(image) = oriented(bytes) {
         return Some(image.to_rgba8());
     }
     let options = usvg::Options {
@@ -1081,6 +1081,23 @@ fn decode(bytes: &[u8]) -> Option<RgbaImage> {
         [c.red(), c.green(), c.blue(), c.alpha()]
     });
     RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixels.collect())
+}
+
+/// A raster image turned upright: a photo's EXIF orientation is a separate
+/// step the decoder leaves to the caller.
+fn oriented(bytes: &[u8]) -> Option<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let orientation = decoder.orientation().ok();
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    if let Some(orientation) = orientation {
+        image.apply_orientation(orientation);
+    }
+    Some(image)
 }
 
 /// A frame from early in the video, taken with ffmpeg when it's installed.
@@ -1291,6 +1308,28 @@ mod tests {
         assert_eq!(pixels.dimensions(), (40, 20));
         assert_eq!(pixels.get_pixel(20, 10), &Rgba([255, 0, 0, 255]));
         assert!(decode(b"not a picture").is_none());
+    }
+
+    #[test]
+    fn a_photo_is_turned_upright_by_its_exif_orientation() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image::RgbImage::from_pixel(40, 20, image::Rgb([9, 9, 9])))
+            .expect("a JPEG encodes");
+        assert_eq!(decode(&jpeg).map(|p| p.dimensions()), Some((40, 20)));
+        // An APP1 segment right after SOI: one IFD entry, Orientation = 6
+        // (turned a quarter clockwise), so width and height swap.
+        let exif: &[u8] = &[
+            b'E', b'x', b'i', b'f', 0, 0, b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0,
+            0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+        ];
+        let length = u16::try_from(exif.len() + 2).expect("short segment");
+        let mut rotated = jpeg[..2].to_vec();
+        rotated.extend([0xFF, 0xE1]);
+        rotated.extend(length.to_be_bytes());
+        rotated.extend(exif);
+        rotated.extend(&jpeg[2..]);
+        assert_eq!(decode(&rotated).map(|p| p.dimensions()), Some((20, 40)));
     }
 
     #[test]

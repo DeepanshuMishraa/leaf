@@ -5,6 +5,7 @@ mod art;
 mod article;
 mod comment;
 mod diff;
+mod diffreview;
 mod diffview;
 mod doc;
 mod edge;
@@ -14,9 +15,12 @@ mod gec;
 mod github;
 mod highlight;
 mod home;
+mod hook;
+mod host;
 mod hue;
 mod kitty;
 mod look;
+mod margin;
 mod markdown;
 mod memory;
 mod mermaid;
@@ -24,7 +28,10 @@ mod mono;
 mod news;
 mod pdf;
 mod picker;
+mod picture;
 mod place;
+mod planblocks;
+mod planview;
 mod plugin;
 mod popover;
 mod pr;
@@ -35,9 +42,11 @@ mod progress;
 mod prview;
 mod remote;
 mod render;
+mod review;
 mod rextheme;
 mod scheme;
 mod shape;
+mod skills;
 mod spinner;
 mod stroke;
 mod syntax;
@@ -59,9 +68,13 @@ use doc::Doc;
 use progress::{Progress, Store};
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | url]   (nothing named: pick one)
+const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | GitHub url]
-       leaf pr [number | owner/repo#number | url]   your open pull requests, or the one named
+       leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
+       leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
+       leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
+       leaf skills install | uninstall | status   teach coding agents to use leaf
+       leaf hook install | uninstall | status     set up every agent CLI here for plan review
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -80,11 +93,14 @@ Diff options:
   --patch <file>     a .diff or .patch file
   --inline           one column, removed lines above added ones (i switches)
 
-Diff keys: j/k move, v visual, C comment, m comments, f files, y copy, o other
+Diff keys: j/k move, V visual, c comment, m comments, f files, y copy, o other
 side, i split/inline, r reload, ? keys, q quit
 
 Pull request keys: tab summary/timeline, 3 code, m merge, x close/reopen, r ready/draft,
-a approve, c comment, o browser, y copy checkout, R reload, ? keys, q back
+a approve, c comment, ] [ pick a comment, enter reply, o browser, y copy, R reload,
+? keys, q back
+Issue keys: tab summary/timeline, x close as completed/not planned or reopen, c comment,
+] [ pick a comment, enter reply, o browser, y copy link, R reload, ? keys, q back
 
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
@@ -121,8 +137,11 @@ fn load(target: &str) -> Result<Doc, String> {
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(Path::new(target)).map_err(|e| e.to_string());
     }
+    if picture::is_picture(Path::new(target)) {
+        return picture::open(Path::new(target)).map_err(|e| e.to_string());
+    }
     Err(format!(
-        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md) and web pages (http:// or https:// URLs)."
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
     ))
 }
 
@@ -254,9 +273,13 @@ fn main() -> ExitCode {
             args.get(1).map(String::as_str)
         ),
         (Some("rex" | "plugin"), Some("install" | "uninstall"))
-    );
+            | (Some("skills" | "skill"), Some("uninstall"))
+    ) || args
+        .first()
+        .is_some_and(|arg| arg == "hook" || arg == "hooks");
     if !installing {
         let _ = plugin::refresh();
+        skills::refresh();
     }
     let Some((command, rest)) = args.split_first() else {
         if std::io::stdout().is_terminal() {
@@ -284,6 +307,10 @@ fn main() -> ExitCode {
             }
         },
         "agents" => agents_command(),
+        "plan" => margin::plan_command(rest),
+        "review" => margin::review_command(rest),
+        "skills" | "skill" => skills::command(rest),
+        "hook" | "hooks" => hook::command(rest),
         "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -580,7 +607,7 @@ fn diff_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `leaf pr`: lists your open pull requests, or opens the one named.
+/// `leaf pr`: lists the pull requests and issues that concern you, or opens the pull request named.
 fn pr_command(args: &[String]) -> ExitCode {
     let here = pr::current_repo();
     let start = match args {
@@ -861,6 +888,7 @@ fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Op
         failure: failure.clone(),
         tabs: false,
         layout: diffview::Layout::Split,
+        margin: margin::diff_margin(key, failure.clone()),
     };
     match Store::open(&progress::default_path()) {
         Ok(store) => {

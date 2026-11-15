@@ -1,0 +1,62 @@
+---
+name: leaf-plan
+description: Hand a written plan, spec or design to the person for review in leaf before acting on it. They note blocks of it and send a verdict, which arrives as your next message. Use after writing a plan that needs their sign-off, or when they ask to review your plan in leaf.
+---
+
+# leaf-plan: get a plan reviewed
+
+1. Write the plan to a Markdown file, such as `docs/plans/<topic>.md`. Use headings for phases and list items for steps. Each heading and everything under it, up to the next heading, becomes one block. The person can comment on a whole block, a single line or a range of lines, so keep each section to one phase and each line to one step. Don't also paste the plan into chat.
+2. Run:
+
+   ```bash
+   leaf plan docs/plans/<topic>.md
+   ```
+
+   In Rex, tmux or Herdr this opens the review beside your pane and returns at once with `Opened … for review`.
+3. **End your turn.** Don't wait, sleep, poll or read the pane. The review arrives as your next message.
+
+If leaf says there's nowhere to open it (you're not in Rex, tmux or Herdr), tell the person to run `leaf plan docs/plans/<topic>.md` in their terminal and paste you the review, or to restart you inside tmux or Herdr.
+
+If you have a `leaf_review_plan` tool (Pi), call it with the file instead: it returns the review.
+
+If you have to block until the answer, as in a script, run `leaf plan --wait <file>`. It prints the review to stdout when the person sends it.
+
+## The review you get back
+
+```markdown
+# Review of docs/plans/auth.md: changes requested
+
+Changes requested. Revise, then submit again.
+
+Global: Split the migration into its own step.
+
+## 1. Block 4, "Phase 2 > Tokens" (lines 12-18): comment
+> Rotate the token on every privilege change
+
+That logs people out mid-session.
+
+## 2. Block 4, lines 15-16: comment
+> Store the hash, not the token
+> Expire after 30 days
+
+Make the expiry configurable.
+
+## 3. Block 6 (lines 30-41): remove
+...
+```
+
+A note with `(lines …)` after the heading is on the whole block. One with `, line N` or `, lines N-M` is on just those lines, quoted below it. A `Global:` note is on the whole plan rather than one block: address it as well as the numbered items.
+
+- **approved**: carry on with the plan as written.
+- **approved with notes**: carry on, and apply every numbered item as you go.
+- **changes requested**: revise the same file, addressing every numbered item. Then run `leaf plan` on it again for the next round. The person's notes on blocks you didn't change are kept.
+
+The kinds of note:
+
+- **comment**: do what it says.
+- **remove**: take that block or passage out.
+- **replace**: use the quoted text instead.
+
+Line numbers refer to the file as you submitted it.
+
+If the message says the review was closed without a verdict, ask the person how they'd like to go on.
