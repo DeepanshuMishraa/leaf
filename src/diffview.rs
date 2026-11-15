@@ -853,7 +853,8 @@ impl App {
                     } else {
                         remember
                     };
-                    let offset = self.cursor.saturating_sub(self.scroll);
+                    let previous_cursor = self.cursor;
+                    let offset = previous_cursor.saturating_sub(self.scroll);
                     let picked = self
                         .overview
                         .filter(|at| *at > 0)
@@ -867,11 +868,22 @@ impl App {
                         self.load_notes();
                     }
                     self.follow_renames();
-                    self.cursor = remember
-                        .and_then(|(file, side, line)| self.loaded.diff.row_for(&file, side, line))
-                        .and_then(|row| self.split.line_for_row(row))
-                        .or_else(|| self.split.first_content())
-                        .unwrap_or(0);
+                    self.cursor = if background {
+                        remember
+                            .and_then(|(file, side, line)| {
+                                self.loaded.diff.exact_row(&file, side, line)
+                            })
+                            .and_then(|row| self.split.line_for_row(row))
+                            .unwrap_or_else(|| self.split.snap(previous_cursor))
+                    } else {
+                        remember
+                            .and_then(|(file, side, line)| {
+                                self.loaded.diff.row_for(&file, side, line)
+                            })
+                            .and_then(|row| self.split.line_for_row(row))
+                            .or_else(|| self.split.first_content())
+                            .unwrap_or(0)
+                    };
                     self.scroll = self.cursor.saturating_sub(if background {
                         offset
                     } else {
@@ -4070,6 +4082,77 @@ diff --git a/b.rs b/b.rs
             background: true,
         });
         assert_eq!(app.toast.as_ref().unwrap().text, "Keep this message");
+    }
+
+    #[test]
+    fn review_fix_background_reload_keeps_position_when_remembered_line_disappears() {
+        let patch = big_patch(30);
+        let changed = patch.replace("@@ -1,30 +1,30 @@", "@@ -101,30 +101,30 @@");
+        let mut app = App::new(loaded(&patch), Options::default());
+        app.view = Rect::new(0, 1, 120, 10);
+        app.cursor = 20;
+        app.scroll = 15;
+        assert_eq!(app.remember(), Some(("src/big.rs".into(), Side::New, 19)));
+
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&changed))),
+            remember: None,
+            background: true,
+        });
+
+        assert_eq!((app.cursor, app.scroll), (20, 15));
+    }
+
+    #[test]
+    fn review_fix_background_reload_snaps_nearby_when_selected_file_disappears() {
+        let mut app = App::new(loaded(&format!("{PATCH}{TWO_FILES}")), Options::default());
+        app.view = Rect::new(0, 1, 120, 10);
+        app.cursor = 4;
+        app.scroll = 2;
+        assert_eq!(app.remember(), Some(("src/main.rs".into(), Side::New, 12)));
+
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(TWO_FILES))),
+            remember: None,
+            background: true,
+        });
+
+        assert_eq!((app.cursor, app.scroll), (5, 3));
+        assert_eq!(app.current_file(), Some(1));
+    }
+
+    #[test]
+    fn review_fix_background_reload_clamps_position_when_diff_shrinks() {
+        let mut app = App::new(loaded(&big_patch(30)), Options::default());
+        app.view = Rect::new(0, 1, 120, 10);
+        app.cursor = 27;
+        app.scroll = 23;
+
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&big_patch(8)))),
+            remember: None,
+            background: true,
+        });
+
+        assert_eq!((app.cursor, app.scroll), (9, 5));
+    }
+
+    #[test]
+    fn review_fix_manual_reload_keeps_file_start_fallback_and_recenters() {
+        let patch = format!("{TWO_FILES}{}", big_patch(30));
+        let changed = patch.replace("@@ -1,30 +1,30 @@", "@@ -101,30 +101,30 @@");
+        let mut app = App::new(loaded(&patch), Options::default());
+        app.view = Rect::new(0, 1, 120, 10);
+        app.cursor = 20;
+        app.scroll = 17;
+
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&changed))),
+            remember: app.remember(),
+            background: false,
+        });
+
+        assert_eq!((app.cursor, app.scroll), (8, 3));
     }
 
     #[test]

@@ -65,7 +65,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use doc::Doc;
-use progress::{Progress, Store};
+use progress::Store;
 use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
@@ -251,9 +251,8 @@ fn resume(
         Box::new(move |bookmarks| record(store.borrow_mut().save_bookmarks(&key, bookmarks)))
     };
     match page_count {
-        Some(count) => {
-            options.on_page =
-                Box::new(move |page| record(store.borrow().save(&key, Progress::of(page, count))))
+        Some(_) => {
+            options.on_page = Box::new(move |progress| record(store.borrow().save(&key, progress)))
         }
         None => {
             options.on_scroll =

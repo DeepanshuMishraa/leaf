@@ -140,8 +140,10 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             .display()
             .to_string();
         let (draft, save, failure) = drafts(&key);
-        // A round that can't be kept only loses the comparison with the last one.
-        let (round, previous) = record_round(&key, &source).unwrap_or((1, None));
+        // A round that can't be kept has no snapshot to update when sent.
+        let (round, previous) = record_round(&key, &source)
+            .map(|(round, previous)| (Some(round), previous))
+            .unwrap_or((None, None));
         let plan = Plan {
             subject: request
                 .title
@@ -149,7 +151,7 @@ pub fn plan_command(args: &[String]) -> ExitCode {
                 .unwrap_or_else(|| shown_path(&request.file)),
             source,
             watch: Some(watch),
-            round: Some(round),
+            round,
             previous,
             draft,
             save,
@@ -163,6 +165,7 @@ pub fn plan_command(args: &[String]) -> ExitCode {
         return match result {
             Ok((outcome, source)) => {
                 if matches!(outcome, Outcome::Sent { .. })
+                    && let Some(round) = round
                     && let Err(error) =
                         std::fs::write(round_dir(&key).join(format!("{round}.md")), source)
                 {

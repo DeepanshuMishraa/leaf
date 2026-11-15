@@ -295,7 +295,7 @@ pub struct ViewerOptions {
     pub image_mode: ImageMode,
     pub highlights: Vec<Highlight>,
     /// Hears each page the reader settles on (1-based).
-    pub on_page: Box<dyn FnMut(usize)>,
+    pub on_page: Box<dyn FnMut(Progress)>,
     /// For documents without pages, where reading resumes: a place in the page text.
     pub start_anchor: Option<usize>,
     /// Hears the place in a document without pages as each percent goes by, and on quitting.
@@ -356,7 +356,7 @@ pub struct App {
     picker: Picker,
     /// Column width pages are laid out at.
     width: u16,
-    laid: HashMap<usize, Rc<Laid>>,
+    laid: HashMap<usize, (Rc<Laid>, bool)>,
     mode: Mode,
     /// The page being read: in paged mode the one shown, when scrolling the one at the top.
     current: usize,
@@ -408,7 +408,7 @@ pub struct App {
     /// The text column on screen, and what each of its rows shows, as last drawn.
     column: Rect,
     screen: Vec<Option<ScreenRow>>,
-    reported: Option<usize>,
+    reported: Option<Progress>,
     /// A place in a page-less document to scroll to at the next draw, once its layout is known.
     anchor: Option<usize>,
     reported_scroll: Option<Scroll>,
@@ -590,7 +590,7 @@ impl App {
     }
 
     fn laid(&mut self, page: usize) -> Rc<Laid> {
-        if let Some(laid) = self.laid.get(&page) {
+        if let Some((laid, _)) = self.laid.get(&page) {
             return laid.clone();
         }
         let markdown = self.doc.source.page(page);
@@ -602,7 +602,7 @@ impl App {
             (font.width, font.height),
             &sizes,
         ));
-        self.laid.insert(page, laid.clone());
+        self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
     }
 
@@ -622,7 +622,8 @@ impl App {
     }
 
     fn blank(&mut self, page: usize) -> bool {
-        self.doc.source.page(page).is_empty()
+        self.laid(page);
+        self.laid[&page].1
     }
 
     fn view(&self) -> usize {
@@ -854,13 +855,13 @@ impl App {
     }
 
     fn report_page(&mut self) {
-        if self.doc.page_count.is_none() {
+        let Some(count) = self.doc.page_count else {
             return self.report_scroll(false);
-        }
-        let page = self.reading() + 1;
-        if self.reported != Some(page) {
-            self.reported = Some(page);
-            (self.options.on_page)(page);
+        };
+        let progress = Progress::of(self.reading() + 1, count);
+        if self.reported != Some(progress) {
+            self.reported = Some(progress);
+            (self.options.on_page)(progress);
         }
     }
 
@@ -3554,6 +3555,86 @@ mod tests {
     }
 
     #[test]
+    fn review_fix_cached_frames_do_not_reread_page_text() {
+        struct Counted {
+            text: Rc<str>,
+            reads: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::doc::Source for Counted {
+            fn page(&self, _: usize) -> Rc<str> {
+                self.reads.set(self.reads.get() + 1);
+                self.text.clone()
+            }
+
+            fn image_size(&self, _: &str) -> Option<(u32, u32)> {
+                None
+            }
+
+            fn decode(&self, _: &str, _: u32) -> Option<RgbaImage> {
+                None
+            }
+        }
+
+        for text in ["", "A cached page\n\nAnother paragraph."] {
+            let reads = Rc::new(std::cell::Cell::new(0));
+            let doc = Doc {
+                title: "Counted book".into(),
+                page_count: Some(1),
+                source: Box::new(Counted {
+                    text: text.into(),
+                    reads: reads.clone(),
+                }),
+            };
+            let mut screen = Screen::new(doc, 120, 30, ViewerOptions::default());
+            let frame = screen.draw();
+            assert!(frame.contains(if text.is_empty() {
+                "blank page"
+            } else {
+                "A cached page"
+            }));
+            assert_eq!(reads.get(), 1, "cached frames reread the source page");
+            screen.draw();
+            assert_eq!(reads.get(), 1);
+            screen.app.laid.clear();
+            screen.draw();
+            assert_eq!(reads.get(), 2, "invalidated layout must reread once");
+        }
+    }
+
+    #[test]
+    fn review_fix_progress_reports_changed_page_count_without_navigation() {
+        let pages = Rc::new(RefCell::new(Vec::new()));
+        let heard = pages.clone();
+        let options = ViewerOptions {
+            on_page: Box::new(move |page| heard.borrow_mut().push(page)),
+            ..ViewerOptions::default()
+        };
+        let mut screen = Screen::new(book(&["Alpha"]), 120, 30, options);
+        assert_eq!(pages.borrow().len(), 1);
+        screen.app.doc = book(&["Alpha", "Bravo"]);
+        screen.app.laid.clear();
+        screen.draw();
+        assert_eq!(
+            pages.borrow().len(),
+            2,
+            "replacement count was not reported"
+        );
+        assert_eq!(
+            *pages.borrow(),
+            vec![Progress::of(1, 1), Progress::of(1, 2)]
+        );
+        screen.press(KeyCode::Right);
+        assert_eq!(pages.borrow().last(), Some(&Progress::of(2, 2)));
+        screen.draw();
+        assert_eq!(
+            pages.borrow().len(),
+            3,
+            "unchanged progress was reported twice"
+        );
+    }
+
+    #[test]
     fn a_figure_that_cant_be_decoded_is_tried_once_while_on_screen() {
         let tries = Rc::new(std::cell::Cell::new(0));
         let doc = Doc {
@@ -3620,7 +3701,10 @@ mod tests {
         let mut s = Screen::new(book(&["Alpha", "Bravo", "Charlie"]), 120, 30, options);
         assert!(s.draw().contains("Bravo"));
         s.press(KeyCode::Char('l'));
-        assert_eq!(*pages.borrow(), vec![2, 3]);
+        assert_eq!(
+            *pages.borrow(),
+            vec![Progress::of(2, 3), Progress::of(3, 3)]
+        );
     }
 
     #[test]
