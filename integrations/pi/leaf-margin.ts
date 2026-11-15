@@ -1,8 +1,8 @@
 /**
  * leaf-margin: hand plans and changes to the person for review in leaf.
  *
- * Installed by `leaf hook install`; `leaf hook uninstall` removes it.
- * Run `leaf hook install` again to refresh it; edit a copy rather than this file.
+ * Installed by `leaf agent setup`. Delete this file to remove it.
+ * Run `leaf agent setup` again to refresh it; edit a copy rather than this file.
  */
 
 import { Type } from "@earendil-works/pi-ai";

@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use crate::plugin::fnv1a;
 
@@ -34,6 +33,11 @@ pub const SKILLS: [Skill; 3] = [
 const STAMP: &str = "  leaf-skill: ";
 
 impl Skill {
+    /// The skill as shipped, without leaf's stamp: what `leaf agent skill` prints.
+    pub fn text(self) -> &'static str {
+        self.text
+    }
+
     fn version(self) -> u64 {
         fnv1a(self.text)
     }
@@ -120,21 +124,31 @@ pub enum Change {
     AlreadyCurrent,
     /// Edited by hand or not leaf's: left as it was.
     Kept,
-    Removed,
-    Absent,
 }
 
 impl Change {
-    fn label(self) -> &'static str {
+    /// The word `leaf agent setup` lists it under.
+    pub fn label(self) -> &'static str {
         match self {
-            Change::Written => "installed",
-            Change::Updated => "updated",
-            Change::AlreadyCurrent => "already current",
-            Change::Kept => "left alone (edited by hand, or not leaf's)",
-            Change::Removed => "removed",
-            Change::Absent => "not installed",
+            Change::Written => "add",
+            Change::Updated => "update",
+            Change::AlreadyCurrent => "current",
+            Change::Kept => "left alone",
         }
     }
+
+    /// Whether installing writes the file.
+    pub fn writes(self) -> bool {
+        matches!(self, Change::Written | Change::Updated)
+    }
+}
+
+/// One skill as installing would leave it, for showing before anything is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    pub skill: Skill,
+    pub path: PathBuf,
+    pub change: Change,
 }
 
 fn write(path: &Path, text: &str) -> Result<(), String> {
@@ -144,48 +158,45 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Installs every skill into each folder of skills.
-pub fn install(dirs: &[PathBuf]) -> Vec<Report> {
-    let mut reports = Vec::new();
+/// What installing every skill into each folder would do, without writing
+/// anything: what `leaf agent setup` shows before it asks.
+pub fn plan(dirs: &[PathBuf]) -> Vec<Planned> {
+    let mut planned = Vec::new();
     for dir in dirs {
         for skill in SKILLS {
-            let path = path_of(dir, skill);
-            let result = match found(dir, skill) {
-                Found::Missing => write(&path, &skill.rendered()).map(|()| Change::Written),
-                Found::Ours { current: false } => {
-                    write(&path, &skill.rendered()).map(|()| Change::Updated)
-                }
-                Found::Ours { current: true } => Ok(Change::AlreadyCurrent),
-                Found::Edited | Found::Foreign => Ok(Change::Kept),
+            let change = match found(dir, skill) {
+                Found::Missing => Change::Written,
+                Found::Ours { current: false } => Change::Updated,
+                Found::Ours { current: true } => Change::AlreadyCurrent,
+                Found::Edited | Found::Foreign => Change::Kept,
             };
-            reports.push(Report { path, result });
+            planned.push(Planned {
+                skill,
+                path: path_of(dir, skill),
+                change,
+            });
         }
     }
-    reports
+    planned
 }
 
-/// Removes leaf's own, unedited skills from each folder.
-pub fn uninstall(dirs: &[PathBuf]) -> Vec<Report> {
-    let mut reports = Vec::new();
-    for dir in dirs {
-        for skill in SKILLS {
-            let path = path_of(dir, skill);
-            let result = match found(dir, skill) {
-                Found::Missing => Ok(Change::Absent),
-                Found::Ours { .. } => fs::remove_file(&path)
-                    .map(|()| {
-                        if let Some(parent) = path.parent() {
-                            let _ = fs::remove_dir(parent);
-                        }
-                        Change::Removed
-                    })
-                    .map_err(|e| format!("{}: {e}", path.display())),
-                Found::Edited | Found::Foreign => Ok(Change::Kept),
+/// Installs every skill into each folder of skills.
+pub fn install(dirs: &[PathBuf]) -> Vec<Report> {
+    plan(dirs)
+        .into_iter()
+        .map(|planned| {
+            let result = match planned.change {
+                Change::Written | Change::Updated => {
+                    write(&planned.path, &planned.skill.rendered()).map(|()| planned.change)
+                }
+                left => Ok(left),
             };
-            reports.push(Report { path, result });
-        }
-    }
-    reports
+            Report {
+                path: planned.path,
+                result,
+            }
+        })
+        .collect()
 }
 
 /// Brings leaf's own installed skills up to this version. Quiet: a copy that
@@ -208,8 +219,7 @@ fn home() -> PathBuf {
 
 /// Where agents look for skills: Claude Code's folder, and the shared one
 /// Codex, OpenCode, Pi and others read.
-pub fn default_dirs() -> Vec<PathBuf> {
-    let home = home();
+pub fn default_dirs(home: &Path) -> Vec<PathBuf> {
     vec![home.join(".claude/skills"), home.join(".agents/skills")]
 }
 
@@ -217,7 +227,7 @@ pub fn default_dirs() -> Vec<PathBuf> {
 /// ones Cursor and Antigravity read. Upgrades refresh these too.
 fn all_dirs() -> Vec<PathBuf> {
     let home = home();
-    let mut dirs = default_dirs();
+    let mut dirs = default_dirs(&home);
     for extra in [".cursor/skills", ".gemini/config/skills"] {
         let dir = home.join(extra);
         if !dirs.contains(&dir) {
@@ -225,80 +235,6 @@ fn all_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
-}
-
-const USAGE: &str = "Usage: leaf skills install | uninstall | status | print <name>
-
-Skills teach coding agents to use leaf: `leaf` (reading, diffs, pull requests
-and every key), `leaf-plan` (hand a plan over for review) and `leaf-review`
-(hand changes over for review).
-
-install    writes them to ~/.claude/skills and ~/.agents/skills
-uninstall  removes the copies leaf wrote (ones you edited stay)
-status     says what's installed where
-print      writes one skill to stdout, for agents that take a file";
-
-fn print_reports(reports: &[Report]) -> ExitCode {
-    let mut failed = false;
-    for report in reports {
-        match &report.result {
-            Ok(change) => println!("{}  {}", change.label(), report.path.display()),
-            Err(e) => {
-                failed = true;
-                eprintln!("leaf: couldn't write {} ({e})", report.path.display());
-            }
-        }
-    }
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-/// `leaf skills`.
-pub fn command(args: &[String]) -> ExitCode {
-    match args {
-        [verb] if verb == "install" => print_reports(&install(&default_dirs())),
-        [verb] if verb == "uninstall" => print_reports(&uninstall(&default_dirs())),
-        [verb] if verb == "status" => {
-            for dir in default_dirs() {
-                for skill in SKILLS {
-                    let state = match found(&dir, skill) {
-                        Found::Missing => "not installed",
-                        Found::Ours { current: true } => "installed, current",
-                        Found::Ours { current: false } => "installed, out of date",
-                        Found::Edited => "edited by hand",
-                        Found::Foreign => "someone else's file",
-                    };
-                    println!("{state:<22}  {}", path_of(&dir, skill).display());
-                }
-            }
-            ExitCode::SUCCESS
-        }
-        [verb, name] if verb == "print" => match SKILLS.iter().find(|s| s.name == name) {
-            Some(skill) => {
-                print!("{}", skill.text);
-                ExitCode::SUCCESS
-            }
-            None => {
-                let names: Vec<&str> = SKILLS.iter().map(|s| s.name).collect();
-                eprintln!(
-                    "leaf: there's no skill called {name}. The skills are {}.",
-                    names.join(", ")
-                );
-                ExitCode::from(2)
-            }
-        },
-        [flag] if flag == "-h" || flag == "--help" => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -366,24 +302,44 @@ mod tests {
                 .all(|r| r.result == Ok(Change::AlreadyCurrent))
         );
         // An older version of leaf's own file is brought up to date.
-        let plan = path_of(&dir, SKILLS[1]);
+        let plan_path = path_of(&dir, SKILLS[1]);
         let old = stamped(
             "---\nname: leaf-plan\n---\nold\n",
             fnv1a("---\nname: leaf-plan\n---\nold\n"),
         );
-        fs::write(&plan, old).unwrap_or_default();
+        fs::write(&plan_path, old).unwrap_or_default();
         assert_eq!(found(&dir, SKILLS[1]), Found::Ours { current: false });
         assert_eq!(install(&dirs)[1].result, Ok(Change::Updated));
-        // A hand edit is kept, by install and uninstall alike.
+        // A hand edit is kept.
         let edited = SKILLS[1].rendered().replace("End your turn", "Stop");
-        fs::write(&plan, &edited).unwrap_or_default();
+        fs::write(&plan_path, &edited).unwrap_or_default();
         assert_eq!(found(&dir, SKILLS[1]), Found::Edited);
         assert_eq!(install(&dirs)[1].result, Ok(Change::Kept));
-        let removed = uninstall(&dirs);
-        assert_eq!(removed[0].result, Ok(Change::Removed));
-        assert_eq!(removed[1].result, Ok(Change::Kept));
-        assert_eq!(fs::read_to_string(&plan).ok(), Some(edited));
-        assert_eq!(found(&dir, SKILLS[0]), Found::Missing);
+        assert_eq!(fs::read_to_string(&plan_path).ok(), Some(edited));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn planning_says_what_installing_would_do_without_writing() {
+        let dir = scratch("plan");
+        let dirs = vec![dir.clone()];
+        let planned = plan(&dirs);
+        assert_eq!(planned.len(), SKILLS.len());
+        assert!(planned.iter().all(|p| p.change == Change::Written));
+        assert!(!dir.exists(), "planning must not write");
+        assert_eq!(planned[0].skill.name, SKILLS[0].name);
+
+        install(&dirs);
+        assert_eq!(
+            plan(&dirs).iter().map(|p| p.change).collect::<Vec<_>>(),
+            [Change::AlreadyCurrent; SKILLS.len()]
+        );
+        write(
+            &path_of(&dir, SKILLS[2]),
+            "---\nname: leaf-review\n---\nmine\n",
+        )
+        .unwrap_or_default();
+        assert_eq!(plan(&dirs)[2].change, Change::Kept);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -395,10 +351,6 @@ mod tests {
         assert_eq!(found(&dir, SKILLS[0]), Found::Foreign);
         assert_eq!(
             install(std::slice::from_ref(&dir))[0].result,
-            Ok(Change::Kept)
-        );
-        assert_eq!(
-            uninstall(std::slice::from_ref(&dir))[0].result,
             Ok(Change::Kept)
         );
         let _ = fs::remove_dir_all(dir);

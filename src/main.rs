@@ -73,8 +73,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | pictur
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
-       leaf skills install | uninstall | status   teach coding agents to use leaf
-       leaf hook install | uninstall | status     set up every agent CLI here for plan review
+       leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -272,8 +271,7 @@ fn main() -> ExitCode {
             args.first().map(String::as_str),
             args.get(1).map(String::as_str)
         ),
-        (Some("rex" | "plugin"), Some("install" | "uninstall"))
-            | (Some("skills" | "skill"), Some("uninstall"))
+        (Some("rex" | "plugin"), Some("install" | "uninstall")) | (Some("agent"), Some("setup"))
     ) || args
         .first()
         .is_some_and(|arg| arg == "hook" || arg == "hooks");
@@ -309,8 +307,14 @@ fn main() -> ExitCode {
         "agents" => agents_command(),
         "plan" => margin::plan_command(rest),
         "review" => margin::review_command(rest),
-        "skills" | "skill" => skills::command(rest),
+        "agent" => hook::agent_command(rest),
         "hook" | "hooks" => hook::command(rest),
+        "skills" | "skill" => {
+            eprintln!(
+                "leaf: skills are installed with `leaf agent setup`; `leaf agent skill <name>` prints one."
+            );
+            ExitCode::from(2)
+        }
         "ui" => ui_command(rest),
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {

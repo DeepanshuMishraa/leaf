@@ -139,11 +139,10 @@ Everything goes through the GitHub CLI, so `gh` must be installed and signed in 
 Margin is how you and a coding agent pass work back and forth in leaf. The agent hands over a plan or a set of changes, you leave notes, and they go back as one review with a verdict. The agent gets it as its next message, in the conversation it's already having.
 
 ```sh
-leaf hook install     # set up every agent CLI here (asks first; --dry-run shows the changes)
-leaf skills install   # or only the skills: leaf, leaf-plan and leaf-review
+leaf agent setup      # set up every agent CLI here (asks first; --dry-run shows the changes)
 ```
 
-`leaf hook install` finds the coding agents on this machine, shows what it will change, and asks once. Each agent gets the skills, and a hook where it has one. With the hook, a plan opens in leaf at the moment the agent would ask you to approve it. Request changes and the agent revises; approve and it goes ahead.
+`leaf agent setup` finds the coding agents on this machine, shows what it will change, and asks once. It installs the leaf skills and adds a plan hook where the agent supports one. The skills also land in `~/.claude/skills` and `~/.agents/skills`, ready for an agent you install later. With a hook, a plan opens in leaf at the moment the agent would ask you to approve it. Request changes and the agent revises; approve and it goes ahead.
 
 | Agent | How it hands you a plan |
 |---|---|
@@ -155,7 +154,7 @@ leaf skills install   # or only the skills: leaf, leaf-plan and leaf-review
 | Pi | an extension with `leaf_review_plan` and `leaf_review_changes` tools |
 | OpenCode | the skills, since it has no plan hook; it runs `leaf plan` itself |
 
-Config files are merged, never replaced, and the first change to a JSON file keeps a `.leaf-backup` beside it. `leaf hook status` shows what's set up, and `leaf hook uninstall` takes out only what leaf added.
+Config files are merged, never replaced, and the first change to a JSON file keeps a `.leaf-backup` beside it. Run `leaf agent setup` again to refresh leaf's hooks and skills; files edited by hand are left alone. To remove setup, delete the leaf skill folders and remove the lines or entries marked `leaf-margin` from the agent configs.
 
 ### Plans
 

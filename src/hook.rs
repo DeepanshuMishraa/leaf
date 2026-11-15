@@ -1,4 +1,4 @@
-//! Wiring Margin into the agent CLIs on this machine. `leaf hook install`
+//! Wiring Margin into the agent CLIs on this machine. `leaf agent setup`
 //! finds each one and sets it up the way it supports, and `leaf hook <agent>`
 //! is what that agent's hook runs when it has a plan to show.
 //!
@@ -185,18 +185,18 @@ fn detect(home: &Path, dirs: &[PathBuf]) -> Vec<Agent> {
         .collect()
 }
 
-/// A file's whole new text, to show and then write; `None` removes it.
+/// A file's whole new text, to show and then write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileChange {
     path: PathBuf,
     before: Option<String>,
-    after: Option<String>,
+    after: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 enum SetupError {
     #[error(
-        "{path} isn't valid JSON ({cause}), so leaf left it alone. Fix the file, then run `leaf hook install` again."
+        "{path} isn't valid JSON ({cause}), so leaf left it alone. Fix the file, then run `leaf agent setup` again."
     )]
     Unparseable { path: String, cause: String },
     #[error("{path} has an unexpected shape ({what}), so leaf left it alone.")]
@@ -303,68 +303,6 @@ fn refresh(existing: &mut Value, fresh: Value) {
     }
 }
 
-/// The settings without leaf's entry under `hooks.<event>`; `None` when it
-/// had none or can't be read.
-fn remove_event(text: &str, event: &str) -> Option<String> {
-    let mut settings: Value = serde_json::from_str(text).ok()?;
-    let hooks = settings.get_mut("hooks")?.as_object_mut()?;
-    let list = hooks.get_mut(event)?.as_array_mut()?;
-    let mut touched = false;
-    list.retain_mut(|entry| strip(entry, &mut touched));
-    if !touched {
-        return None;
-    }
-    if list.is_empty() {
-        hooks.remove(event);
-    }
-    if hooks.is_empty()
-        && let Some(root) = settings.as_object_mut()
-    {
-        root.remove("hooks");
-    }
-    Some(pretty(&settings))
-}
-
-/// Removes leaf's own handler from `value`, keeping everything else; `false`
-/// when nothing worth keeping is left in it.
-fn strip(value: &mut Value, touched: &mut bool) -> bool {
-    match value {
-        Value::String(text) => {
-            let leaf = text.contains(MARK);
-            *touched |= leaf;
-            !leaf
-        }
-        Value::Array(items) => {
-            items.retain_mut(|item| strip(item, touched));
-            !items.is_empty()
-        }
-        Value::Object(map) => {
-            let leaf = map
-                .values()
-                .any(|value| matches!(value, Value::String(text) if text.contains(MARK)));
-            if leaf {
-                *touched = true;
-                return false;
-            }
-            let mut ours = false;
-            let emptied = match map.get_mut("hooks") {
-                Some(hooks) => !strip(hooks, &mut ours),
-                None => false,
-            };
-            *touched |= ours;
-            if emptied {
-                map.remove("hooks");
-            }
-            // An entry whose only handlers were leaf's goes when nothing but
-            // its `matcher` is left, which means nothing without them; any
-            // other field keeps it.
-            let only_matcher = map.keys().all(|key| key == "matcher");
-            !(ours && emptied && only_matcher) && !map.is_empty()
-        }
-        _ => true,
-    }
-}
-
 /// The new text of `agent`'s hook file with leaf in it, or `None` when it
 /// gets no hook.
 fn installed_text(
@@ -420,28 +358,11 @@ fn installed_text(
     Ok(Some(text))
 }
 
-/// The hook file's text without leaf in it; `Some(None)` deletes the file,
-/// and `None` means there's nothing of leaf's to take out.
-fn removed_text(agent: Agent, before: &str) -> Option<Option<String>> {
-    match agent {
-        Agent::Claude => remove_event(before, "PermissionRequest").map(Some),
-        Agent::Codex => remove_event(before, "Stop").map(Some),
-        Agent::Cursor => remove_event(before, "preToolUse").map(Some),
-        Agent::Grok | Agent::Pi => has_mark(&Value::String(before.to_owned())).then_some(None),
-        Agent::Antigravity => {
-            let mut settings: Value = serde_json::from_str(before).ok()?;
-            settings.as_object_mut()?.remove(MARK)?;
-            Some(Some(pretty(&settings)))
-        }
-        Agent::OpenCode => None,
-    }
-}
-
 /// The lines `after` adds and `before` drops, for the person to read
 /// before anything is written.
 fn summary(change: &FileChange) -> String {
     let before: Vec<&str> = change.before.as_deref().unwrap_or("").lines().collect();
-    let after: Vec<&str> = change.after.as_deref().unwrap_or("").lines().collect();
+    let after: Vec<&str> = change.after.lines().collect();
     let mut out = String::new();
     for line in before.iter().filter(|line| !after.contains(line)) {
         out.push_str(&format!("    - {line}\n"));
@@ -457,23 +378,18 @@ fn summary(change: &FileChange) -> String {
 fn apply(change: &FileChange) -> Result<(), String> {
     let path = &change.path;
     let fail = |e: std::io::Error| format!("{}: {e}", path.display());
-    match &change.after {
-        Some(after) => {
-            if let (Some(before), Some(extension)) = (&change.before, path.extension())
-                && extension == "json"
-            {
-                let backup = path.with_extension("json.leaf-backup");
-                if !backup.exists() {
-                    fs::write(&backup, before).map_err(fail)?;
-                }
-            }
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(fail)?;
-            }
-            atomic_write(path, after).map_err(fail)
+    if let (Some(before), Some(extension)) = (&change.before, path.extension())
+        && extension == "json"
+    {
+        let backup = path.with_extension("json.leaf-backup");
+        if !backup.exists() {
+            fs::write(&backup, before).map_err(fail)?;
         }
-        None => fs::remove_file(path).map_err(fail),
     }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(fail)?;
+    }
+    atomic_write(path, &change.after).map_err(fail)
 }
 
 /// Replaces `path` through a temporary file, so a failed write leaves the old
@@ -523,38 +439,86 @@ fn tilde(path: &Path, home: &Path) -> String {
     }
 }
 
-const USAGE: &str = "Usage: leaf hook install [--yes] [--dry-run] | uninstall | status
+const USAGE: &str = "Usage: leaf agent setup [--yes] [--dry-run] | skill <name>
 
 Sets up the coding agents on this machine to hand you their plans and changes
 for review in leaf: Claude Code, Codex, Antigravity, Grok Build, Cursor, Pi
 and OpenCode. Each gets the leaf skills, and a hook where it has one.
 
-install    shows what will change, asks once, then does it
+setup      shows what will change, asks once, then does it
            (--yes doesn't ask, --dry-run only shows)
-uninstall  takes out everything leaf added
-status     shows what's set up";
+skill      prints one skill to stdout, for agents that take a file:
+           leaf, leaf-plan or leaf-review";
 
-/// `leaf hook`.
-pub fn command(args: &[String]) -> ExitCode {
+const HOOK_USAGE: &str = "Usage: leaf hook <agent>
+
+Called by an agent's hook, not by hand: it opens leaf for the plan or the
+changes the agent is handing over, and answers in that agent's own format.
+Agents: claude, codex, antigravity (agy), grok, cursor, pi, opencode.
+Set the hooks up with `leaf agent setup`.";
+
+/// `leaf agent`.
+pub fn agent_command(args: &[String]) -> ExitCode {
     let Some((verb, rest)) = args.split_first() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     match verb.as_str() {
-        "install" => install(rest),
-        "uninstall" => uninstall(),
-        "status" => status(),
+        "setup" => setup(rest),
+        "skill" => skill(rest),
         "-h" | "--help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        word => match Agent::parse(word) {
-            Some(agent) => run(agent),
+        _ => {
+            eprintln!("{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `leaf agent skill <name>`, which prints one skill for agents that take a file.
+fn skill(args: &[String]) -> ExitCode {
+    match args {
+        [name] => match skills::SKILLS.iter().find(|skill| skill.name == name) {
+            Some(skill) => {
+                print!("{}", skill.text());
+                ExitCode::SUCCESS
+            }
             None => {
-                eprintln!("{USAGE}");
+                let names: Vec<&str> = skills::SKILLS.iter().map(|skill| skill.name).collect();
+                eprintln!(
+                    "leaf: there's no skill called {name}. The skills are {}.",
+                    names.join(", ")
+                );
                 ExitCode::from(2)
             }
         },
+        _ => {
+            eprintln!("leaf: name the skill to print: leaf, leaf-plan or leaf-review.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `leaf hook`, the entry point an agent's hook runs.
+pub fn command(args: &[String]) -> ExitCode {
+    match args {
+        [flag] if flag == "-h" || flag == "--help" => {
+            println!("{HOOK_USAGE}");
+            ExitCode::SUCCESS
+        }
+        [word] => match Agent::parse(word) {
+            Some(agent) => run(agent),
+            None => {
+                eprintln!("{HOOK_USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        _ => {
+            eprintln!("{HOOK_USAGE}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -582,7 +546,7 @@ fn plan_install(home: &Path, agents: &[Agent], exe: &Path) -> (Vec<FileChange>, 
             Ok(Some(after)) if Some(&after) != before.as_ref() => changes.push(FileChange {
                 path,
                 before,
-                after: Some(after),
+                after,
             }),
             Ok(_) => {}
             Err(e) => problems.push(format!("{}: {e}", agent.name())),
@@ -591,8 +555,10 @@ fn plan_install(home: &Path, agents: &[Agent], exe: &Path) -> (Vec<FileChange>, 
     (changes, problems)
 }
 
+/// The folders setup writes skills into: the shared ones always, so they're
+/// ready for an agent installed later, plus each detected agent's own.
 fn skill_dirs(home: &Path, agents: &[Agent]) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dirs = skills::default_dirs(home);
     for agent in agents {
         let dir = agent.skills_dir(home);
         if !dirs.contains(&dir) {
@@ -602,7 +568,55 @@ fn skill_dirs(home: &Path, agents: &[Agent]) -> Vec<PathBuf> {
     dirs
 }
 
-fn install(args: &[String]) -> ExitCode {
+/// `1 file`, `3 files`.
+fn files(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{n} files")
+    }
+}
+
+/// What setup would change, one line each, then the files it leaves alone.
+fn show_plan(home: &Path, changes: &[FileChange], planned: &[skills::Planned], diff: bool) {
+    for change in changes {
+        let verb = if change.before.is_some() {
+            "update"
+        } else {
+            "add"
+        };
+        println!("  {verb:<10} {} (the plan hook)", tilde(&change.path, home));
+        if diff {
+            print!("{}", summary(change));
+        }
+    }
+    let mut current = 0;
+    let mut kept = Vec::new();
+    for item in planned {
+        if item.change.writes() {
+            println!("  {:<10} {}", item.change.label(), tilde(&item.path, home));
+        } else if item.change == skills::Change::AlreadyCurrent {
+            current += 1;
+        } else {
+            kept.push(item);
+        }
+    }
+    if current > 0 {
+        let plural = if current == 1 { "" } else { "s" };
+        println!("  {current} skill{plural} already current");
+    }
+    if !kept.is_empty() {
+        println!(
+            "  {} left alone, edited by hand or not leaf's:",
+            files(kept.len())
+        );
+        for item in kept {
+            println!("    {}", tilde(&item.path, home));
+        }
+    }
+}
+
+fn setup(args: &[String]) -> ExitCode {
     let mut yes = false;
     let mut dry_run = false;
     for arg in args {
@@ -610,36 +624,29 @@ fn install(args: &[String]) -> ExitCode {
             "--yes" | "-y" => yes = true,
             "--dry-run" | "-n" => dry_run = true,
             other => {
-                eprintln!("leaf: unknown option {other}. Run `leaf hook --help` for usage.");
+                eprintln!("leaf: unknown option {other}. Run `leaf agent --help` for usage.");
                 return ExitCode::from(2);
             }
         }
     }
     let home = home();
     let agents = detect(&home, &search_dirs(&home));
-    if agents.is_empty() {
-        println!(
-            "No coding agents found. leaf works with Claude Code, Codex, Antigravity, Grok Build, Cursor, Pi and OpenCode; install one, then run this again."
-        );
-        return ExitCode::SUCCESS;
-    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("leaf"));
     let (changes, problems) = plan_install(&home, &agents, &exe);
     let dirs = skill_dirs(&home, &agents);
+    let planned = skills::plan(&dirs);
+    let writing = changes.len() + planned.iter().filter(|item| item.change.writes()).count();
     println!();
+    if agents.is_empty() {
+        println!(
+            "No coding agents found here yet. leaf works with Claude Code, Codex, Antigravity, Grok Build, Cursor, Pi and OpenCode; the skills below are ready for when you install one."
+        );
+    }
     for agent in &agents {
         println!("  {:<13} {}", agent.name(), agent.setup());
     }
     println!();
-    for change in &changes {
-        println!("  {}", tilde(&change.path, &home));
-        if dry_run {
-            print!("{}", summary(change));
-        }
-    }
-    for dir in &dirs {
-        println!("  {}/leaf, leaf-plan, leaf-review", tilde(dir, &home));
-    }
+    show_plan(&home, &changes, &planned, dry_run);
     for problem in &problems {
         eprintln!("\n  ! {problem}");
     }
@@ -647,24 +654,62 @@ fn install(args: &[String]) -> ExitCode {
         println!("\nNothing written (dry run).");
         return ExitCode::SUCCESS;
     }
+    if writing == 0 {
+        println!("\nEverything is already set up.");
+        return if problems.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     if !yes && !confirm("\nSet these up?") {
-        println!("Nothing changed. `leaf hook install --yes` sets them up without asking.");
+        println!("Nothing changed. `leaf agent setup --yes` sets them up without asking.");
         return ExitCode::SUCCESS;
     }
+    let mut written = 0;
     let mut failed = !problems.is_empty();
     for change in &changes {
-        if let Err(e) = apply(change) {
-            failed = true;
-            eprintln!("leaf: couldn't write {e}. That file is as it was.");
+        match apply(change) {
+            Ok(()) => {
+                written += 1;
+                let verb = if change.before.is_some() {
+                    "updated"
+                } else {
+                    "added"
+                };
+                println!(
+                    "  {verb:<10} {} (the plan hook)",
+                    tilde(&change.path, &home)
+                );
+            }
+            Err(e) => {
+                failed = true;
+                eprintln!("leaf: couldn't write {e}. That file is as it was.");
+            }
         }
     }
     for report in skills::install(&dirs) {
-        if let Err(e) = report.result {
-            failed = true;
-            eprintln!("leaf: couldn't write the skill {e}");
+        match report.result {
+            Ok(change) if change.writes() => {
+                written += 1;
+                let verb = match change {
+                    skills::Change::Written => "added",
+                    skills::Change::Updated => "updated",
+                    _ => unreachable!("only writes have a success message"),
+                };
+                println!("  {verb:<10} {}", tilde(&report.path, &home));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                failed = true;
+                eprintln!("leaf: couldn't write the skill {e}. That skill is as it was.");
+            }
         }
     }
-    println!("\nDone. Start a new agent session to pick it up.");
+    println!(
+        "\nSetup finished: {} written. Start a new agent session to pick it up.",
+        files(written)
+    );
     if agents.contains(&Agent::Codex) {
         println!("Codex runs a new hook only once you trust it: open /hooks in Codex.");
     }
@@ -673,85 +718,6 @@ fn install(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
-}
-
-fn uninstall() -> ExitCode {
-    let home = home();
-    let mut failed = false;
-    for agent in Agent::ALL {
-        let Some(path) = agent.hook_file(&home) else {
-            continue;
-        };
-        let Some(before) = fs::read_to_string(&path).ok() else {
-            continue;
-        };
-        let Some(after) = removed_text(agent, &before) else {
-            continue;
-        };
-        let change = FileChange {
-            path,
-            before: Some(before),
-            after,
-        };
-        match apply(&change) {
-            Ok(()) => println!(
-                "  {:<13} removed from {}",
-                agent.name(),
-                tilde(&change.path, &home)
-            ),
-            Err(e) => {
-                failed = true;
-                eprintln!("leaf: couldn't write {e}");
-            }
-        }
-    }
-    let dirs = skill_dirs(&home, &Agent::ALL);
-    let removed = skills::uninstall(&dirs)
-        .into_iter()
-        .filter(|report| match &report.result {
-            Ok(change) => *change == skills::Change::Removed,
-            Err(e) => {
-                failed = true;
-                eprintln!("leaf: couldn't remove {e}");
-                false
-            }
-        })
-        .count();
-    if removed > 0 {
-        println!("  skills        {removed} removed");
-    }
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-fn status() -> ExitCode {
-    let home = home();
-    let found = detect(&home, &search_dirs(&home));
-    for agent in Agent::ALL {
-        let state = if !found.contains(&agent) {
-            "not installed"
-        } else {
-            let hooked = agent
-                .hook_file(&home)
-                .and_then(|path| fs::read_to_string(path).ok())
-                .is_some_and(|text| text.contains(MARK));
-            let skilled = skills::SKILLS.iter().all(|skill| {
-                matches!(
-                    skills::found(&agent.skills_dir(&home), *skill),
-                    skills::Found::Ours { .. }
-                )
-            });
-            match (agent.hook_file(&home).is_some(), hooked, skilled) {
-                (true, true, true) | (false, _, true) => "ready",
-                (true, false, _) | (_, _, false) => "not set up: run leaf hook install",
-            }
-        };
-        println!("  {:<13} {state}", agent.name());
-    }
-    ExitCode::SUCCESS
 }
 
 // Running as an agent's hook. Whatever goes wrong, a hook steps aside
@@ -1085,6 +1051,19 @@ mod tests {
     }
 
     #[test]
+    fn setup_writes_the_shared_skill_folders_even_with_no_agents() {
+        let home = PathBuf::from("/Users/me");
+        assert_eq!(
+            skill_dirs(&home, &[]),
+            vec![home.join(".claude/skills"), home.join(".agents/skills")]
+        );
+        let dirs = skill_dirs(&home, &Agent::ALL);
+        for agent in Agent::ALL {
+            assert!(dirs.contains(&agent.skills_dir(&home)), "{}", agent.name());
+        }
+    }
+
+    #[test]
     fn the_hook_command_runs_this_leaf_and_carries_the_mark() {
         assert_eq!(
             hook_command(Path::new("/Users/me/it's/leaf"), Agent::Grok),
@@ -1119,35 +1098,6 @@ mod tests {
         assert_eq!(list[1]["matcher"], "ExitPlanMode");
         assert_eq!(list[1]["hooks"][0]["timeout"], HOOK_TIMEOUT);
         assert_eq!(install_text(Agent::Claude, Some(&once)), once);
-        let removed = removed_text(Agent::Claude, &once)
-            .flatten()
-            .unwrap_or_default();
-        assert!(removed.contains("guard") && !removed.contains(MARK));
-    }
-
-    #[test]
-    fn uninstall_leaves_no_empty_matcher_behind() {
-        let once = install_text(Agent::Claude, Some(r#"{"model": "opus"}"#));
-        let removed = removed_text(Agent::Claude, &once)
-            .flatten()
-            .unwrap_or_default();
-        let value: Value = serde_json::from_str(&removed).unwrap_or_default();
-        assert_eq!(value, serde_json::json!({"model": "opus"}), "{removed}");
-
-        // Someone else's field on the same entry keeps it.
-        let command = format!("'{EXE}' hook claude # {MARK}");
-        let shared = format!(
-            r#"{{"hooks":{{"PermissionRequest":[{{"matcher":"ExitPlanMode","note":"mine","hooks":[{{"type":"command","command":"{command}"}}]}}]}}}}"#
-        );
-        let removed = removed_text(Agent::Claude, &shared)
-            .flatten()
-            .unwrap_or_default();
-        let value: Value = serde_json::from_str(&removed).unwrap_or_default();
-        assert_eq!(
-            value["hooks"]["PermissionRequest"][0],
-            serde_json::json!({"matcher": "ExitPlanMode", "note": "mine"}),
-            "{removed}"
-        );
     }
 
     #[cfg(unix)]
@@ -1200,10 +1150,7 @@ mod tests {
             hooks.iter().any(|hook| hook["command"] == command),
             "{once}"
         );
-        let removed = removed_text(Agent::Claude, &once)
-            .flatten()
-            .unwrap_or_default();
-        assert!(removed.contains("audit") && !removed.contains(MARK));
+        assert_eq!(install_text(Agent::Claude, Some(&once)), once);
     }
 
     #[test]
@@ -1221,12 +1168,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|c| c.ends_with("hook codex # leaf-margin"))
         );
-        let removed = removed_text(Agent::Codex, &text)
-            .flatten()
-            .unwrap_or_default();
-        let value: Value = serde_json::from_str(&removed).unwrap_or_default();
-        assert!(value["hooks"].get("Stop").is_none());
-        assert!(value["hooks"].get("SessionStart").is_some());
+        assert_eq!(install_text(Agent::Codex, Some(&text)), text);
     }
 
     #[test]
@@ -1257,17 +1199,12 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap_or_default();
         assert!(value.get("safety").is_some());
         assert_eq!(value[MARK]["Stop"][0]["timeout"], HOOK_TIMEOUT);
-        let removed = removed_text(Agent::Antigravity, &text)
-            .flatten()
-            .unwrap_or_default();
-        assert!(!removed.contains(MARK) && removed.contains("safety"));
+        assert_eq!(install_text(Agent::Antigravity, Some(&text)), text);
         let grok = install_text(Agent::Grok, None);
         assert!(grok.contains("\"exit_plan_mode\""));
-        assert_eq!(removed_text(Agent::Grok, &grok), Some(None));
         let pi = install_text(Agent::Pi, None);
         assert!(pi.contains(&format!("const LEAF = \"{EXE}\"")));
-        assert!(pi.contains(MARK) || pi.contains("leaf hook install"));
-        assert_eq!(removed_text(Agent::Pi, "unrelated"), None);
+        assert!(pi.contains("Delete this file to remove it"));
     }
 
     #[test]

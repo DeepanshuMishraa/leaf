@@ -4,6 +4,10 @@ After an update, leaf shows the current version's notes once, over whatever
 it opens first. Each release needs a `## <version>` section with one line
 per change, starting with `- `.
 
+## Unreleased
+
+- `leaf agent setup` sets up every agent CLI here in one go: Claude Code, Codex, Antigravity, Grok Build, Cursor and Pi hand you their plans before they build, OpenCode gets the skills, and every agent gets the leaf, leaf-plan and leaf-review skills. It replaces `leaf hook install` and `leaf skills install`; `leaf hook <agent>` stays as the hook entry point.
+
 ## 0.16.0
 
 - Review your agent's plans: `leaf plan plan.md` shows a plan block by block and line by line. `V` selects lines, `c` comments on them or on the cursor line, `B` the whole block, `x`/`r` remove or replace the selection or the block, `C` adds a note on the whole plan, and `S` sends one review with a verdict.

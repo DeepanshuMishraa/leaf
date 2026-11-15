@@ -29,8 +29,7 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 | `leaf comments --json` | Every saved diff comment as JSON: key, file, side, line range, body, and state (`draft`, `agent`, `github`). |
 | `leaf agents` | Picks which agent CLI the person's questions go to. |
 | `leaf rex install` | Adds leaf to Rex's command palette. |
-| `leaf hook install` | Wires plan review into every agent CLI installed here. |
-| `leaf skills install` | Installs these skills for every agent here. |
+| `leaf agent setup` | Wires plan review and these skills into every agent CLI installed here. |
 
 ## Reading what the person left
 
