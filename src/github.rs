@@ -111,6 +111,16 @@ fn bare_host(host: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
+/// The authority a link names, as written and lower case, without credentials
+/// but with the port it listens on: that is where the request goes. The name
+/// without the port is what decides the forge, in [`bare_host`].
+fn authority_with_port(text: &str) -> Option<String> {
+    let text = text.trim().to_ascii_lowercase();
+    let name = text.split(':').next().unwrap_or("");
+    let plain = !text.contains([' ', '\t']);
+    (plain && !name.is_empty()).then_some(text)
+}
+
 /// The host and the path below it, from a remote over any of git's schemes:
 /// `scheme://[user@]host[:port]/path`, or `git@host:path`.
 pub fn host_and_path(url: &str) -> Option<(String, String)> {
@@ -231,7 +241,7 @@ impl Resource {
         if authority.contains('@') {
             return None;
         }
-        let host = bare_host(authority)?;
+        let host = authority_with_port(authority)?;
         let rest = rest.split(['?', '#']).next().unwrap_or(rest);
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         // A host that names its forge decides how the path is read, so a
@@ -469,7 +479,7 @@ fn github_diff(resource: &Resource) -> Result<String, GithubFailed> {
     http_get(&resource.diff_url(), "application/vnd.github.v3.diff").map_err(|e| match gh_error {
         Some(gh) => GithubFailed::Network {
             forge: Forge::GitHub.title(),
-            cause: format!("{e}; gh said: {gh}"),
+            cause: format!("{}; gh said: {gh}", inner_cause(&e)),
         },
         None => e,
     })
@@ -532,7 +542,7 @@ fn gitlab_diff(resource: &Resource) -> Result<String, GithubFailed> {
         match glab_error {
             Some(glab) => GithubFailed::Network {
                 forge: Forge::GitLab.title(),
-                cause: format!("{e}; glab said: {glab}"),
+                cause: format!("{}; glab said: {glab}", inner_cause(&e)),
             },
             None => e,
         }
@@ -935,6 +945,18 @@ fn gitlab_token(host: &str) -> Option<String> {
     is_gitlab_host(host, &configured_gitlab_hosts()).then_some(token)
 }
 
+/// What a failure said, without the forge it already named, so that folding it
+/// into another message doesn't say "Could not reach GitLab" twice.
+fn inner_cause(failed: &GithubFailed) -> String {
+    match failed {
+        GithubFailed::Network { cause, .. } => cause.clone(),
+        GithubFailed::Http {
+            status, what, hint, ..
+        } => format!("HTTP {status} while {what}. {hint}"),
+        other => other.to_string(),
+    }
+}
+
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
 }
@@ -1274,6 +1296,73 @@ mod tests {
         );
         // Without `/-/` and without a kind, there's no page to open.
         assert_eq!(Resource::parse_url("https://gitlab.com/o/r"), None);
+    }
+
+    #[test]
+    fn a_self_hosted_instance_keeps_its_port() {
+        // A port is where the request goes, so it stays in the URL asked for,
+        // while the name without it decides the forge and the token.
+        let resource =
+            Resource::parse_url("https://gitlab.example.com:8443/g/p/-/merge_requests/3")
+                .expect("a merge request on its own port");
+        assert_eq!(resource.host, "gitlab.example.com:8443");
+        assert_eq!(
+            resource.web_url(),
+            "https://gitlab.example.com:8443/g/p/-/merge_requests/3"
+        );
+        assert_eq!(
+            resource.diff_url(),
+            "https://gitlab.example.com:8443/g/p/-/merge_requests/3.diff"
+        );
+        assert!(is_gitlab_host(
+            &resource.host,
+            &parse_hosts("gitlab.example.com")
+        ));
+        // Two instances of one project on different ports keep their own notes.
+        let other = Resource::parse_url("https://gitlab.example.com/g/p/-/merge_requests/3")
+            .expect("the same project on the default port");
+        assert_ne!(resource.key(), other.key());
+        // A link that says only a port names no host.
+        assert_eq!(
+            Resource::parse_url("https://:8443/g/p/-/merge_requests/3"),
+            None
+        );
+        assert_eq!(
+            Resource::parse_url("https:// /g/p/-/merge_requests/3"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fallback_does_not_say_reach_twice() {
+        // The fallback folds in what the CLI said, and the CLI's own failure
+        // already reads as a sentence; repeating the forge around it reads
+        // as "Could not reach GitLab (Could not reach GitLab (..))".
+        let inner = GithubFailed::Network {
+            forge: Forge::GitLab.title(),
+            cause: "io: timeout".to_owned(),
+        };
+        assert_eq!(inner_cause(&inner), "io: timeout");
+        let http = GithubFailed::Http {
+            forge: Forge::GitLab.title(),
+            status: 403,
+            what: "fetching the diff".to_owned(),
+            hint: "Set GITLAB_TOKEN".to_owned(),
+        };
+        // The token hint is what makes a private project openable, so it
+        // survives being folded in.
+        assert_eq!(
+            inner_cause(&http),
+            "HTTP 403 while fetching the diff. Set GITLAB_TOKEN"
+        );
+        // Anything else keeps its own message.
+        assert_eq!(
+            inner_cause(&GithubFailed::NotDiff {
+                forge: Forge::GitLab.title(),
+                url: "https://gitlab.com/a/b/-/merge_requests/1".to_owned(),
+            }),
+            "GitLab returned a page rather than a diff for https://gitlab.com/a/b/-/merge_requests/1. The project may be private, or the link may name something other than a merge request, a commit or a comparison."
+        );
     }
 
     #[test]
