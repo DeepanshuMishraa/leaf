@@ -6,7 +6,9 @@ per change, starting with `- `.
 
 ## Unreleased
 
-- `leaf agent setup` sets up every agent CLI here in one go: Claude Code, Codex, Antigravity, Grok Build, Cursor and Pi hand you their plans before they build, OpenCode gets the skills, and every agent gets the leaf, leaf-plan and leaf-review skills. It replaces `leaf hook install` and `leaf skills install`; `leaf hook <agent>` stays as the hook entry point.
+## 0.16.1
+
+- `leaf agent setup` installs Leaf's skills and plan hooks together, shows the planned changes, and reports each file written. Separate skill install and agent status/uninstall commands have been removed; use `leaf agent skill <name>` to print a skill.
 
 ## 0.16.0
 
