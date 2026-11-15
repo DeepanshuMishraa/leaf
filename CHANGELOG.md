@@ -4,6 +4,10 @@ After an update, leaf shows the current version's notes once, over whatever
 it opens first. Each release needs a `## <version>` section with one line
 per change, starting with `- `.
 
+## 0.16.3
+
+- GitLab merge request patches use `glab` when available, then the API when `GITLAB_TOKEN` is set, and the page otherwise. Commit and comparison patches use the API when a token is set. A truncated or failed API patch no longer replaces the page patch.
+
 ## 0.16.2
 
 - GitLab merge request, commit and comparison links open in `leaf diff`, on gitlab.com and on self-hosted instances, including ones whose host doesn't say `gitlab`: `GITLAB_HOST` names those, for opening a repository's remotes and for the `GITLAB_TOKEN` a private project needs, and never overrides a host that names itself GitHub. A merge request's patch is asked of `glab` first when it's installed; a commit's and a comparison's have no `glab` command, so all three are asked of the API when `GITLAB_TOKEN` is set (GitLab's page routes refuse a token), of the page itself otherwise, and of the page again when the API fails; both a token and `glab` go only to a host that names itself GitLab or that `GITLAB_HOST` names. Comments are still posted to GitHub only.
