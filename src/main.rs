@@ -69,7 +69,7 @@ use progress::Store;
 use viewer::ViewerOptions;
 
 const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
-       leaf diff [options] [path | revision | GitHub url]
+       leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
@@ -611,12 +611,37 @@ fn diff_command(args: &[String]) -> ExitCode {
 
 /// `leaf pr`: lists the pull requests and issues that concern you, or opens the pull request named.
 fn pr_command(args: &[String]) -> ExitCode {
-    let here = pr::current_repo();
+    // A GitLab checkout has merge requests, which this list doesn't read yet.
+    // A link to a pull request still opens: it names its own repository, so the
+    // folder it's run in doesn't matter.
+    let forge_repo = pr::current_forge_repo();
+    let here = match &forge_repo {
+        Some((github::Forge::GitHub, project)) => Some(project.clone()),
+        Some((github::Forge::GitLab, _)) | None => None,
+    };
+    let gitlab_here = || match &forge_repo {
+        Some((github::Forge::GitLab, project)) => Some(pr::PrFailed::GitLabRepo {
+            project: project.clone(),
+        }),
+        _ => None,
+    };
     let start = match args {
-        [] => prview::Start::List,
+        [] => match gitlab_here() {
+            Some(e) => {
+                eprintln!("leaf: {e}");
+                return ExitCode::from(2);
+            }
+            None => prview::Start::List,
+        },
         [target] => match pr::PrRef::parse(target, here.as_deref()) {
             Ok(pr) => prview::Start::Pr(pr),
             Err(e) => {
+                // A bare number is the folder's own pull request, which a
+                // GitLab checkout can't name.
+                let e = match (&e, gitlab_here()) {
+                    (pr::PrFailed::NoRepo { .. }, Some(gitlab)) => gitlab,
+                    _ => e,
+                };
                 eprintln!("leaf: {e}");
                 return ExitCode::from(2);
             }
@@ -996,9 +1021,7 @@ fn diff_request(args: &[String]) -> Result<(diff::Request, diffview::Layout), St
         let lower = arg.to_ascii_lowercase();
         if lower.starts_with("http://") || lower.starts_with("https://") {
             if github::Resource::parse_url(arg).is_none() {
-                return Err(format!(
-                    "That link isn't a GitHub pull request, commit or comparison: {arg}. Use a link like https://github.com/owner/repo/pull/12."
-                ));
+                return Err(github::GithubFailed::NotForge { url: arg.clone() }.to_string());
             }
             set_origin(&mut origin, diff::Origin::Github { url: arg.clone() }, arg)?;
             continue;

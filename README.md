@@ -86,7 +86,7 @@ Images use the Kitty, iTerm2 or Sixel graphics protocol, whichever the terminal 
 
 ## Diffs
 
-`leaf diff` shows the working tree's changes. Pass a path, revision, range, patch file or GitHub link to review something else:
+`leaf diff` shows the working tree's changes. Pass a path, revision, range, patch file or GitHub pull request or GitLab merge request link to review something else:
 
 ```sh
 leaf diff                          # unstaged changes
@@ -99,9 +99,13 @@ leaf diff --inline                 # one column instead of side by side
 leaf diff https://github.com/owner/repo/pull/12
 ```
 
-Local diffs need a Git repository. A patch file and a GitHub pull request, commit or comparison link open without one. `o` flips between the working tree and the base branch, and `r` reloads.
+Local diffs need a Git repository. A patch file and a GitHub or GitLab link open without one: a pull request or merge request, a commit, or a comparison. `o` flips between the working tree and the base branch, and `r` reloads.
 
-Local diffs refresh every second; GitHub diffs refresh every 10 seconds, including the PR Code tab. Unchanged content keeps your position. Refresh waits while you write notes or select text. If annotated files change, Leaf keeps the reviewed snapshot until you clear their line comments. Posting that stale snapshot to GitHub is blocked.
+A self-hosted GitLab is recognized by the `/-/` in its links, so a link opens whatever its host is called; an older link without it, which GitLab itself redirects, opens too. `GITLAB_HOST` names one whose remote doesn't say `gitlab` in its name: one or more hosts, comma separated, as a URL or a bare name.
+
+Leaf trusts a host with a credential only when the host names itself GitLab (`gitlab.com`, or a name with a `gitlab` label) or when `GITLAB_HOST` names it, so a link pasted from anywhere else is read without one; a host that names itself GitHub never qualifies, so a stray `GITLAB_HOST` can't send a token there. A merge request's patch is asked of `glab` first when it's installed, which opens a private project with the sign-in it already holds. Otherwise the page is asked, and a private project needs `GITLAB_TOKEN` set to a personal access token with `read_api`. Neither is needed to read a public project. Links are fetched over HTTPS. Comments are still GitHub's alone, so a merge request's diff opens to read and to note on, not to post.
+
+Local diffs refresh every second; diffs from GitHub and GitLab refresh every 10 seconds, including the PR Code tab. Unchanged content keeps your position. Refresh waits while you write notes or select text. If annotated files change, Leaf keeps the reviewed snapshot until you clear their line comments. Posting that stale snapshot to GitHub is blocked.
 
 Only the lines on screen are drawn, so a diff of any size scrolls without pre-measuring it, and syntax highlighting fills in for the visible hunks. The diff is split side by side: removed code stays on the left, added code on the right, each with its own line number, and paired changes share a row. `i` switches to one column, removed lines above added ones as `git diff` shows them, with both line numbers; `leaf diff --inline` opens that way. Comments and the changed-word highlighting work the same in both. Added and removed lines are tinted, with the changed words picked out. The tints follow the terminal's light or dark theme and switch with it while the diff is open in Rex (or another terminal that answers the `CSI ? 996 n` color-scheme query); other terminals are matched by their background color once. `LEAF_THEME=light` or `LEAF_THEME=dark` sets it outright.
 
