@@ -172,6 +172,12 @@ pub enum GithubFailed {
     )]
     Unsupported { forge: &'static str },
     #[error(
+        "{forge} sent only part of the patch ({detail}), so leaf stopped rather than show a review that is missing files. Open it on the page in your browser, or install `glab` and sign in to that host."
+    )]
+    Partial { forge: &'static str, detail: String },
+    #[error("{cause}")]
+    Folded { cause: String },
+    #[error(
         "GitHub rejected the comment: {detail} Check that the line is still part of the pull request, then try again."
     )]
     Post { detail: String },
@@ -661,24 +667,63 @@ fn gitlab_diff_json(url: &str, resource: &Resource) -> Result<String, GithubFail
 /// A patch from the JSON the API answered with, or a refusal to read it as
 /// one: an error page can come back as a 200 too.
 fn patch_from_json(body: &str, url: &str) -> Result<String, GithubFailed> {
-    let changes = changes_of(body).ok_or_else(|| GithubFailed::NotDiff {
+    let Changed { changes, cut } = changes_of(body).ok_or_else(|| GithubFailed::NotDiff {
         forge: Forge::GitLab.title(),
         url: url.to_owned(),
     })?;
+    // A review of part of a patch is worse than none: what isn't shown is
+    // indistinguishable from what isn't there.
+    if let Some(detail) = cut {
+        return Err(GithubFailed::Partial {
+            forge: Forge::GitLab.title(),
+            detail,
+        });
+    }
     Ok(patch_from_changes(&changes))
 }
 
 /// The changed files out of whichever shape GitLab answered in: a commit's
 /// diff is the list itself, a comparison's is under `diffs`, and a merge
 /// request's under `changes`.
-fn changes_of(body: &str) -> Option<Vec<serde_json::Value>> {
+///
+/// A big page comes back cut: GitLab caps a merge request at 1000 changed
+/// files and says so with `overflow`, and a comparison that runs out of time
+/// says `compare_timeout`. Reading either as complete would show a review
+/// with files quietly missing, so what the answer admits is passed on.
+fn changes_of(body: &str) -> Option<Changed> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    if let Some(list) = value.as_array() {
-        return Some(list.clone());
-    }
-    ["changes", "diffs"]
-        .into_iter()
-        .find_map(|key| value.get(key)?.as_array().cloned())
+    let flag = |key: &str| value.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let cut = if flag("overflow") || flag("compare_timeout") {
+        let count = match value.get("changes_count").and_then(|v| v.as_str()) {
+            Some(count) if count.ends_with('+') => format!("at least {count} files"),
+            Some(count) => format!("{count} files"),
+            None => "more files than it sends".to_owned(),
+        };
+        Some(format!(
+            "it sent {} of {count}",
+            value
+                .get("changes")
+                .or_else(|| value.get("diffs"))
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len)
+        ))
+    } else {
+        None
+    };
+    let changes = if let Some(list) = value.as_array() {
+        list.clone()
+    } else {
+        ["changes", "diffs"]
+            .into_iter()
+            .find_map(|key| value.get(key)?.as_array().cloned())?
+    };
+    Some(Changed { changes, cut })
+}
+
+/// The changed files an answer listed, and what it admitted was left out.
+struct Changed {
+    changes: Vec<serde_json::Value>,
+    cut: Option<String>,
 }
 
 /// A patch built the way Git writes one, from the files the API listed. The
@@ -720,9 +765,19 @@ fn patch_from_changes(changes: &[serde_json::Value]) -> String {
             let _ = writeln!(patch, "new file mode {}", mode("b_mode"));
         } else if deleted {
             let _ = writeln!(patch, "deleted file mode {}", mode("a_mode"));
-        } else if flag("renamed_file") {
-            let _ = writeln!(patch, "rename from {old}");
-            let _ = writeln!(patch, "rename to {new}");
+        } else {
+            // A file made executable changes no lines at all: the two modes
+            // are the whole change, and without them it reads as an untouched
+            // file. Git writes them before the rename for the same reason.
+            let (before, after) = (text("a_mode"), text("b_mode"));
+            if !before.is_empty() && !after.is_empty() && before != after {
+                let _ = writeln!(patch, "old mode {before}");
+                let _ = writeln!(patch, "new mode {after}");
+            }
+            if flag("renamed_file") {
+                let _ = writeln!(patch, "rename from {old}");
+                let _ = writeln!(patch, "rename to {new}");
+            }
         }
         let _ = writeln!(
             patch,
@@ -744,11 +799,18 @@ fn patch_from_changes(changes: &[serde_json::Value]) -> String {
         );
         let diff = text("diff");
         if diff.trim().is_empty() {
-            // A rename or a mode change carries its whole meaning in the
-            // lines above; anything else emptied here is a file GitLab sent
-            // no changes for, which it does for one it can't show.
-            if !flag("renamed_file") {
-                let _ = writeln!(patch, "leaf: GitLab sent no changes for this file");
+            // A rename or a mode change carries its whole meaning in the lines
+            // above. Anything else emptied here is a file GitLab couldn't show,
+            // and it says so rather than look untouched.
+            let moved =
+                flag("renamed_file") || (text("a_mode") != text("b_mode") && !added && !deleted);
+            if !moved {
+                let why = if flag("too_large") {
+                    "leaf: too large for GitLab to send its changes"
+                } else {
+                    "leaf: GitLab sent no changes for this file"
+                };
+                let _ = writeln!(patch, "{why}");
             }
         } else {
             patch.push_str(diff);
@@ -801,9 +863,12 @@ fn said_so(
             forge,
             cause: format!("{cause}{tail}"),
         },
-        // Nothing else has room for a tail; its own message already says what
-        // went wrong.
-        other => other,
+        // Everything else has no place to put a tail, so it is carried whole:
+        // dropping what the other routes said is how a `glab` failure turns
+        // into an unrelated complaint about the page.
+        other => GithubFailed::Folded {
+            cause: format!("{}{tail}", short_cause(&other)),
+        },
     }
 }
 
@@ -1700,6 +1765,17 @@ mod tests {
             folded.to_string(),
             "GitLab returned HTTP 401 while fetching the diff. Check the token; the page said: HTTP 404 while fetching the diff; glab said: it failed"
         );
+        // A failure with no room for a tail keeps what the other routes said
+        // instead of dropping it: a `glab` failure must not turn into an
+        // unrelated complaint about the page.
+        let not_diff = GithubFailed::NotDiff {
+            forge: Forge::GitLab.title(),
+            url: "https://gitlab.com/a/b/-/merge_requests/1".to_owned(),
+        };
+        let folded = said_so(not_diff, &[], &said);
+        assert!(matches!(folded, GithubFailed::Folded { .. }));
+        assert!(folded.to_string().ends_with("glab said: it failed"));
+
         // Nothing folded means the failure is handed back untouched.
         assert_eq!(
             said_so(
@@ -1768,7 +1844,9 @@ mod tests {
         // The API answers a commit with the list itself, a comparison under
         // `diffs`, and a merge request under `changes`.
         let drawn = r#"{"changes":[{"old_path":"a/x.txt","new_path":"a/x.txt","new_file":false,"deleted_file":false,"renamed_file":false,"a_mode":"100644","b_mode":"100644","diff":"@@ -1,2 +1,2 @@\n one\n-two\n+three"}]}"#;
-        let changes = changes_of(drawn).expect("a merge request's changes");
+        let changes = changes_of(drawn)
+            .expect("a merge request's changes")
+            .changes;
         let patch = patch_from_changes(&changes);
         assert_eq!(
             patch,
@@ -1782,7 +1860,7 @@ mod tests {
         assert_eq!(parsed.files()[0].removed, 1);
 
         let list = r#"[{"old_path":"gone.md","new_path":"gone.md","deleted_file":true,"a_mode":"100644","diff":"@@ -1,1 +0,0 @@\n-bye"},{"old_path":"new.md","new_path":"new.md","new_file":true,"b_mode":"100644","diff":"@@ -0,0 +1,1 @@\n+hello"}]"#;
-        let patch = patch_from_changes(&changes_of(list).expect("a commit's diff"));
+        let patch = patch_from_changes(&changes_of(list).expect("a commit's diff").changes);
         assert!(patch.contains("diff --git a/gone.md b/gone.md\ndeleted file mode 100644\n--- a/gone.md\n+++ /dev/null\n"));
         assert!(patch.contains(
             "diff --git a/new.md b/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/new.md\n"
@@ -1791,22 +1869,64 @@ mod tests {
         // A rename says so, and carries no hunks; a file GitLab sent nothing
         // for says that instead of looking unchanged.
         let renamed = r#"[{"old_path":"was.md","new_path":"is.md","renamed_file":true,"diff":""}]"#;
-        let patch = patch_from_changes(&changes_of(renamed).expect("a renamed file"));
+        let patch = patch_from_changes(&changes_of(renamed).expect("a renamed file").changes);
         assert_eq!(
             patch,
             "diff --git a/was.md b/is.md\nrename from was.md\nrename to is.md\n--- a/was.md\n+++ b/is.md\n"
         );
         let empty = r#"[{"old_path":"logo.png","new_path":"logo.png","diff":""}]"#;
-        let patch = patch_from_changes(&changes_of(empty).expect("a file with no text"));
+        let patch = patch_from_changes(&changes_of(empty).expect("a file with no text").changes);
         assert!(patch.contains("leaf: GitLab sent no changes for this file"));
 
         // A path with a space is quoted the way git quotes one, or the header
         // would end the path at the space.
         let spaced =
             r#"[{"old_path":"a b/x.txt","new_path":"a b/x.txt","diff":"@@ -1,1 +1,1 @@\n-a\n+b"}]"#;
-        let patch = patch_from_changes(&changes_of(spaced).expect("a path with a space"));
+        let patch = patch_from_changes(&changes_of(spaced).expect("a path with a space").changes);
         assert!(patch.starts_with("diff --git \"a/a b/x.txt\" \"b/a b/x.txt\"\n"));
         assert_eq!(crate::diff::Diff::parse(patch).files().len(), 1);
+
+        // A file made executable changes no lines, so its two modes are the
+        // whole change and have to survive.
+        let chmod = r#"[{"old_path":"run.sh","new_path":"run.sh","a_mode":"100644","b_mode":"100755","diff":""}]"#;
+        let patch = patch_from_changes(&changes_of(chmod).expect("a chmod").changes);
+        assert_eq!(
+            patch,
+            "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n--- a/run.sh\n+++ b/run.sh\n"
+        );
+        // A rename that also changes the mode says both.
+        let both = r#"[{"old_path":"was.sh","new_path":"is.sh","a_mode":"100644","b_mode":"100755","renamed_file":true,"diff":""}]"#;
+        let patch = patch_from_changes(&changes_of(both).expect("a rename and a chmod").changes);
+        assert!(
+            patch.contains(
+                "old mode 100644\nnew mode 100755\nrename from was.sh\nrename to is.sh\n"
+            )
+        );
+
+        // A page GitLab cuts short is refused rather than shown as whole: a
+        // review that is missing files looks exactly like one that isn't.
+        let capped = r#"{"changes":[],"overflow":true,"changes_count":"1000+"}"#;
+        let changed = changes_of(capped).expect("an overflowed merge request");
+        assert_eq!(
+            changed.cut.as_deref(),
+            Some("it sent 0 of at least 1000+ files")
+        );
+        let timed_out = r#"{"diffs":[],"compare_timeout":true}"#;
+        assert_eq!(
+            changes_of(timed_out)
+                .expect("a comparison that timed out")
+                .cut
+                .as_deref(),
+            Some("it sent 0 of more files than it sends")
+        );
+        let whole = r#"{"changes":[],"overflow":false,"changes_count":"3"}"#;
+        assert!(changes_of(whole).expect("a whole page").cut.is_none());
+        match patch_from_json(capped, "https://gitlab.com/a/b/-/merge_requests/1/changes") {
+            Err(GithubFailed::Partial { detail, .. }) => {
+                assert_eq!(detail, "it sent 0 of at least 1000+ files");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
 
         // An error page is not a list of changes, however it arrived.
         assert!(changes_of("<html>Not Found</html>").is_none());
