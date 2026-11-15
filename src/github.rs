@@ -172,9 +172,13 @@ pub enum GithubFailed {
     )]
     Unsupported { forge: &'static str },
     #[error(
-        "{forge} sent only part of the patch ({detail}), so leaf stopped rather than show a review that is missing files. Open it on the page in your browser, or install `glab` and sign in to that host."
+        "{forge} sent only part of the patch ({detail}), so leaf stopped rather than show a review that is missing files. {advice}"
     )]
-    Partial { forge: &'static str, detail: String },
+    Partial {
+        forge: &'static str,
+        detail: String,
+        advice: &'static str,
+    },
     #[error("{cause}")]
     Folded { cause: String },
     #[error(
@@ -652,7 +656,7 @@ fn gitlab_api_diff(resource: &Resource) -> Result<String, GithubFailed> {
             gitlab_diff_json(&url, resource)
         }
         Ok(patch) if accept == "text/plain" => Ok(patch),
-        Ok(body) => patch_from_json(&body, &url),
+        Ok(body) => patch_from_json(&body, &url, matches!(resource.page, Page::Pull { .. })),
         Err(e) => Err(e),
     }
 }
@@ -661,12 +665,12 @@ fn gitlab_api_diff(resource: &Resource) -> Result<String, GithubFailed> {
 /// how the API answers every page but a merge request.
 fn gitlab_diff_json(url: &str, resource: &Resource) -> Result<String, GithubFailed> {
     let body = http_get_forge(url, "application/json", Forge::GitLab, &resource.host)?;
-    patch_from_json(&body, url)
+    patch_from_json(&body, url, matches!(resource.page, Page::Pull { .. }))
 }
 
 /// A patch from the JSON the API answered with, or a refusal to read it as
 /// one: an error page can come back as a 200 too.
-fn patch_from_json(body: &str, url: &str) -> Result<String, GithubFailed> {
+fn patch_from_json(body: &str, url: &str, merge_request: bool) -> Result<String, GithubFailed> {
     let Changed { changes, cut } = changes_of(body).ok_or_else(|| GithubFailed::NotDiff {
         forge: Forge::GitLab.title(),
         url: url.to_owned(),
@@ -677,6 +681,13 @@ fn patch_from_json(body: &str, url: &str) -> Result<String, GithubFailed> {
         return Err(GithubFailed::Partial {
             forge: Forge::GitLab.title(),
             detail,
+            // `glab` has no command for a commit or a comparison, so naming it
+            // would send the reader at something that can't help.
+            advice: if merge_request {
+                "Open it on the page in your browser, or install `glab` and sign in to that host."
+            } else {
+                "Open it on the page in your browser."
+            },
         });
     }
     Ok(patch_from_changes(&changes))
@@ -693,20 +704,25 @@ fn patch_from_json(body: &str, url: &str) -> Result<String, GithubFailed> {
 fn changes_of(body: &str) -> Option<Changed> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let flag = |key: &str| value.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
-    let cut = if flag("overflow") || flag("compare_timeout") {
-        let count = match value.get("changes_count").and_then(|v| v.as_str()) {
+    let sent = value
+        .get("changes")
+        .or_else(|| value.get("diffs"))
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len);
+    let cut = if flag("compare_timeout") {
+        // A comparison that runs out of time doesn't say how many files it
+        // would have listed, only that it stopped early.
+        Some(format!(
+            "it stopped after {sent}, with more it didn't reach"
+        ))
+    } else if flag("overflow") {
+        // Past the cap `changes_count` is the string `1000+`.
+        let total = match value.get("changes_count").and_then(|v| v.as_str()) {
             Some(count) if count.ends_with('+') => format!("at least {count} files"),
             Some(count) => format!("{count} files"),
-            None => "more files than it sends".to_owned(),
+            None => "a page too big to send whole".to_owned(),
         };
-        Some(format!(
-            "it sent {} of {count}",
-            value
-                .get("changes")
-                .or_else(|| value.get("diffs"))
-                .and_then(|v| v.as_array())
-                .map_or(0, Vec::len)
-        ))
+        Some(format!("it sent {sent} of {total}"))
     } else {
         None
     };
@@ -1917,13 +1933,26 @@ mod tests {
                 .expect("a comparison that timed out")
                 .cut
                 .as_deref(),
-            Some("it sent 0 of more files than it sends")
+            Some("it stopped after 0, with more it didn't reach")
         );
         let whole = r#"{"changes":[],"overflow":false,"changes_count":"3"}"#;
         assert!(changes_of(whole).expect("a whole page").cut.is_none());
-        match patch_from_json(capped, "https://gitlab.com/a/b/-/merge_requests/1/changes") {
-            Err(GithubFailed::Partial { detail, .. }) => {
+        match patch_from_json(
+            capped,
+            "https://gitlab.com/a/b/-/merge_requests/1/changes",
+            true,
+        ) {
+            Err(GithubFailed::Partial { detail, advice, .. }) => {
                 assert_eq!(detail, "it sent 0 of at least 1000+ files");
+                // `glab` has no commit or comparison command, so only a merge
+                // request is pointed at it.
+                assert!(advice.contains("glab"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        match patch_from_json(timed_out, "https://gitlab.com/a/b/-/compare/x...y", false) {
+            Err(GithubFailed::Partial { advice, .. }) => {
+                assert!(!advice.contains("glab"), "advice named glab: {advice}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
