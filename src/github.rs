@@ -246,58 +246,31 @@ impl Resource {
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         // A host that names its forge decides how the path is read, so a
         // GitHub ref that happens to contain `/-/` is still a GitHub ref.
-        // Only a host that says nothing needs `/-/` to be told apart.
-        let (forge, project, tail) = match Forge::of_host(&host) {
+        // Only a host that says nothing needs `/-/` to be told apart. A host
+        // `GITLAB_HOST` names is read the way a host naming itself GitLab is.
+        let named = forge_of(&host);
+        let page = match named {
             Some(Forge::GitHub) => {
                 let (owner, rest) = rest.split_once('/')?;
                 let (name, tail) = rest.split_once('/')?;
-                (
-                    Forge::GitHub,
-                    format!("{}/{}", clean(owner)?, clean(name)?),
-                    tail,
-                )
+                let project = format!("{}/{}", clean(owner)?, clean(name)?);
+                page_of(Forge::GitHub, project, tail)?
             }
-            Some(Forge::GitLab) => {
-                let (project, tail) = gitlab_project(rest)?;
-                (Forge::GitLab, project, tail)
-            }
+            Some(Forge::GitLab) => gitlab_page(rest)?,
             None => {
+                // Nothing says which forge this is, so `/-/` does: it is the
+                // separator GitLab alone has, and a page to read is all that
+                // is wanted here -- no credential is offered to a host that
+                // hasn't named itself.
                 let (project, tail) = rest.split_once("/-/")?;
-                (Forge::GitLab, clean_project(project)?, tail)
+                page_of(Forge::GitLab, clean_project(project)?, tail)?
             }
         };
-        let mut parts = tail.split('/');
-        let kind = parts.next()?;
-        let pull = match forge {
-            Forge::GitHub => kind == "pull" || kind == "pulls",
-            Forge::GitLab => kind == "merge_requests" || kind == "merge_request",
-        };
-        let page = if pull {
-            Page::Pull {
-                project,
-                number: parts.next()?.trim_end_matches(".diff").parse().ok()?,
-            }
-        } else if kind == "commit" || kind == "commits" {
-            let sha = parts.next()?.trim_end_matches(".diff");
-            if !is_sha(sha) {
-                return None;
-            }
-            Page::Commit {
-                project,
-                sha: sha.to_owned(),
-            }
-        } else if kind == "compare" {
-            let range = parts.collect::<Vec<_>>().join("/");
-            let (base, head) = range.trim_end_matches(".diff").split_once("...")?;
-            Page::Compare {
-                project,
-                base: clean(base)?,
-                head: clean(head)?,
-            }
-        } else {
-            return None;
-        };
-        Some(Resource { forge, host, page })
+        Some(Resource {
+            forge: named.unwrap_or(Forge::GitLab),
+            host,
+            page,
+        })
     }
 
     /// The repository's path within the forge.
@@ -389,13 +362,18 @@ fn clean(part: &str) -> Option<String> {
 /// `/-/` before every repository page, and still redirects the older form
 /// without it (`group/project/merge_requests/12`), which people link to in
 /// older issues and mail.
-fn gitlab_project(rest: &str) -> Option<(String, &str)> {
+/// The page a GitLab path names, both as GitLab writes links now and as it
+/// wrote them before `/-/`: `/group/project/merge_requests/1` still redirects
+/// to `/-/merge_requests/1`, and people paste the older form from older
+/// issues and mail.
+fn gitlab_page(rest: &str) -> Option<Page> {
     if let Some((project, tail)) = rest.split_once("/-/") {
-        return Some((clean_project(project)?, tail));
+        return page_of(Forge::GitLab, clean_project(project)?, tail);
     }
-    // Without `/-/`, the page kind is the last segment that names one, so a
-    // group called `commit` doesn't hide the project.
-    let at = [
+    // Without `/-/` the project has to be found by trying each place a page
+    // could start: a group may be called `commit`, and a branch may contain
+    // `/merge_requests/`, so only the way the rest reads says which it is.
+    let mut at: Vec<usize> = [
         "merge_requests",
         "merge_request",
         "commit",
@@ -403,10 +381,54 @@ fn gitlab_project(rest: &str) -> Option<(String, &str)> {
         "compare",
     ]
     .into_iter()
-    .filter_map(|kind| rest.rfind(&format!("/{kind}/")).map(|at| at + 1))
-    .max()?;
-    let (project, tail) = rest.split_at(at);
-    Some((clean_project(project)?, tail))
+    .flat_map(|kind| {
+        let needle = format!("/{kind}/");
+        rest.match_indices(&needle)
+            .map(|(at, _)| at + 1)
+            .collect::<Vec<_>>()
+    })
+    .collect();
+    at.sort_unstable();
+    at.into_iter().find_map(|at| {
+        let (project, tail) = rest.split_at(at);
+        page_of(Forge::GitLab, clean_project(project)?, tail)
+    })
+}
+
+/// The page a path names below a project it is already known to sit in.
+fn page_of(forge: Forge, project: String, tail: &str) -> Option<Page> {
+    let mut parts = tail.split('/');
+    let kind = parts.next()?;
+    let pull = match forge {
+        Forge::GitHub => kind == "pull" || kind == "pulls",
+        Forge::GitLab => kind == "merge_requests" || kind == "merge_request",
+    };
+    if pull {
+        return Some(Page::Pull {
+            project,
+            number: parts.next()?.trim_end_matches(".diff").parse().ok()?,
+        });
+    }
+    if kind == "commit" || kind == "commits" {
+        let sha = parts.next()?.trim_end_matches(".diff");
+        if !is_sha(sha) {
+            return None;
+        }
+        return Some(Page::Commit {
+            project,
+            sha: sha.to_owned(),
+        });
+    }
+    if kind == "compare" {
+        let range = parts.collect::<Vec<_>>().join("/");
+        let (base, head) = range.trim_end_matches(".diff").split_once("...")?;
+        return Some(Page::Compare {
+            project,
+            base: clean(base)?,
+            head: clean(head)?,
+        });
+    }
+    None
 }
 
 /// A repository path such as `owner/name` or `group/subgroup/project`, with no
@@ -1204,6 +1226,71 @@ mod tests {
             })
             .diff_url(),
             "https://github.com/o/r/compare/main...feat.diff"
+        );
+    }
+
+    #[test]
+    fn a_branch_that_names_a_page_does_not_steal_the_comparison() {
+        // The project ends where the page begins, and a branch may itself
+        // contain `/merge_requests/` or `/commit/`; the range is what decides.
+        let resource =
+            Resource::parse_url("https://gitlab.com/o/r/compare/main...feature/merge_requests/1")
+                .expect("a comparison of two branches");
+        assert_eq!(
+            resource.page,
+            Page::Compare {
+                project: "o/r".to_owned(),
+                base: "main".to_owned(),
+                head: "feature/merge_requests/1".to_owned(),
+            }
+        );
+        let resource =
+            Resource::parse_url("https://gitlab.com/o/r/compare/main...feature/commit/1")
+                .expect("a comparison of two branches, the second one named commit");
+        assert_eq!(
+            resource.page,
+            Page::Compare {
+                project: "o/r".to_owned(),
+                base: "main".to_owned(),
+                head: "feature/commit/1".to_owned(),
+            }
+        );
+        // A group called `commit` is still found, since a commit is a sha and
+        // `b` is not one.
+        let resource = Resource::parse_url("https://gitlab.com/a/commit/b/merge_requests/3")
+            .expect("a group named commit");
+        assert_eq!(
+            resource.page,
+            Page::Pull {
+                project: "a/commit/b".to_owned(),
+                number: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn a_host_named_gitlab_reads_the_older_link_form() {
+        // GitLab still redirects `/-/`-less links, and a name that says GitLab
+        // is enough to read one, whether it says so itself or by `GITLAB_HOST`.
+        let resource = Resource::parse_url("https://gitlab.example.com/o/r/merge_requests/7")
+            .expect("an older merge request link on a named host");
+        assert_eq!(resource.forge, Forge::GitLab);
+        assert_eq!(
+            resource.page,
+            Page::Pull {
+                project: "o/r".to_owned(),
+                number: 7,
+            }
+        );
+        // The link is asked for as GitLab writes it now, whatever form it came in.
+        assert_eq!(
+            resource.web_url(),
+            "https://gitlab.example.com/o/r/-/merge_requests/7"
+        );
+        // A host that names no forge still needs `/-/` to be read at all.
+        assert_eq!(
+            Resource::parse_url("https://code.example.com/o/r/merge_requests/7"),
+            None
         );
     }
 
