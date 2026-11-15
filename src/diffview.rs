@@ -283,6 +283,7 @@ enum Job {
     Load {
         rx: mpsc::Receiver<Result<Loaded, diff::DiffFailed>>,
         remember: Option<(String, Side, u32)>,
+        background: bool,
     },
     Post {
         rx: mpsc::Receiver<Result<String, github::GithubFailed>>,
@@ -296,6 +297,7 @@ enum Done {
     Load {
         result: Box<Result<Loaded, diff::DiffFailed>>,
         remember: Option<(String, Side, u32)>,
+        background: bool,
     },
     Post {
         result: Result<String, github::GithubFailed>,
@@ -515,6 +517,8 @@ struct App {
     /// When the last key, click or paste came, so the terminal is asked
     /// about its theme only once the reader has paused.
     last_input: Instant,
+    polled: Instant,
+    stale: bool,
     /// The split line the cursor is on.
     cursor: usize,
     /// First split line on screen.
@@ -597,6 +601,8 @@ impl App {
             news: News::unseen(),
             clock: usage::Clock::start(),
             last_input: Instant::now(),
+            polled: Instant::now(),
+            stale: false,
             cursor,
             scroll: 0,
             left: 0,
@@ -650,6 +656,7 @@ impl App {
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         loop {
             self.receive_job();
+            self.poll();
             // The reply is read straight from stdin, so a key typed meanwhile
             // could be taken with it: ask only while the reader is idle (no
             // key waiting, none in the last second, not writing a comment).
@@ -711,18 +718,56 @@ impl App {
         self.toast = Some(Toast::error(text));
     }
 
+    fn can_refresh(&self) -> bool {
+        self.composer.is_none()
+            && self.note_editor.is_none()
+            && matches!(self.dialog, Dialog::None)
+            && self.selection.is_none()
+            && !self.visual
+            && self.drag_origin.is_none()
+            && self.rex_command.is_none()
+    }
+
+    fn poll(&mut self) {
+        if self.job.is_none()
+            && self.can_refresh()
+            && self.polled.elapsed() >= self.loaded.request.refresh_interval()
+        {
+            self.start_load(self.loaded.request.clone(), None);
+        }
+    }
+
     fn receive_job(&mut self) {
+        if matches!(
+            self.job,
+            Some(Job::Load {
+                background: true,
+                ..
+            })
+        ) && !self.can_refresh()
+        {
+            return;
+        }
         let Some(job) = self.job.take() else {
             return;
         };
         let done = match job {
-            Job::Load { rx, remember } => match rx.try_recv() {
+            Job::Load {
+                rx,
+                remember,
+                background,
+            } => match rx.try_recv() {
                 Ok(result) => Some(Done::Load {
                     result: Box::new(result),
                     remember,
+                    background,
                 }),
                 Err(TryRecvError::Empty) => {
-                    self.job = Some(Job::Load { rx, remember });
+                    self.job = Some(Job::Load {
+                        rx,
+                        remember,
+                        background,
+                    });
                     None
                 }
                 Err(TryRecvError::Disconnected) => Some(Done::Load {
@@ -731,6 +776,7 @@ impl App {
                         cause: "the loader stopped before returning a diff".to_owned(),
                     })),
                     remember,
+                    background,
                 }),
             },
             Job::Post {
@@ -771,9 +817,48 @@ impl App {
 
     fn finish(&mut self, done: Done) {
         match done {
-            Done::Load { result, remember } => match *result {
+            Done::Load {
+                result,
+                remember,
+                background,
+            } => match *result {
                 Ok(loaded) => {
                     let same_key = loaded.key == self.key;
+                    if same_key && loaded.diff.same_content(&self.loaded.diff) {
+                        self.loaded = loaded;
+                        self.stale = false;
+                        if !background {
+                            self.dialog = Dialog::None;
+                            self.toast("Diff unchanged");
+                        }
+                        return;
+                    }
+                    if same_key
+                        && !diffreview::keeps_comments(
+                            &self.loaded.diff,
+                            &loaded.diff,
+                            &self.comments,
+                        )
+                    {
+                        if !self.stale || !background {
+                            self.toast("Annotated files changed; keeping the reviewed snapshot until their line comments are cleared");
+                        }
+                        self.stale = true;
+                        self.dialog = Dialog::None;
+                        return;
+                    }
+                    self.stale = false;
+                    let remember = if background {
+                        self.remember()
+                    } else {
+                        remember
+                    };
+                    let offset = self.cursor.saturating_sub(self.scroll);
+                    let picked = self
+                        .overview
+                        .filter(|at| *at > 0)
+                        .and_then(|at| self.loaded.diff.file(at - 1))
+                        .map(|file| file.path().to_owned());
                     self.loaded = loaded;
                     self.key = self.loaded.key.clone();
                     self.split = Split::new(&self.loaded.diff, self.layout);
@@ -787,18 +872,39 @@ impl App {
                         .and_then(|row| self.split.line_for_row(row))
                         .or_else(|| self.split.first_content())
                         .unwrap_or(0);
-                    self.scroll = self.cursor.saturating_sub(self.view.height as usize / 2);
+                    self.scroll = self.cursor.saturating_sub(if background {
+                        offset
+                    } else {
+                        self.view.height as usize / 2
+                    });
+                    if let Some(picked) = picked {
+                        self.overview = Some(
+                            self.loaded
+                                .diff
+                                .files()
+                                .iter()
+                                .position(|file| file.path() == picked)
+                                .map_or(1.min(self.loaded.diff.files().len()), |at| at + 1),
+                        );
+                    }
+                    self.rebuild_marks();
                     self.selection = None;
                     self.focus = None;
                     self.composer = None;
-                    self.left = 0;
+                    if !background {
+                        self.left = 0;
+                    }
                     self.highlight.clear();
                     self.dialog = Dialog::None;
                     let _ = execute!(io::stdout(), SetTitle(&self.loaded.title));
-                    self.toast(format!("Loaded {}", self.loaded.label));
+                    if !background {
+                        self.toast(format!("Loaded {}", self.loaded.label));
+                    }
                 }
                 Err(e) => {
-                    self.dialog = Dialog::Error(e.to_string());
+                    if !background {
+                        self.dialog = Dialog::Error(e.to_string());
+                    }
                 }
             },
             Done::Post {
@@ -1879,6 +1985,10 @@ impl App {
     }
 
     fn ask_github(&mut self) {
+        if self.stale {
+            self.fail("The reviewed snapshot is out of date; clear its line comments and refresh before posting to GitHub");
+            return;
+        }
         let Some(composer) = self.composer.take() else {
             return;
         };
@@ -1897,6 +2007,10 @@ impl App {
     }
 
     fn comment_to_github(&mut self, comment: &Comment, index: Option<usize>) {
+        if self.stale {
+            self.fail("The reviewed snapshot is out of date; clear its line comments and refresh before posting to GitHub");
+            return;
+        }
         let (Some(first), Some(last)) = (
             self.loaded.diff.row_for(
                 &comment.anchor.file,
@@ -2097,25 +2211,32 @@ impl App {
         (line > 0).then(|| (diff.path(row.file as usize, side).to_owned(), side, line))
     }
 
-    fn start_load(&mut self, request: Request, message: &str) {
+    fn start_load(&mut self, request: Request, message: Option<&str>) {
         let remember = self.remember();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(request.load());
         });
-        self.job = Some(Job::Load { rx, remember });
-        self.dialog = Dialog::Loading(message.to_owned());
+        self.job = Some(Job::Load {
+            rx,
+            remember,
+            background: message.is_none(),
+        });
+        self.polled = Instant::now();
+        if let Some(message) = message {
+            self.dialog = Dialog::Loading(message.to_owned());
+        }
     }
 
     fn reload(&mut self) {
-        self.start_load(self.loaded.request.clone(), "Reloading the diff…");
+        self.start_load(self.loaded.request.clone(), Some("Reloading the diff…"));
     }
 
     fn other_side(&mut self) {
         match self.loaded.request.other_side() {
             Some(request) => {
                 let message = request.label();
-                self.start_load(request, &format!("Loading {message}…"));
+                self.start_load(request, Some(&format!("Loading {message}…")));
             }
             None => self.toast("This view has no second side"),
         }
@@ -3261,7 +3382,7 @@ impl App {
             None
         };
         // Wakes in time to follow the theme and the UI setting.
-        let due = self.look.due();
+        let due = self.look.due().min(self.loaded.request.refresh_interval());
         Some(wait.map_or(due, |wait| wait.min(due)))
     }
 }
@@ -3842,6 +3963,149 @@ diff --git a/b.rs b/b.rs
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
+    }
+
+    #[test]
+    fn live_diff_refreshes_wait_for_drafts_and_keep_saved_comments() {
+        let path =
+            std::env::temp_dir().join(format!("leaf-diff-live-{}.patch", std::process::id()));
+        let changed = PATCH.replace("let b = 3;", "let b = 30;");
+        std::fs::write(&path, PATCH).unwrap();
+        let request = Request {
+            origin: diff::Origin::Patch { path: path.clone() },
+            repo: None,
+            paths: Vec::new(),
+        };
+        let mut app = App::new(request.load().unwrap(), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
+        std::fs::write(&path, &changed).unwrap();
+        app.polled -= Duration::from_secs(2);
+        press(&mut app, KeyCode::Char('c'));
+        app.poll();
+        assert!(app.job.is_none(), "typing defers starting the reload");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        app.poll();
+        assert!(matches!(
+            app.job,
+            Some(Job::Load {
+                background: true,
+                ..
+            })
+        ));
+        assert!(matches!(app.dialog, Dialog::None));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "Keep this note");
+        app.receive_job();
+        assert!(
+            app.composer.is_some(),
+            "a pending reload leaves the draft alone"
+        );
+        assert!(app.loaded.diff.same_content(&Diff::parse(PATCH.to_owned())));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        let until = Instant::now() + Duration::from_secs(2);
+        while app.job.is_some() && Instant::now() < until {
+            app.receive_job();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.job.is_none());
+        assert!(app.stale);
+        assert!(app.loaded.diff.same_content(&Diff::parse(PATCH.to_owned())));
+        assert_eq!(app.comments.len(), 1);
+        assert_eq!(app.comments[0].comment.body, "Keep this note");
+        assert!(!app.marks.is_empty());
+        app.remove(0);
+        app.polled -= Duration::from_secs(2);
+        app.poll();
+        let until = Instant::now() + Duration::from_secs(2);
+        while app.job.is_some() && Instant::now() < until {
+            app.receive_job();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.stale);
+        assert!(app.loaded.diff.same_content(&Diff::parse(changed)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn changed_annotated_files_keep_the_reviewed_snapshot() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "Review this exact line");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        let changed = PATCH
+            .replace("@@ -10,3 +10,4 @@", "@@ -10,3 +10,5 @@")
+            .replace(" let a = 1;", "+let inserted = 0;\n let a = 1;");
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&changed))),
+            remember: None,
+            background: true,
+        });
+        assert!(app.loaded.diff.same_content(&Diff::parse(PATCH.to_owned())));
+        assert_eq!(app.comments[0].comment.body, "Review this exact line");
+        let comment = app.comments[0].comment.clone();
+        app.comment_to_github(&comment, Some(0));
+        assert!(matches!(app.dialog, Dialog::None));
+        assert!(app.job.is_none());
+    }
+
+    #[test]
+    fn background_reload_results_do_not_replace_toasts() {
+        let mut app = app();
+        app.toast("Keep this message");
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&PATCH.replace("let b = 3;", "let b = 30;")))),
+            remember: None,
+            background: true,
+        });
+        assert_eq!(app.toast.as_ref().unwrap().text, "Keep this message");
+        app.finish(Done::Load {
+            result: Box::new(Err(diff::DiffFailed::Git {
+                command: "git diff".into(),
+                cause: "busy".into(),
+            })),
+            remember: None,
+            background: true,
+        });
+        assert_eq!(app.toast.as_ref().unwrap().text, "Keep this message");
+    }
+
+    #[test]
+    fn manual_unchanged_reloads_confirm_without_moving() {
+        let mut app = app();
+        app.scroll = 2;
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(PATCH))),
+            remember: app.remember(),
+            background: false,
+        });
+        assert_eq!(app.scroll, 2);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.text.contains("unchanged"))
+        );
+    }
+
+    #[test]
+    fn an_unchanged_reload_keeps_the_review_in_place() {
+        let mut app = app();
+        app.scroll = 2;
+        app.left = 4;
+        app.selection = Some(app.cursor);
+        let cursor = app.cursor;
+        let remember = app.remember();
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(PATCH))),
+            remember,
+            background: true,
+        });
+        assert_eq!(app.cursor, cursor);
+        assert_eq!(app.scroll, 2);
+        assert_eq!(app.left, 4);
+        assert_eq!(app.selection, Some(cursor));
     }
 
     #[test]

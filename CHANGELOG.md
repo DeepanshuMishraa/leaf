@@ -6,6 +6,10 @@ per change, starting with `- `.
 
 ## Unreleased
 
+- Plans and local documents reload in place after file changes settle, using the same watcher. Refresh waits while you write or select text. Annotated plan blocks must match unambiguously, and the saved review round follows the source you reviewed. Failed file loads retry at most every five seconds unless the file changes again. PDF and EPUB replacements load in the background, keeping the current document usable until the replacement is ready.
+- Diffs and change reviews refresh in the background: every second for local sources, every 10 seconds for GitHub, including a PR's Code tab. Unchanged content keeps your position and notes. Changed annotated files keep their reviewed snapshot until line comments are cleared; stale snapshots cannot post comments to GitHub. Background reloads stay quiet, and manual reloads confirm unchanged content.
+- Visible PR and issue pages and lists refresh every 10 seconds, keeping the selected item and waiting for comments or text selections to finish. Running job logs still update every 5 seconds. Edited comments keep their reply selection by GitHub ID or an unambiguous identity match.
+
 ## 0.16.1
 
 - `leaf agent setup` installs Leaf's skills and plan hooks together, shows the planned changes, and reports each file written. Separate skill install and agent status/uninstall commands have been removed; use `leaf agent skill <name>` to print a skill.

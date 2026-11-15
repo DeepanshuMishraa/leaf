@@ -125,6 +125,7 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let watch = crate::doc::Watch::new(PathBuf::from(&request.file));
     let source = match read_plan(Path::new(&request.file)) {
         Ok(source) => source,
         Err(e) => {
@@ -147,6 +148,7 @@ pub fn plan_command(args: &[String]) -> ExitCode {
                 .clone()
                 .unwrap_or_else(|| shown_path(&request.file)),
             source,
+            watch: Some(watch),
             round: Some(round),
             previous,
             draft,
@@ -159,14 +161,24 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             );
         }
         return match result {
-            Ok(outcome) => finish(
-                &outcome,
-                if request.wait {
-                    &Reply::Print
-                } else {
-                    &request.reply
-                },
-            ),
+            Ok((outcome, source)) => {
+                if matches!(outcome, Outcome::Sent { .. })
+                    && let Err(error) =
+                        std::fs::write(round_dir(&key).join(format!("{round}.md")), source)
+                {
+                    eprintln!(
+                        "leaf: the reviewed plan couldn't be saved for the next round ({error})"
+                    );
+                }
+                finish(
+                    &outcome,
+                    if request.wait {
+                        &Reply::Print
+                    } else {
+                        &request.reply
+                    },
+                )
+            }
             Err(e) => {
                 eprintln!("leaf: {}", MarginFailed::Terminal(e));
                 ExitCode::from(1)
@@ -487,13 +499,16 @@ pub fn data_dir() -> PathBuf {
     margin_dir()
 }
 
+fn round_dir(key: &str) -> PathBuf {
+    margin_dir()
+        .join("rounds")
+        .join(format!("{:016x}", crate::plugin::fnv1a(key)))
+}
+
 /// Keeps `text` as the next round of the plan `key` when it differs from the
 /// last one, and says which round it is and what the round before said.
 fn record_round(key: &str, text: &str) -> std::io::Result<(u32, Option<String>)> {
-    let dir = margin_dir()
-        .join("rounds")
-        .join(format!("{:016x}", crate::plugin::fnv1a(key)));
-    record_round_in(&dir, text)
+    record_round_in(&round_dir(key), text)
 }
 
 fn record_round_in(dir: &Path, text: &str) -> std::io::Result<(u32, Option<String>)> {

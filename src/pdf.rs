@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::LazyLock;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use image::RgbaImage;
 use mupdf::{
@@ -1465,6 +1466,96 @@ impl Source for PdfSource {
     }
 }
 
+// MuPDF handles use their owning thread's context; only text and pixels cross this channel.
+type Query = Box<dyn FnOnce(&dyn Source) + Send>;
+
+#[derive(Clone)]
+struct Worker {
+    tx: Sender<Query>,
+}
+
+impl Worker {
+    fn read<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&dyn Source) -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Box::new(move |source| {
+                let _ = tx.send(read(source));
+            }))
+            .ok()?;
+        rx.recv().ok()
+    }
+}
+
+impl Source for Worker {
+    fn page(&self, index: usize) -> Rc<str> {
+        self.read(move |source| source.page(index).to_string())
+            .unwrap_or_default()
+            .into()
+    }
+
+    fn image_size(&self, id: &str) -> Option<(u32, u32)> {
+        let id = id.to_owned();
+        self.read(move |source| source.image_size(&id)).flatten()
+    }
+
+    fn decode(&self, id: &str, width: u32) -> Option<RgbaImage> {
+        let id = id.to_owned();
+        self.read(move |source| source.decode(&id, width)).flatten()
+    }
+}
+
+pub struct Loading {
+    ready: Receiver<Result<(String, Option<usize>), PdfOpenFailed>>,
+    worker: Worker,
+}
+
+impl Loading {
+    pub fn open(path: PathBuf) -> Self {
+        Self::spawn(move || open(&path))
+    }
+
+    fn spawn(load: impl FnOnce() -> Result<Doc, PdfOpenFailed> + Send + 'static) -> Self {
+        let (ready, rx) = mpsc::channel();
+        let (tx, queries) = mpsc::channel::<Query>();
+        std::thread::spawn(move || {
+            let doc = match load() {
+                Ok(doc) => doc,
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                    return;
+                }
+            };
+            if ready.send(Ok((doc.title.clone(), doc.page_count))).is_err() {
+                return;
+            }
+            while let Ok(query) = queries.recv() {
+                query(doc.source.as_ref());
+            }
+        });
+        Self {
+            ready: rx,
+            worker: Worker { tx },
+        }
+    }
+
+    pub fn poll(&self) -> Option<Result<Doc, PdfOpenFailed>> {
+        match self.ready.try_recv() {
+            Ok(result) => Some(result.map(|(title, page_count)| Doc {
+                title,
+                page_count,
+                source: Box::new(self.worker.clone()),
+            })),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(PdfOpenFailed {
+                message: "The document loader stopped before returning a document".into(),
+            })),
+        }
+    }
+}
+
 /// Opens a PDF or EPUB. Only a small sample of pages is read up front, to learn
 /// the layout; the rest are read as they are shown. A PDF returns at once; an
 /// EPUB first lays out the whole book to count its pages.
@@ -2049,6 +2140,75 @@ mod tests {
 #[cfg(test)]
 mod epub_tests {
     use super::*;
+
+    #[test]
+    fn background_open_keeps_non_send_sources_on_their_worker() {
+        struct Owned {
+            thread: std::thread::ThreadId,
+            text: Rc<str>,
+            dropped: Sender<std::thread::ThreadId>,
+        }
+        impl Source for Owned {
+            fn page(&self, _: usize) -> Rc<str> {
+                assert_eq!(std::thread::current().id(), self.thread);
+                self.text.clone()
+            }
+            fn image_size(&self, _: &str) -> Option<(u32, u32)> {
+                assert_eq!(std::thread::current().id(), self.thread);
+                Some((8, 4))
+            }
+            fn decode(&self, _: &str, width: u32) -> Option<RgbaImage> {
+                assert_eq!(std::thread::current().id(), self.thread);
+                Some(RgbaImage::new(width, 2))
+            }
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(std::thread::current().id());
+            }
+        }
+        let (entered, started) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let (dropped, finished) = mpsc::channel();
+        let loading = Loading::spawn(move || {
+            let thread = std::thread::current().id();
+            entered.send(thread).unwrap();
+            gate.recv().unwrap();
+            Ok(Doc {
+                title: "Worker book".into(),
+                page_count: Some(1),
+                source: Box::new(Owned {
+                    thread,
+                    text: "Worker page".into(),
+                    dropped,
+                }),
+            })
+        });
+        let timeout = std::time::Duration::from_secs(2);
+        let owner = started.recv_timeout(timeout).unwrap();
+        assert_ne!(owner, std::thread::current().id());
+        assert!(
+            loading.poll().is_none(),
+            "polling cannot wait for the loader"
+        );
+        release.send(()).unwrap();
+        let until = std::time::Instant::now() + timeout;
+        let doc = loop {
+            if let Some(result) = loading.poll() {
+                break result.unwrap();
+            }
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        };
+        drop(loading);
+        assert_eq!(doc.title, "Worker book");
+        assert_eq!(doc.page_count, Some(1));
+        assert_eq!(&*doc.source.page(0), "Worker page");
+        assert_eq!(doc.source.image_size("0"), Some((8, 4)));
+        assert_eq!(doc.source.decode("0", 7).unwrap().dimensions(), (7, 2));
+        drop(doc);
+        assert_eq!(finished.recv_timeout(timeout).unwrap(), owner);
+    }
 
     #[test]
     fn an_epub_opens_and_its_text_reads() {

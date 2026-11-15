@@ -29,7 +29,7 @@ use crate::agent::{self, Agent, AgentFailed};
 use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
 use crate::art;
 use crate::article;
-use crate::doc::{Doc, ImageRef};
+use crate::doc::{Doc, ImageRef, WATCH_TICK, Watch};
 use crate::edge;
 use crate::find::Query;
 use crate::highlight::{self, Highlight};
@@ -63,8 +63,6 @@ const KEPT_PAGES: usize = 4;
 const BOOKMARK_LABEL_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
-/// How often a watched file is checked; a change shows once it holds for one check.
-const WATCH_TICK: Duration = Duration::from_millis(250);
 /// How often the word read aloud is checked: fast enough that the mark
 /// keeps up with the voice at 4×.
 const NARRATION_TICK: Duration = Duration::from_millis(15);
@@ -323,9 +321,7 @@ pub struct ViewerOptions {
     pub speech: Backend,
     /// Path or URL this document was opened from, when leaf knows it.
     pub source: Option<String>,
-    /// A markdown file to read again whenever it changes, with its stamp from
-    /// before it was first read.
-    pub watch: Option<(std::path::PathBuf, Option<Stamp>)>,
+    pub watch: Option<Watch>,
 }
 
 impl Default for ViewerOptions {
@@ -352,22 +348,6 @@ impl Default for ViewerOptions {
             watch: None,
         }
     }
-}
-
-struct Watch {
-    path: std::path::PathBuf,
-    loaded: Option<Stamp>,
-    seen: Option<Stamp>,
-    checked: Instant,
-}
-
-/// A file's modification time and size. The size catches edits that land
-/// within one tick of a coarse clock, such as FAT's two seconds.
-pub type Stamp = (std::time::SystemTime, u64);
-
-pub fn stamp(path: &std::path::Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
 }
 
 pub struct App {
@@ -504,12 +484,7 @@ impl App {
                 stroke: stroke.clone(),
             })
             .collect();
-        let watch = options.watch.take().map(|(path, loaded)| Watch {
-            path,
-            loaded,
-            seen: loaded,
-            checked: Instant::now(),
-        });
+        let watch = options.watch.take();
         let narrator = Narrator::new(
             options.voice.clone(),
             options.speed,
@@ -568,29 +543,26 @@ impl App {
 
     /// Reads the watched file again once a change to it has settled.
     fn reload(&mut self) -> bool {
-        let Some(watch) = &mut self.watch else {
-            return false;
-        };
-        if watch.checked.elapsed() < WATCH_TICK {
-            return false;
-        }
-        watch.checked = Instant::now();
-        let now = stamp(&watch.path);
-        let settled = now == watch.seen;
-        watch.seen = now;
-        if !settled || now.is_none() || now == watch.loaded {
+        if self.selection.is_some()
+            || !matches!(self.dialog, Dialog::None)
+            || !matches!(self.drag, Drag::Idle)
+        {
             return false;
         }
-        let Ok(doc) = crate::markdown::open(&watch.path) else {
+        let Some(doc) = self
+            .watch
+            .as_mut()
+            .and_then(|watch| watch.document(crate::load_file))
+        else {
             return false;
         };
-        watch.loaded = now;
         if self.narrator.active() {
             self.narrator.stop();
             self.notice = Some("the file changed, so reading aloud stopped".into());
         }
         self.hold_anchor();
         self.doc = doc;
+        self.current = self.current.min(self.last());
         self.laid.clear();
         self.retain_protocols(|_| false);
         self.pixels.clear();
@@ -3549,6 +3521,36 @@ mod tests {
             self.0.set(self.0.get() + 1);
             None
         }
+    }
+
+    #[test]
+    fn a_live_picture_uses_its_own_loader() {
+        let path =
+            std::env::temp_dir().join(format!("leaf-picture-live-{}.png", std::process::id()));
+        RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let options = ViewerOptions {
+            watch: Some(Watch::new(path.clone())),
+            ..ViewerOptions::default()
+        };
+        let mut screen = Screen::new(
+            crate::load(path.to_str().unwrap()).unwrap(),
+            80,
+            20,
+            options,
+        );
+        assert_eq!(screen.app.doc.source.image_size("0"), Some((2, 2)));
+        RgbaImage::from_pixel(8, 4, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        std::thread::sleep(WATCH_TICK);
+        assert!(!screen.app.reload());
+        std::thread::sleep(WATCH_TICK);
+        assert!(screen.app.reload());
+        assert_eq!(screen.app.doc.source.image_size("0"), Some((8, 4)));
+        screen.draw();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
