@@ -207,10 +207,11 @@ impl Drop for Review {
 
 #[test]
 fn sending_after_round_recording_fails_preserves_the_existing_snapshot() {
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("SKIP: root bypasses the mode-0300 directory listing restriction");
-        return;
-    }
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "this permission regression requires a non-root user; rerun cargo test --test plan_round as a non-root user"
+    );
     let mut fixture = Fixture::new();
     let mut review = Review::open(&fixture);
     review.until("OLD-SNAPSHOT-CONTENTS");
@@ -227,6 +228,10 @@ fn sending_after_round_recording_fails_preserves_the_existing_snapshot() {
 
     let mut review = Review::open(&fixture);
     review.until("NEW-SNAPSHOT-CONTENTS");
+    assert!(
+        !history.join("2.md").try_exists().unwrap(),
+        "round recording must fail before the second review opens"
+    );
     assert!(review.finish(b"Sa").contains("Approved. Go ahead."));
     assert_eq!(
         fs::read_to_string(&snapshot).unwrap(),

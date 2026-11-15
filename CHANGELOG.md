@@ -6,9 +6,22 @@ per change, starting with `- `.
 
 ## Unreleased
 
-- Plans and local documents reload in place after file changes settle. Refresh waits while you write or select text. When an annotated plan block changes or has duplicate matches, Leaf keeps the reviewed snapshot until you send or clear its notes. Saved notes follow moved blocks when you reopen the plan, and live updates do not repeat startup notices. Saved review rounds follow the source you reviewed; failed history recording cannot overwrite an earlier round. Failed file loads wait five seconds before retrying unless the file changes again. PDF and EPUB replacements load in the background while you keep reading. Saved progress follows the replacement's page count, and cached pages avoid repeated text reads during redraws.
-- Diffs and change reviews refresh in the background: every second for local sources, every 10 seconds for GitHub, including a PR's Code tab. Unchanged content keeps your position and notes. If your current line or file disappears, background refresh keeps your position nearby instead of jumping to the beginning. Changed annotated files keep their reviewed snapshot until line comments are cleared; stale snapshots cannot post comments to GitHub. Background reloads stay quiet, and manual reloads confirm unchanged content.
-- Visible PR and issue pages and lists refresh every 10 seconds, keeping the selected item and waiting for comments or text selections to finish. Running job logs still update every 5 seconds. Edited comments keep their reply selection by GitHub ID or an unambiguous identity match.
+- Plans and local documents reload in place after file changes settle. Refresh waits while you write or select text.
+- When an annotated plan block changes or has duplicate matches, Leaf keeps the reviewed snapshot until you send or clear its notes.
+- Saved notes follow moved blocks when you reopen the plan.
+- Live plan updates do not repeat startup notices.
+- Saved review rounds follow the plan version you reviewed.
+- Sending a review cannot overwrite an earlier round when history recording fails.
+- Failed file loads wait five seconds before retrying unless the file changes again.
+- PDF and EPUB replacements load in the background while you keep reading.
+- Saved PDF and EPUB progress follows the replacement's page count.
+- Diffs and change reviews refresh every second for local sources and every 10 seconds for GitHub, including a PR's Code tab.
+- Unchanged diffs keep your position and notes.
+- If your current diff line or file disappears, background refresh keeps your position nearby instead of jumping to the beginning.
+- Changed annotated files keep their reviewed snapshot until you clear their line comments. You cannot post comments from stale snapshots to GitHub.
+- Background diff reloads stay quiet. Manual reloads confirm unchanged content.
+- Visible PR and issue pages and lists refresh every 10 seconds. Refresh keeps the selected item and waits for comments or text selections to finish; running job logs retain their five-second polling.
+- Editing a comment on GitHub no longer changes which comment Leaf replies to.
 
 ## 0.16.1
 
