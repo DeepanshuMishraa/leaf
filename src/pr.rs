@@ -980,21 +980,9 @@ pub fn current_branch() -> Option<String> {
 /// The forge and project path a remote URL names, over SSH or HTTPS, with the
 /// project as deep as its groups are.
 fn forge_repo(url: &str) -> Option<(Forge, String)> {
-    let (host, path) = match url.split_once("://") {
-        // scheme://[user@]host[:port]/path
-        Some((_, rest)) => {
-            let (authority, path) = rest.split_once('/')?;
-            (authority.rsplit('@').next()?, path)
-        }
-        // git@host:path
-        None => {
-            let (authority, path) = url.split_once(':')?;
-            (authority.rsplit('@').next()?, path)
-        }
-    };
-    let forge = github::forge_of(host)?;
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (host, path) = github::host_and_path(url)?;
+    let forge = github::forge_of(&host)?;
+    let path = path.strip_suffix(".git").unwrap_or(&path);
     let parts: Vec<&str> = path.split('/').collect();
     // A GitHub project is exactly `owner/name`; a GitLab one nests as deep as
     // its groups do.

@@ -98,14 +98,30 @@ fn parse_hosts(list: &str) -> Vec<String> {
     list.split([',', ';', ' ']).filter_map(bare_host).collect()
 }
 
-/// A host on its own: lower case, without a scheme, a port or a path.
+/// A host on its own: lower case, without a scheme, credentials, a port or a
+/// path. `user:password@host` names `host`, and `gitlab.com@evil.test` names
+/// `evil.test`, which is where the request would actually go.
 fn bare_host(host: &str) -> Option<String> {
     let host = host.trim().to_ascii_lowercase();
     let host = host
         .trim_start_matches("https://")
         .trim_start_matches("http://");
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
     let host = host.split(['/', ':']).next().unwrap_or("");
     (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// The host and the path below it, from a remote over any of git's schemes:
+/// `scheme://[user@]host[:port]/path`, or `git@host:path`.
+pub fn host_and_path(url: &str) -> Option<(String, String)> {
+    let (authority, path) = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?,
+        // Without a scheme, git writes `git@host:path`.
+        None => url.split_once(':')?,
+    };
+    let host = bare_host(authority)?;
+    let path = path.trim_matches('/');
+    (!path.is_empty()).then(|| (host, path.to_owned()))
 }
 
 /// Whether a host is a GitLab: by its name, or one `GITLAB_HOST` names. A
@@ -208,21 +224,21 @@ impl Resource {
             .strip_prefix("https://")
             .or_else(|| url.strip_prefix("http://"))
             .unwrap_or(url);
-        let (host, rest) = rest.split_once('/')?;
-        let host = host.trim().to_ascii_lowercase();
-        if host.is_empty() {
+        let (authority, rest) = rest.split_once('/')?;
+        // A link that carries credentials names one host and reaches another:
+        // `gitlab.com@evil.test` connects to `evil.test`. It isn't a forge
+        // page link, whatever the part before the `@` says, so it is refused.
+        if authority.contains('@') {
             return None;
         }
+        let host = bare_host(authority)?;
         let rest = rest.split(['?', '#']).next().unwrap_or(rest);
         let rest = rest.strip_suffix('/').unwrap_or(rest);
-        // GitLab puts `/-/` before every repository page; GitHub names the
-        // project in the first two segments and the page after them.
-        let (forge, project, tail) = match rest.split_once("/-/") {
-            Some((project, tail)) => (Forge::GitLab, clean_project(project)?, tail),
-            None => {
-                if Forge::of_host(&host) != Some(Forge::GitHub) {
-                    return None;
-                }
+        // A host that names its forge decides how the path is read, so a
+        // GitHub ref that happens to contain `/-/` is still a GitHub ref.
+        // Only a host that says nothing needs `/-/` to be told apart.
+        let (forge, project, tail) = match Forge::of_host(&host) {
+            Some(Forge::GitHub) => {
                 let (owner, rest) = rest.split_once('/')?;
                 let (name, tail) = rest.split_once('/')?;
                 (
@@ -230,6 +246,14 @@ impl Resource {
                     format!("{}/{}", clean(owner)?, clean(name)?),
                     tail,
                 )
+            }
+            Some(Forge::GitLab) => {
+                let (project, tail) = gitlab_project(rest)?;
+                (Forge::GitLab, project, tail)
+            }
+            None => {
+                let (project, tail) = rest.split_once("/-/")?;
+                (Forge::GitLab, clean_project(project)?, tail)
             }
         };
         let mut parts = tail.split('/');
@@ -349,6 +373,30 @@ impl Resource {
 fn clean(part: &str) -> Option<String> {
     let part = part.trim();
     (!part.is_empty()).then(|| part.to_owned())
+}
+
+/// A GitLab path split into its project and the page below it. GitLab puts
+/// `/-/` before every repository page, and still redirects the older form
+/// without it (`group/project/merge_requests/12`), which people link to in
+/// older issues and mail.
+fn gitlab_project(rest: &str) -> Option<(String, &str)> {
+    if let Some((project, tail)) = rest.split_once("/-/") {
+        return Some((clean_project(project)?, tail));
+    }
+    // Without `/-/`, the page kind is the last segment that names one, so a
+    // group called `commit` doesn't hide the project.
+    let at = [
+        "merge_requests",
+        "merge_request",
+        "commit",
+        "commits",
+        "compare",
+    ]
+    .into_iter()
+    .filter_map(|kind| rest.rfind(&format!("/{kind}/")).map(|at| at + 1))
+    .max()?;
+    let (project, tail) = rest.split_at(at);
+    Some((clean_project(project)?, tail))
 }
 
 /// A repository path such as `owner/name` or `group/subgroup/project`, with no
@@ -1135,6 +1183,97 @@ mod tests {
             .diff_url(),
             "https://github.com/o/r/compare/main...feat.diff"
         );
+    }
+
+    #[test]
+    fn a_link_that_carries_credentials_is_refused() {
+        // `gitlab.com@evil.test` reaches evil.test, so a link that says
+        // gitlab.com must not be read as one -- nor be handed a token.
+        for url in [
+            "https://gitlab.com@evil.test/x/-/merge_requests/1",
+            "https://github.com@evil.test/o/r/pull/1",
+            "https://user:password@gitlab.com/a/b/-/merge_requests/1",
+            "https://oauth2:token@gitlab.com/a/b/-/merge_requests/1",
+        ] {
+            assert_eq!(Resource::parse_url(url), None, "{url}");
+        }
+        // The host is what a link would reach, with or without credentials.
+        assert_eq!(bare_host("gitlab.com@evil.test"), Some("evil.test".into()));
+        assert_eq!(
+            bare_host("user:password@gitlab.com"),
+            Some("gitlab.com".into())
+        );
+        // A remote may keep its credentials; the project is still named.
+        assert_eq!(
+            host_and_path("https://user:secret@gitlab.example.com/o/r.git"),
+            Some(("gitlab.example.com".into(), "o/r.git".into()))
+        );
+        assert_eq!(
+            host_and_path("ssh://git@gitlab.example.com:2222/group/p.git"),
+            Some(("gitlab.example.com".into(), "group/p.git".into()))
+        );
+        assert_eq!(host_and_path("https://"), None);
+        assert_eq!(host_and_path(""), None);
+    }
+
+    #[test]
+    fn a_host_that_names_its_forge_decides_before_the_path() {
+        // A GitHub ref may contain `/-/`, and that doesn't make it a GitLab.
+        assert_eq!(
+            Resource::parse_url("https://github.com/o/r/compare/main...feature/-/start"),
+            github(Page::Compare {
+                project: "o/r".into(),
+                base: "main".into(),
+                head: "feature/-/start".into(),
+            })
+        );
+        // A GitLab page is still read as one, and never as GitHub's shape.
+        assert_eq!(
+            Resource::parse_url("https://gitlab.com/a/b/-/merge_requests/9"),
+            gitlab("gitlab.com", pull("a/b", 9))
+        );
+        assert_eq!(Resource::parse_url("https://gitlab.com/o/r/pull/1"), None);
+    }
+
+    #[test]
+    fn an_older_gitlab_link_is_read_without_its_dash() {
+        // GitLab 301s these to the `/-/` form, so the same page opens.
+        assert_eq!(
+            Resource::parse_url("https://gitlab.com/group/project/merge_requests/12"),
+            gitlab("gitlab.com", pull("group/project", 12))
+        );
+        assert_eq!(
+            Resource::parse_url("https://gitlab.example.com/group/sub/project/merge_requests/3"),
+            gitlab("gitlab.example.com", pull("group/sub/project", 3))
+        );
+        assert_eq!(
+            Resource::parse_url("https://gitlab.com/o/r/commit/abcdef1"),
+            gitlab(
+                "gitlab.com",
+                Page::Commit {
+                    project: "o/r".into(),
+                    sha: "abcdef1".into(),
+                }
+            )
+        );
+        assert_eq!(
+            Resource::parse_url("https://gitlab.com/o/r/compare/v1...v2"),
+            gitlab(
+                "gitlab.com",
+                Page::Compare {
+                    project: "o/r".into(),
+                    base: "v1".into(),
+                    head: "v2".into(),
+                }
+            )
+        );
+        // A group named for a page kind doesn't hide where the project ends.
+        assert_eq!(
+            Resource::parse_url("https://gitlab.com/a/commit/b/merge_requests/3"),
+            gitlab("gitlab.com", pull("a/commit/b", 3))
+        );
+        // Without `/-/` and without a kind, there's no page to open.
+        assert_eq!(Resource::parse_url("https://gitlab.com/o/r"), None);
     }
 
     #[test]
