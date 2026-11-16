@@ -162,6 +162,11 @@ impl Tab {
     /// The page's own tabs in order; a pull request's Code tab sits between
     /// Comments and Checks.
     const ALL: [Tab; 4] = [Tab::Summary, Tab::Timeline, Tab::Comments, Tab::Checks];
+
+    /// Whether the tab draws pictures and videos: the description's, or comments'.
+    fn shows_media(self) -> bool {
+        matches!(self, Tab::Summary | Tab::Timeline | Tab::Comments)
+    }
 }
 
 /// Where moving one tab on or back from the shown one lands.
@@ -1379,7 +1384,7 @@ impl App {
                     || page.busy.is_some()
                     || page.code
                     || self.inflight.contains(&page.pr)
-                    || (page.tab == Tab::Summary && self.gallery.loading())
+                    || (page.tab.shows_media() && self.gallery.loading())
                     || page
                         .log
                         .is_some_and(|job| self.logs.inflight.contains(&job))
@@ -1397,8 +1402,8 @@ impl App {
                 self.receive(msg, terminal)?;
             }
             self.gallery.receive();
-            // A video plays only while its description is on screen.
-            if self.page.as_ref().is_none_or(|p| p.tab != Tab::Summary) {
+            // A video plays only while a tab that can show it is on screen.
+            if self.page.as_ref().is_none_or(|p| !p.tab.shows_media()) {
                 self.gallery.stop();
             }
             if let Some(failed) = self.gallery.tick()
@@ -2991,19 +2996,19 @@ fn draw_page(
         let body = match page.tab {
             Tab::Summary => summary(detail, w, gallery),
             Tab::Timeline => {
-                let (lines, starts) = timeline(detail, w, now, page.expanded, page.focus);
-                page.starts = starts;
+                let listed = timeline(detail, w, now, page.expanded, page.focus, gallery);
+                page.starts = listed.starts;
                 Body {
-                    lines,
-                    figures: Vec::new(),
+                    lines: listed.lines,
+                    figures: listed.figures,
                 }
             }
             Tab::Comments => {
-                let (lines, starts) = comments(detail, w, now, page.focus);
-                page.starts = starts;
+                let listed = comments(detail, w, now, page.focus, page.expanded, gallery);
+                page.starts = listed.starts;
                 Body {
-                    lines,
-                    figures: Vec::new(),
+                    lines: listed.lines,
+                    figures: listed.figures,
                 }
             }
             Tab::Checks => match page.log {
@@ -3305,7 +3310,7 @@ fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
             ("space/b, g/G", "a screen, top and bottom"),
             ("drag", "select text; it's copied"),
             ("click", "a picture opens it, a video plays"),
-            ("e", "long comments, or a job's groups"),
+            ("e", "long comments and quotes, or a job's groups"),
             ("m", "merge: squash, merge commit or rebase"),
             ("x", "close, or reopen a closed one"),
             ("r", "ready or draft; on Checks, re-run"),
@@ -3326,7 +3331,7 @@ fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
             ("space/b, g/G", "a screen, top and bottom"),
             ("drag", "select text; it's copied"),
             ("click", "a picture opens it, a video plays"),
-            ("e", "expand or cut short long comments"),
+            ("e", "expand or cut short long comments and quotes"),
             ("x", "close as done or not planned, reopen"),
             ("c", "comment"),
             ("] [, enter", "pick a comment, reply quoting it"),
@@ -4077,18 +4082,26 @@ fn description(body: &str, width: u16, gallery: &mut Gallery) -> Body {
             figures: Vec::new(),
         };
     }
-    let prepared = prmedia::prepare(&body);
+    with_media(&body, width, 0, gallery)
+}
+
+/// Markdown laid out by the reader, as lines `indent` columns in, with room
+/// held for its pictures and videos and a label under each video. Only for a
+/// terminal that can draw them.
+fn with_media(body: &str, width: u16, indent: u16, gallery: &mut Gallery) -> Body {
+    let prepared = prmedia::prepare(body);
     gallery.learn(&prepared);
-    let laid = {
+    let mut laid = {
         let gallery = &*gallery;
         render::layout(&prepared.markdown, width.max(10), gallery.cell(), &|href| {
             gallery.size(href)
         })
     };
-    for figure in &laid.figures {
+    for figure in &mut laid.figures {
         gallery.want(&figure.href);
+        figure.x += indent;
     }
-    let mut lines = rows(&laid.rows, 0);
+    let mut lines = rows(&laid.rows, indent);
     // Trailing blank rows go, but not the rows a picture at the end is drawn over.
     let held = laid
         .figures
@@ -4162,9 +4175,77 @@ fn quoted(event: &pr::Event) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    let mut quote: String = body.lines().map(|line| format!("> {line}\n")).collect();
+    // Only what the comment says itself: quoting its quotes too would nest
+    // the whole thread one level deeper with every reply.
+    let own: Vec<&str> = quote_lines(&body)
+        .into_iter()
+        .filter(|(quote, _)| !quote)
+        .map(|(_, line)| line)
+        .collect();
+    let own = own.join("\n");
+    let own = own.trim_matches('\n');
+    let text = if own.trim().is_empty() {
+        body.as_str()
+    } else {
+        own
+    };
+    let mut quote: String = text.lines().map(|line| format!("> {line}\n")).collect();
     quote.push('\n');
     Some(quote)
+}
+
+/// Each of `body`'s lines, and whether it quotes something: a `>` line
+/// outside a code block.
+fn quote_lines(body: &str) -> Vec<(bool, &str)> {
+    let mut fenced = false;
+    body.lines()
+        .map(|line| {
+            let start = line.trim_start();
+            if start.starts_with("```") || start.starts_with("~~~") {
+                fenced = !fenced;
+            }
+            (!fenced && start.starts_with('>'), line)
+        })
+        .collect()
+}
+
+/// `body` with each quote in it cut down to one line saying how long it was.
+fn without_quotes(body: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut run = 0usize;
+    let end_run = |out: &mut Vec<String>, run: &mut usize| {
+        if *run > 0 {
+            let lines = if *run == 1 {
+                "1 line".to_owned()
+            } else {
+                format!("{run} lines")
+            };
+            out.extend([
+                String::new(),
+                format!("_▸ quote · {lines} · e shows it_"),
+                String::new(),
+            ]);
+            *run = 0;
+        }
+    };
+    for (quote, line) in quote_lines(body) {
+        if quote {
+            run += 1;
+        } else {
+            end_run(&mut out, &mut run);
+            out.push(line.to_owned());
+        }
+    }
+    end_run(&mut out, &mut run);
+    out.join("\n")
+}
+
+/// A list of events laid out: its lines, the first line of each event (by
+/// timeline index), and the pictures drawn over the lines.
+struct Listed {
+    lines: Vec<Line<'static>>,
+    starts: Vec<usize>,
+    figures: Vec<Figure>,
 }
 
 /// Which events a list of them holds.
@@ -4183,8 +4264,9 @@ fn timeline(
     now: i64,
     expanded: bool,
     focus: Option<usize>,
-) -> (Vec<Line<'static>>, Vec<usize>) {
-    events(detail, width, now, expanded, focus, Events::All)
+    gallery: &mut Gallery,
+) -> Listed {
+    events(detail, width, now, expanded, focus, Events::All, gallery)
 }
 
 /// The Comments tab: every comment and review with something to say, in
@@ -4194,10 +4276,12 @@ fn comments(
     width: usize,
     now: i64,
     focus: Option<usize>,
-) -> (Vec<Line<'static>>, Vec<usize>) {
-    let (lines, starts) = events(detail, width, now, true, focus, Events::Comments);
-    if !lines.is_empty() {
-        return (lines, starts);
+    quotes: bool,
+    gallery: &mut Gallery,
+) -> Listed {
+    let listed = events(detail, width, now, quotes, focus, Events::Comments, gallery);
+    if !listed.lines.is_empty() {
+        return listed;
     }
     let subject = match detail.kind {
         Kind::Pull => "pull request",
@@ -4207,7 +4291,11 @@ fn comments(
         format!("No comments on this {subject} yet. c writes the first one."),
         Style::default().fg(DIM),
     ))];
-    (empty, starts)
+    Listed {
+        lines: empty,
+        starts: listed.starts,
+        figures: Vec::new(),
+    }
 }
 
 fn events(
@@ -4217,11 +4305,15 @@ fn events(
     expanded: bool,
     focus: Option<usize>,
     which: Events,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+    gallery: &mut Gallery,
+) -> Listed {
+    // The Comments tab shows each comment whole; `e` shows quotes too.
+    let (quotes, expanded) = (expanded, expanded || which == Events::Comments);
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = Vec::new();
     let mut starts = Vec::new();
+    let mut figures = Vec::new();
     let indent = 4u16;
     let subject = match detail.kind {
         Kind::Pull => "pull request",
@@ -4336,7 +4428,21 @@ fn events(
         };
         lines.push(spread(left, right, width));
         if let Some(body) = body.map(|b| pr::visible(&b)).filter(|b| !b.is_empty()) {
-            let rendered = markdown(&body, (width as u16).saturating_sub(indent), indent);
+            let body = if quotes { body } else { without_quotes(&body) };
+            let room = (width as u16).saturating_sub(indent);
+            // A cut-short excerpt would cut a picture in two, so pictures
+            // show only where comments are shown whole.
+            let rendered = if expanded && gallery.shows_media() {
+                let laid = with_media(&body, room, indent, gallery);
+                let top = lines.len();
+                figures.extend(laid.figures.into_iter().map(|mut figure| {
+                    figure.top += top;
+                    figure
+                }));
+                laid.lines
+            } else {
+                markdown(&body, room, indent)
+            };
             let total = rendered.len();
             let shown = if expanded { total } else { total.min(EXCERPT) };
             lines.extend(rendered.into_iter().take(shown).map(|mut line| {
@@ -4349,16 +4455,27 @@ fn events(
                 line
             }));
             if shown < total {
-                lines.push(Line::from(Span::styled(
-                    format!("│   … {} more lines · e expands", total - shown),
-                    dim,
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(if picked { "┃" } else { "│" }, rail),
+                    Span::styled(
+                        format!("   … {} more lines · e expands", total - shown),
+                        dim,
+                    ),
+                ]));
             }
         }
-        lines.push(Line::from(Span::styled("│", dim)));
+        // The picked comment's rail runs on to the next event.
+        lines.push(Line::from(Span::styled(
+            if picked { "┃" } else { "│" },
+            rail,
+        )));
     }
     lines.pop();
-    (lines, starts)
+    Listed {
+        lines,
+        starts,
+        figures,
+    }
 }
 
 /// Swaps markdown and HTML images for `▣ alt` so they don't leave blank space.
@@ -4890,17 +5007,17 @@ mod tests {
                 headline: "fix it".into(),
             },
         });
-        let (lines, starts) = comments(&d, 60, now, None);
+        let Listed { lines, starts, .. } = comments(&d, 60, now, None, true, &mut Gallery::plain());
         let shown = texts(&lines);
         assert!(shown[0].starts_with("◆  bot commented"), "{shown:?}");
         // Picked, it's pointed at, its rail is thick, and enter is named.
-        let (picked, _) = comments(&d, 60, now, Some(1));
+        let picked = comments(&d, 60, now, Some(1), true, &mut Gallery::plain()).lines;
         let picked = texts(&picked);
         assert!(picked[0].starts_with("▶  bot commented"), "{picked:?}");
         assert!(picked[0].contains("enter replies"), "{picked:?}");
         assert!(picked[1].starts_with('┃'), "{picked:?}");
         // Too narrow for the hint, the header keeps its own words whole.
-        let (narrow, _) = comments(&d, 24, now, Some(1));
+        let narrow = comments(&d, 24, now, Some(1), true, &mut Gallery::plain()).lines;
         let narrow = texts(&narrow);
         assert!(narrow[0].starts_with("▶  bot commented"), "{narrow:?}");
         assert!(!narrow[0].contains("enter"), "{narrow:?}");
@@ -4914,7 +5031,7 @@ mod tests {
         assert_eq!(starts[1], 0);
 
         d.timeline.truncate(1);
-        let (lines, _) = comments(&d, 60, now, None);
+        let lines = comments(&d, 60, now, None, true, &mut Gallery::plain()).lines;
         assert!(texts(&lines)[0].starts_with("No comments on this pull request yet"));
     }
 
@@ -5004,10 +5121,30 @@ mod tests {
     #[test]
     fn long_timeline_comments_are_cut_short_until_expanded() {
         let now = pr::seconds("2026-11-12T04:30:00Z").unwrap();
-        let short = texts(&timeline(&detail(State::Open), 60, now, false, None).0);
+        let short = texts(
+            &timeline(
+                &detail(State::Open),
+                60,
+                now,
+                false,
+                None,
+                &mut Gallery::plain(),
+            )
+            .lines,
+        );
         assert!(short[0].starts_with("●  marcos opened this pull request"));
         assert!(short.iter().any(|l| l.contains("more lines · e expands")));
-        let long = texts(&timeline(&detail(State::Open), 60, now, true, None).0);
+        let long = texts(
+            &timeline(
+                &detail(State::Open),
+                60,
+                now,
+                true,
+                None,
+                &mut Gallery::plain(),
+            )
+            .lines,
+        );
         assert!(long.iter().any(|l| l.contains("line 30")));
         assert!(!long.iter().any(|l| l.contains("more lines")));
     }
