@@ -1370,12 +1370,9 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(false),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.page(true, true)
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.page(false, true)
-            }
+            // Ctrl+d and Ctrl+u also arrive as these characters, so both work.
+            KeyCode::Char('d') => self.page(true, true),
+            KeyCode::Char('u') => self.page(false, true),
             KeyCode::PageDown | KeyCode::Char(' ') => self.page(true, false),
             KeyCode::PageUp | KeyCode::Char('b') => self.page(false, false),
             KeyCode::Char('g') | KeyCode::Home => self.go_edge(false),
@@ -1828,12 +1825,30 @@ impl App {
         if height == 0 {
             return;
         }
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
+        if self.cursor <= self.scroll {
+            // Scrolling back up keeps the file and hunk headings directly
+            // above the cursor on screen, so a file's name does not disappear.
+            self.scroll = self.heading_start(self.cursor);
         } else if self.cursor >= self.scroll + height {
             self.scroll = self.cursor + 1 - height;
         }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The line a scroll can stop at when bringing `line` to the top: the
+    /// line itself, plus the file and hunk headings directly above it.
+    fn heading_start(&self, line: usize) -> usize {
+        let mut top = line;
+        while top > 0
+            && self
+                .split
+                .lines()
+                .get(top - 1)
+                .is_some_and(|line| line.band.is_some())
+        {
+            top -= 1;
+        }
+        top
     }
 
     /// Keeps a whole highlighted range on screen, not only its cursor.
@@ -4627,6 +4642,31 @@ diff --git a/b.rs b/b.rs
         let screen = draw(&mut app, 100, 16);
         assert!(screen.contains("big.rs"));
         assert!(app.highlight.len() <= 1);
+    }
+
+    #[test]
+    fn scrolling_back_up_keeps_the_first_files_name_on_screen() {
+        let mut app = App::new(loaded(&big_patch(80)), Options::default());
+        app.view = Rect::new(0, 1, 120, 12);
+        press(&mut app, KeyCode::PageDown);
+        assert!(app.scroll > 0);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Char('u'));
+        }
+        assert_eq!(app.scroll, 0, "the file heading scrolls back into view");
+        assert_eq!(app.cursor, app.split.first_content().unwrap());
+
+        // Plain d and u are the half-page keys the help has always shown.
+        let first = app.cursor;
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.cursor > first);
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Char('u'));
+        }
+        assert_eq!(app.scroll, 0, "the file heading scrolls back into view");
+        assert_eq!(app.cursor, first);
+        let screen = draw(&mut app, 100, 22);
+        assert!(screen.contains("big.rs"));
     }
 
     #[test]
