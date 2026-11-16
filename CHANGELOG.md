@@ -4,6 +4,11 @@ After an update, leaf shows the current version's notes once, over whatever
 it opens first. Each release needs a `## <version>` section with one line
 per change, starting with `- `.
 
+## 0.16.4
+
+- `d` and `u` scroll half a page in `leaf diff`, as the keys panel says; `ctrl+d` and `ctrl+u` still work.
+- Scrolling back up in a diff keeps the first file's name on screen instead of stopping at its first line.
+
 ## 0.16.3
 
 - GitLab merge request patches use `glab` when available, then the API when `GITLAB_TOKEN` is set, and the page otherwise. Commit and comparison patches use the API when a token is set. A truncated or failed API patch no longer replaces the page patch.
