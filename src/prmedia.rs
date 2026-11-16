@@ -93,6 +93,17 @@ fn figure(alt: &str, src: &str) -> String {
     format!("\n\n![{alt}]({})\n\n", src.replace(' ', "%20"))
 }
 
+/// A signed upload link, as a quoted reply copies it, expires within minutes;
+/// the upload's own github.com link signs a fresh one each time it's fetched.
+fn lasting(src: &str) -> String {
+    if SIGNED.is_match(src)
+        && let Some(id) = UPLOAD_ID.find(src)
+    {
+        return format!("https://github.com/user-attachments/assets/{}", id.as_str());
+    }
+    src.to_owned()
+}
+
 fn has_media(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("<img") || lower.contains("<video") || text.contains("![")
@@ -164,17 +175,17 @@ pub fn prepare(body: &str) -> Prepared {
     let body = untable(body);
     let text = VIDEO.replace_all(&body, |c: &Captures| {
         let found = attrs(&c[0]);
-        match found.get("src") {
+        match found.get("src").map(|src| lasting(src)) {
             Some(src) => {
                 videos.insert(src.clone());
-                figure("video", src)
+                figure("video", &src)
             }
             None => String::new(),
         }
     });
     let text = IMG.replace_all(&text, |c: &Captures| {
         let found = attrs(&c[0]);
-        let Some(src) = found.get("src") else {
+        let Some(src) = found.get("src").map(|src| lasting(src)) else {
             return String::new();
         };
         let size = |key: &str| found.get(key).and_then(|v| v.trim().parse::<u32>().ok());
@@ -184,7 +195,7 @@ pub fn prepare(body: &str) -> Prepared {
         {
             hints.insert(src.clone(), (w, h));
         }
-        figure(found.get("alt").map_or("image", String::as_str), src)
+        figure(found.get("alt").map_or("image", String::as_str), &src)
     });
     let text = BARE.replace_all(&text, |c: &Captures| figure("attachment", &c[1]));
     Prepared {
@@ -1227,6 +1238,22 @@ mod tests {
         assert!(prepared.markdown.contains("![md](https://x/b.png)"));
         assert_eq!(prepared.hints.get("https://x/a.png"), Some(&(663, 200)));
         assert!(prepared.videos.contains("https://x/v.mp4"));
+    }
+
+    #[test]
+    fn a_quoted_signed_upload_link_goes_back_to_the_lasting_one() {
+        let id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+        let body = format!(
+            "> <img alt=\"shot\" width=\"638\" height=\"408\" src=\"https://private-user-images.githubusercontent.com/1/2-{id}.png?jwt=old\">"
+        );
+        let prepared = prepare(&body);
+        let lasting = format!("https://github.com/user-attachments/assets/{id}");
+        assert!(
+            prepared.markdown.contains(&format!("![shot]({lasting})")),
+            "{}",
+            prepared.markdown
+        );
+        assert_eq!(prepared.hints.get(&lasting), Some(&(638, 408)));
     }
 
     #[test]
