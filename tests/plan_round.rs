@@ -70,6 +70,10 @@ struct Review {
 
 impl Review {
     fn open(fixture: &Fixture) -> Self {
+        Self::open_with(fixture, &["--print"], &[])
+    }
+
+    fn open_with(fixture: &Fixture, options: &[&str], env: &[(&str, PathBuf)]) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {
@@ -108,9 +112,12 @@ impl Review {
         );
         let mut command = Command::new(env!("CARGO_BIN_EXE_leaf"));
         command
-            .args(["plan", "--print", "plan.md"])
+            .arg("plan")
+            .args(options)
+            .arg("plan.md")
             .current_dir(&fixture.root)
             .env_clear()
+            .envs(env.iter().map(|(name, value)| (name, value)))
             .env("HOME", fixture.root.join("home"))
             .env("XDG_DATA_HOME", fixture.root.join("data"))
             .env("XDG_CACHE_HOME", fixture.root.join("cache"))
@@ -237,6 +244,39 @@ fn sending_after_round_recording_fails_preserves_the_existing_snapshot() {
         fs::read_to_string(&snapshot).unwrap(),
         OLD,
         "a failed round record must not overwrite the earlier snapshot on Send"
+    );
+}
+
+#[test]
+fn closing_a_review_no_agent_asked_for_tells_no_agent() {
+    let fixture = Fixture::new();
+    let log = fixture.root.join("rex.log");
+    let rex = fixture.root.join("rex");
+    fs::write(
+        &rex,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncat > /dev/null\n[ \"$1 $2\" = 'block ls' ] && echo '{{\"blocks\":[{{\"block_id\":\"agent-block\"}}]}}'\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&rex, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut review = Review::open_with(
+        &fixture,
+        &[],
+        &[
+            ("PATH", PathBuf::from("/usr/bin:/bin")),
+            ("REX_SESSION", PathBuf::from("session")),
+            ("LEAF_REX", rex),
+            ("LEAF_AGENT_PANE", PathBuf::from("agent-block")),
+        ],
+    );
+    review.until("OLD-SNAPSHOT-CONTENTS");
+    assert!(review.finish(b"q").contains("closed without a verdict"));
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|call| call.ends_with("write -")),
+        "a review no agent asked for must not message one on close: {calls:?}"
     );
 }
 
