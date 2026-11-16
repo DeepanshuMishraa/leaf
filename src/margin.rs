@@ -653,23 +653,19 @@ pub fn finish(outcome: &Outcome, reply: &Reply) -> ExitCode {
         }
         Reply::Agent(pane) => {
             let Outcome::Sent { text, verdict } = outcome else {
-                // The agent was told to end its turn and wait, so a silent
-                // close would leave it waiting with nothing to go on.
-                let notice = "The review was closed without a verdict. Ask the person how they'd like to go on.";
-                let delivered = match pane {
-                    Some(pane) => agent::deliver_to_pane(pane, notice),
-                    None => agent::deliver(notice),
+                // Only an agent that asked for the review is waiting on it;
+                // without one named, a person opened it and no agent should
+                // be interrupted.
+                let Some(pane) = pane else {
+                    eprintln!("leaf: the review was closed without a verdict.");
+                    return ExitCode::SUCCESS;
                 };
-                match delivered {
+                let notice = "The review was closed without a verdict. Ask the person how they'd like to go on.";
+                match agent::deliver_to_pane(pane, notice) {
                     Ok(found) => eprintln!(
                         "leaf: the review was closed without a verdict; told {}.",
                         found.describe()
                     ),
-                    // No agent was named, so there may be none to tell: a
-                    // person closing the screen in a plain terminal.
-                    Err(_) if pane.is_none() => {
-                        eprintln!("leaf: the review was closed without a verdict.")
-                    }
                     Err(e) => eprintln!("leaf: {e}"),
                 }
                 return ExitCode::SUCCESS;
