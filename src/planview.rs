@@ -471,16 +471,16 @@ impl App {
             return Vec::new();
         };
         let mut lines: Vec<(usize, usize, usize)> = Vec::new();
+        // Rows run through the text in order, so newlines are counted once.
+        let (mut line, mut counted) = (0, 0);
         for (at, row) in laid.rows.iter().enumerate() {
             let Some(offset) = row.segs.iter().find_map(|seg| seg.offset) else {
                 continue;
             };
-            let line = laid
-                .text
-                .iter()
-                .take(offset)
-                .filter(|c| **c == '\n')
-                .count();
+            if let Some(passed) = laid.text.get(counted..offset) {
+                line += passed.iter().filter(|c| **c == '\n').count();
+                counted = offset;
+            }
             match lines.last_mut() {
                 Some((number, _, last)) if *number == line => *last = at,
                 _ => lines.push((line, at, at)),
@@ -695,10 +695,17 @@ impl App {
     /// Where `quote` sits in block `block`'s laid-out text, as a character
     /// range: its first occurrence.
     fn passage_range(&self, block: usize, quote: &str) -> Option<(usize, usize)> {
-        let text: String = self.laid.get(block)?.text.iter().collect();
-        let at = text.find(quote)?;
-        let start = text[..at].chars().count();
-        Some((start, start + quote.chars().count()))
+        let quote: Vec<char> = quote.chars().collect();
+        if quote.is_empty() {
+            return None;
+        }
+        let start = self
+            .laid
+            .get(block)?
+            .text
+            .windows(quote.len())
+            .position(|window| window == quote.as_slice())?;
+        Some((start, start + quote.len()))
     }
 
     /// The row a passage note is drawn under: the one its passage ends on.

@@ -485,6 +485,21 @@ Loose closing paragraph.
     }
 
     #[test]
+    fn a_passage_across_a_wrapped_paragraph_spans_its_source_lines() {
+        assert_eq!(
+            locate("We move sessions\nto tokens.", "move sessions to tokens"),
+            Some((1, 2))
+        );
+        assert_eq!(
+            locate(
+                "# Plan\n\nWe move sessions\nto tokens.\n",
+                "We move sessions to tokens."
+            ),
+            Some((3, 4))
+        );
+    }
+
+    #[test]
     fn every_source_line_is_found_where_it_is() {
         for (number, line) in PLAN.lines().enumerate() {
             let text = plain(line);
