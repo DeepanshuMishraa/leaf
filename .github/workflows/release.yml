@@ -83,6 +83,7 @@ jobs:
   # Runs beside the builds; the release job waits for both.
   test:
     name: Test
+    needs: check
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
