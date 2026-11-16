@@ -11,8 +11,10 @@
 # A stable release also bumps Formula/leaf.rb in DeepanshuMishraa/homebrew-tap,
 # pushed with the HOMEBREW_TAP_DEPLOY_KEY secret (a write deploy key on the tap).
 #
-# It runs only for a pushed v tag or a published release, never for branches or
-# pull requests.
+# It publishes only for a pushed v tag or a published release, never for
+# branches or pull requests. It also builds, without publishing, on main and
+# weekly: a tag run can only restore Rust caches saved on main, so those runs
+# save the cache and tag runs only read it.
 
 name: Release
 
@@ -20,6 +22,15 @@ on:
   push:
     # Any v tag; the check job holds it to Cargo.toml's exact version.
     tags: ["v*"]
+    # Path filters don't apply to tags, only to these main pushes.
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/release.yml
+  # A new stable Rust changes every cache key, so main warms them again weekly.
+  schedule:
+    - cron: "0 6 * * 1"
   release:
     types: [published]
 
@@ -41,9 +52,9 @@ env:
 
 jobs:
   check:
-    name: Check version and test
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    name: Check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -66,6 +77,17 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Building leaf ${version}"
 
+      - name: Check the install script parses
+        run: sh -n site/public/install.sh
+
+  # Runs beside the builds; the release job waits for both.
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -75,13 +97,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo test --locked
-
-      - name: Check the install script parses
-        run: sh -n site/public/install.sh
 
   build:
     name: Build ${{ matrix.target }}
@@ -123,6 +142,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: cargo build --release --locked --target "$TARGET"
@@ -180,7 +200,7 @@ jobs:
 
   release:
     name: Publish the release
-    needs: [check, build]
+    needs: [check, test, build]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 15
