@@ -1540,20 +1540,32 @@ impl App {
             return;
         }
         let (top, height, scroll) = (self.view.y, self.view.height, self.scroll);
+        let pinned = self.pinned_header();
+        let offset = u16::from(pinned.is_some());
         let row_at = |y: u16| -> Option<usize> {
-            let inside = y.checked_sub(top)? as usize;
-            (inside < height as usize).then_some(scroll + inside)
+            let inside = y.checked_sub(top)?;
+            if inside >= height {
+                return None;
+            }
+            if inside < offset {
+                return pinned;
+            }
+            Some(scroll + (inside - offset) as usize)
         };
         match mouse.kind {
             MouseEventKind::ScrollDown => {
                 self.clear_selection_on_move();
+                let before = self.scroll;
                 self.scroll = (self.scroll + WHEEL_ROWS).min(self.max_scroll());
-                self.cursor = self.snap(self.cursor.max(self.scroll));
+                let moved = self.scroll - before;
+                self.cursor = self.snap(self.cursor + moved);
             }
             MouseEventKind::ScrollUp => {
                 self.clear_selection_on_move();
+                let before = self.scroll;
                 self.scroll = self.scroll.saturating_sub(WHEEL_ROWS);
-                self.cursor = self.snap(self.cursor.min(self.scroll + self.view.height as usize));
+                let moved = before - self.scroll;
+                self.cursor = self.snap(self.cursor.saturating_sub(moved));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(row) = row_at(mouse.row)
@@ -1833,6 +1845,26 @@ impl App {
             self.scroll = self.cursor + 1 - height;
         }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The file header pinned above the lines that are on screen, when the
+    /// file it belongs to is scrolled under its own name.
+    fn pinned_header(&self) -> Option<usize> {
+        if self.scroll == 0 {
+            return None;
+        }
+        let diff = &self.loaded.diff;
+        let lines = self.split.lines();
+        let last = self.scroll.min(lines.len().saturating_sub(1));
+        (0..=last)
+            .rev()
+            .find(|&index| {
+                lines
+                    .get(index)
+                    .and_then(|line| line.band)
+                    .is_some_and(|row| diff.rows()[row].kind == RowKind::File)
+            })
+            .filter(|&index| index < self.scroll)
     }
 
     /// The line a scroll can stop at when bringing `line` to the top: the
@@ -2465,24 +2497,36 @@ impl App {
             );
             return;
         }
-        let end = (self.scroll + area.height as usize).min(self.split.lines().len());
-        let mut lines = Vec::with_capacity(end.saturating_sub(self.scroll));
+        // The file header stays pinned at the top while its lines scroll under
+        // it, so a file's name is always visible no matter how the view moved.
+        let pinned = self.pinned_header();
+        let offset = usize::from(pinned.is_some());
+        let height = (area.height as usize).saturating_sub(offset);
+        let end = (self.scroll + height).min(self.split.lines().len());
+        let mut lines = Vec::with_capacity(end.saturating_sub(self.scroll) + offset);
         // File headers, by screen row and the width of their text.
         let mut headers = Vec::new();
+        if let Some(index) = pinned
+            && let Some(row) = self.split.lines()[index].band
+        {
+            let drawn = self.row_line(row);
+            headers.push((0, drawn.width() as u16));
+            lines.push(drawn);
+        }
         for index in self.scroll..end {
             let line = self.split.lines()[index];
-            lines.push(match line.band {
-                Some(row) => {
-                    let drawn = self.row_line(row);
-                    if self.loaded.diff.rows()[row].kind == RowKind::File {
-                        headers.push((index - self.scroll, drawn.width() as u16));
-                    }
-                    drawn
-                }
+            let drawn = match line.band {
+                Some(row) => self.row_line(row),
                 None => self.split_content(index, area.width),
-            });
+            };
+            if let Some(row) = line.band
+                && self.loaded.diff.rows()[row].kind == RowKind::File
+            {
+                headers.push((lines.len() as u16, drawn.width() as u16));
+            }
+            lines.push(drawn);
         }
-        let drawn = (end - self.scroll) as u16;
+        let drawn = lines.len() as u16;
         f.render_widget(Paragraph::new(lines), area);
         // Each file opens with a tinted bar whose text trails off in dither.
         let Some(ink) = self.look.ink() else {
@@ -4667,6 +4711,74 @@ diff --git a/b.rs b/b.rs
         assert_eq!(app.cursor, first);
         let screen = draw(&mut app, 100, 22);
         assert!(screen.contains("big.rs"));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_back_to_the_first_files_name() {
+        let mut app = App::new(loaded(&big_patch(80)), Options::default());
+        app.view = Rect::new(0, 1, 120, 12);
+        for _ in 0..10 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+        }
+        assert!(app.scroll > 0);
+        for _ in 0..80 {
+            wheel(&mut app, MouseEventKind::ScrollUp);
+            // Each frame follows the cursor, which must not pull the view back
+            // down onto the cursor while the wheel is still going up.
+            app.follow_cursor();
+        }
+        assert_eq!(app.scroll, 0, "the file heading scrolls back into view");
+        let screen = draw(&mut app, 100, 22);
+        assert!(screen.contains("big.rs"));
+    }
+
+    #[test]
+    fn a_files_name_stays_pinned_while_its_lines_scroll() {
+        let mut app = App::new(loaded(&big_patch(80)), Options::default());
+        app.cursor = 8;
+        app.scroll = 6;
+        let screen = draw(&mut app, 100, 22);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(
+            rows[0].contains("big.rs"),
+            "the file name heads the view even with its own row scrolled off:\n{screen}"
+        );
+        assert!(!rows[1].contains("big.rs"), "the heading is pinned once");
+
+        app.scroll = 0;
+        app.cursor = 2;
+        let screen = draw(&mut app, 100, 22);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(rows[0].contains("big.rs"));
+        assert!(!rows[1].contains("big.rs"), "no duplicate heading");
+    }
+
+    #[test]
+    fn a_click_under_the_pinned_name_lands_on_the_line_shown_there() {
+        let mut app = App::new(loaded(&big_patch(80)), Options::default());
+        app.view = Rect::new(0, 0, 120, 22);
+        app.cursor = 8;
+        app.scroll = 6;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.cursor, 6,
+            "the row under the pinned name is the top line"
+        );
+        assert!(app.selection.is_none());
+    }
+
+    fn wheel(app: &mut App, kind: MouseEventKind) {
+        app.mouse(MouseEvent {
+            kind,
+            column: 0,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
     }
 
     #[test]

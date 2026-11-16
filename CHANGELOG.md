@@ -7,7 +7,7 @@ per change, starting with `- `.
 ## 0.16.4
 
 - `d` and `u` scroll half a page in `leaf diff`, as the keys panel says; `ctrl+d` and `ctrl+u` still work.
-- Scrolling back up in a diff keeps the first file's name on screen instead of stopping at its first line.
+- Scrolling back up in a diff keeps the first file's name on screen instead of stopping at its first line, and a file's name stays pinned at the top while its lines scroll under it.
 
 ## 0.16.3
 
