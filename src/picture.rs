@@ -119,7 +119,7 @@ pub fn in_folder(path: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .map(|entry| entry.path())
+        .map(|entry| path.with_file_name(entry.file_name()))
         .filter(|p| {
             let hidden = p
                 .file_name()

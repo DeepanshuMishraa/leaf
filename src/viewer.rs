@@ -3912,6 +3912,7 @@ mod tests {
     fn picture_screen(path: &Path) -> Screen {
         let options = ViewerOptions {
             source: Some(path.display().to_string()),
+            picture_path: Some(path.to_path_buf()),
             ..ViewerOptions::default()
         };
         Screen::new(picture::open(path).unwrap(), 100, 30, options)
