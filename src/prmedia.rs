@@ -64,7 +64,7 @@ static UPLOAD_ID: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A signed link to an upload in a private repository, as the rendered body has it.
 static SIGNED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https://private-user-images\.githubusercontent\.com/[^"'\s<>]+"#)
+    Regex::new(r#"https://private-user-images\.githubusercontent\.com/[^"'\s<>()]+"#)
         .expect("pattern is valid")
 });
 static BARE: LazyLock<Regex> = LazyLock::new(|| {
@@ -95,13 +95,11 @@ fn figure(alt: &str, src: &str) -> String {
 
 /// A signed upload link, as a quoted reply copies it, expires within minutes;
 /// the upload's own github.com link signs a fresh one each time it's fetched.
-fn lasting(src: &str) -> String {
-    if SIGNED.is_match(src)
-        && let Some(id) = UPLOAD_ID.find(src)
-    {
-        return format!("https://github.com/user-attachments/assets/{}", id.as_str());
+fn lasting(signed: &str) -> String {
+    match UPLOAD_ID.find(signed) {
+        Some(id) => format!("https://github.com/user-attachments/assets/{}", id.as_str()),
+        None => signed.to_owned(),
     }
-    src.to_owned()
 }
 
 fn has_media(text: &str) -> bool {
@@ -173,9 +171,11 @@ pub fn prepare(body: &str) -> Prepared {
     let mut hints = HashMap::new();
     let mut videos = HashSet::new();
     let body = untable(body);
+    // In tags, Markdown images and plain links alike.
+    let body = SIGNED.replace_all(&body, |c: &Captures| lasting(&c[0]));
     let text = VIDEO.replace_all(&body, |c: &Captures| {
         let found = attrs(&c[0]);
-        match found.get("src").map(|src| lasting(src)) {
+        match found.get("src").cloned() {
             Some(src) => {
                 videos.insert(src.clone());
                 figure("video", &src)
@@ -185,7 +185,7 @@ pub fn prepare(body: &str) -> Prepared {
     });
     let text = IMG.replace_all(&text, |c: &Captures| {
         let found = attrs(&c[0]);
-        let Some(src) = found.get("src").map(|src| lasting(src)) else {
+        let Some(src) = found.get("src").cloned() else {
             return String::new();
         };
         let size = |key: &str| found.get(key).and_then(|v| v.trim().parse::<u32>().ok());
@@ -1254,6 +1254,17 @@ mod tests {
             prepared.markdown
         );
         assert_eq!(prepared.hints.get(&lasting), Some(&(638, 408)));
+
+        let markdown = format!(
+            "> ![shot](https://private-user-images.githubusercontent.com/1/2-{id}.png?jwt=old)"
+        );
+        assert!(
+            prepare(&markdown)
+                .markdown
+                .contains(&format!("![shot]({lasting})")),
+            "{}",
+            prepare(&markdown).markdown
+        );
     }
 
     #[test]

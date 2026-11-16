@@ -162,6 +162,11 @@ impl Tab {
     /// The page's own tabs in order; a pull request's Code tab sits between
     /// Comments and Checks.
     const ALL: [Tab; 4] = [Tab::Summary, Tab::Timeline, Tab::Comments, Tab::Checks];
+
+    /// Whether the tab draws pictures and videos: the description's, or comments'.
+    fn shows_media(self) -> bool {
+        matches!(self, Tab::Summary | Tab::Timeline | Tab::Comments)
+    }
 }
 
 /// Where moving one tab on or back from the shown one lands.
@@ -1379,7 +1384,7 @@ impl App {
                     || page.busy.is_some()
                     || page.code
                     || self.inflight.contains(&page.pr)
-                    || (page.tab == Tab::Summary && self.gallery.loading())
+                    || (page.tab.shows_media() && self.gallery.loading())
                     || page
                         .log
                         .is_some_and(|job| self.logs.inflight.contains(&job))
@@ -1397,8 +1402,8 @@ impl App {
                 self.receive(msg, terminal)?;
             }
             self.gallery.receive();
-            // A video plays only while its description is on screen.
-            if self.page.as_ref().is_none_or(|p| p.tab != Tab::Summary) {
+            // A video plays only while a tab that can show it is on screen.
+            if self.page.as_ref().is_none_or(|p| !p.tab.shows_media()) {
                 self.gallery.stop();
             }
             if let Some(failed) = self.gallery.tick()
