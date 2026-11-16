@@ -550,19 +550,33 @@ fn agents_command() -> ExitCode {
 fn open(first: &str) -> ExitCode {
     std::thread::spawn(syntax::warm);
     let mut target = first.to_owned();
+    let mut path_override: Option<PathBuf> = None;
+    let mut seen = std::collections::HashSet::new();
     // Moving along a folder of pictures opens the reader again on each one, so
     // every picture keeps its own place, ink and bookmarks. Set while moving:
     // the direction, and how many pictures may still be skipped if one won't open.
     let mut moving: Option<(i32, usize)> = None;
     loop {
-        let watch = (!is_url(&target)).then(|| doc::Watch::new(PathBuf::from(&target)));
-        let doc = match load(&target) {
+        let source_path = path_override
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&target));
+        let watch = (!is_url(&target)).then(|| doc::Watch::new(source_path.clone()));
+        let doc = match path_override
+            .as_deref()
+            .map(load_file)
+            .unwrap_or_else(|| load(&target))
+        {
             Ok(doc) => doc,
             Err(message) => {
                 if let Some((step, left)) = moving.filter(|(_, left)| *left > 0)
-                    && let Some(next) = picture::neighbour(Path::new(&target), step)
+                    && let Some(next) = picture::neighbour(&source_path, step)
                 {
+                    if seen.contains(&next) {
+                        return ExitCode::SUCCESS;
+                    }
+                    seen.insert(source_path.clone());
                     target = next.to_string_lossy().into_owned();
+                    path_override = Some(next);
                     moving = Some((step, left - 1));
                     continue;
                 }
@@ -571,7 +585,9 @@ fn open(first: &str) -> ExitCode {
             }
         };
         let failure = Rc::new(RefCell::new(None));
+        seen.insert(source_path.clone());
         let mut options = resume(&target, doc.page_count, &failure);
+        options.picture_path = Some(source_path.clone());
         options.watch = watch;
         let result = viewer::run(doc, options);
         if let Some(message) = failure.borrow().as_ref() {
@@ -583,6 +599,7 @@ fn open(first: &str) -> ExitCode {
                 Some(next) => {
                     moving = Some((go.step, picture::in_folder(&go.path).len()));
                     target = next.to_string_lossy().into_owned();
+                    path_override = Some(next);
                 }
                 None => return ExitCode::SUCCESS,
             },

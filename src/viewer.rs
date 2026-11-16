@@ -323,6 +323,8 @@ pub struct ViewerOptions {
     pub speech: Backend,
     /// Path or URL this document was opened from, when leaf knows it.
     pub source: Option<String>,
+    /// Original filesystem path for picture navigation, which may differ from the progress key.
+    pub picture_path: Option<PathBuf>,
     pub watch: Option<Watch>,
 }
 
@@ -347,6 +349,7 @@ impl Default for ViewerOptions {
             on_speed: Box::new(|_| {}),
             speech: Backend::Edge,
             source: None,
+            picture_path: None,
             watch: None,
         }
     }
@@ -423,7 +426,7 @@ pub struct App {
     watch: Option<Watch>,
     /// For a picture file with others beside it: its place among them and how many there are.
     folder: Option<(usize, usize)>,
-    /// The picture to open next, once the reader has closed.
+    /// A request to move to a neighbouring picture, once the reader has closed.
     go: Option<Go>,
     quit: bool,
 }
@@ -491,7 +494,7 @@ impl App {
             })
             .collect();
         let watch = options.watch.take();
-        let folder = Self::folder_place(&doc, options.source.as_deref());
+        let folder = Self::folder_place(&doc, options.picture_path.as_deref());
         let narrator = Narrator::new(
             options.voice.clone(),
             options.speed,
@@ -551,8 +554,8 @@ impl App {
     }
 
     /// Where a picture file sits among the pictures in its folder, if it has company.
-    fn folder_place(doc: &Doc, source: Option<&str>) -> Option<(usize, usize)> {
-        let path = Path::new(source?);
+    fn folder_place(doc: &Doc, source: Option<&Path>) -> Option<(usize, usize)> {
+        let path = source?;
         if doc.page_count.is_some() || !picture::is_picture(path) || !path.is_file() {
             return None;
         }
@@ -567,7 +570,7 @@ impl App {
     fn turn(&mut self, forward: bool) {
         if self.folder.is_some() {
             let step = if forward { 1 } else { -1 };
-            if let Some(path) = self.options.source.as_deref().map(PathBuf::from) {
+            if let Some(path) = self.options.picture_path.clone() {
                 self.go = Some(Go { path, step });
                 self.quit = true;
             }
@@ -3444,11 +3447,14 @@ pub struct Go {
 /// Runs the reader in the terminal until the reader quits, or asks for
 /// another picture in the folder.
 pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<Option<Go>> {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-        previous(info);
-    }));
+    static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            previous(info);
+        }));
+    });
     let mut terminal = ratatui::init();
     // The title names the terminal tab; on screen it would only take rows from the text.
     let setup = execute!(io::stdout(), EnableMouseCapture, SetTitle(&doc.title));

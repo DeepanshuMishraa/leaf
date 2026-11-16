@@ -115,7 +115,7 @@ pub fn in_folder(path: &Path) -> Vec<PathBuf> {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -126,9 +126,10 @@ pub fn in_folder(path: &Path) -> Vec<PathBuf> {
                 .is_some_and(|name| name.to_string_lossy().starts_with('.'));
             !hidden && is_picture(p) && p.is_file()
         })
+        .map(|path| (name_of(&path), path))
         .collect();
-    found.sort_by(|a, b| natural(&name_of(a), &name_of(b)).then_with(|| a.cmp(b)));
-    found
+    found.sort_by(|(a_name, a), (b_name, b)| natural(a_name, b_name).then_with(|| a.cmp(b)));
+    found.into_iter().map(|(_, path)| path).collect()
 }
 
 /// The picture `step` places along from `path` in its folder, going round
