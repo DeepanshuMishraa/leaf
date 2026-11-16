@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.1
+
+- Closing a review nobody asked for no longer pastes "closed without a verdict" into an unrelated agent pane; the notice goes only to the pane named with `--reply-to`.
+
 ## 0.17.0
 
 - Step through pictures in a folder with the arrow keys, wrapping around at either end.
