@@ -47,7 +47,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read the version, and match it against the tag
         id: version
@@ -108,7 +108,7 @@ jobs:
       VERSION: ${{ needs.check.outputs.version }}
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -171,7 +171,7 @@ jobs:
             lipo -archs ./smoke/leaf
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: leaf-${{ matrix.target }}
           path: dist/*
@@ -192,7 +192,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: leaf-*
@@ -239,7 +239,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Write Formula/leaf.rb and push it to the tap
         shell: bash
@@ -274,7 +274,7 @@ jobs:
     env:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # leaf links the ALSA sound library on Linux, as a desktop has it.
       - name: Install the ALSA runtime
