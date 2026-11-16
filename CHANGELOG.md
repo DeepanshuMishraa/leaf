@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.0
+
+- Step through pictures in a folder with the arrow keys, wrapping around at either end.
+
 After an update, leaf shows the current version's notes once, over whatever
 it opens first. Each release needs a `## <version>` section with one line
 per change, starting with `- `.
