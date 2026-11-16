@@ -317,13 +317,32 @@ pub fn locate(source: &str, quote: &str) -> Option<(usize, usize)> {
         .collect();
     let (first, last) = (wanted.first()?, wanted.last()?);
     let plains: Vec<String> = source.lines().map(plain).collect();
-    let start = plains
-        .iter()
-        .position(|line| line.contains(first.as_str()))?;
-    let end = plains[start..]
-        .iter()
-        .position(|line| line.contains(last.as_str()))?;
-    Some((start + 1, start + end + 1))
+    let start = plains.iter().position(|line| line.contains(first.as_str()));
+    if let Some(start) = start
+        && let Some(end) = plains[start..]
+            .iter()
+            .position(|line| line.contains(last.as_str()))
+    {
+        return Some((start + 1, start + end + 1));
+    }
+    locate_joined(&plains, &wanted.join(" "))
+}
+
+/// A passage that crosses source lines where Markdown only wraps, like a
+/// paragraph written over several lines: looked for in the lines joined up.
+fn locate_joined(plains: &[String], wanted: &str) -> Option<(usize, usize)> {
+    let mut joined = String::new();
+    let mut starts = Vec::with_capacity(plains.len());
+    for line in plains {
+        if !joined.is_empty() && !line.is_empty() {
+            joined.push(' ');
+        }
+        starts.push(joined.len());
+        joined.push_str(line);
+    }
+    let at = joined.find(wanted)?;
+    let line_at = |byte: usize| starts.partition_point(|start| *start <= byte);
+    Some((line_at(at), line_at(at + wanted.len() - 1)))
 }
 
 #[cfg(test)]
@@ -463,6 +482,21 @@ Loose closing paragraph.
         // example above it.
         let source = "Write `[a](b)` here\nWrite a here";
         assert_eq!(locate(source, "Write a here"), Some((2, 2)));
+    }
+
+    #[test]
+    fn a_passage_across_a_wrapped_paragraph_spans_its_source_lines() {
+        assert_eq!(
+            locate("We move sessions\nto tokens.", "move sessions to tokens"),
+            Some((1, 2))
+        );
+        assert_eq!(
+            locate(
+                "# Plan\n\nWe move sessions\nto tokens.\n",
+                "We move sessions to tokens."
+            ),
+            Some((3, 4))
+        );
     }
 
     #[test]

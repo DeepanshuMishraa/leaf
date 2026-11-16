@@ -111,16 +111,26 @@ struct Selection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     GlobalTitle,
-    GlobalNote,
-    Text { block: usize, row: usize },
-    Note { block: usize, note: usize },
+    /// Row `line` of the box holding the note on the whole plan: its top
+    /// edge, then the note's lines, then its bottom edge.
+    GlobalNote {
+        line: usize,
+    },
+    Text {
+        block: usize,
+        row: usize,
+    },
+    Note {
+        block: usize,
+        note: usize,
+    },
     Gap,
 }
 
 impl Row {
     fn focus(self) -> Option<Focus> {
         match self {
-            Row::GlobalTitle | Row::GlobalNote => Some(Focus::Global),
+            Row::GlobalTitle | Row::GlobalNote { .. } => Some(Focus::Global),
             Row::Text { block, .. } | Row::Note { block, .. } => Some(Focus::Block(block)),
             Row::Gap => None,
         }
@@ -453,17 +463,49 @@ impl App {
         }
     }
 
-    /// The rows of block `block` that hold text, top to bottom.
-    fn text_rows(&self, block: usize) -> Vec<usize> {
+    /// Block `block`'s lines as Markdown has them, top to bottom: the first
+    /// and last row of each. A line wrapped onto several rows is still one
+    /// line, so the cursor and line comments take it whole.
+    fn text_lines(&self, block: usize) -> Vec<(usize, usize)> {
         let Some(laid) = self.laid.get(block) else {
             return Vec::new();
         };
-        laid.rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.segs.iter().any(|seg| seg.offset.is_some()))
-            .map(|(at, _)| at)
+        let mut lines: Vec<(usize, usize, usize)> = Vec::new();
+        // Rows run through the text in order, so newlines are counted once.
+        let (mut line, mut counted) = (0, 0);
+        for (at, row) in laid.rows.iter().enumerate() {
+            let Some(offset) = row.segs.iter().find_map(|seg| seg.offset) else {
+                continue;
+            };
+            if let Some(passed) = laid.text.get(counted..offset) {
+                line += passed.iter().filter(|c| **c == '\n').count();
+                counted = offset;
+            }
+            match lines.last_mut() {
+                Some((number, _, last)) if *number == line => *last = at,
+                _ => lines.push((line, at, at)),
+            }
+        }
+        lines
+            .into_iter()
+            .map(|(_, first, last)| (first, last))
             .collect()
+    }
+
+    /// The first row of each of block `block`'s lines: where the cursor can be.
+    fn text_rows(&self, block: usize) -> Vec<usize> {
+        self.text_lines(block)
+            .into_iter()
+            .map(|(first, _)| first)
+            .collect()
+    }
+
+    /// The line holding row `row` of block `block`, as its first and last row.
+    fn line_of(&self, block: usize, row: usize) -> (usize, usize) {
+        self.text_lines(block)
+            .into_iter()
+            .find(|(first, last)| (*first..=*last).contains(&row))
+            .unwrap_or((row, row))
     }
 
     /// Every row with text in the plan, as (block, row), top to bottom. A
@@ -499,8 +541,10 @@ impl App {
 
     /// Selects rows `from` through `to` of block `block`.
     fn select_rows(&mut self, block: usize, from: usize, to: usize) {
+        let first = self.line_of(block, from.min(to)).0;
+        let last = self.line_of(block, from.max(to)).1;
         self.selection = self
-            .row_span(block, from, to)
+            .row_span(block, first, last)
             .map(|(start, end)| Selection { block, start, end });
     }
 
@@ -610,23 +654,85 @@ impl App {
         })
     }
 
+    /// The note on the whole plan, wrapped to fit inside its box.
+    fn global_lines(&self) -> Option<Vec<String>> {
+        let text = self.global.as_deref()?;
+        Some(word_wrapped(
+            text.trim_end(),
+            usize::from(self.laid_width.saturating_sub(4)).max(1),
+        ))
+    }
+
     /// Every row of the plan, top to bottom.
     fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::GlobalTitle];
-        if self.global.is_some() {
-            rows.push(Row::GlobalNote);
-        }
+        let mut rows = match self.global_lines() {
+            Some(lines) => (0..lines.len() + 2)
+                .map(|line| Row::GlobalNote { line })
+                .collect(),
+            None => vec![Row::GlobalTitle],
+        };
         rows.push(Row::Gap);
         for (block, laid) in self.laid.iter().enumerate() {
-            for row in 0..laid.rows.len().max(1) {
-                rows.push(Row::Text { block, row });
-            }
+            let count = laid.rows.len().max(1);
+            let mut under: Vec<Vec<usize>> = vec![Vec::new(); count];
+            let mut bottom = Vec::new();
             for (note, _) in self.notes_on(block) {
-                rows.push(Row::Note { block, note });
+                match self.note_row(note).filter(|row| *row < count) {
+                    Some(row) => under[row].push(note),
+                    None => bottom.push(note),
+                }
             }
+            for (row, notes) in under.into_iter().enumerate() {
+                rows.push(Row::Text { block, row });
+                rows.extend(notes.into_iter().map(|note| Row::Note { block, note }));
+            }
+            rows.extend(bottom.into_iter().map(|note| Row::Note { block, note }));
             rows.push(Row::Gap);
         }
         rows
+    }
+
+    /// Where `quote` sits in block `block`'s laid-out text, as a character
+    /// range: its first occurrence.
+    fn passage_range(&self, block: usize, quote: &str) -> Option<(usize, usize)> {
+        let quote: Vec<char> = quote.chars().collect();
+        if quote.is_empty() {
+            return None;
+        }
+        let start = self
+            .laid
+            .get(block)?
+            .text
+            .windows(quote.len())
+            .position(|window| window == quote.as_slice())?;
+        Some((start, start + quote.len()))
+    }
+
+    /// The row a passage note is drawn under: the one its passage ends on.
+    /// `None` for a block note, or a passage that can't be found.
+    fn note_row(&self, note: usize) -> Option<usize> {
+        let note = self.notes.get(note)?;
+        let PlanTarget::Passage { quote, .. } = &note.target else {
+            return None;
+        };
+        let block = block_of(&note.target);
+        let last = self.passage_range(block, quote)?.1.checked_sub(1)?;
+        self.laid.get(block)?.rows.iter().position(|row| {
+            row.segs.iter().any(|seg| {
+                seg.offset
+                    .is_some_and(|start| start <= last && last < start + seg.text.chars().count())
+            })
+        })
+    }
+
+    /// The column row `row` of block `block`'s text starts at, past any
+    /// list marker.
+    fn text_indent(&self, block: usize, row: usize) -> u16 {
+        self.laid
+            .get(block)
+            .and_then(|laid| laid.rows.get(row))
+            .and_then(|row| row.segs.iter().find(|seg| seg.offset.is_some()))
+            .map_or(0, |seg| seg.x)
     }
 
     fn focus_rows(&self, rows: &[Row]) -> (usize, usize) {
@@ -640,16 +746,13 @@ impl App {
         let rows = self.rows();
         let (first, last) = match self.focus {
             Focus::Block(block) => {
-                let at = rows
-                    .iter()
-                    .position(|row| {
-                        *row == Row::Text {
-                            block,
-                            row: self.row,
-                        }
-                    })
-                    .unwrap_or(0);
-                (at, at)
+                let (top, bottom) = self.line_of(block, self.row);
+                let at = |row: usize| {
+                    rows.iter()
+                        .position(|shown| *shown == Row::Text { block, row })
+                        .unwrap_or(0)
+                };
+                (at(top), at(bottom))
             }
             Focus::Global => self.focus_rows(&rows),
         };
@@ -715,7 +818,7 @@ impl App {
             .skip(self.scroll)
             .find(|row| match row {
                 Row::Text { block, row } => self.text_rows(*block).contains(row),
-                Row::GlobalTitle => true,
+                Row::GlobalTitle | Row::GlobalNote { line: 0 } => true,
                 _ => false,
             });
         match found {
@@ -751,7 +854,7 @@ impl App {
             return None;
         };
         let line = self
-            .row_span(block, self.row, self.row)
+            .row_span(block, self.row, self.line_of(block, self.row).1)
             .map(|(start, end)| self.selected_text(Selection { block, start, end }))
             .filter(|text| !text.trim().is_empty());
         Some(match line {
@@ -1272,11 +1375,15 @@ impl App {
                 if let Some(focus) = row.focus() {
                     self.focus = focus;
                 }
-                if let Row::Note { block, .. } = row {
-                    self.row = self.text_rows(block).first().copied().unwrap_or(0);
+                if let Row::Note { block, note } = row {
+                    self.row = self
+                        .note_row(note)
+                        .map(|row| self.line_of(block, row).0)
+                        .or_else(|| self.text_rows(block).first().copied())
+                        .unwrap_or(0);
                 }
                 if let Row::Text { block, row } = row {
-                    self.row = row;
+                    self.row = self.line_of(block, row).0;
                     self.drag = self
                         .offset_at(block, row, mouse.column)
                         .map(|offset| (block, offset));
@@ -1348,16 +1455,11 @@ impl App {
     /// Ranges of block `block`'s text to mark: passages with notes, in their
     /// note's color.
     fn passage_marks(&self, block: usize) -> Vec<(usize, usize, Color)> {
-        let Some(laid) = self.laid.get(block) else {
-            return Vec::new();
-        };
-        let text: String = laid.text.iter().collect();
         self.notes_on(block)
             .filter_map(|(_, note)| match &note.target {
                 PlanTarget::Passage { quote, .. } => {
-                    let at = text.find(quote.as_str())?;
-                    let start = text[..at].chars().count();
-                    Some((start, start + quote.chars().count(), hue_of(&note.edit)))
+                    let (start, end) = self.passage_range(block, quote)?;
+                    Some((start, end, hue_of(&note.edit)))
                 }
                 PlanTarget::Block { .. } => None,
             })
@@ -1492,18 +1594,56 @@ impl App {
         self.shown.clear();
         let text_x = left + GUTTER;
         self.text_x = text_x;
+        let cursor_line = match self.focus {
+            Focus::Block(block) => self.line_of(block, self.row),
+            Focus::Global => (0, 0),
+        };
+        // A block with notes on all of it gets a bar in the first one's color
+        // down its side, which its notes close off at the bottom.
+        let block_notes: Vec<Vec<usize>> = (0..self.blocks.len())
+            .map(|block| {
+                self.notes_on(block)
+                    .filter(|(_, note)| matches!(note.target, PlanTarget::Block { .. }))
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .collect();
+        let bar_hue = |block: usize| {
+            block_notes[block]
+                .first()
+                .map(|note| hue_of(&self.notes[*note].edit))
+        };
         for (y, row) in (area.y..area.bottom()).zip(rows.iter().skip(self.scroll)) {
             self.shown.push((y, *row));
             let focused = row.focus() == Some(self.focus);
             // The cursor's line gets the full bar; the rest of its block a thin one.
             let cursor = match (*row, self.focus) {
-                (Row::Text { row, .. }, Focus::Block(_)) => focused && row == self.row,
+                (Row::Text { row, .. }, Focus::Block(_)) => {
+                    focused && (cursor_line.0..=cursor_line.1).contains(&row)
+                }
                 (_, Focus::Global) => focused,
                 _ => false,
+            };
+            let (row_block, on_block) = match *row {
+                Row::Text { block, .. } => (Some(block), false),
+                Row::Note { block, note } => (Some(block), block_notes[block].contains(&note)),
+                _ => (None, false),
             };
             let buf = f.buffer_mut();
             if cursor {
                 buf.set_string(left + GUTTER - 2, y, "▌", Style::default().fg(ACCENT));
+            } else if let Some(hue) = row_block.and_then(bar_hue) {
+                let joint = match *row {
+                    Row::Note { block, note } if on_block => {
+                        if block_notes[block].last() == Some(&note) {
+                            "╰─"
+                        } else {
+                            "├─"
+                        }
+                    }
+                    _ => "┃",
+                };
+                buf.set_string(left + GUTTER - 2, y, joint, Style::default().fg(hue));
             } else if focused {
                 buf.set_string(left + GUTTER - 2, y, "▏", Style::default().fg(ACCENT));
             }
@@ -1524,15 +1664,33 @@ impl App {
                         );
                     }
                 }
-                Row::GlobalNote => {
-                    let text = self.global.as_deref().unwrap_or("");
-                    let first = text.lines().next().unwrap_or("");
-                    buf.set_string(
-                        text_x,
-                        y,
-                        clip(&format!("● {first}"), width as usize),
-                        Style::default().fg(Hue::Purple.marker()),
-                    );
+                Row::GlobalNote { line } => {
+                    let lines = self.global_lines().unwrap_or_default();
+                    let edge = Style::default().fg(Hue::Purple.marker());
+                    let inner = usize::from(width.saturating_sub(2));
+                    let right = text_x + width.saturating_sub(1);
+                    let buf = f.buffer_mut();
+                    if line == 0 {
+                        let title = " Whole plan · comment ";
+                        let fill = inner.saturating_sub(title.chars().count() + 1);
+                        buf.set_string(
+                            text_x,
+                            y,
+                            clip(&format!("╭─{title}{}╮", "─".repeat(fill)), width as usize),
+                            edge,
+                        );
+                    } else if line > lines.len() {
+                        buf.set_string(text_x, y, format!("╰{}╯", "─".repeat(inner)), edge);
+                    } else {
+                        buf.set_string(text_x, y, "│", edge);
+                        buf.set_string(
+                            text_x + 2,
+                            y,
+                            clip(&lines[line - 1], inner.saturating_sub(2)),
+                            Style::default(),
+                        );
+                        buf.set_string(right, y, "│", edge);
+                    }
                 }
                 Row::Text { block, row } => {
                     if row == 0 {
@@ -1587,13 +1745,20 @@ impl App {
                         }
                     }
                 }
-                Row::Note { note, .. } => {
+                Row::Note { block, note } => {
+                    // A passage note hangs under the row its passage ends on;
+                    // a block note, or one whose passage is gone, sits below.
+                    let (indent, mark) = match self.note_row(note) {
+                        Some(row) => (self.text_indent(block, row).min(width), "└ "),
+                        None if on_block => (1.min(width), ""),
+                        None => (0, "● "),
+                    };
                     let note = &self.notes[note];
-                    let text = format!("● {}", note_summary(note));
+                    let text = format!("{mark}{}", note_summary(note));
                     buf.set_string(
-                        text_x,
+                        text_x + indent,
                         y,
-                        clip(&text, width as usize),
+                        clip(&text, (width - indent) as usize),
                         Style::default().fg(hue_of(&note.edit)),
                     );
                 }
@@ -1834,6 +1999,38 @@ fn clip(text: &str, width: usize) -> String {
 }
 
 /// `text` broken into lines no wider than `width`, keeping its own line breaks.
+/// `text` broken between words into lines no wider than `width`; a word
+/// longer than that is broken where it must be.
+fn word_wrapped(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let mut current = String::new();
+        let mut used = 0;
+        for word in line.split_whitespace() {
+            let w = unicode_width::UnicodeWidthStr::width(word);
+            if used > 0 && used + 1 + w > width {
+                out.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            if used > 0 {
+                current.push(' ');
+                used += 1;
+            }
+            for piece in wrapped(word, width) {
+                if used > 0 && used + unicode_width::UnicodeWidthStr::width(piece.as_str()) > width
+                {
+                    out.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+                used += unicode_width::UnicodeWidthStr::width(piece.as_str());
+                current.push_str(&piece);
+            }
+        }
+        out.push(current);
+    }
+    out
+}
+
 fn wrapped(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.split('\n') {
@@ -2337,7 +2534,7 @@ create table tokens (id int);
         type_text(&mut app, "Use a migration");
         press(&mut app, KeyCode::Enter);
         let screen = draw(&mut app, 90, 30);
-        assert!(screen.contains("● comment  Use a migration"), "{screen}");
+        assert!(screen.contains("╰─ comment  Use a migration"), "{screen}");
         press(&mut app, KeyCode::Char('S'));
         press(&mut app, KeyCode::Char('c'));
         let text = sent(&app);
