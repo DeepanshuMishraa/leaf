@@ -1754,12 +1754,22 @@ impl App {
                         None => (0, "● "),
                     };
                     let note = &self.notes[note];
-                    let text = format!("{mark}{}", note_summary(note));
+                    // The kind in the note's color, what it says in the text's.
+                    let (label, body) = note_parts(note);
+                    let room = usize::from(width - indent);
+                    let head = clip(&format!("{mark}{label}  "), room);
+                    let used = unicode_width::UnicodeWidthStr::width(head.as_str());
                     buf.set_string(
                         text_x + indent,
                         y,
-                        clip(&text, (width - indent) as usize),
+                        &head,
                         Style::default().fg(hue_of(&note.edit)),
+                    );
+                    buf.set_string(
+                        text_x + indent + used as u16,
+                        y,
+                        clip(&body, room.saturating_sub(used)),
+                        Style::default(),
                     );
                 }
                 Row::Gap => {}
@@ -1928,6 +1938,12 @@ fn target_label(target: &PlanTarget) -> String {
 
 /// One line about a note: what it asks, and its text's first line.
 fn note_summary(note: &PlanNote) -> String {
+    let (label, body) = note_parts(note);
+    format!("{label}  {body}")
+}
+
+/// What kind of note `note` is, and its text's first line.
+fn note_parts(note: &PlanNote) -> (&'static str, String) {
     let (label, body) = match &note.edit {
         PlanEdit::Comment(body) => ("comment", body.as_str()),
         PlanEdit::Remove => match &note.target {
@@ -1936,7 +1952,7 @@ fn note_summary(note: &PlanNote) -> String {
         },
         PlanEdit::Replace(with) => ("replace", with.as_str()),
     };
-    format!("{label}  {}", one_line(body))
+    (label, one_line(body))
 }
 
 /// A note's first line for a one-line list row, with `…` when there's more.
