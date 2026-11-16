@@ -107,6 +107,79 @@ pub fn open(path: &Path) -> Result<Doc, PictureFailed> {
     })
 }
 
+/// The pictures beside `path` (itself included), in the order a file manager
+/// lists them: names compared without regard to case, with numbers counted as
+/// numbers, so `img2` comes before `img10`. Hidden files are left out.
+pub fn in_folder(path: &Path) -> Vec<PathBuf> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            let hidden = p
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+            !hidden && is_picture(p) && p.is_file()
+        })
+        .collect();
+    found.sort_by(|a, b| natural(&name_of(a), &name_of(b)).then_with(|| a.cmp(b)));
+    found
+}
+
+/// The picture `step` places along from `path` in its folder, going round
+/// past either end. `None` when `path` has no neighbour.
+pub fn neighbour(path: &Path, step: i32) -> Option<PathBuf> {
+    let all = in_folder(path);
+    let here = all.iter().position(|p| p == path)?;
+    let next = (here as i64 + step as i64).rem_euclid(all.len() as i64) as usize;
+    (next != here).then(|| all[next].clone())
+}
+
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Compares names with each run of digits taken as a number.
+fn natural(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let number = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut digits = String::new();
+                    while let Some(d) = chars.next_if(|c| c.is_ascii_digit()) {
+                        digits.push(d);
+                    }
+                    digits.trim_start_matches('0').to_owned()
+                };
+                let (x, y) = (number(&mut a), number(&mut b));
+                // A longer number, with no leading zeros, is the bigger one.
+                let order = x.len().cmp(&y.len()).then_with(|| x.cmp(&y));
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
 fn pixels(path: &Path, bytes: &[u8]) -> Option<RgbaImage> {
     crate::prmedia::decode(bytes).or_else(|| through_sips(path))
 }
@@ -171,6 +244,58 @@ mod tests {
             Err(PictureFailed::Undecodable { .. })
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn folder_of(names: &[&str], tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("leaf-folder-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+                .save_with_format(dir.join(name), image::ImageFormat::Bmp)
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_folder_lists_pictures_with_numbers_counted_as_numbers() {
+        let dir = folder_of(
+            &["img10.bmp", "IMG2.bmp", "img1.bmp", ".hidden.bmp"],
+            "order",
+        );
+        std::fs::write(dir.join("notes.txt"), "not a picture").unwrap();
+        let names: Vec<String> = in_folder(&dir.join("img1.bmp"))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["img1.bmp", "IMG2.bmp", "img10.bmp"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn neighbours_go_round_past_either_end() {
+        let dir = folder_of(&["a.bmp", "b.bmp", "c.bmp"], "round");
+        let at = |n: &str| dir.join(n);
+        assert_eq!(neighbour(&at("a.bmp"), 1), Some(at("b.bmp")));
+        assert_eq!(neighbour(&at("c.bmp"), 1), Some(at("a.bmp")));
+        assert_eq!(neighbour(&at("a.bmp"), -1), Some(at("c.bmp")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lone_picture_has_no_neighbour() {
+        let dir = folder_of(&["only.bmp"], "lone");
+        assert_eq!(neighbour(&dir.join("only.bmp"), 1), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn natural_order_ignores_leading_zeros_and_case() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural("img2", "img10"), Less);
+        assert_eq!(natural("img007", "img7"), Equal);
+        assert_eq!(natural("a", "ab"), Less);
     }
 
     #[test]

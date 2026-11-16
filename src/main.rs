@@ -547,30 +547,51 @@ fn agents_command() -> ExitCode {
     }
 }
 
-fn open(target: &str) -> ExitCode {
+fn open(first: &str) -> ExitCode {
     std::thread::spawn(syntax::warm);
-    let watch = (!is_url(target)).then(|| doc::Watch::new(PathBuf::from(target)));
-    let doc = match load(target) {
-        Ok(doc) => doc,
-        Err(message) => {
+    let mut target = first.to_owned();
+    // Moving along a folder of pictures opens the reader again on each one, so
+    // every picture keeps its own place, ink and bookmarks. Set while moving:
+    // the direction, and how many pictures may still be skipped if one won't open.
+    let mut moving: Option<(i32, usize)> = None;
+    loop {
+        let watch = (!is_url(&target)).then(|| doc::Watch::new(PathBuf::from(&target)));
+        let doc = match load(&target) {
+            Ok(doc) => doc,
+            Err(message) => {
+                if let Some((step, left)) = moving.filter(|(_, left)| *left > 0)
+                    && let Some(next) = picture::neighbour(Path::new(&target), step)
+                {
+                    target = next.to_string_lossy().into_owned();
+                    moving = Some((step, left - 1));
+                    continue;
+                }
+                eprintln!("leaf: {message}");
+                return ExitCode::from(1);
+            }
+        };
+        let failure = Rc::new(RefCell::new(None));
+        let mut options = resume(&target, doc.page_count, &failure);
+        options.watch = watch;
+        let result = viewer::run(doc, options);
+        if let Some(message) = failure.borrow().as_ref() {
             eprintln!("leaf: {message}");
-            return ExitCode::from(1);
         }
-    };
-    let failure = Rc::new(RefCell::new(None));
-    let mut options = resume(target, doc.page_count, &failure);
-    options.watch = watch;
-    let result = viewer::run(doc, options);
-    if let Some(message) = failure.borrow().as_ref() {
-        eprintln!("leaf: {message}");
-    }
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!(
-                "leaf: the terminal failed ({e}). Your place and highlights up to now are saved."
-            );
-            ExitCode::from(1)
+        match result {
+            Ok(None) => return ExitCode::SUCCESS,
+            Ok(Some(go)) => match picture::neighbour(&go.path, go.step) {
+                Some(next) => {
+                    moving = Some((go.step, picture::in_folder(&go.path).len()));
+                    target = next.to_string_lossy().into_owned();
+                }
+                None => return ExitCode::SUCCESS,
+            },
+            Err(e) => {
+                eprintln!(
+                    "leaf: the terminal failed ({e}). Your place and highlights up to now are saved."
+                );
+                return ExitCode::from(1);
+            }
         }
     }
 }

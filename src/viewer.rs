@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -38,6 +39,7 @@ use crate::kitty::{self, Kitty};
 use crate::look::Look;
 use crate::mono::{self, Rgb};
 use crate::news::News;
+use crate::picture;
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::remote::{self, Command};
 use crate::render::{self, DIM, Laid};
@@ -419,6 +421,10 @@ pub struct App {
     /// away lets it go; it picks up again once the word is back on screen.
     follow: bool,
     watch: Option<Watch>,
+    /// For a picture file with others beside it: its place among them and how many there are.
+    folder: Option<(usize, usize)>,
+    /// The picture to open next, once the reader has closed.
+    go: Option<Go>,
     quit: bool,
 }
 
@@ -485,6 +491,7 @@ impl App {
             })
             .collect();
         let watch = options.watch.take();
+        let folder = Self::folder_place(&doc, options.source.as_deref());
         let narrator = Narrator::new(
             options.voice.clone(),
             options.speed,
@@ -537,7 +544,37 @@ impl App {
             copy: None,
             search: None,
             watch,
+            folder,
+            go: None,
             quit: false,
+        }
+    }
+
+    /// Where a picture file sits among the pictures in its folder, if it has company.
+    fn folder_place(doc: &Doc, source: Option<&str>) -> Option<(usize, usize)> {
+        let path = Path::new(source?);
+        if doc.page_count.is_some() || !picture::is_picture(path) || !path.is_file() {
+            return None;
+        }
+        let all = picture::in_folder(path);
+        let here = all.iter().position(|p| p == path)?;
+        (all.len() > 1).then_some((here + 1, all.len()))
+    }
+
+    /// Turns a page forward or back. On a picture file it moves to the next or
+    /// previous picture in the folder instead: the reader closes and `main`
+    /// opens that one, so each picture keeps its own place, ink and bookmarks.
+    fn turn(&mut self, forward: bool) {
+        if self.folder.is_some() {
+            let step = if forward { 1 } else { -1 };
+            if let Some(path) = self.options.source.as_deref().map(PathBuf::from) {
+                self.go = Some(Go { path, step });
+                self.quit = true;
+            }
+        } else if forward {
+            self.go_to_page(self.current + 1, false);
+        } else {
+            self.go_to_page(self.current.saturating_sub(1), false);
         }
     }
 
@@ -778,7 +815,10 @@ impl App {
     /// Where the reader is: the page and how far through, or how far down a page-less document.
     fn place(&mut self) -> String {
         match self.doc.page_count {
-            None => format!("{}%", self.scrolled()),
+            None => match self.folder {
+                Some((here, all)) => format!("{here} / {all} · {}%", self.scrolled()),
+                None => format!("{}%", self.scrolled()),
+            },
             Some(count) => {
                 let reading = self.reading();
                 let progress = Progress::of(reading + 1, count);
@@ -1406,6 +1446,8 @@ impl App {
         let mut rows = Vec::new();
         if paged {
             rows.push(("←/→  h/l", "previous / next page"));
+        } else if self.folder.is_some() {
+            rows.push(("←/→  h/l  p/n", "previous / next picture in the folder"));
         }
         rows.extend([
             ("j/k  ↓/↑", "scroll"),
@@ -2563,8 +2605,8 @@ impl App {
             Some('u') => self.scroll_by(-(self.screen_step() / 2)),
             Some(' ') => self.next_screen(paged),
             Some('b') => self.previous_screen(paged),
-            Some('l') | Some('n') => self.go_to_page(self.current + 1, false),
-            Some('h') | Some('p') => self.go_to_page(self.current.saturating_sub(1), false),
+            Some('l') | Some('n') => self.turn(true),
+            Some('h') | Some('p') => self.turn(false),
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
@@ -2602,8 +2644,8 @@ impl App {
                 KeyCode::Up => self.scroll_by(-1),
                 KeyCode::PageDown => self.next_screen(paged),
                 KeyCode::PageUp => self.previous_screen(paged),
-                KeyCode::Right => self.go_to_page(self.current + 1, false),
-                KeyCode::Left => self.go_to_page(self.current.saturating_sub(1), false),
+                KeyCode::Right => self.turn(true),
+                KeyCode::Left => self.turn(false),
                 KeyCode::Home => self.go_to_page(0, false),
                 KeyCode::End => self.go_to_page(self.last(), !paged),
                 _ => {}
@@ -3390,8 +3432,18 @@ fn parse_color_reply(reply: &str) -> Option<Rgb> {
     Some([*channels.first()?, *channels.get(1)?, *channels.get(2)?])
 }
 
-/// Runs the reader in the terminal until the reader quits.
-pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<()> {
+/// A request to move along to another picture in the same folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Go {
+    /// The picture that was open.
+    pub path: PathBuf,
+    /// 1 for the next picture, -1 for the previous one.
+    pub step: i32,
+}
+
+/// Runs the reader in the terminal until the reader quits, or asks for
+/// another picture in the folder.
+pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<Option<Go>> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -3408,7 +3460,7 @@ pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<()> {
     remote::withdraw(remote::Kind::Document);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
-    result
+    result.map(|()| app.go.take())
 }
 
 #[cfg(test)]
@@ -3837,6 +3889,76 @@ mod tests {
             }]
         );
         assert!(!list.contains("Charlie"), "{list}");
+    }
+
+    fn picture_folder(names: &[&str], tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("leaf-nav-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]))
+                .save_with_format(dir.join(name), image::ImageFormat::Bmp)
+                .unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    fn picture_screen(path: &Path) -> Screen {
+        let options = ViewerOptions {
+            source: Some(path.display().to_string()),
+            ..ViewerOptions::default()
+        };
+        Screen::new(picture::open(path).unwrap(), 100, 30, options)
+    }
+
+    #[test]
+    fn keys_on_a_picture_ask_for_its_neighbour_in_the_folder() {
+        let dir = picture_folder(&["a.bmp", "b.bmp", "c.bmp"], "keys");
+        let middle = dir.join("b.bmp");
+        let go = |code: KeyCode| {
+            let mut s = picture_screen(&middle);
+            s.press(code);
+            (s.app.go.clone(), s.app.quit)
+        };
+        for code in [KeyCode::Right, KeyCode::Char('l'), KeyCode::Char('n')] {
+            let (asked, quit) = go(code);
+            let want = Go {
+                path: middle.clone(),
+                step: 1,
+            };
+            assert_eq!(asked, Some(want), "{code:?}");
+            assert!(quit);
+        }
+        for code in [KeyCode::Left, KeyCode::Char('h'), KeyCode::Char('p')] {
+            let (asked, quit) = go(code);
+            let want = Go {
+                path: middle.clone(),
+                step: -1,
+            };
+            assert_eq!(asked, Some(want), "{code:?}");
+            assert!(quit);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_picture_shows_its_place_among_the_pictures_in_its_folder() {
+        let dir = picture_folder(&["a.bmp", "b.bmp", "c.bmp"], "place");
+        let mut s = picture_screen(&dir.join("b.bmp"));
+        let frame = s.draw();
+        assert!(frame.contains("2 / 3"), "{frame}");
+        let help = s.press(KeyCode::Char('?'));
+        assert!(help.contains("next picture in the folder"), "{help}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lone_picture_does_not_navigate() {
+        let dir = picture_folder(&["only.bmp"], "lone");
+        let mut s = picture_screen(&dir.join("only.bmp"));
+        s.press(KeyCode::Right);
+        assert!(s.app.go.is_none() && !s.app.quit);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
