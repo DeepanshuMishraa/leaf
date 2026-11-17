@@ -1,6 +1,5 @@
 # leaf
 
-WOW
 Read PDFs, markdown files and web articles in the terminal, and review diffs.
 
 ```sh
