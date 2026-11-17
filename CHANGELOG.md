@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Configure the document reader's maximum width in `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config.toml`). Omitted settings keep the 76-column layout.
+- Keep the reading position within PDF and EPUB pages when resizing in scroll mode.
 
 ## 0.17.2
 

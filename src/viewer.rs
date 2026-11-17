@@ -415,7 +415,7 @@ pub struct App {
     column: Rect,
     screen: Vec<Option<ScreenRow>>,
     reported: Option<Progress>,
-    /// A place in a page-less document to scroll to at the next draw, once its layout is known.
+    /// A source offset survives reflow; a wrapped row number does not.
     anchor: Option<usize>,
     reported_scroll: Option<Scroll>,
     copy: Option<String>,
@@ -845,12 +845,11 @@ impl App {
         (self.offset * 100).checked_div(max).unwrap_or(100)
     }
 
-    /// Where in a page-less document's text the top line of the screen sits.
     fn top_anchor(&mut self) -> usize {
-        let laid = self.laid(0);
+        let laid = self.laid(self.current);
         let top = self
             .offset
-            .saturating_sub(self.prefix(0))
+            .saturating_sub(self.prefix(self.current))
             .min(laid.rows.len());
         laid.rows[top..]
             .iter()
@@ -859,9 +858,8 @@ impl App {
             .unwrap_or(laid.text.len())
     }
 
-    /// Scrolls a page-less document so the line holding `anchor` is at the top.
     fn scroll_to_anchor(&mut self, anchor: usize) {
-        let laid = self.laid(0);
+        let laid = self.laid(self.current);
         let holds = |seg: &render::Seg| {
             seg.offset
                 .is_some_and(|o| o + seg.text.chars().count() > anchor)
@@ -871,12 +869,17 @@ impl App {
             .iter()
             .position(|row| row.segs.iter().any(holds))
             .unwrap_or(laid.rows.len());
-        self.offset = if row == 0 { 0 } else { row + self.prefix(0) };
+        let prefix = self.prefix(self.current);
+        self.offset = row
+            + if row == 0 {
+                self.offset.min(prefix)
+            } else {
+                prefix
+            };
     }
 
-    /// Keeps a page-less document's top line in place while it lays out again.
     fn hold_anchor(&mut self) {
-        if self.doc.page_count.is_none() && self.width > 0 && self.anchor.is_none() {
+        if self.mode == Mode::Scroll && self.width > 0 && self.anchor.is_none() {
             self.anchor = Some(self.top_anchor());
         }
     }
@@ -3859,27 +3862,35 @@ mod tests {
 
     #[test]
     fn resizing_keeps_the_source_anchor_when_wide_text_reflows() {
-        let mut s = Screen::new(
-            Doc::whole(
-                "Notes",
-                "one two three four five six seven eight nine ten ".repeat(300),
-            ),
-            160,
-            30,
-            ViewerOptions {
-                max_text_width: 150,
-                ..ViewerOptions::default()
-            },
-        );
-        s.press(KeyCode::Char(' '));
-        let anchor = s.app.top_anchor();
-        let rows = s.app.laid(0).rows.len();
-        assert!(anchor > 0);
-        s.terminal.backend_mut().resize(44, 30);
-        s.draw();
-        assert_eq!(s.app.column.width, 40);
-        assert!(s.app.laid(0).rows.len() > rows);
-        assert_eq!(s.app.screen_row(0, anchor), Some(0));
+        let text = "one two three four five six seven eight nine ten ".repeat(300);
+        for (paged, before, after, width) in [(false, 160, 44, 40), (true, 90, 80, 76)] {
+            let doc = if paged {
+                book(&["Before", &text, "After"])
+            } else {
+                Doc::whole("Notes", text.clone())
+            };
+            let mut s = Screen::new(
+                doc,
+                before,
+                30,
+                ViewerOptions {
+                    max_text_width: 150,
+                    start_page: Some(2),
+                    ..ViewerOptions::default()
+                },
+            );
+            assert_eq!(s.app.mode, Mode::Scroll);
+            s.press(KeyCode::Char(' '));
+            let anchor = s.app.screen_top();
+            let rows = s.app.laid(anchor.page).rows.len();
+            assert!(anchor.offset > 76);
+            s.terminal.backend_mut().resize(after, 30);
+            s.draw();
+            assert_eq!(s.app.column.width, width);
+            assert_eq!(s.app.current, anchor.page);
+            assert!(s.app.laid(anchor.page).rows.len() > rows);
+            assert_eq!(s.app.screen_row(anchor.page, anchor.offset), Some(0));
+        }
     }
 
     #[test]
