@@ -4554,6 +4554,57 @@ mod tests {
     }
 
     #[test]
+    fn asking_about_a_sentence_after_the_context_cap_sends_the_exact_selection() {
+        let prefix = "Earlier text. ".repeat(40);
+        let selected = "The selected sentence.";
+        let paragraph = format!("{prefix}{selected} Following text.");
+        let sent = Rc::new(RefCell::new(None));
+        let mut s = Screen::new(
+            Doc::whole("Notes", paragraph),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        let start = prefix.chars().count();
+        s.app.selection = Some(Selection {
+            anchor: TextPos {
+                page: 0,
+                offset: start,
+            },
+            head: TextPos {
+                page: 0,
+                offset: start + selected.chars().count(),
+            },
+        });
+        let captured = sent.clone();
+        s.app.ask = Some(Box::new(move |text| {
+            *captured.borrow_mut() = Some(text.to_owned());
+            Ok(Agent {
+                pane: "block:agent".into(),
+                command: "claude".into(),
+            })
+        }));
+        let preview = s.press(KeyCode::Char('@'));
+        assert!(preview.contains(selected), "{preview}");
+        for c in "What does this sentence mean?".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        let frame = s.press(KeyCode::Enter);
+        assert!(frame.contains("sent to claude"), "{frame}");
+        let text = sent.borrow().clone().expect("sent");
+        assert!(text.contains(selected), "{text}");
+        assert!(
+            text.contains(&format!("Selected:\n{selected}\n\nContext:\n")),
+            "{text}"
+        );
+        assert!(text.contains("From Notes, line 1"), "{text}");
+        assert!(
+            text.trim_end().ends_with("What does this sentence mean?"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn centered_blocks_sit_in_the_middle_of_the_column() {
         let mut s = Screen::new(
             book(&["<div align=\"center\">\nSubmitted By\n</div>\n\nLeft text."]),

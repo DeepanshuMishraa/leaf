@@ -2,6 +2,7 @@
 
 ## 0.17.1
 
+- Asking an agent about a selection sends the exact selected text, even beyond character 400 of a paragraph. Surrounding lines remain capped.
 - Closing a review nobody asked for no longer pastes "closed without a verdict" into an unrelated agent pane; the notice goes only to the pane named with `--reply-to`.
 
 ## 0.17.0
