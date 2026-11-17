@@ -74,6 +74,13 @@ impl Review {
     }
 
     fn open_with(fixture: &Fixture, options: &[&str], env: &[(&str, PathBuf)]) -> Self {
+        let mut args = vec!["plan"];
+        args.extend_from_slice(options);
+        args.push("plan.md");
+        Self::start(fixture, &args, env)
+    }
+
+    fn start(fixture: &Fixture, args: &[&str], env: &[(&str, PathBuf)]) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {
@@ -112,9 +119,7 @@ impl Review {
         );
         let mut command = Command::new(env!("CARGO_BIN_EXE_leaf"));
         command
-            .arg("plan")
-            .args(options)
-            .arg("plan.md")
+            .args(args)
             .current_dir(&fixture.root)
             .env_clear()
             .envs(env.iter().map(|(name, value)| (name, value)))
@@ -298,4 +303,40 @@ fn recorded_rounds_keep_old_snapshots_and_save_the_live_reviewed_source() {
     assert_eq!(fs::read_to_string(history.join("1.md")).unwrap(), OLD);
     assert_eq!(fs::read_to_string(history.join("2.md")).unwrap(), LIVE);
     assert!(!history.join("3.md").exists());
+}
+
+#[test]
+fn reader_width_uses_settings_even_when_the_progress_store_fails() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("plan.md"), "A".repeat(90)).unwrap();
+    fs::write(fixture.root.join("data/leaf"), "not a directory").unwrap();
+    fs::create_dir_all(fixture.root.join("config/leaf")).unwrap();
+    fs::create_dir_all(fixture.root.join("home/.config/leaf")).unwrap();
+    fs::write(
+        fixture.root.join("home/.config/leaf/config.toml"),
+        "invalid = true",
+    )
+    .unwrap();
+    for (config, width) in [
+        (None, 76),
+        (Some(""), 76),
+        (Some("[reader]"), 76),
+        (Some("[reader]\nmax_width = 90"), 90),
+    ] {
+        if let Some(config) = config {
+            fs::write(fixture.root.join("config/leaf/config.toml"), config).unwrap();
+        }
+        let mut reader = Review::start(
+            &fixture,
+            &["open", "plan.md"],
+            &[("PATH", fixture.root.join("runtime"))],
+        );
+        reader.until(&"A".repeat(width));
+        let output = reader.finish(b"q");
+        assert!(!output.contains(&"A".repeat(width + 1)), "{output:?}");
+        assert!(
+            output.contains("reading progress and highlights"),
+            "{output:?}"
+        );
+    }
 }

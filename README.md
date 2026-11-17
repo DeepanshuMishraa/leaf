@@ -86,6 +86,23 @@ Code is colored with [Highlights](https://diffs.com/highlights), whose lexers ar
 
 Images use the Kitty, iTerm2 or Sixel graphics protocol, whichever the terminal answers to, and fall back to colored half blocks.
 
+## Configuration
+
+Leaf reads an optional settings file at `$XDG_CONFIG_HOME/leaf/config.toml`. When `XDG_CONFIG_HOME` is unset or empty, it uses `$HOME/.config/leaf/config.toml`. If neither base is available, it uses defaults without searching the current folder. Leaf never creates or rewrites the settings file.
+
+To change the maximum reading width, add:
+
+```toml
+[reader]
+max_width = 100
+```
+
+`max_width` accepts integers from 1 through 65535 and defaults to 76. The column stays centered and fits within the terminal, retaining the existing four-column margin budget and minimum one-column layout. This changes wrapping, not the terminal font size. Images retain their existing size limits.
+
+Missing or empty files and omitted settings use defaults. Unknown keys, invalid values, and unreadable files stop document opening before fetching or converting the document, with an error identifying the file and cause. Reopen the reader after editing the file; picture navigation keeps the settings loaded at the start of the session.
+
+These settings apply only to the document reader, not plans, diffs, pull requests, issues, or the home screen. Existing preferences and reading progress remain in SQLite.
+
 ## Diffs
 
 `leaf diff` shows the working tree's changes. Pass a path, revision, range, patch file or GitHub pull request or GitLab merge request link to review something else:

@@ -46,8 +46,7 @@ use crate::render::{self, DIM, Laid};
 use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
 use crate::usage;
 
-/// Widest the text column gets; a book-like measure is easiest to read.
-const MAX_TEXT_WIDTH: u16 = 76;
+const SPEECH_SENTENCE_REWIND: usize = 76;
 /// Windows at least this big show one page per screen; smaller ones scroll.
 const PAGED_MIN_WIDTH: u16 = 100;
 const PAGED_MIN_HEIGHT: u16 = 24;
@@ -292,6 +291,7 @@ pub type BookmarksListener = Box<dyn FnMut(&[Bookmark])>;
 pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 
 pub struct ViewerOptions {
+    pub max_text_width: u16,
     /// For paged documents, where reading resumes (1-based).
     pub start_page: Option<usize>,
     pub image_mode: ImageMode,
@@ -331,6 +331,7 @@ pub struct ViewerOptions {
 impl Default for ViewerOptions {
     fn default() -> Self {
         ViewerOptions {
+            max_text_width: crate::config::DEFAULT_MAX_WIDTH,
             start_page: None,
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
@@ -1001,7 +1002,11 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
-        let width = MAX_TEXT_WIDTH.min(area.width.saturating_sub(4)).max(1);
+        let width = self
+            .options
+            .max_text_width
+            .min(area.width.saturating_sub(4))
+            .max(1);
         let mode = if self.doc.page_count.is_some()
             && area.width >= PAGED_MIN_WIDTH
             && area.height >= PAGED_MIN_HEIGHT
@@ -1965,7 +1970,7 @@ impl App {
                 let start = aloud::sentence_start(&laid.text, offset);
                 return Spot {
                     page: slot.page,
-                    offset: if offset - start <= MAX_TEXT_WIDTH as usize {
+                    offset: if offset - start <= SPEECH_SENTENCE_REWIND {
                         start
                     } else {
                         offset
@@ -3748,6 +3753,57 @@ mod tests {
     }
 
     #[test]
+    fn configured_width_controls_wrapping_and_centering() {
+        assert_eq!(ViewerOptions::default().max_text_width, 76);
+        for (maximum, terminal_width, width, x) in [
+            (150, 160, 150, 5),
+            (40, 160, 40, 60),
+            (150, 60, 56, 2),
+            (1, 160, 1, 79),
+            (65535, 160, 156, 2),
+        ] {
+            let mut s = Screen::new(
+                Doc::whole("Notes", "A".repeat(200)),
+                terminal_width,
+                30,
+                ViewerOptions {
+                    max_text_width: maximum,
+                    ..ViewerOptions::default()
+                },
+            );
+            assert_eq!(s.app.column, Rect::new(x, 0, width, 27));
+            assert!(s.draw().contains(&"A".repeat(width as usize)));
+        }
+    }
+
+    #[test]
+    fn wide_tables_and_code_stay_inside_the_reading_column() {
+        let table = "T".repeat(90);
+        let code = "C".repeat(100);
+        let text = format!("| Header |\n| --- |\n| {table} |\n\n```\n{code}\n```");
+        let mut s = Screen::new(
+            Doc::whole("Notes", text),
+            160,
+            30,
+            ViewerOptions {
+                max_text_width: 150,
+                ..ViewerOptions::default()
+            },
+        );
+        let frame = s.draw();
+        assert!(frame.contains(&table) && frame.contains(&code));
+        let column = s.app.column;
+        assert!(frame.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with('┌') && line.ends_with('┐')
+        }));
+        for line in frame.lines().take(column.height as usize) {
+            assert!(line.chars().take(column.x as usize).all(|c| c == ' '));
+            assert!(line.chars().skip(column.right() as usize).all(|c| c == ' '));
+        }
+    }
+
+    #[test]
     fn reading_resumes_on_the_saved_page_and_page_changes_are_reported() {
         let pages = Rc::new(RefCell::new(Vec::new()));
         let heard = pages.clone();
@@ -3799,6 +3855,31 @@ mod tests {
             Some(top.as_str()),
             "{frame}"
         );
+    }
+
+    #[test]
+    fn resizing_keeps_the_source_anchor_when_wide_text_reflows() {
+        let mut s = Screen::new(
+            Doc::whole(
+                "Notes",
+                "one two three four five six seven eight nine ten ".repeat(300),
+            ),
+            160,
+            30,
+            ViewerOptions {
+                max_text_width: 150,
+                ..ViewerOptions::default()
+            },
+        );
+        s.press(KeyCode::Char(' '));
+        let anchor = s.app.top_anchor();
+        let rows = s.app.laid(0).rows.len();
+        assert!(anchor > 0);
+        s.terminal.backend_mut().resize(44, 30);
+        s.draw();
+        assert_eq!(s.app.column.width, 40);
+        assert!(s.app.laid(0).rows.len() > rows);
+        assert_eq!(s.app.screen_row(0, anchor), Some(0));
     }
 
     #[test]
@@ -4691,6 +4772,29 @@ mod tests {
         s.press(KeyCode::Char('a'));
         listen(&mut s, 1.0);
         assert_eq!(marked(&mut s), "gamma");
+    }
+
+    #[test]
+    fn configured_width_does_not_change_speech_sentence_policy() {
+        let text = format!(
+            "{}Visible {}.",
+            "Earlier ".repeat(18),
+            "later ".repeat(1000)
+        );
+        let mut s = Screen::new(
+            Doc::whole("Notes", text),
+            160,
+            30,
+            ViewerOptions {
+                max_text_width: 150,
+                ..ViewerOptions::default()
+            },
+        );
+        s.press(KeyCode::Down);
+        s.press(KeyCode::Down);
+        let offset = s.app.top_anchor();
+        assert!(offset > 76 && offset < 150);
+        assert_eq!(s.app.screen_top(), Spot { page: 0, offset });
     }
 
     #[test]
