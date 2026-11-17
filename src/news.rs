@@ -221,6 +221,19 @@ mod tests {
     }
 
     #[test]
+    fn selection_fix_notes_are_available_after_0_17_1() {
+        let store = memory();
+        store.save_seen_version("0.17.1").expect("saves");
+        let news = News::due(&store, "0.17.2", CHANGELOG)
+            .expect("upgrading from 0.17.1 shows the selection fix notes");
+        assert!(
+            news.notes
+                .iter()
+                .any(|note| note.contains("exact selected text"))
+        );
+    }
+
+    #[test]
     fn notes_are_the_lines_of_one_version() {
         assert_eq!(notes(LOG, "1.1.0"), ["Faster.", "Run `leaf ui`."]);
         assert_eq!(notes(LOG, "1.0.0"), ["First."]);

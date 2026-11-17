@@ -4594,7 +4594,7 @@ mod tests {
         let text = sent.borrow().clone().expect("sent");
         assert!(text.contains(selected), "{text}");
         assert!(
-            text.contains(&format!("Selected:\n{selected}\n\nContext:\n")),
+            text.contains(&format!("Selected:\n```\n{selected}\n```\n\nContext:\n")),
             "{text}"
         );
         assert!(text.contains("From Notes, line 1"), "{text}");
