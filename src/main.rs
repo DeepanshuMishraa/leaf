@@ -4,6 +4,7 @@ mod aloud;
 mod art;
 mod article;
 mod comment;
+mod config;
 mod diff;
 mod diffreview;
 mod diffview;
@@ -548,6 +549,13 @@ fn agents_command() -> ExitCode {
 }
 
 fn open(first: &str) -> ExitCode {
+    let config = match config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("leaf: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     std::thread::spawn(syntax::warm);
     let mut target = first.to_owned();
     let mut path_override: Option<PathBuf> = None;
@@ -587,6 +595,7 @@ fn open(first: &str) -> ExitCode {
         let failure = Rc::new(RefCell::new(None));
         seen.insert(source_path.clone());
         let mut options = resume(&target, doc.page_count, &failure);
+        options.max_text_width = config.reader.max_width;
         options.picture_path = Some(source_path.clone());
         options.watch = watch;
         let result = viewer::run(doc, options);

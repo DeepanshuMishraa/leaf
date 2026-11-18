@@ -31,10 +31,12 @@ regex = "1"
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha2 = "0.11.1"
 symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }
 thiserror = "2"
+toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 unicode-ident = "1.0.27"
 unicode-width = "0.2"
