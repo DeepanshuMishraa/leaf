@@ -400,7 +400,13 @@ impl List {
         for (index, entries) in std::mem::take(&mut self.pending) {
             self.replace_entries(index, entries);
         }
-        if self.polled.elapsed() < POLL || self.loading() {
+        // Every search `reload(true)` starts, whatever the scope shows, so a
+        // slow one outside it isn't started again while it's still out.
+        let (kind, status) = (self.kind, self.status);
+        let in_flight = self.slots.iter().any(|s| {
+            s.source.kind() == kind && s.status == status && matches!(s.fetch, Fetch::Loading)
+        });
+        if self.polled.elapsed() < POLL || in_flight {
             return Vec::new();
         }
         self.reload(true)
@@ -5398,6 +5404,20 @@ mod tests {
                 assert!(!list.poll().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn assigned_does_not_restart_a_search_still_out_of_scope() {
+        let mut list = list_of(live_rows());
+        list.scope = Scope::Assigned;
+        list.polled = Instant::now() - Duration::from_secs(11);
+        let asks = list.poll();
+        assert!(!asks.is_empty());
+        list.polled = Instant::now() - Duration::from_secs(11);
+        assert!(
+            list.poll().is_empty(),
+            "the searches outside Assigned are still out"
+        );
     }
 
     #[test]

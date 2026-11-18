@@ -1924,15 +1924,23 @@ impl App {
             .and_then(|(first, last)| self.split.rows_between(first, last));
         self.layout = self.layout.toggled();
         // Remembered, so the next diff opens the same way.
-        if let Some(Err(e)) = self
+        match self
             .store
             .as_ref()
             .map(|store| store.save_diff_layout(self.layout))
         {
-            *self.failure.borrow_mut() = Some(e.to_string());
-            self.toast = Some(Toast::error(format!(
-                "This layout lasts only until you quit: {e}"
-            )));
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                *self.failure.borrow_mut() = Some(e.to_string());
+                self.toast = Some(Toast::error(format!(
+                    "This layout lasts only until you quit: {e}"
+                )));
+            }
+            None => {
+                self.toast = Some(Toast::error(
+                    "This layout lasts only until you quit: leaf's settings store couldn't be opened.",
+                ));
+            }
         }
         self.split = Split::new(&self.loaded.diff, self.layout);
         self.cursor = cursor
@@ -4909,6 +4917,19 @@ diff --git a/x b/x
         assert_eq!(saved(&app), Some(Layout::Inline));
         press(&mut app, KeyCode::Char('i'));
         assert_eq!(saved(&app), Some(Layout::Split));
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn switching_the_layout_without_a_store_says_it_will_not_last() {
+        let mut app = App::new(loaded(PATCH), Options::default());
+        press(&mut app, KeyCode::Char('i'));
+        let toast = app.toast.as_ref().expect("a toast");
+        assert!(
+            toast
+                .text
+                .starts_with("This layout lasts only until you quit")
+        );
     }
 
     #[test]
