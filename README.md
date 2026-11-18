@@ -96,7 +96,7 @@ To change the maximum reading width, add:
 max_width = 100
 ```
 
-`max_width` accepts integers from 1 through 65535 and defaults to 76. The column stays centered and fits within the terminal, retaining the existing four-column margin budget and minimum one-column layout. This changes wrapping, not the terminal font size. Images fit within the configured reading width; their row limit is unchanged. While reading, `<` and `>` narrow or widen the column by 8, and `=` fits it to the screen or returns to `max_width`. These last until you quit.
+`max_width` accepts integers from 1 through 65535 and defaults to 76. The column stays centered and fits within the terminal, retaining the existing four-column margin budget and minimum one-column layout. This changes wrapping, not the terminal font size. Images fit within the current reading width; their row limit is unchanged. While reading, `<` and `>` narrow or widen the column by 8, with `<` stopping at 20 columns, and `=` fits it to the screen or returns to `max_width`. These last until you quit.
 
 Missing or empty files and omitted settings use defaults. Unknown keys, invalid values, and unreadable files stop document opening before fetching or converting the document, with an error identifying the file and cause. Reopen the reader after editing the file; picture navigation keeps the settings loaded at the start of the session.
 

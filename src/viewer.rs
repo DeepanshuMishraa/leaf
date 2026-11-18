@@ -61,6 +61,17 @@ enum ReadingWidth {
     /// As wide as the screen allows.
     Fit,
 }
+
+impl ReadingWidth {
+    /// The column width this asks for on a screen with `room` columns to spare.
+    fn within(self, room: u16) -> u16 {
+        match self {
+            ReadingWidth::Columns(columns) => columns.min(room),
+            ReadingWidth::Fit => room,
+        }
+        .max(1)
+    }
+}
 const PAGED_MIN_HEIGHT: u16 = 24;
 /// The footer line with a blank row above and below it.
 const FOOTER_ROWS: u16 = 3;
@@ -376,6 +387,8 @@ pub struct App {
     width: u16,
     /// Starts at the configured width; `<`, `>` and `=` change it.
     reading_width: ReadingWidth,
+    /// Columns the last frame left for the reading column; unbounded before it.
+    room: u16,
     laid: HashMap<usize, (Rc<Laid>, bool)>,
     mode: Mode,
     /// The page being read: in paged mode the one shown, when scrolling the one at the top.
@@ -532,6 +545,7 @@ impl App {
             rex_command: None,
             bookmarks: options.bookmarks.clone(),
             reading_width: ReadingWidth::Columns(options.max_text_width),
+            room: u16::MAX,
             doc,
             options,
             picker,
@@ -1020,12 +1034,8 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
-        let room = area.width.saturating_sub(4);
-        let width = match self.reading_width {
-            ReadingWidth::Columns(columns) => columns.min(room),
-            ReadingWidth::Fit => room,
-        }
-        .max(1);
+        self.room = area.width.saturating_sub(4);
+        let width = self.reading_width.within(self.room);
         let mode = if self.doc.page_count.is_some()
             && area.width >= PAGED_MIN_WIDTH
             && area.height >= PAGED_MIN_HEIGHT
@@ -1413,10 +1423,13 @@ impl App {
 
     /// The redraw after a resize clears the screen, and kitty's placements with
     /// it. Rex and Ghostty drop the uploaded figures too, so placing the old
-    /// ids again shows nothing: every figure is uploaded afresh.
+    /// ids again shows nothing: every figure and stroke is uploaded afresh.
     fn resized(&mut self) {
         if let Some(kitty) = &mut self.kitty {
             kitty.reset();
+            for (_, image) in self.ink_drawn.drain() {
+                kitty.free(image);
+            }
         }
         self.retain_protocols(|_| false);
     }
@@ -2655,13 +2668,16 @@ impl App {
             Some('s') | Some('S') => self.open_voices(),
             Some('[') => self.change_speed(false),
             Some(']') => self.change_speed(true),
-            // From the width on screen, so a column the screen narrowed answers at once.
+            // From the width the screen allows, so a column it narrowed answers at
+            // once, and from the one asked for, so presses before the next frame add up.
             Some('<') => {
+                let now = self.reading_width.within(self.room);
                 self.reading_width =
-                    ReadingWidth::Columns(self.width.saturating_sub(WIDTH_STEP).max(MIN_WIDTH))
+                    ReadingWidth::Columns(now.saturating_sub(WIDTH_STEP).max(MIN_WIDTH))
             }
             Some('>') => {
-                self.reading_width = ReadingWidth::Columns(self.width.saturating_add(WIDTH_STEP))
+                let now = self.reading_width.within(self.room);
+                self.reading_width = ReadingWidth::Columns(now.saturating_add(WIDTH_STEP))
             }
             Some('=') => {
                 self.reading_width = match self.reading_width {
@@ -3802,6 +3818,54 @@ mod tests {
             before, after,
             "the figure kept an id the terminal may have dropped"
         );
+    }
+
+    #[test]
+    fn a_resize_uploads_ink_again_too() {
+        let (mut s, _, _) = with_a_line();
+        let ink = |s: &Screen| -> Vec<u32> {
+            s.app
+                .placements
+                .iter()
+                .filter(|(image, _)| image.layer == INK_LAYER)
+                .map(|(image, _)| image.id)
+                .collect()
+        };
+        let before = ink(&s);
+        assert_eq!(before.len(), 1);
+        s.app.resized();
+        s.draw();
+        let after = ink(&s);
+        assert_eq!(after.len(), 1);
+        assert_ne!(
+            before, after,
+            "the ink kept an id the terminal may have dropped"
+        );
+    }
+
+    #[test]
+    fn width_keys_pressed_before_the_next_frame_all_count() {
+        let mut s = Screen::new(
+            Doc::whole("Notes", "A".repeat(300)),
+            160,
+            30,
+            ViewerOptions::default(),
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        s.app.key(key(KeyCode::Char('<')));
+        s.app.key(key(KeyCode::Char('<')));
+        s.draw();
+        assert_eq!(s.app.column.width, 76 - 2 * WIDTH_STEP);
+        s.app.key(key(KeyCode::Char('>')));
+        s.app.key(key(KeyCode::Char('>')));
+        s.app.key(key(KeyCode::Char('>')));
+        s.draw();
+        assert_eq!(s.app.column.width, 76 + WIDTH_STEP);
     }
 
     #[test]
