@@ -1245,7 +1245,9 @@ impl App {
         let job = rejob.or_else(|| {
             page.log.filter(|job| {
                 page.tab == Tab::Checks
-                    && matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.done)
+                    // Still running, or its log failed to download: GitHub's
+                    // log endpoint often answers 5xx for a moment after a job ends.
+                    && matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.settled())
                     && page.log_polled.elapsed() >= JOB_POLL
             })
         });
@@ -1875,7 +1877,11 @@ impl App {
                 }
                 return Ok(true);
             }
-            Mode::Compose { text, cursor, .. } => {
+            Mode::Compose {
+                text,
+                cursor,
+                reply,
+            } => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Esc => page.mode = Mode::Normal,
@@ -1885,10 +1891,9 @@ impl App {
                     }
                     KeyCode::Enter => {
                         let body: String = text.iter().collect::<String>().trim().to_owned();
-                        if body.is_empty() {
-                            page.mode = Mode::Normal;
-                        } else {
-                            self.act(Action::Comment(body));
+                        match empty_comment(&body, reply.is_some()) {
+                            Some(why) => page.toast = Some(why.to_owned()),
+                            None => self.act(Action::Comment(body)),
                         }
                     }
                     KeyCode::Backspace if *cursor > 0 => {
@@ -3257,12 +3262,14 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 Some(who) => format!("Reply to {who} on #{}", page.pr.number),
                 None => format!("Comment on #{}", page.pr.number),
             };
+            // Why enter didn't send, until the next key; else the keys.
+            let hint = match &page.toast {
+                Some(why) => Span::styled(format!("   {why}"), Style::default().fg(RED)),
+                None => Span::styled("   enter send · alt+enter new line · esc cancel", dim),
+            };
             let mut lines = vec![
                 Line::default(),
-                Line::from(vec![
-                    Span::styled(title, accent),
-                    Span::styled("   enter send · alt+enter new line · esc cancel", dim),
-                ]),
+                Line::from(vec![Span::styled(title, accent), hint]),
             ];
             let mut body: String = text[..*cursor].iter().collect();
             body.push('▏');
@@ -4242,6 +4249,21 @@ fn rows(rows: &[render::Row], indent: u16) -> Vec<Line<'static>> {
 }
 
 /// A comment quoted to start a reply, or `None` for an event with nothing to quote.
+/// Why `body` can't be posted: nothing written, or a reply that's only the
+/// comment it quotes.
+fn empty_comment(body: &str, reply: bool) -> Option<&'static str> {
+    let own = body
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('>'));
+    if body.trim().is_empty() {
+        Some("Can't post an empty comment; write something, or esc to cancel")
+    } else if reply && !own {
+        Some("Write your reply below the quote, or esc to cancel")
+    } else {
+        None
+    }
+}
+
 fn quoted(event: &pr::Event) -> Option<String> {
     let body = match &event.kind {
         EventKind::Comment { body }
@@ -5062,6 +5084,39 @@ mod tests {
         page.log_polled = before;
         app.poll();
         assert_eq!(app.page.as_ref().unwrap().log_polled, before);
+    }
+
+    #[test]
+    fn empty_comments_and_quote_only_replies_are_not_posted() {
+        assert!(empty_comment("", false).is_some());
+        assert!(empty_comment("", true).is_some());
+        assert!(empty_comment("> what bot said", true).is_some());
+        assert!(empty_comment(">\n> two lines", true).is_some());
+        assert_eq!(empty_comment("> what bot said\n\nthanks", true), None);
+        assert_eq!(empty_comment("thanks", false), None);
+        // A comment of your own may be a quote alone.
+        assert_eq!(empty_comment("> from the docs", false), None);
+    }
+
+    #[test]
+    fn a_finished_job_whose_log_failed_is_asked_again_while_shown() {
+        let mut app = app_with_page(detail(State::Open));
+        let before = Instant::now() - Duration::from_secs(6);
+        let page = app.page.as_mut().unwrap();
+        page.tab = Tab::Checks;
+        page.log = Some(34);
+        page.log_polled = before;
+        app.logs.jobs.insert(
+            34,
+            Load::Ready(pr::JobLog {
+                steps: Vec::new(),
+                done: true,
+                missing: Some("HTTP 503".into()),
+            }),
+        );
+        app.logs.inflight.insert(34);
+        app.poll();
+        assert!(app.page.as_ref().unwrap().log_polled > before);
     }
 
     fn texts(lines: &[Line]) -> Vec<String> {
