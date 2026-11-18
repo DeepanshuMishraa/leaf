@@ -442,7 +442,11 @@ pub fn job_log(repo: &str, job: u64) -> Result<JobLog, PrFailed> {
     if done && !steps.is_empty() {
         match gh(&["api", &format!("repos/{repo}/actions/jobs/{job}/logs")]) {
             Ok(log) => split_log(&log, &mut steps),
-            Err(e) => missing = Some(format!("Couldn't read this job's log: {e}")),
+            Err(e) => {
+                missing = Some(format!(
+                    "Couldn't read this job's log yet; trying again every few seconds. o opens it on GitHub. ({e})"
+                ))
+            }
         }
     }
     Ok(JobLog {

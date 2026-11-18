@@ -4,6 +4,8 @@
 
 - Configure the document reader's maximum width in `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config.toml`). Omitted settings keep the 76-column layout.
 - Keep the reading position within PDF and EPUB pages when resizing in scroll mode.
+- A finished job's log that GitHub failed to send (such as HTTP 503) is asked for again every few seconds while you're on it, instead of showing the error until you reopen it.
+- `leaf pr` no longer posts an empty comment, or a reply that's only the quoted comment; the composer says why and stays open.
 
 ## 0.17.2
 
