@@ -47,7 +47,7 @@ ln -s "$PWD/completions/_leaf" ~/.zsh/completions/
 fpath=(~/.zsh/completions $fpath)   # in ~/.zshrc, before compinit
 ```
 
-Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `ctrl+d`/`u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `?` all keys, `q` quit.
+Keys: `←/→` (or `h/l`, `p/n`) page, `j/k` scroll, `ctrl+d`/`u` half screen, `space/b` screen (turns the page at its end), `g/G` first/last, `t` (or `:`) go to page, `i` original/painted images, `<`/`>` narrower/wider column, `=` fit the screen (again to go back), `?` all keys, `q` quit.
 
 On a picture file, `←/→` (or `h/l`, `p/n`) move to the previous or next picture in its folder instead, since a picture has only the one page. Names go in the order a file manager lists them, with numbers counted as numbers (`img2` before `img10`), and past the last picture the first comes round again. The footer shows where you are among them, like `2 / 12`.
 
@@ -96,7 +96,7 @@ To change the maximum reading width, add:
 max_width = 100
 ```
 
-`max_width` accepts integers from 1 through 65535 and defaults to 76. The column stays centered and fits within the terminal, retaining the existing four-column margin budget and minimum one-column layout. This changes wrapping, not the terminal font size. Images fit within the configured reading width; their row limit is unchanged.
+`max_width` accepts integers from 1 through 65535 and defaults to 76. The column stays centered and fits within the terminal, retaining the existing four-column margin budget and minimum one-column layout. This changes wrapping, not the terminal font size. Images fit within the current reading width; their row limit is unchanged. While reading, `<` and `>` narrow or widen the column by 8, with `<` stopping at 20 columns, and `=` fits it to the screen or returns to `max_width`. These last until you quit.
 
 Missing or empty files and omitted settings use defaults. Unknown keys, invalid values, and unreadable files stop document opening before fetching or converting the document, with an error identifying the file and cause. Reopen the reader after editing the file; picture navigation keeps the settings loaded at the start of the session.
 

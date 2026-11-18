@@ -4,6 +4,8 @@
 
 - Configure the document reader's maximum width in `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config.toml`). Omitted settings keep the 76-column layout.
 - Keep the reading position within PDF and EPUB pages when resizing in scroll mode.
+- `<` and `>` narrow or widen the reading column, and `=` fits it to the screen, so wide diagrams can be read without quitting.
+- Diagrams and images no longer vanish after the terminal or pane is resized several times in quick succession.
 
 ## 0.17.2
 
