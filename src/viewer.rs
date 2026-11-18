@@ -49,6 +49,18 @@ use crate::usage;
 const SPEECH_SENTENCE_REWIND: usize = 76;
 /// Windows at least this big show one page per screen; smaller ones scroll.
 const PAGED_MIN_WIDTH: u16 = 100;
+/// Columns `<` and `>` take from or add to the reading column.
+const WIDTH_STEP: u16 = 8;
+/// The narrowest column `<` goes to.
+const MIN_WIDTH: u16 = 20;
+
+/// How wide the reading column is asked to be, before the screen limits it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadingWidth {
+    Columns(u16),
+    /// As wide as the screen allows.
+    Fit,
+}
 const PAGED_MIN_HEIGHT: u16 = 24;
 /// The footer line with a blank row above and below it.
 const FOOTER_ROWS: u16 = 3;
@@ -362,6 +374,8 @@ pub struct App {
     picker: Picker,
     /// Column width pages are laid out at.
     width: u16,
+    /// Starts at the configured width; `<`, `>` and `=` change it.
+    reading_width: ReadingWidth,
     laid: HashMap<usize, (Rc<Laid>, bool)>,
     mode: Mode,
     /// The page being read: in paged mode the one shown, when scrolling the one at the top.
@@ -517,6 +531,7 @@ impl App {
             ask: None,
             rex_command: None,
             bookmarks: options.bookmarks.clone(),
+            reading_width: ReadingWidth::Columns(options.max_text_width),
             doc,
             options,
             picker,
@@ -1005,11 +1020,12 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
-        let width = self
-            .options
-            .max_text_width
-            .min(area.width.saturating_sub(4))
-            .max(1);
+        let room = area.width.saturating_sub(4);
+        let width = match self.reading_width {
+            ReadingWidth::Columns(columns) => columns.min(room),
+            ReadingWidth::Fit => room,
+        }
+        .max(1);
         let mode = if self.doc.page_count.is_some()
             && area.width >= PAGED_MIN_WIDTH
             && area.height >= PAGED_MIN_HEIGHT
@@ -1395,6 +1411,16 @@ impl App {
         self.pixels.retain(|key, _| pixels_used.contains(key));
     }
 
+    /// The redraw after a resize clears the screen, and kitty's placements with
+    /// it. Rex and Ghostty drop the uploaded figures too, so placing the old
+    /// ids again shows nothing: every figure is uploaded afresh.
+    fn resized(&mut self) {
+        if let Some(kitty) = &mut self.kitty {
+            kitty.reset();
+        }
+        self.retain_protocols(|_| false);
+    }
+
     /// Keeps the drawn figures `keep` accepts, freeing the terminal's copy of the rest.
     fn retain_protocols(&mut self, keep: impl Fn(&ProtocolKey) -> bool) {
         let kitty = &mut self.kitty;
@@ -1487,6 +1513,7 @@ impl App {
             ("[  ]", "read slower / faster"),
             (",  .", "previous / next sentence aloud"),
             ("s", "pick a voice"),
+            ("<  >  =", "narrower / wider / fit column"),
         ]);
         rows.push((
             "i",
@@ -1501,8 +1528,7 @@ impl App {
             ("@  ^enter", "ask an agent about the selection (⇧⌘A in Rex)"),
             ("y", "highlight selection, or clear one"),
             ("1-6", "pick a color; paints the selection"),
-            ("d", "pen: drag to draw"),
-            ("e", "eraser: drag over ink"),
+            ("d  e", "pen / eraser: drag to draw or erase"),
             ("v", "move tool: pick, move, resize ink"),
             ("!", "how to highlight and draw"),
             ("?", "this help"),
@@ -2629,6 +2655,20 @@ impl App {
             Some('s') | Some('S') => self.open_voices(),
             Some('[') => self.change_speed(false),
             Some(']') => self.change_speed(true),
+            // From the width on screen, so a column the screen narrowed answers at once.
+            Some('<') => {
+                self.reading_width =
+                    ReadingWidth::Columns(self.width.saturating_sub(WIDTH_STEP).max(MIN_WIDTH))
+            }
+            Some('>') => {
+                self.reading_width = ReadingWidth::Columns(self.width.saturating_add(WIDTH_STEP))
+            }
+            Some('=') => {
+                self.reading_width = match self.reading_width {
+                    ReadingWidth::Fit => ReadingWidth::Columns(self.options.max_text_width),
+                    ReadingWidth::Columns(_) => ReadingWidth::Fit,
+                }
+            }
             Some(',') => self.skip_sentence(Direction::Backward),
             Some('.') => self.skip_sentence(Direction::Forward),
             _ => match key.code {
@@ -3340,12 +3380,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => self.key(key),
                     Event::Mouse(mouse) => self.mouse(mouse),
-                    // The redraw after a resize clears the screen, and kitty's placements with it.
-                    Event::Resize(..) => {
-                        if let Some(kitty) = &mut self.kitty {
-                            kitty.reset();
-                        }
-                    }
+                    Event::Resize(..) => self.resized(),
                     _ => {}
                 }
                 if self.quit || !event::poll(Duration::ZERO)? {
@@ -3713,6 +3748,92 @@ mod tests {
             3,
             "unchanged progress was reported twice"
         );
+    }
+
+    /// A page with one figure that decodes to a solid square.
+    struct Pictured;
+
+    impl crate::doc::Source for Pictured {
+        fn page(&self, _: usize) -> Rc<str> {
+            "Before\n\n![](leaf-image:square)\n\nAfter".into()
+        }
+        fn image_size(&self, _: &str) -> Option<(u32, u32)> {
+            Some((160, 80))
+        }
+        fn decode(&self, _: &str, _: u32) -> Option<RgbaImage> {
+            Some(RgbaImage::from_pixel(
+                160,
+                80,
+                image::Rgba([0, 0, 255, 255]),
+            ))
+        }
+    }
+
+    fn figure_ids(s: &Screen) -> Vec<u32> {
+        s.app
+            .placements
+            .iter()
+            .filter(|(image, _)| image.layer == 0)
+            .map(|(image, _)| image.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_resize_uploads_figures_again_because_terminals_may_drop_them() {
+        let doc = Doc {
+            title: "Book".into(),
+            page_count: Some(1),
+            source: Box::new(Pictured),
+        };
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        s.app.kitty = Some(Kitty::default());
+        // The first frame drew it in half blocks, before kitty was there.
+        s.app.protocols.clear();
+        s.draw();
+        let before = figure_ids(&s);
+        assert_eq!(before.len(), 1);
+        // The column stays 76 wide, so nothing else would make the figure change.
+        s.app.resized();
+        s.terminal.backend_mut().resize(118, 30);
+        s.draw();
+        let after = figure_ids(&s);
+        assert_eq!(after.len(), 1);
+        assert_ne!(
+            before, after,
+            "the figure kept an id the terminal may have dropped"
+        );
+    }
+
+    #[test]
+    fn angle_brackets_narrow_and_widen_the_column_and_equals_fits_the_screen() {
+        let mut s = Screen::new(
+            Doc::whole("Notes", "A".repeat(300)),
+            160,
+            30,
+            ViewerOptions::default(),
+        );
+        assert_eq!(s.app.column.width, 76);
+        s.press(KeyCode::Char('<'));
+        assert_eq!(s.app.column.width, 76 - WIDTH_STEP);
+        s.press(KeyCode::Char('>'));
+        s.press(KeyCode::Char('>'));
+        assert_eq!(s.app.column.width, 76 + WIDTH_STEP);
+        s.press(KeyCode::Char('='));
+        assert_eq!(s.app.column.width, 156);
+        // Wider than the screen stays inside it, and narrowing starts from what's shown.
+        s.press(KeyCode::Char('>'));
+        assert_eq!(s.app.column.width, 156);
+        s.press(KeyCode::Char('<'));
+        assert_eq!(s.app.column.width, 156 - WIDTH_STEP);
+        s.press(KeyCode::Char('='));
+        assert_eq!(s.app.column.width, 156);
+        // Fitting again goes back to the configured width.
+        s.press(KeyCode::Char('='));
+        assert_eq!(s.app.column.width, 76);
+        for _ in 0..40 {
+            s.press(KeyCode::Char('<'));
+        }
+        assert_eq!(s.app.column.width, MIN_WIDTH);
     }
 
     #[test]
