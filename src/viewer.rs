@@ -2667,6 +2667,21 @@ impl App {
         }
     }
 
+    /// Scrolls by a turn of the wheel. In paged mode the wheel runs on past a
+    /// page's edge: down from its end turns to the next page, up from its top
+    /// to the end of the previous one.
+    fn wheel(&mut self, delta: isize) {
+        if self.mode == Mode::Paged {
+            if delta > 0 && self.at_bottom() && self.current < self.last() {
+                return self.go_to_page(self.current + 1, false);
+            }
+            if delta < 0 && self.offset == 0 && self.current > 0 {
+                return self.go_to_page(self.current - 1, true);
+            }
+        }
+        self.scroll_by(delta);
+    }
+
     fn previous_screen(&mut self, paged: bool) {
         if paged && self.offset == 0 && self.current > 0 {
             self.go_to_page(self.current - 1, true);
@@ -2842,11 +2857,11 @@ impl App {
             }
             (MouseEventKind::ScrollDown, _) => {
                 self.follow = false;
-                self.scroll_by(WHEEL_STEP)
+                self.wheel(WHEEL_STEP)
             }
             (MouseEventKind::ScrollUp, _) => {
                 self.follow = false;
-                self.scroll_by(-WHEEL_STEP)
+                self.wheel(-WHEEL_STEP)
             }
             _ => {}
         }
@@ -3827,6 +3842,33 @@ mod tests {
         assert!(
             frame.contains("Line 60"),
             "b goes back to the end of the previous page: {frame}"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_through_to_the_next_and_previous_page() {
+        let long: String = (1..=60).map(|i| format!("Line {i}\n\n")).collect();
+        let mut s = Screen::new(
+            book(&[&long, "Next page"]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        let mut frame = s.draw();
+        for _ in 0..60 {
+            if frame.contains("Next page") {
+                break;
+            }
+            frame = s.mouse(MouseEventKind::ScrollDown, 60, 10);
+        }
+        assert!(
+            frame.contains("Next page") && frame.contains("2 / 2"),
+            "{frame}"
+        );
+        let frame = s.mouse(MouseEventKind::ScrollUp, 60, 10);
+        assert!(
+            frame.contains("Line 60") && frame.contains("1 / 2"),
+            "the wheel goes back to the end of the previous page: {frame}"
         );
     }
 
