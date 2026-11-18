@@ -203,6 +203,8 @@ enum Mode {
         cursor: usize,
         /// Whose comment this replies to, quoted at the top of `text`.
         reply: Option<String>,
+        /// Why enter didn't send it, shown until the next key.
+        refused: Option<&'static str>,
     },
     Help,
 }
@@ -730,6 +732,7 @@ impl Page {
             cursor: text.len(),
             text,
             reply: Some(event.actor.clone()),
+            refused: None,
         };
     }
 
@@ -1881,8 +1884,10 @@ impl App {
                 text,
                 cursor,
                 reply,
+                refused,
             } => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
+                *refused = None;
                 match key.code {
                     KeyCode::Esc => page.mode = Mode::Normal,
                     KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1892,7 +1897,7 @@ impl App {
                     KeyCode::Enter => {
                         let body: String = text.iter().collect::<String>().trim().to_owned();
                         match empty_comment(&body, reply.is_some()) {
-                            Some(why) => page.toast = Some(why.to_owned()),
+                            Some(why) => *refused = Some(why),
                             None => self.act(Action::Comment(body)),
                         }
                     }
@@ -2087,6 +2092,7 @@ impl App {
                     text: Vec::new(),
                     cursor: 0,
                     reply: None,
+                    refused: None,
                 };
             }
             KeyCode::Char(c @ ('m' | 'x' | 'r' | 'a')) => {
@@ -3255,6 +3261,7 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
             text,
             cursor,
             reply,
+            refused,
         } => {
             let height = footer_height(page, width);
             let top = y + 1 - height;
@@ -3263,7 +3270,7 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 None => format!("Comment on #{}", page.pr.number),
             };
             // Why enter didn't send, until the next key; else the keys.
-            let hint = match &page.toast {
+            let hint = match refused {
                 Some(why) => Span::styled(format!("   {why}"), Style::default().fg(RED)),
                 None => Span::styled("   enter send · alt+enter new line · esc cancel", dim),
             };
@@ -3895,7 +3902,9 @@ fn job_view(
             } else {
                 "No output."
             };
-            lines.push(Line::from(Span::styled(format!("      {note}"), dim)));
+            for line in wrap(note, width.saturating_sub(6)) {
+                lines.push(Line::from(Span::styled(format!("      {line}"), dim)));
+            }
             lines.push(Line::default());
             continue;
         }
@@ -4707,10 +4716,20 @@ mod tests {
                 .collect(),
             earlier: 0,
         }];
+        let mut quiet = steps.clone();
+        quiet[0].items.clear();
         let job = Load::Ready(pr::JobLog {
             steps,
             done: true,
             missing: None,
+        });
+        let missing = Load::Ready(pr::JobLog {
+            steps: quiet,
+            done: true,
+            missing: Some(
+                "Couldn't read this job's log yet; trying again every few seconds. o opens it on GitHub. (HTTP 503)"
+                    .into(),
+            ),
         });
         let mut page = Page::new(
             PrRef {
@@ -4721,17 +4740,23 @@ mod tests {
             Load::Loading,
         );
         page.open_steps.insert(0);
-        for width in [12, 16, 24, 40] {
-            let view = job_view(None, Some(&job), &page, width, 0);
-            for line in &view.lines {
-                assert!(
-                    line.width() <= width,
-                    "{width} columns: {:?} is {} wide",
-                    plain(line),
-                    line.width()
-                );
+        for job in [&job, &missing] {
+            for width in [12, 16, 24, 40] {
+                let view = job_view(None, Some(job), &page, width, 0);
+                for line in &view.lines {
+                    assert!(
+                        line.width() <= width,
+                        "{width} columns: {:?} is {} wide",
+                        plain(line),
+                        line.width()
+                    );
+                }
             }
         }
+        // Wrapped, not cut: the whole note is still there.
+        let view = job_view(None, Some(&missing), &page, 24, 0);
+        let text: String = view.lines.iter().map(|l| plain(l)).collect();
+        assert!(text.contains("GitHub."), "{text}");
     }
 
     #[test]
@@ -4887,6 +4912,7 @@ mod tests {
                         text: "draft".chars().collect(),
                         cursor: 5,
                         reply: None,
+                        refused: None,
                     }
                 }
                 1 => page.mode = Mode::Help,
@@ -5084,6 +5110,48 @@ mod tests {
         page.log_polled = before;
         app.poll();
         assert_eq!(app.page.as_ref().unwrap().log_polled, before);
+    }
+
+    #[test]
+    fn the_composer_shows_only_its_own_refusal() {
+        let draw = |page: &Page| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10))
+                .expect("test terminal");
+            terminal
+                .draw(|f| footer(f, page, f.area(), 0, 100))
+                .expect("draws");
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        let mut page = Page::new(
+            PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            Kind::Pull,
+            Load::Loading,
+        );
+        page.mode = Mode::Compose {
+            text: Vec::new(),
+            cursor: 0,
+            reply: None,
+            refused: None,
+        };
+        page.toast = Some("A background refresh failed".into());
+        let text = draw(&page);
+        assert!(text.contains("enter send"), "{text}");
+        assert!(!text.contains("background refresh"), "{text}");
+        if let Mode::Compose { refused, .. } = &mut page.mode {
+            *refused = empty_comment("", false);
+        }
+        assert!(draw(&page).contains("Can't post an empty comment"));
     }
 
     #[test]
