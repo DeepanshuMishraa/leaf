@@ -4,6 +4,8 @@
 
 - Configure the document reader's maximum width in `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config.toml`). Omitted settings keep the 76-column layout.
 - Keep the reading position within PDF and EPUB pages when resizing in scroll mode.
+- `leaf diff`, `leaf review` and the PR Code tab remember whether you last used the split or inline layout.
+- `leaf pr` lists pull requests and issues assigned to you. `@` switches the list between All and Assigned.
 
 ## 0.17.2
 

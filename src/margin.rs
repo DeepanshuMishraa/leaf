@@ -342,7 +342,9 @@ pub fn review_command(args: &[String]) -> ExitCode {
     }
     let failure = Rc::new(RefCell::new(None));
     let mut options = crate::diff_options(&loaded.key, failure.clone());
-    options.layout = layout;
+    if let Some(layout) = layout {
+        options.layout = layout;
+    }
     let result = crate::diffview::review(loaded, options);
     if let Some(message) = failure.borrow().as_ref() {
         eprintln!("leaf: {message}");

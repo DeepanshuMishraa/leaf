@@ -150,6 +150,21 @@ pub enum Layout {
 }
 
 impl Layout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layout::Split => "split",
+            Layout::Inline => "inline",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "split" => Some(Layout::Split),
+            "inline" => Some(Layout::Inline),
+            _ => None,
+        }
+    }
+
     fn toggled(self) -> Self {
         match self {
             Layout::Split => Layout::Inline,
@@ -1908,6 +1923,17 @@ impl App {
             .focus
             .and_then(|(first, last)| self.split.rows_between(first, last));
         self.layout = self.layout.toggled();
+        // Remembered, so the next diff opens the same way.
+        if let Some(Err(e)) = self
+            .store
+            .as_ref()
+            .map(|store| store.save_diff_layout(self.layout))
+        {
+            *self.failure.borrow_mut() = Some(e.to_string());
+            self.toast = Some(Toast::error(format!(
+                "This layout lasts only until you quit: {e}"
+            )));
+        }
         self.split = Split::new(&self.loaded.diff, self.layout);
         self.cursor = cursor
             .and_then(|row| self.split.line_for_row(row))
@@ -4862,6 +4888,27 @@ diff --git a/x b/x
                 .lines()
                 .any(|line| line.contains("let b = 2;") && line.contains("let b = 3;"))
         );
+    }
+
+    #[test]
+    fn switching_the_layout_remembers_it() {
+        let store = Store::open(std::path::Path::new(":memory:")).expect("in-memory store");
+        let mut app = App::new(
+            loaded(PATCH),
+            Options {
+                store: Some(store),
+                ..Options::default()
+            },
+        );
+        let saved = |app: &App| {
+            app.store
+                .as_ref()
+                .and_then(|store| store.load_diff_layout().expect("reads"))
+        };
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(saved(&app), Some(Layout::Inline));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(saved(&app), Some(Layout::Split));
     }
 
     #[test]

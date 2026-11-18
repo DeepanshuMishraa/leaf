@@ -224,11 +224,43 @@ struct Slot {
     background: bool,
 }
 
+/// Whose rows the list shows: everything that concerns you, or only those
+/// assigned to you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    All,
+    Assigned,
+}
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::All => "All",
+            Scope::Assigned => "Assigned",
+        }
+    }
+
+    fn other(self) -> Scope {
+        match self {
+            Scope::All => Scope::Assigned,
+            Scope::Assigned => Scope::All,
+        }
+    }
+
+    fn holds(self, source: &Source) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Assigned => matches!(source, Source::Assigned(_)),
+        }
+    }
+}
+
 /// What a click in the list's tab row asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListHit {
     Kind(Kind),
     Status(Status),
+    Scope(Scope),
 }
 
 struct List {
@@ -236,6 +268,8 @@ struct List {
     kind: Kind,
     /// Open rows, or merged and closed ones.
     status: Status,
+    /// Everything, or only what's assigned to you.
+    scope: Scope,
     slots: Vec<Slot>,
     /// Your login, once known; until then rows aren't colored.
     me: Option<String>,
@@ -263,12 +297,12 @@ struct List {
 }
 
 impl List {
-    /// The searches behind a tab, for the shown status.
+    /// The searches behind a tab, for the shown status and scope.
     fn slots_of(&self, kind: Kind) -> impl Iterator<Item = &Slot> {
-        let status = self.status;
-        self.slots
-            .iter()
-            .filter(move |s| s.source.kind() == kind && s.status == status)
+        let (status, scope) = (self.status, self.scope);
+        self.slots.iter().filter(move |s| {
+            s.source.kind() == kind && s.status == status && scope.holds(&s.source)
+        })
     }
 
     /// Everything a tab found for the shown status, each once, newest first.
@@ -315,6 +349,14 @@ impl List {
     fn show_status(&mut self, status: Status) {
         if self.status != status {
             self.status = status;
+            self.reset_pick();
+        }
+    }
+
+    /// Switches between everything and what's assigned to you.
+    fn show_scope(&mut self, scope: Scope) {
+        if self.scope != scope {
+            self.scope = scope;
             self.reset_pick();
         }
     }
@@ -937,6 +979,7 @@ impl App {
         self.list = Some(List {
             kind: Kind::Pull,
             status: Status::Open,
+            scope: Scope::All,
             slots,
             me: pr::cached_viewer(),
             tab_hits: Vec::new(),
@@ -1605,6 +1648,7 @@ impl App {
             list.selection = None;
             match hit {
                 ListHit::Kind(kind) => list.show(kind),
+                ListHit::Scope(scope) => list.show_scope(scope),
                 ListHit::Status(status) => {
                     list.show_status(status);
                     self.ask_shown();
@@ -1701,6 +1745,11 @@ impl App {
             // Tab flips open rows and done ones: merged or closed.
             KeyCode::Tab | KeyCode::BackTab => {
                 self.flip_status();
+                return Ok(true);
+            }
+            // `@` for "@me": everything, or only what's assigned to you.
+            KeyCode::Char('@') => {
+                list.show_scope(list.scope.other());
                 return Ok(true);
             }
             // Asks every search again now rather than waiting. `R` only while
@@ -2293,10 +2342,28 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     if list.loading() {
         tabs.push(Span::styled(spinner().to_string(), dim));
     }
-    // The switch between open rows and done ones, at the right: the shown
-    // one bright and underlined, the other quiet; tab or a click flips it.
+    // Two switches at the right, each the shown side bright and underlined,
+    // the other quiet: whose rows (`@`), then open or done ones (tab). A click
+    // flips either.
     let mut switch = Vec::new();
     let mut labels = Vec::new();
+    for scope in [Scope::All, Scope::Assigned] {
+        if !switch.is_empty() {
+            switch.push(Span::styled("  ·  ", dim));
+        }
+        let style = if scope == list.scope {
+            bold.add_modifier(Modifier::UNDERLINED)
+        } else {
+            dim
+        };
+        labels.push((
+            switch.iter().map(|s| s.content.width()).sum::<usize>(),
+            scope.label(),
+            ListHit::Scope(scope),
+        ));
+        switch.push(Span::styled(scope.label(), style));
+    }
+    switch.push(Span::raw("     "));
     for status in [Status::Open, Status::Done] {
         let label = status.label(list.kind);
         let on = status == list.status;
@@ -2308,22 +2375,22 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         } else {
             dim
         };
-        if !switch.is_empty() {
+        if status == Status::Done {
             switch.push(Span::styled("  ·  ", dim));
         }
         labels.push((
             switch.iter().map(|s| s.content.width()).sum::<usize>(),
             label,
-            status,
+            ListHit::Status(status),
         ));
         switch.push(Span::styled(label, style));
     }
     let switch_width: usize = switch.iter().map(|s| s.content.width()).sum();
     let switch_x = x + width.saturating_sub(switch_width as u16);
-    for (offset, label, status) in labels {
+    for (offset, label, hit) in labels {
         list.tab_hits.push((
             Rect::new(switch_x + offset as u16, row, label.width() as u16, 1),
-            ListHit::Status(status),
+            hit,
         ));
     }
     f.render_widget(
@@ -2411,6 +2478,8 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
             format!("{}  Loading your {state} {what}", spinner())
         } else if let Some(e) = list.failure().filter(|_| list.typed.is_empty()) {
             e
+        } else if list.typed.is_empty() && list.scope == Scope::Assigned {
+            format!("No {state} {what} are assigned to you.")
         } else if list.typed.is_empty() {
             format!("No {state} {what} concern you.")
         } else {
@@ -2528,6 +2597,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     }
 
     let flip = list.status.other().label(list.kind).to_lowercase();
+    let scope = list.scope.other().label().to_lowercase();
     let footer = match (list.failure(), &list.note) {
         (_, Some(note)) => Line::from(Span::styled(clip(note, w), dim)),
         (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
@@ -2536,6 +2606,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
                 ("↑↓", "move"),
                 ("enter", "open"),
                 ("tab", &flip),
+                ("@", &scope),
                 ("←→", "pulls · issues"),
                 ("type", "filter"),
                 ("^y", "copy #"),
@@ -5239,6 +5310,7 @@ mod tests {
         List {
             kind: Kind::Pull,
             status: Status::Open,
+            scope: Scope::All,
             slots,
             me: Some("me".into()),
             tab_hits: Vec::new(),
@@ -5483,6 +5555,69 @@ mod tests {
             list.tab_hits
                 .iter()
                 .any(|(_, hit)| *hit == ListHit::Status(Status::Open))
+        );
+    }
+
+    #[test]
+    fn assigned_shows_only_what_is_assigned_to_you() {
+        let entry = |number: u64, title: &str| Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number,
+            },
+            title: title.into(),
+            author: "someone".into(),
+            updated: format!("2026-11-12T04:0{number}:00Z"),
+            draft: false,
+            ended: None,
+        };
+        let slot = |source: Source, entries: Vec<Entry>| Slot {
+            source,
+            status: Status::Open,
+            entries: Some(entries),
+            fetch: Fetch::Done,
+            background: false,
+        };
+        let mut list = list_of(vec![
+            slot(Source::Authored(Kind::Pull), vec![entry(1, "mine")]),
+            slot(Source::Assigned(Kind::Pull), vec![entry(2, "handed to me")]),
+            slot(Source::Assigned(Kind::Issue), Vec::new()),
+        ]);
+        let titles =
+            |list: &List| -> Vec<String> { list.entries().into_iter().map(|e| e.title).collect() };
+        assert_eq!(titles(&list), ["handed to me", "mine"]);
+        list.show_scope(Scope::Assigned);
+        assert_eq!(titles(&list), ["handed to me"]);
+        assert_eq!(list.all(Kind::Issue).len(), 0);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+            .expect("test terminal");
+        list.kind = Kind::Issue;
+        terminal
+            .draw(|f| draw_list(f, &mut list, 0, None))
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            text.contains("All  ·  Assigned     Open  ·  Closed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("No open issues are assigned to you."),
+            "{text}"
+        );
+        assert!(text.contains("@ all"), "{text}");
+        assert!(
+            list.tab_hits
+                .iter()
+                .any(|(_, hit)| *hit == ListHit::Scope(Scope::All))
         );
     }
 
