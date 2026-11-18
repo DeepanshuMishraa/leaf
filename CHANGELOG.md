@@ -7,6 +7,10 @@
 
 ## 0.17.2
 
+- `leaf diff`, `leaf review` and the PR Code tab remember whether you last used the split or inline layout.
+- `leaf pr` lists pull requests and issues assigned to you. `@` switches the list between All and Assigned.
+- A finished job's log that GitHub failed to send (such as HTTP 503) is asked for again every few seconds while you're on it, instead of showing the error until you reopen it.
+- `leaf pr` no longer posts an empty comment, or a reply that's only the quoted comment; the composer says why and stays open.
 - Asking an agent about a selection sends the exact selected text, even beyond character 400 of a paragraph. Surrounding lines remain capped. Selections are fenced and marked as quoted document data, not instructions.
 
 ## 0.17.1

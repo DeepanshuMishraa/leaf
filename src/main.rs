@@ -640,7 +640,9 @@ fn diff_command(args: &[String]) -> ExitCode {
     };
     let failure = Rc::new(RefCell::new(None));
     let mut options = diff_options(&loaded.key, failure.clone());
-    options.layout = layout;
+    if let Some(layout) = layout {
+        options.layout = layout;
+    }
     let result = diffview::run(loaded, options).map(|_| ());
     if let Some(message) = failure.borrow().as_ref() {
         eprintln!("leaf: {message}");
@@ -970,6 +972,10 @@ fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Op
                 Ok(comments) => options.comments = comments,
                 Err(e) => *failure.borrow_mut() = Some(e.to_string()),
             }
+            match store.load_diff_layout() {
+                Ok(layout) => options.layout = layout.unwrap_or_default(),
+                Err(e) => *failure.borrow_mut() = Some(e.to_string()),
+            }
             options.store = Some(store);
         }
         Err(e) => *failure.borrow_mut() = Some(e.to_string()),
@@ -1005,9 +1011,9 @@ fn set_origin(
 
 /// Parses `leaf diff` arguments into a request, discovering the repository and
 /// making paths relative to its root, and the layout to open it in.
-fn diff_request(args: &[String]) -> Result<(diff::Request, diffview::Layout), String> {
+fn diff_request(args: &[String]) -> Result<(diff::Request, Option<diffview::Layout>), String> {
     let mut origin: Option<diff::Origin> = None;
-    let mut layout = diffview::Layout::Split;
+    let mut layout = None;
     let mut base: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut options = true;
@@ -1041,7 +1047,7 @@ fn diff_request(args: &[String]) -> Result<(diff::Request, diffview::Layout), St
                 "--branch" | "-b" => {
                     set_origin(&mut origin, diff::Origin::Branch { base: None }, "--branch")?;
                 }
-                "--inline" | "-i" => layout = diffview::Layout::Inline,
+                "--inline" | "-i" => layout = Some(diffview::Layout::Inline),
                 "--base" => base = Some(value(&mut at)?),
                 "--range" | "-r" => {
                     let spec = value(&mut at)?;

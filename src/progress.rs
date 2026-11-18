@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::comment::{Anchor, Comment, Side, State};
+use crate::diffview::Layout;
 use crate::highlight::Highlight;
 use crate::hue::Hue;
 use crate::stroke::{Stroke, Trace};
@@ -421,6 +422,18 @@ impl Store {
 
     pub fn save_ui(&self, ui: Ui) -> Result<(), StoreFailed> {
         self.save_setting("ui", ui.as_str())
+    }
+
+    /// The diff layout `i` last switched to; `None` until it's been used.
+    pub fn load_diff_layout(&self) -> Result<Option<Layout>, StoreFailed> {
+        Ok(self
+            .setting("diff_layout")?
+            .as_deref()
+            .and_then(Layout::parse))
+    }
+
+    pub fn save_diff_layout(&self, layout: Layout) -> Result<(), StoreFailed> {
+        self.save_setting("diff_layout", layout.as_str())
     }
 
     /// The leaf version whose "What's new" was last shown.
@@ -1114,6 +1127,16 @@ mod tests {
         store.save_bookmarks("/a.epub", &[]).unwrap();
         assert!(store.load_bookmarks("/a.epub").unwrap().is_empty());
         assert_eq!(store.load_bookmarks("/b.epub").unwrap(), vec![late]);
+    }
+
+    #[test]
+    fn the_diff_layout_is_remembered() {
+        let store = memory();
+        assert_eq!(store.load_diff_layout().unwrap(), None);
+        store.save_diff_layout(Layout::Inline).unwrap();
+        assert_eq!(store.load_diff_layout().unwrap(), Some(Layout::Inline));
+        store.save_diff_layout(Layout::Split).unwrap();
+        assert_eq!(store.load_diff_layout().unwrap(), Some(Layout::Split));
     }
 
     #[test]

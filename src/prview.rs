@@ -203,6 +203,8 @@ enum Mode {
         cursor: usize,
         /// Whose comment this replies to, quoted at the top of `text`.
         reply: Option<String>,
+        /// Why enter didn't send it, shown until the next key.
+        refused: Option<&'static str>,
     },
     Help,
 }
@@ -224,11 +226,43 @@ struct Slot {
     background: bool,
 }
 
+/// Whose rows the list shows: everything that concerns you, or only those
+/// assigned to you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    All,
+    Assigned,
+}
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::All => "All",
+            Scope::Assigned => "Assigned",
+        }
+    }
+
+    fn other(self) -> Scope {
+        match self {
+            Scope::All => Scope::Assigned,
+            Scope::Assigned => Scope::All,
+        }
+    }
+
+    fn holds(self, source: &Source) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Assigned => matches!(source, Source::Assigned(_)),
+        }
+    }
+}
+
 /// What a click in the list's tab row asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListHit {
     Kind(Kind),
     Status(Status),
+    Scope(Scope),
 }
 
 struct List {
@@ -236,6 +270,8 @@ struct List {
     kind: Kind,
     /// Open rows, or merged and closed ones.
     status: Status,
+    /// Everything, or only what's assigned to you.
+    scope: Scope,
     slots: Vec<Slot>,
     /// Your login, once known; until then rows aren't colored.
     me: Option<String>,
@@ -263,12 +299,12 @@ struct List {
 }
 
 impl List {
-    /// The searches behind a tab, for the shown status.
+    /// The searches behind a tab, for the shown status and scope.
     fn slots_of(&self, kind: Kind) -> impl Iterator<Item = &Slot> {
-        let status = self.status;
-        self.slots
-            .iter()
-            .filter(move |s| s.source.kind() == kind && s.status == status)
+        let (status, scope) = (self.status, self.scope);
+        self.slots.iter().filter(move |s| {
+            s.source.kind() == kind && s.status == status && scope.holds(&s.source)
+        })
     }
 
     /// Everything a tab found for the shown status, each once, newest first.
@@ -319,6 +355,14 @@ impl List {
         }
     }
 
+    /// Switches between everything and what's assigned to you.
+    fn show_scope(&mut self, scope: Scope) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.reset_pick();
+        }
+    }
+
     fn reset_pick(&mut self) {
         self.selected = 0;
         self.resting = None;
@@ -358,7 +402,13 @@ impl List {
         for (index, entries) in std::mem::take(&mut self.pending) {
             self.replace_entries(index, entries);
         }
-        if self.polled.elapsed() < POLL || self.loading() {
+        // Every search `reload(true)` starts, whatever the scope shows, so a
+        // slow one outside it isn't started again while it's still out.
+        let (kind, status) = (self.kind, self.status);
+        let in_flight = self.slots.iter().any(|s| {
+            s.source.kind() == kind && s.status == status && matches!(s.fetch, Fetch::Loading)
+        });
+        if self.polled.elapsed() < POLL || in_flight {
             return Vec::new();
         }
         self.reload(true)
@@ -682,6 +732,7 @@ impl Page {
             cursor: text.len(),
             text,
             reply: Some(event.actor.clone()),
+            refused: None,
         };
     }
 
@@ -937,6 +988,7 @@ impl App {
         self.list = Some(List {
             kind: Kind::Pull,
             status: Status::Open,
+            scope: Scope::All,
             slots,
             me: pr::cached_viewer(),
             tab_hits: Vec::new(),
@@ -1196,7 +1248,9 @@ impl App {
         let job = rejob.or_else(|| {
             page.log.filter(|job| {
                 page.tab == Tab::Checks
-                    && matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.done)
+                    // Still running, or its log failed to download: GitHub's
+                    // log endpoint often answers 5xx for a moment after a job ends.
+                    && matches!(self.logs.jobs.get(job), Some(Load::Ready(log)) if !log.settled())
                     && page.log_polled.elapsed() >= JOB_POLL
             })
         });
@@ -1605,6 +1659,7 @@ impl App {
             list.selection = None;
             match hit {
                 ListHit::Kind(kind) => list.show(kind),
+                ListHit::Scope(scope) => list.show_scope(scope),
                 ListHit::Status(status) => {
                     list.show_status(status);
                     self.ask_shown();
@@ -1701,6 +1756,11 @@ impl App {
             // Tab flips open rows and done ones: merged or closed.
             KeyCode::Tab | KeyCode::BackTab => {
                 self.flip_status();
+                return Ok(true);
+            }
+            // `@` for "@me": everything, or only what's assigned to you.
+            KeyCode::Char('@') => {
+                list.show_scope(list.scope.other());
                 return Ok(true);
             }
             // Asks every search again now rather than waiting. `R` only while
@@ -1820,8 +1880,14 @@ impl App {
                 }
                 return Ok(true);
             }
-            Mode::Compose { text, cursor, .. } => {
+            Mode::Compose {
+                text,
+                cursor,
+                reply,
+                refused,
+            } => {
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
+                *refused = None;
                 match key.code {
                     KeyCode::Esc => page.mode = Mode::Normal,
                     KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1830,10 +1896,9 @@ impl App {
                     }
                     KeyCode::Enter => {
                         let body: String = text.iter().collect::<String>().trim().to_owned();
-                        if body.is_empty() {
-                            page.mode = Mode::Normal;
-                        } else {
-                            self.act(Action::Comment(body));
+                        match empty_comment(&body, reply.is_some()) {
+                            Some(why) => *refused = Some(why),
+                            None => self.act(Action::Comment(body)),
                         }
                     }
                     KeyCode::Backspace if *cursor > 0 => {
@@ -2027,6 +2092,7 @@ impl App {
                     text: Vec::new(),
                     cursor: 0,
                     reply: None,
+                    refused: None,
                 };
             }
             KeyCode::Char(c @ ('m' | 'x' | 'r' | 'a')) => {
@@ -2293,10 +2359,28 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     if list.loading() {
         tabs.push(Span::styled(spinner().to_string(), dim));
     }
-    // The switch between open rows and done ones, at the right: the shown
-    // one bright and underlined, the other quiet; tab or a click flips it.
+    // Two switches at the right, each the shown side bright and underlined,
+    // the other quiet: whose rows (`@`), then open or done ones (tab). A click
+    // flips either.
     let mut switch = Vec::new();
     let mut labels = Vec::new();
+    for scope in [Scope::All, Scope::Assigned] {
+        if !switch.is_empty() {
+            switch.push(Span::styled("  ·  ", dim));
+        }
+        let style = if scope == list.scope {
+            bold.add_modifier(Modifier::UNDERLINED)
+        } else {
+            dim
+        };
+        labels.push((
+            switch.iter().map(|s| s.content.width()).sum::<usize>(),
+            scope.label(),
+            ListHit::Scope(scope),
+        ));
+        switch.push(Span::styled(scope.label(), style));
+    }
+    switch.push(Span::raw("     "));
     for status in [Status::Open, Status::Done] {
         let label = status.label(list.kind);
         let on = status == list.status;
@@ -2308,22 +2392,22 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         } else {
             dim
         };
-        if !switch.is_empty() {
+        if status == Status::Done {
             switch.push(Span::styled("  ·  ", dim));
         }
         labels.push((
             switch.iter().map(|s| s.content.width()).sum::<usize>(),
             label,
-            status,
+            ListHit::Status(status),
         ));
         switch.push(Span::styled(label, style));
     }
     let switch_width: usize = switch.iter().map(|s| s.content.width()).sum();
     let switch_x = x + width.saturating_sub(switch_width as u16);
-    for (offset, label, status) in labels {
+    for (offset, label, hit) in labels {
         list.tab_hits.push((
             Rect::new(switch_x + offset as u16, row, label.width() as u16, 1),
-            ListHit::Status(status),
+            hit,
         ));
     }
     f.render_widget(
@@ -2411,6 +2495,8 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
             format!("{}  Loading your {state} {what}", spinner())
         } else if let Some(e) = list.failure().filter(|_| list.typed.is_empty()) {
             e
+        } else if list.typed.is_empty() && list.scope == Scope::Assigned {
+            format!("No {state} {what} are assigned to you.")
         } else if list.typed.is_empty() {
             format!("No {state} {what} concern you.")
         } else {
@@ -2528,6 +2614,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
     }
 
     let flip = list.status.other().label(list.kind).to_lowercase();
+    let scope = list.scope.other().label().to_lowercase();
     let footer = match (list.failure(), &list.note) {
         (_, Some(note)) => Line::from(Span::styled(clip(note, w), dim)),
         (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
@@ -2536,6 +2623,7 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
                 ("↑↓", "move"),
                 ("enter", "open"),
                 ("tab", &flip),
+                ("@", &scope),
                 ("←→", "pulls · issues"),
                 ("type", "filter"),
                 ("^y", "copy #"),
@@ -3173,6 +3261,7 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
             text,
             cursor,
             reply,
+            refused,
         } => {
             let height = footer_height(page, width);
             let top = y + 1 - height;
@@ -3180,12 +3269,14 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 Some(who) => format!("Reply to {who} on #{}", page.pr.number),
                 None => format!("Comment on #{}", page.pr.number),
             };
+            // Why enter didn't send, until the next key; else the keys.
+            let hint = match refused {
+                Some(why) => Span::styled(format!("   {why}"), Style::default().fg(RED)),
+                None => Span::styled("   enter send · alt+enter new line · esc cancel", dim),
+            };
             let mut lines = vec![
                 Line::default(),
-                Line::from(vec![
-                    Span::styled(title, accent),
-                    Span::styled("   enter send · alt+enter new line · esc cancel", dim),
-                ]),
+                Line::from(vec![Span::styled(title, accent), hint]),
             ];
             let mut body: String = text[..*cursor].iter().collect();
             body.push('▏');
@@ -3811,7 +3902,9 @@ fn job_view(
             } else {
                 "No output."
             };
-            lines.push(Line::from(Span::styled(format!("      {note}"), dim)));
+            for line in wrap(note, width.saturating_sub(6)) {
+                lines.push(Line::from(Span::styled(format!("      {line}"), dim)));
+            }
             lines.push(Line::default());
             continue;
         }
@@ -4165,6 +4258,21 @@ fn rows(rows: &[render::Row], indent: u16) -> Vec<Line<'static>> {
 }
 
 /// A comment quoted to start a reply, or `None` for an event with nothing to quote.
+/// Why `body` can't be posted: nothing written, or a reply that's only the
+/// comment it quotes.
+fn empty_comment(body: &str, reply: bool) -> Option<&'static str> {
+    let own = body
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('>'));
+    if body.trim().is_empty() {
+        Some("Can't post an empty comment; write something, or esc to cancel")
+    } else if reply && !own {
+        Some("Write your reply below the quote, or esc to cancel")
+    } else {
+        None
+    }
+}
+
 fn quoted(event: &pr::Event) -> Option<String> {
     let body = match &event.kind {
         EventKind::Comment { body }
@@ -4608,10 +4716,20 @@ mod tests {
                 .collect(),
             earlier: 0,
         }];
+        let mut quiet = steps.clone();
+        quiet[0].items.clear();
         let job = Load::Ready(pr::JobLog {
             steps,
             done: true,
             missing: None,
+        });
+        let missing = Load::Ready(pr::JobLog {
+            steps: quiet,
+            done: true,
+            missing: Some(
+                "Couldn't read this job's log yet; trying again every few seconds. o opens it on GitHub. (HTTP 503)"
+                    .into(),
+            ),
         });
         let mut page = Page::new(
             PrRef {
@@ -4622,17 +4740,23 @@ mod tests {
             Load::Loading,
         );
         page.open_steps.insert(0);
-        for width in [12, 16, 24, 40] {
-            let view = job_view(None, Some(&job), &page, width, 0);
-            for line in &view.lines {
-                assert!(
-                    line.width() <= width,
-                    "{width} columns: {:?} is {} wide",
-                    plain(line),
-                    line.width()
-                );
+        for job in [&job, &missing] {
+            for width in [12, 16, 24, 40] {
+                let view = job_view(None, Some(job), &page, width, 0);
+                for line in &view.lines {
+                    assert!(
+                        line.width() <= width,
+                        "{width} columns: {:?} is {} wide",
+                        plain(line),
+                        line.width()
+                    );
+                }
             }
         }
+        // Wrapped, not cut: the whole note is still there.
+        let view = job_view(None, Some(&missing), &page, 24, 0);
+        let text: String = view.lines.iter().map(|l| plain(l)).collect();
+        assert!(text.contains("GitHub."), "{text}");
     }
 
     #[test]
@@ -4788,6 +4912,7 @@ mod tests {
                         text: "draft".chars().collect(),
                         cursor: 5,
                         reply: None,
+                        refused: None,
                     }
                 }
                 1 => page.mode = Mode::Help,
@@ -4985,6 +5110,81 @@ mod tests {
         page.log_polled = before;
         app.poll();
         assert_eq!(app.page.as_ref().unwrap().log_polled, before);
+    }
+
+    #[test]
+    fn the_composer_shows_only_its_own_refusal() {
+        let draw = |page: &Page| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10))
+                .expect("test terminal");
+            terminal
+                .draw(|f| footer(f, page, f.area(), 0, 100))
+                .expect("draws");
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        let mut page = Page::new(
+            PrRef {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            Kind::Pull,
+            Load::Loading,
+        );
+        page.mode = Mode::Compose {
+            text: Vec::new(),
+            cursor: 0,
+            reply: None,
+            refused: None,
+        };
+        page.toast = Some("A background refresh failed".into());
+        let text = draw(&page);
+        assert!(text.contains("enter send"), "{text}");
+        assert!(!text.contains("background refresh"), "{text}");
+        if let Mode::Compose { refused, .. } = &mut page.mode {
+            *refused = empty_comment("", false);
+        }
+        assert!(draw(&page).contains("Can't post an empty comment"));
+    }
+
+    #[test]
+    fn empty_comments_and_quote_only_replies_are_not_posted() {
+        assert!(empty_comment("", false).is_some());
+        assert!(empty_comment("", true).is_some());
+        assert!(empty_comment("> what bot said", true).is_some());
+        assert!(empty_comment(">\n> two lines", true).is_some());
+        assert_eq!(empty_comment("> what bot said\n\nthanks", true), None);
+        assert_eq!(empty_comment("thanks", false), None);
+        // A comment of your own may be a quote alone.
+        assert_eq!(empty_comment("> from the docs", false), None);
+    }
+
+    #[test]
+    fn a_finished_job_whose_log_failed_is_asked_again_while_shown() {
+        let mut app = app_with_page(detail(State::Open));
+        let before = Instant::now() - Duration::from_secs(6);
+        let page = app.page.as_mut().unwrap();
+        page.tab = Tab::Checks;
+        page.log = Some(34);
+        page.log_polled = before;
+        app.logs.jobs.insert(
+            34,
+            Load::Ready(pr::JobLog {
+                steps: Vec::new(),
+                done: true,
+                missing: Some("HTTP 503".into()),
+            }),
+        );
+        app.logs.inflight.insert(34);
+        app.poll();
+        assert!(app.page.as_ref().unwrap().log_polled > before);
     }
 
     fn texts(lines: &[Line]) -> Vec<String> {
@@ -5239,6 +5439,7 @@ mod tests {
         List {
             kind: Kind::Pull,
             status: Status::Open,
+            scope: Scope::All,
             slots,
             me: Some("me".into()),
             tab_hits: Vec::new(),
@@ -5326,6 +5527,20 @@ mod tests {
                 assert!(!list.poll().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn assigned_does_not_restart_a_search_still_out_of_scope() {
+        let mut list = list_of(live_rows());
+        list.scope = Scope::Assigned;
+        list.polled = Instant::now() - Duration::from_secs(11);
+        let asks = list.poll();
+        assert!(!asks.is_empty());
+        list.polled = Instant::now() - Duration::from_secs(11);
+        assert!(
+            list.poll().is_empty(),
+            "the searches outside Assigned are still out"
+        );
     }
 
     #[test]
@@ -5483,6 +5698,69 @@ mod tests {
             list.tab_hits
                 .iter()
                 .any(|(_, hit)| *hit == ListHit::Status(Status::Open))
+        );
+    }
+
+    #[test]
+    fn assigned_shows_only_what_is_assigned_to_you() {
+        let entry = |number: u64, title: &str| Entry {
+            pr: PrRef {
+                repo: "o/r".into(),
+                number,
+            },
+            title: title.into(),
+            author: "someone".into(),
+            updated: format!("2026-11-12T04:0{number}:00Z"),
+            draft: false,
+            ended: None,
+        };
+        let slot = |source: Source, entries: Vec<Entry>| Slot {
+            source,
+            status: Status::Open,
+            entries: Some(entries),
+            fetch: Fetch::Done,
+            background: false,
+        };
+        let mut list = list_of(vec![
+            slot(Source::Authored(Kind::Pull), vec![entry(1, "mine")]),
+            slot(Source::Assigned(Kind::Pull), vec![entry(2, "handed to me")]),
+            slot(Source::Assigned(Kind::Issue), Vec::new()),
+        ]);
+        let titles =
+            |list: &List| -> Vec<String> { list.entries().into_iter().map(|e| e.title).collect() };
+        assert_eq!(titles(&list), ["handed to me", "mine"]);
+        list.show_scope(Scope::Assigned);
+        assert_eq!(titles(&list), ["handed to me"]);
+        assert_eq!(list.all(Kind::Issue).len(), 0);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+            .expect("test terminal");
+        list.kind = Kind::Issue;
+        terminal
+            .draw(|f| draw_list(f, &mut list, 0, None))
+            .expect("draws");
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            text.contains("All  ·  Assigned     Open  ·  Closed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("No open issues are assigned to you."),
+            "{text}"
+        );
+        assert!(text.contains("@ all"), "{text}");
+        assert!(
+            list.tab_hits
+                .iter()
+                .any(|(_, hit)| *hit == ListHit::Scope(Scope::All))
         );
     }
 

@@ -442,7 +442,11 @@ pub fn job_log(repo: &str, job: u64) -> Result<JobLog, PrFailed> {
     if done && !steps.is_empty() {
         match gh(&["api", &format!("repos/{repo}/actions/jobs/{job}/logs")]) {
             Ok(log) => split_log(&log, &mut steps),
-            Err(e) => missing = Some(format!("Couldn't read this job's log: {e}")),
+            Err(e) => {
+                missing = Some(format!(
+                    "Couldn't read this job's log yet; trying again every few seconds. o opens it on GitHub. ({e})"
+                ))
+            }
         }
     }
     Ok(JobLog {
@@ -1032,13 +1036,14 @@ pub enum Source {
     Authored(Kind),
     Reviewing,
     Owned(Kind),
+    Assigned(Kind),
 }
 
 impl Source {
     pub fn kind(&self) -> Kind {
         match self {
             Source::Branch { .. } | Source::Repo(_) | Source::Reviewing => Kind::Pull,
-            Source::Authored(kind) | Source::Owned(kind) => *kind,
+            Source::Authored(kind) | Source::Owned(kind) | Source::Assigned(kind) => *kind,
         }
     }
 
@@ -1051,6 +1056,7 @@ impl Source {
             (Source::Reviewing, Status::Open) => "review-requested:@me".to_owned(),
             (Source::Reviewing, Status::Done) => "reviewed-by:@me".to_owned(),
             (Source::Owned(_), _) => format!("user:{}", viewer()?),
+            (Source::Assigned(_), _) => "assignee:@me".to_owned(),
         };
         let state = match (status, self.kind()) {
             (Status::Open, _) => "is:open",
@@ -1070,6 +1076,7 @@ impl Source {
             Source::Authored(kind) => format!("list-authored-{}", kind.key()),
             Source::Reviewing => "list-reviewing".to_owned(),
             Source::Owned(kind) => format!("list-owned-{}", kind.key()),
+            Source::Assigned(kind) => format!("list-assigned-{}", kind.key()),
         };
         match status {
             Status::Open => key,
@@ -1080,8 +1087,8 @@ impl Source {
 
 /// The searches behind each tab. Pull requests: this branch's (a default
 /// branch has none of its own), this repository's, yours, those waiting on
-/// your review, and those in repositories you own. Issues: yours, and those in
-/// repositories you own.
+/// your review, those in repositories you own, and those assigned to you.
+/// Issues: yours, those in repositories you own, and those assigned to you.
 pub fn sources(here: Option<&str>, branch: Option<&str>) -> Vec<Source> {
     let mut out = Vec::new();
     if let Some(repo) = here {
@@ -1097,8 +1104,10 @@ pub fn sources(here: Option<&str>, branch: Option<&str>) -> Vec<Source> {
         Source::Authored(Kind::Pull),
         Source::Reviewing,
         Source::Owned(Kind::Pull),
+        Source::Assigned(Kind::Pull),
         Source::Authored(Kind::Issue),
         Source::Owned(Kind::Issue),
+        Source::Assigned(Kind::Issue),
     ]);
     out
 }
@@ -1998,9 +2007,15 @@ mod tests {
                 Source::Authored(Kind::Pull),
                 Source::Reviewing,
                 Source::Owned(Kind::Pull),
+                Source::Assigned(Kind::Pull),
                 Source::Authored(Kind::Issue),
                 Source::Owned(Kind::Issue),
+                Source::Assigned(Kind::Issue),
             ]
+        );
+        assert_eq!(
+            Source::Assigned(Kind::Pull).query(Status::Open).unwrap(),
+            "is:pr is:open archived:false assignee:@me sort:updated-desc"
         );
         assert_eq!(
             sources(Some("o/r"), Some("main"))[0],
