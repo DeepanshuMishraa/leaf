@@ -145,6 +145,82 @@ function M.setup(opts)
     if err ~= nil then error("leaf: couldn't open the picker: " .. tostring(err), 0) end
   end
 
+  -- Asking in Rex's palette -------------------------------------------------
+  --
+  -- Rex 17 and later can ask a question in its own command palette
+  -- (`rex.ui.pick`). Pickers ask there, and fall back to leaf's popover when
+  -- no app can show the question or the Rex here is older. leaf prints the
+  -- rows as JSON. On a remote host the files and agents are the host's, so
+  -- those keep the popover, which runs leaf there.
+
+  -- Reasons a prompt couldn't be shown, for which leaf's own picker stands in.
+  local FALL_BACK = { unsupported = true, failed = true }
+
+  -- The answer; or nil and a reason, `fallback` when leaf's picker should ask.
+  local function ask(spec)
+    if type(rex.ui) ~= "table" or type(rex.ui.pick) ~= "function" then
+      return nil, "fallback"
+    end
+    local answer, reason, detail = rex.ui.pick(spec)
+    if answer ~= nil then return answer end
+    if FALL_BACK[reason] then
+      if detail ~= nil then rex.log("warn", "leaf: palette prompt failed: " .. tostring(detail)) end
+      return nil, "fallback"
+    end
+    if reason == "busy" then
+      error("leaf: Rex is already asking something else. Answer or close that, then try again.", 0)
+    end
+    -- cancelled, timeout, or no app connected to answer: nothing to do.
+    return nil, reason
+  end
+
+  -- What leaf prints as JSON for `...`, or nil and why it couldn't.
+  local function leaf_json(...)
+    local result = rex.exec(argv(...), { env = env, timeout = 15 })
+    if result == nil then return nil, "leaf didn't start" end
+    if not result.ok then
+      local why = (result.stderr or ""):gsub("^%s+", ""):gsub("%s+$", "")
+      return nil, why ~= "" and why or "leaf exited with an error"
+    end
+    local ok, value = pcall(rex.json.decode, result.stdout or "")
+    if not ok or type(value) ~= "table" then
+      return nil, "leaf printed something that isn't a list (" .. tostring(value) .. ")"
+    end
+    return value
+  end
+
+  -- Browses for a document in the palette, from `dir`: folders open in place,
+  -- and a path or link can be typed. The target; or nil and a reason.
+  local function pick_document(dir)
+    local listing, err = leaf_json("open", "--list", dir, "--recent")
+    while true do
+      if listing == nil then
+        error("leaf: couldn't list documents: " .. tostring(err), 0)
+      end
+      if listing.kind == "document" then return listing.target end
+      local answer, reason = ask{
+        title = listing.title,
+        placeholder = "Filter, or type a path or a link",
+        items = listing.items,
+        allow_other = true,
+      }
+      if answer == nil then return nil, reason end
+      local next_path
+      if type(answer) == "table" then
+        local text = (answer.text or ""):match("^%s*(.-)%s*$")
+        if text:match("^[Hh][Tt][Tt][Pp][Ss]?://") then return text end
+        if text == "" then return nil, "cancelled" end
+        local first = text:sub(1, 1)
+        next_path = (first == "/" or first == "~") and text or (listing.dir .. "/" .. text)
+      elseif answer:sub(1, 4) == "dir:" then
+        next_path = answer:sub(5)
+      else
+        return (answer:gsub("^open:", ""))
+      end
+      listing, err = leaf_json("open", "--list", next_path)
+    end
+  end
+
   -- Readers -----------------------------------------------------------------
 
   -- A pane shows a leaf document (or, with `diffs`, a diff) while the record
@@ -211,10 +287,18 @@ function M.setup(opts)
     args = { target = "string?" },
     run = function(ctx, args)
       local target = args.target or ""
-      -- Nothing named: leaf's home screen, in this pane (beside it when busy).
+      -- Nothing named: browse in Rex's palette; or leaf's home screen, in
+      -- this pane (beside it when busy), when the palette can't ask.
       if target == "" then
-        place(ctx, "leaf", "open")
-        return
+        if ctx.server == nil then
+          local picked, reason = pick_document(cwd(ctx) or os.getenv("HOME") or "/")
+          if picked == nil and reason ~= "fallback" then return end
+          target = picked or ""
+        end
+        if target == "" then
+          place(ctx, "leaf", "open")
+          return
+        end
       end
       place(ctx, target:match("([^/]+)$") or "leaf", "open", target)
     end,
@@ -315,6 +399,24 @@ function M.setup(opts)
     category = "Leaf",
     keywords = "leaf agent claude codex opencode gemini grok pi cursor default send ask picker",
     run = function(ctx)
+      if ctx.server == nil then
+        local items, err = leaf_json("agents", "--list")
+        if items == nil then error("leaf: couldn't list the agents: " .. tostring(err), 0) end
+        local picked, reason = ask{
+          title = "Send questions to",
+          placeholder = "Search installed agents",
+          items = items,
+        }
+        if picked ~= nil then
+          local result = rex.exec(argv("agents", "--set", picked), { env = env, timeout = 5 })
+          if result == nil or not result.ok then
+            error("leaf: couldn't save the agent (" .. tostring(result and result.stderr)
+              .. "). Questions still go to the agent picked before.", 0)
+          end
+          return
+        end
+        if reason ~= "fallback" then return end
+      end
       popover(ctx, "Agent", pane_command(ctx, "agents"), cwd(ctx))
     end,
   }
@@ -401,6 +503,18 @@ function M.setup(opts)
     run = function(ctx)
       local reader = find_reader(ctx)
       if reader == nil then error(NO_READER, 0) end
+      if ctx.server == nil then
+        local items, err = leaf_json("voices", "--list")
+        if items == nil then error("leaf: couldn't list the voices: " .. tostring(err), 0) end
+        local picked, reason = ask{
+          title = "Read aloud in",
+          placeholder = "Search by name, language or gender",
+          items = items,
+        }
+        -- The reader switches, and saves it as the default.
+        if picked ~= nil then tell(reader, "voice " .. picked) return end
+        if reason ~= "fallback" then return end
+      end
       popover(ctx, "Voice", pane_command(ctx, "voices", "--reader", reader.block_id))
     end,
   }

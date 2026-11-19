@@ -32,6 +32,7 @@ mod mono;
 mod news;
 mod office;
 mod ooxml;
+mod palette;
 mod pdf;
 mod picker;
 mod picture;
@@ -307,6 +308,10 @@ fn main() -> ExitCode {
         "open" => match rest {
             [] => pick_and_open(None),
             [flag, block] if flag == "--beside" => pick_and_open(Some(block)),
+            [flag, path] if flag == "--list" => list_documents(path, false),
+            [flag, path, recent] if flag == "--list" && recent == "--recent" => {
+                list_documents(path, true)
+            }
             [target] => open(target),
             _ => {
                 eprintln!("{USAGE}");
@@ -316,12 +321,21 @@ fn main() -> ExitCode {
         "voices" => match rest {
             [] => voices_command(None),
             [flag, block] if flag == "--reader" => voices_command(Some(block)),
+            [flag] if flag == "--list" => list_voices(),
             _ => {
                 eprintln!("{USAGE}");
                 ExitCode::from(2)
             }
         },
-        "agents" => agents_command(),
+        "agents" => match rest {
+            [] => agents_command(),
+            [flag] if flag == "--list" => list_agents(),
+            [flag, name] if flag == "--set" => set_agent(name),
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         "plan" => margin::plan_command(rest),
         "review" => margin::review_command(rest),
         "agent" => hook::agent_command(rest),
@@ -439,6 +453,95 @@ fn pick_and_open(beside: Option<&str>) -> ExitCode {
         Err(e) => {
             eprintln!("leaf: couldn't open {target} in that pane ({e}). Opening it here instead.");
             open(&target)
+        }
+    }
+}
+
+/// Prints `value` as one line of JSON for the Rex plugin.
+fn print_json(value: &impl serde::Serialize) -> ExitCode {
+    match serde_json::to_string(value) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("leaf: couldn't write the list as JSON ({e}).");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `leaf open --list PATH [--recent]`: what Rex's palette offers in `PATH`.
+fn list_documents(path: &str, with_recent: bool) -> ExitCode {
+    let recent = with_recent
+        .then(|| {
+            Store::open(&progress::default_path())
+                .and_then(|store| store.recent(30))
+                .ok()
+        })
+        .flatten();
+    match palette::documents(path, recent.as_deref()) {
+        Ok(listing) => print_json(&listing),
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `leaf voices --list`: every voice for Rex's palette, or the built-in
+/// ones when Microsoft's list doesn't come within a few seconds.
+fn list_voices() -> ExitCode {
+    let current = Store::open(&progress::default_path())
+        .ok()
+        .and_then(|s| s.load_voice().ok().flatten())
+        .unwrap_or_else(|| edge::DEFAULT_VOICE.to_owned());
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(edge::voices());
+    });
+    let voices = match receive.recv_timeout(std::time::Duration::from_secs(6)) {
+        Ok(Ok(voices)) if !voices.is_empty() => voices,
+        _ => edge::built_in(),
+    };
+    print_json(&palette::voices(&voices, &current))
+}
+
+/// `leaf agents --list`: the installed agents for Rex's palette.
+fn list_agents() -> ExitCode {
+    let current = Store::open(&progress::default_path())
+        .ok()
+        .and_then(|store| store.load_agent().ok().flatten());
+    print_json(&palette::agents(&agent::installed(), current.as_deref()))
+}
+
+/// `leaf agents --set NAME`: questions go to NAME from now on; `any` clears it.
+fn set_agent(name: &str) -> ExitCode {
+    let installed = agent::installed();
+    let pick = if name == palette::ANY_AGENT {
+        None
+    } else {
+        match installed.iter().find(|a| a.name == name) {
+            Some(agent) => Some(agent.name),
+            None => {
+                let names: Vec<_> = installed.iter().map(|a| a.name).collect();
+                eprintln!(
+                    "leaf: {name} isn't an installed agent here. Installed: {}. The agent is unchanged.",
+                    if names.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+                return ExitCode::from(2);
+            }
+        }
+    };
+    match Store::open(&progress::default_path()).and_then(|store| store.save_agent(pick)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: {e} Questions still go to the agent picked before.");
+            ExitCode::from(1)
         }
     }
 }

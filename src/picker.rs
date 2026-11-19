@@ -54,7 +54,7 @@ pub fn tilde(path: &str) -> String {
     }
 }
 
-fn expand(typed: &str) -> PathBuf {
+pub(crate) fn expand(typed: &str) -> PathBuf {
     match typed.strip_prefix('~') {
         Some(rest) => PathBuf::from(format!(
             "{}{rest}",
