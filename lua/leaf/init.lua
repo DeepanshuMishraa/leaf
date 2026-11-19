@@ -205,9 +205,9 @@ function M.setup(opts)
     name = "leaf_open",
     title = "Leaf: Open Document…",
     description = "Open leaf's home in this pane: today's reading, a heat map of the days you read,"
-      .. " and a search over recent documents and this folder's PDFs, EPUBs and markdown files.",
+      .. " and a search over recent documents and this folder's PDFs, EPUBs, markdown and office files.",
     category = "Leaf",
-    keywords = "leaf pdf markdown epub read document article book file picker",
+    keywords = "leaf pdf markdown epub word powerpoint excel slides spreadsheet read document article book file picker",
     args = { target = "string?" },
     run = function(ctx, args)
       local target = args.target or ""

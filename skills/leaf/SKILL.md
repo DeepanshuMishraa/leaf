@@ -1,11 +1,11 @@
 ---
 name: leaf
-description: Use leaf, a terminal reader and code reviewer, to show the person documents, diffs and pull requests, read the comments they leave, and hand plans or changes to them for review. Use when the person mentions leaf, asks to read or show a PDF, Markdown file, article, diff or pull request in the terminal, or asks for their review.
+description: Use leaf, a terminal reader and code reviewer, to show the person documents, diffs and pull requests, read the comments they leave, and hand plans or changes to them for review. Use when the person mentions leaf, asks to read or show a PDF, Markdown file, Word document, slide deck, spreadsheet, article, diff or pull request in the terminal, or asks for their review.
 ---
 
 # leaf
 
-leaf reads PDFs, EPUBs, Markdown files and web articles in the terminal, and reviews diffs and GitHub pull requests. The person reads in leaf. You start it, hand it files, and read what they leave behind.
+leaf reads PDFs, EPUBs, Markdown files, Word documents, slide decks, spreadsheets and web articles in the terminal, and reviews diffs and GitHub pull requests. The person reads in leaf. You start it, hand it files, and read what they leave behind.
 
 ## Before you run it
 
@@ -21,7 +21,7 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 
 | Command | What it opens |
 |---|---|
-| `leaf open <file or url>`, or just `leaf <file>` | A PDF, EPUB or Markdown file, or a web article. It reopens where the person left off. |
+| `leaf open <file or url>`, or just `leaf <file>` | A PDF, EPUB, Markdown file, Word document, slide deck or spreadsheet, or a web article. It reopens where the person left off. |
 | `leaf diff` | Unstaged changes. `--staged`, `--branch` (this branch against its base), `--base <ref>`, a range such as `main...HEAD`, a path, a `.patch` file or a GitHub PR, commit or compare link. `--inline` uses one column. |
 | `leaf pr` | The person's open pull requests and issues. `leaf pr 12`, `leaf pr owner/repo#12` or a PR link opens one, with Summary, Timeline and Comments tabs, plus Code and Checks for a pull request. In the list, `←/→` switch pull requests and issues, `tab` switches open and merged/closed, `R` reloads. |
 | `leaf plan <plan.md>` | Plan review, block by block. |

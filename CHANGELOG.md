@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Open Word documents (`.docx`), slide decks (`.pptx`) and spreadsheets (`.xlsx`, `.xls`, `.ods`, `.csv`, `.tsv`). leaf reads them itself on macOS and Linux, with no LibreOffice, Keynote or Numbers. Decks and documents show as designed, in their own fonts, colors and layout, and spreadsheets as a grid; `+`/`-` zoom, `o` switches to the terminal's font, and `i` paints the designed page in the terminal's colors. Decks show one slide per page with speaker notes, Word documents keep their pages, and `.xlsx`/`.xlsm` workbooks keep their cell styles, column widths and row heights.
 - Configure the document reader's maximum width in `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config.toml`). Omitted settings keep the 76-column layout.
 - Keep the reading position within PDF and EPUB pages when resizing in scroll mode.
 - `<` and `>` narrow or widen the reading column, and `=` fits it to the screen, so wide diagrams can be read without quitting.

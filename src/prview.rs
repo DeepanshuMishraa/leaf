@@ -4187,7 +4187,7 @@ fn with_media(body: &str, width: u16, indent: u16, gallery: &mut Gallery) -> Bod
     let mut laid = {
         let gallery = &*gallery;
         render::layout(&prepared.markdown, width.max(10), gallery.cell(), &|href| {
-            gallery.size(href)
+            gallery.size(href).map(render::ImageSize::from)
         })
     };
     for figure in &mut laid.figures {

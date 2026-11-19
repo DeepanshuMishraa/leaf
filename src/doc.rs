@@ -79,13 +79,16 @@ impl Watch {
     }
 
     pub fn document(&mut self, load: fn(&Path) -> Result<Doc, String>) -> Option<Doc> {
+        // Big office files take a moment to lay out, so they load in the
+        // background like PDFs and EPUBs.
         let paged = self
             .path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| {
                 extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("epub")
-            });
+            })
+            || crate::office::Kind::of(&self.path).is_some();
         if !paged {
             return self.read(load);
         }
@@ -109,7 +112,7 @@ impl Watch {
             };
         }
         let at = self.changed()?;
-        self.pending = Some((at, crate::pdf::Loading::open(self.path.clone())));
+        self.pending = Some((at, crate::pdf::Loading::with(self.path.clone(), load)));
         None
     }
 }
@@ -137,9 +140,40 @@ pub trait Source {
     fn is_diagram(&self, _id: &str) -> bool {
         false
     }
+    /// Whether an embedded image is a whole page drawn as designed, shown
+    /// as tall as the column's width makes it rather than capped.
+    fn is_page(&self, _id: &str) -> bool {
+        false
+    }
     /// A diagram drawn in `ink` on a transparent `paper`, at most `width` pixels wide.
     fn draw(&self, _id: &str, _width: u32, _ink: Rgb, _paper: Rgb) -> Option<RgbaImage> {
         None
+    }
+    /// How the document is shown, for one that can be shown two ways;
+    /// `None` for one that can't.
+    fn look(&self) -> Option<Look> {
+        None
+    }
+    /// Shows the document another way. Pages keep their numbers, so the
+    /// reader stays on the same page.
+    fn set_look(&self, _look: Look) {}
+}
+
+/// The two ways an office document can be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look {
+    /// As its author designed it: its own fonts, colors and layout, drawn as a picture.
+    Original,
+    /// As text in the terminal's own font and colors.
+    Terminal,
+}
+
+impl Look {
+    pub fn other(self) -> Look {
+        match self {
+            Look::Original => Look::Terminal,
+            Look::Terminal => Look::Original,
+        }
     }
 }
 

@@ -398,6 +398,8 @@ pub struct App {
     /// Rows the text area shows.
     view_height: u16,
     image_mode: ImageMode,
+    /// How an office document is shown (`o` switches); `None` for other documents.
+    shown_as: Option<crate::doc::Look>,
     ink: Option<Rgb>,
     paper: Option<Rgb>,
     /// The theme and the UI setting, followed while the document is open.
@@ -538,6 +540,7 @@ impl App {
             picked: None,
             ink_drawn: HashMap::new(),
             image_mode: options.image_mode,
+            shown_as: doc.source.look(),
             highlights: options.highlights.clone(),
             hue: Hue::default(),
             notice: None,
@@ -632,6 +635,9 @@ impl App {
         }
         self.hold_anchor();
         self.doc = doc;
+        if let Some(look) = self.shown_as {
+            self.doc.source.set_look(look);
+        }
         self.current = self.current.min(self.last());
         self.laid.clear();
         self.retain_protocols(|_| false);
@@ -649,11 +655,21 @@ impl App {
         self.pages().saturating_sub(1)
     }
 
-    fn image_size(&self, href: &str) -> Option<(u32, u32)> {
+    fn image_size(&self, href: &str) -> Option<render::ImageSize> {
         match Doc::image_ref(href) {
-            ImageRef::Embedded(id) => self.doc.source.image_size(id),
+            ImageRef::Embedded(id) => {
+                let pixels = self.doc.source.image_size(id)?;
+                Some(render::ImageSize {
+                    pixels,
+                    kind: if self.doc.source.is_page(id) {
+                        render::ImageKind::Page
+                    } else {
+                        render::ImageKind::Figure
+                    },
+                })
+            }
             ImageRef::Remote(url) => match self.remote.get(url) {
-                Some(Remote::Ready(image)) => Some(image.dimensions()),
+                Some(Remote::Ready(image)) => Some(image.dimensions().into()),
                 _ => None,
             },
         }
@@ -816,6 +832,24 @@ impl App {
             let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
             self.strokes.iter().any(|i| pages.contains(&i.stroke.page))
         };
+        if let Some(look) = self.shown_as {
+            let images = match self.image_mode {
+                ImageMode::Color => "i paint",
+                ImageMode::Mono => "i real colors",
+            };
+            // While a drawing is picked, + and - resize it instead.
+            let zoom = if self.picked.is_some() {
+                ""
+            } else {
+                " · + - zoom"
+            };
+            footer = match look {
+                crate::doc::Look::Original => {
+                    format!("{footer}{zoom} · {images} · o terminal font")
+                }
+                crate::doc::Look::Terminal => format!("{footer} · o original look"),
+            };
+        }
         match &self.notice {
             Some(notice) => format!("{footer} · {notice}"),
             None if hidden => format!("{footer} · drawings here need Kitty graphics to show"),
@@ -1526,8 +1560,17 @@ impl App {
             ("[  ]", "read slower / faster"),
             (",  .", "previous / next sentence aloud"),
             ("s", "pick a voice"),
-            ("<  >  =", "narrower / wider / fit column"),
+            ("<  >  =", "narrower / wider / fit column (- + too)"),
         ]);
+        if let Some(look) = self.shown_as {
+            rows.push((
+                "o",
+                match look {
+                    crate::doc::Look::Original => "show in the terminal's font",
+                    crate::doc::Look::Terminal => "show as designed",
+                },
+            ));
+        }
         rows.push((
             "i",
             if self.image_mode == ImageMode::Color {
@@ -2055,6 +2098,17 @@ impl App {
         self.follow = true;
         if self.narrator.active() {
             return self.narrator.toggle();
+        }
+        // A page drawn as designed is a picture, with no words to read, so
+        // reading aloud shows the words and starts at the top of the page.
+        if self.shown_as == Some(crate::doc::Look::Original) {
+            self.toggle_look();
+            self.notice = Some("reading the text aloud; o shows the design again".into());
+            self.narrator.start(Spot {
+                page: self.current,
+                offset: 0,
+            });
+            return;
         }
         let from = match self.selection.map(Selection::range) {
             Some((start, end)) if start != end => {
@@ -2660,6 +2714,7 @@ impl App {
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
+            Some('o') => self.toggle_look(),
             Some('d') | Some('D') => self.take_tool(Tool::Pen),
             Some('e') | Some('E') => self.take_tool(Tool::Eraser),
             Some('v') | Some('V') => self.take_tool(Tool::Move),
@@ -2670,12 +2725,12 @@ impl App {
             Some(']') => self.change_speed(true),
             // From the width the screen allows, so a column it narrowed answers at
             // once, and from the one asked for, so presses before the next frame add up.
-            Some('<') => {
+            Some('<' | '-') => {
                 let now = self.reading_width.within(self.room);
                 self.reading_width =
                     ReadingWidth::Columns(now.saturating_sub(WIDTH_STEP).max(MIN_WIDTH))
             }
-            Some('>') => {
+            Some('>' | '+') => {
                 let now = self.reading_width.within(self.room);
                 self.reading_width = ReadingWidth::Columns(now.saturating_add(WIDTH_STEP))
             }
@@ -2752,6 +2807,27 @@ impl App {
         } else {
             self.scroll_by(-self.screen_step());
         }
+    }
+
+    /// Switches an office document between its own design and terminal text,
+    /// staying on the same page.
+    fn toggle_look(&mut self) {
+        let Some(look) = self.shown_as.map(crate::doc::Look::other) else {
+            return;
+        };
+        // What was being read aloud is gone from the page, as on a reload.
+        if self.narrator.active() {
+            self.narrator.stop();
+            self.notice = Some("the page changed, so reading aloud stopped".into());
+        }
+        self.shown_as = Some(look);
+        self.doc.source.set_look(look);
+        self.laid.clear();
+        self.retain_protocols(|_| false);
+        self.pixels.clear();
+        self.selection = None;
+        self.search = None;
+        self.offset = 0;
     }
 
     fn toggle_images(&mut self) {

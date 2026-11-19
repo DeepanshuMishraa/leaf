@@ -1,7 +1,7 @@
 # Completions for leaf. Install: ln -s (pwd)/completions/leaf.fish ~/.config/fish/completions/
 complete -c leaf -f
-complete -c leaf -n __fish_use_subcommand -a open -d 'Read a PDF, markdown file or web page'
-complete -c leaf -n '__fish_seen_subcommand_from open' -a '(__fish_complete_suffix .pdf .epub .md .markdown .png .jpg .jpeg .jpe .jfif .gif .webp .bmp .ico .tif .tiff .tga .pnm .pbm .pgm .ppm .pam .qoi .hdr .exr .dds .ff .svg)'
+complete -c leaf -n __fish_use_subcommand -a open -d 'Read a PDF, office file, markdown file or web page'
+complete -c leaf -n '__fish_seen_subcommand_from open' -a '(__fish_complete_suffix .pdf .epub .md .markdown .docx .docm .dotx .dotm .pptx .pptm .ppsx .ppsm .potx .potm .xlsx .xlsm .xlsb .xls .xla .xlam .ods .csv .tsv .png .jpg .jpeg .jpe .jfif .gif .webp .bmp .ico .tif .tiff .tga .pnm .pbm .pgm .ppm .pam .qoi .hdr .exr .dds .ff .svg)'
 # HEIC, HEIF, AVIF and JPEG XL need macOS's sips.
 test (uname) = Darwin; and complete -c leaf -n '__fish_seen_subcommand_from open' -a '(__fish_complete_suffix .jxl .heic .heif .avif)'
 complete -c leaf -n __fish_use_subcommand -a diff -d 'Review a diff'

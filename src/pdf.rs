@@ -1505,6 +1505,20 @@ impl Source for Worker {
         let id = id.to_owned();
         self.read(move |source| source.decode(&id, width)).flatten()
     }
+
+    fn is_page(&self, id: &str) -> bool {
+        let id = id.to_owned();
+        self.read(move |source| source.is_page(&id))
+            .unwrap_or(false)
+    }
+
+    fn look(&self) -> Option<crate::doc::Look> {
+        self.read(|source| source.look()).flatten()
+    }
+
+    fn set_look(&self, look: crate::doc::Look) {
+        self.read(move |source| source.set_look(look));
+    }
 }
 
 pub struct Loading {
@@ -1513,8 +1527,10 @@ pub struct Loading {
 }
 
 impl Loading {
-    pub fn open(path: PathBuf) -> Self {
-        Self::spawn(move || open(&path))
+    /// Loads `path` with `load` in the background, for any document whose
+    /// source must stay on the thread that made it.
+    pub fn with(path: PathBuf, load: fn(&Path) -> Result<Doc, String>) -> Self {
+        Self::spawn(move || load(&path).map_err(|message| PdfOpenFailed { message }))
     }
 
     fn spawn(load: impl FnOnce() -> Result<Doc, PdfOpenFailed> + Send + 'static) -> Self {
@@ -2228,5 +2244,35 @@ mod epub_tests {
             text.contains("Chapter One") && text.contains("Hello from an epub"),
             "got: {text}"
         );
+    }
+
+    #[test]
+    fn an_office_file_loaded_in_the_background_switches_looks_through_the_worker() {
+        let dir = std::env::temp_dir().join(format!("leaf-loading-office-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("people.csv");
+        std::fs::write(&path, "name,age\nAda,36\n").unwrap();
+        let loading = Loading::with(path, crate::office::open);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let doc = loop {
+            if let Some(result) = loading.poll() {
+                break result.unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the loader never finished"
+            );
+            std::thread::yield_now();
+        };
+        use crate::doc::Look;
+        assert_eq!(doc.source.look(), Some(Look::Original));
+        assert!(doc.source.is_page("grid-0"));
+        assert!(!doc.source.is_page("pic:x.png"));
+        doc.source.set_look(Look::Terminal);
+        assert_eq!(doc.source.look(), Some(Look::Terminal));
+        assert!(doc.source.page(0).starts_with("| name | age |"));
+        drop(doc);
+        drop(loading);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
