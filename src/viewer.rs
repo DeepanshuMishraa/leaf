@@ -655,11 +655,21 @@ impl App {
         self.pages().saturating_sub(1)
     }
 
-    fn image_size(&self, href: &str) -> Option<(u32, u32)> {
+    fn image_size(&self, href: &str) -> Option<render::ImageSize> {
         match Doc::image_ref(href) {
-            ImageRef::Embedded(id) => self.doc.source.image_size(id),
+            ImageRef::Embedded(id) => {
+                let pixels = self.doc.source.image_size(id)?;
+                Some(render::ImageSize {
+                    pixels,
+                    kind: if self.doc.source.is_page(id) {
+                        render::ImageKind::Page
+                    } else {
+                        render::ImageKind::Figure
+                    },
+                })
+            }
             ImageRef::Remote(url) => match self.remote.get(url) {
-                Some(Remote::Ready(image)) => Some(image.dimensions()),
+                Some(Remote::Ready(image)) => Some(image.dimensions().into()),
                 _ => None,
             },
         }
@@ -828,7 +838,9 @@ impl App {
                 ImageMode::Mono => "i real colors",
             };
             footer = match look {
-                crate::doc::Look::Original => format!("{footer} · {images} · o terminal font"),
+                crate::doc::Look::Original => {
+                    format!("{footer} · + - zoom · {images} · o terminal font")
+                }
                 crate::doc::Look::Terminal => format!("{footer} · o original look"),
             };
         }
@@ -1544,6 +1556,9 @@ impl App {
             ("s", "pick a voice"),
             ("<  >  =", "narrower / wider / fit column"),
         ]);
+        if self.shown_as.is_some() {
+            rows.push(("+  -", "zoom in / out"));
+        }
         if let Some(look) = self.shown_as {
             rows.push((
                 "o",
@@ -2696,12 +2711,12 @@ impl App {
             Some(']') => self.change_speed(true),
             // From the width the screen allows, so a column it narrowed answers at
             // once, and from the one asked for, so presses before the next frame add up.
-            Some('<') => {
+            Some('<' | '-') => {
                 let now = self.reading_width.within(self.room);
                 self.reading_width =
                     ReadingWidth::Columns(now.saturating_sub(WIDTH_STEP).max(MIN_WIDTH))
             }
-            Some('>') => {
+            Some('>' | '+') => {
                 let now = self.reading_width.within(self.room);
                 self.reading_width = ReadingWidth::Columns(now.saturating_add(WIDTH_STEP))
             }

@@ -14,8 +14,9 @@ use image::RgbaImage;
 use crate::doc::{Doc, Look, Source};
 use crate::grid::{Grid, Looks, letters};
 
-/// Width a page is measured at before the screen picks the real one.
-const MEASURE_WIDTH: u32 = 1600;
+/// Points of sheet that fill the reading column, about a letter page's
+/// width: a sheet of a few columns takes part of it, a wide one all of it.
+const COLUMN_POINTS: f32 = 612.0;
 /// Widest a page is drawn, in pixels.
 const MAX_WIDTH: u32 = 3200;
 
@@ -90,16 +91,20 @@ impl Source for Book {
 
     fn image_size(&self, id: &str) -> Option<(u32, u32)> {
         let (w, h) = self.grid(id.strip_prefix("grid-")?.parse().ok()?)?.size();
-        let ratio = h / w.max(1.0);
+        let scale = crate::render::PAGE_PIXELS as f32 / COLUMN_POINTS;
         Some((
-            MEASURE_WIDTH,
-            (MEASURE_WIDTH as f32 * ratio).round().max(1.0) as u32,
+            (w * scale).round().max(1.0) as u32,
+            (h * scale).round().max(1.0) as u32,
         ))
     }
 
     fn decode(&self, id: &str, width: u32) -> Option<RgbaImage> {
         let svg = self.grid(id.strip_prefix("grid-")?.parse().ok()?)?.svg();
         crate::typeset::rasterize(&svg, width.clamp(1, MAX_WIDTH))
+    }
+
+    fn is_page(&self, id: &str) -> bool {
+        id.starts_with("grid-")
     }
 
     fn look(&self) -> Option<Look> {

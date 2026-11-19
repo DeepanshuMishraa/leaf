@@ -106,16 +106,32 @@ impl Laid {
 /// Rough pixels per terminal column, so small images aren't blown up to full width.
 const PIXELS_PER_COLUMN: u32 = 8;
 
+/// A page image this many pixels wide fills the column; a narrower one (a
+/// spreadsheet of a few columns) takes its share, so every page keeps one
+/// scale and widening the column zooms them all alike.
+pub const PAGE_PIXELS: u32 = 1600;
+
 /// Terminal cell size for an image, given the column budget, the image's
 /// pixel size and a cell's pixel size (for its shape).
-pub fn image_cells(max_cols: u16, width: u32, height: u32, cell: (u16, u16)) -> (u16, u16) {
-    let (width, height) = (width.max(1), height.max(1));
+pub fn image_cells(max_cols: u16, size: ImageSize, cell: (u16, u16)) -> (u16, u16) {
+    let (width, height) = (size.pixels.0.max(1), size.pixels.1.max(1));
     let (cell_w, cell_h) = (cell.0.max(1) as u32, cell.1.max(1) as u32);
-    let cols = (width.div_ceil(PIXELS_PER_COLUMN) as u16).clamp(1, max_cols.max(1));
+    let max_cols = max_cols.max(1);
+    let (cols, tallest) = match size.kind {
+        ImageKind::Figure => (
+            (width.div_ceil(PIXELS_PER_COLUMN) as u16).clamp(1, max_cols),
+            MAX_IMAGE_ROWS,
+        ),
+        ImageKind::Page => (
+            ((max_cols as u32 * width.min(PAGE_PIXELS)).div_ceil(PAGE_PIXELS) as u16)
+                .clamp(1, max_cols),
+            u16::MAX,
+        ),
+    };
     let rows =
         ((cols as f32 * cell_w as f32 * height as f32 / width as f32 / cell_h as f32).round()
             as u16)
-            .clamp(1, MAX_IMAGE_ROWS);
+            .clamp(1, tallest);
     (cols, rows)
 }
 
@@ -580,8 +596,34 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
 // ---------------------------------------------------------------------------
 // Layout.
 
-/// Pixel sizes of images, when known.
-pub type ImageSizes<'a> = &'a dyn Fn(&str) -> Option<(u32, u32)>;
+/// What an image is, which decides how tall it may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    /// A figure among text, capped so it never fills several screens.
+    Figure,
+    /// A whole page (an office document drawn as designed), as tall as its
+    /// width makes it, so widening the column zooms it.
+    Page,
+}
+
+/// An image's size in pixels, and what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSize {
+    pub pixels: (u32, u32),
+    pub kind: ImageKind,
+}
+
+impl From<(u32, u32)> for ImageSize {
+    fn from(pixels: (u32, u32)) -> Self {
+        ImageSize {
+            pixels,
+            kind: ImageKind::Figure,
+        }
+    }
+}
+
+/// Sizes of images, when known.
+pub type ImageSizes<'a> = &'a dyn Fn(&str) -> Option<ImageSize>;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Align {
@@ -694,7 +736,7 @@ impl Ctx<'_> {
     fn figures(&mut self, hrefs: &[String], x: u16, width: u16) {
         for href in hrefs {
             let (cols, rows) = match (self.image_sizes)(href) {
-                Some((w, h)) => image_cells(width, w, h, self.cell),
+                Some(size) => image_cells(width, size, self.cell),
                 None if href.starts_with("http") => (width, REMOTE_IMAGE_ROWS),
                 None => continue,
             };
@@ -1215,7 +1257,7 @@ pub fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSi
 mod tests {
     use super::*;
 
-    fn no_images(_: &str) -> Option<(u32, u32)> {
+    fn no_images(_: &str) -> Option<ImageSize> {
         None
     }
 
@@ -1410,7 +1452,7 @@ mod tests {
             )[..2],
             ["More", ""]
         );
-        let sizes = |_: &str| Some((160, 80));
+        let sizes = |_: &str| Some(ImageSize::from((160, 80)));
         let laid = layout(
             "<p align=\"center\"><img src=\"leaf-image:0\"></p>",
             40,
@@ -1422,7 +1464,7 @@ mod tests {
 
     #[test]
     fn images_alone_in_a_paragraph_hold_space_as_figures() {
-        let sizes = |_: &str| Some((160, 80));
+        let sizes = |_: &str| Some(ImageSize::from((160, 80)));
         let laid = layout("![](leaf-image:a)", 76, (8, 16), &sizes);
         assert_eq!(
             laid.figures,
@@ -1435,6 +1477,28 @@ mod tests {
             }]
         );
         assert_eq!(laid.rows.len(), 1 + 5 + 1);
+    }
+
+    #[test]
+    fn pages_fill_the_column_uncapped_and_narrow_pages_take_their_share() {
+        let page = |pixels| ImageSize {
+            pixels,
+            kind: ImageKind::Page,
+        };
+        // A portrait page is as tall as its width makes it, past a figure's cap.
+        let (cols, rows) = image_cells(76, page((PAGE_PIXELS, PAGE_PIXELS * 1294 / 1000)), (8, 16));
+        assert_eq!(cols, 76);
+        assert!(rows > MAX_IMAGE_ROWS, "{rows}");
+        // Widening the column zooms it.
+        assert_eq!(
+            image_cells(152, page((PAGE_PIXELS, PAGE_PIXELS)), (8, 16)).0,
+            152
+        );
+        // Half a page wide takes half the column.
+        assert_eq!(image_cells(76, page((PAGE_PIXELS / 2, 100)), (8, 16)).0, 38);
+        // A figure keeps its cap.
+        let figure = ImageSize::from((PAGE_PIXELS, PAGE_PIXELS * 2));
+        assert_eq!(image_cells(76, figure, (8, 16)).1, MAX_IMAGE_ROWS);
     }
 
     fn plain_cells(text: &str) -> Vec<Cell> {

@@ -25,7 +25,7 @@ use crate::ooxml::{
 use roxmltree::{Document, Node};
 
 /// Width slides are measured at before the screen picks the real one.
-const MEASURE_WIDTH: u32 = 1920;
+const MEASURE_WIDTH: u32 = crate::render::PAGE_PIXELS;
 /// Widest a slide is drawn, in pixels.
 const MAX_WIDTH: u32 = 3200;
 
@@ -203,46 +203,23 @@ impl Deck {
             number: index + 1,
             map: Cell::new(NO_MAP),
         };
-        let mut blocks: Vec<(f32, f32, String)> = Vec::new();
+        let mut blocks = Vec::new();
         if let Some(t) = tree(slide.root_element()) {
-            self.collect_text(&ctx, t, &mut blocks, None);
+            self.collect_text(&ctx, t, &mut blocks);
         }
-        // Titles first, then top to bottom, left to right.
-        blocks.sort_by(|a, b| {
-            (!a.2.starts_with("## "))
-                .cmp(&!b.2.starts_with("## "))
-                .then(a.1.total_cmp(&b.1))
-                .then(a.0.total_cmp(&b.0))
-        });
-        Some(
-            blocks
-                .into_iter()
-                .map(|(_, _, md)| md)
-                .filter(|md| !md.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        )
+        Some(slide_markdown(blocks, self.size))
     }
 
-    fn collect_text(
-        &self,
-        ctx: &Ctx,
-        tree: Node,
-        out: &mut Vec<(f32, f32, String)>,
-        at: Option<(f32, f32)>,
-    ) {
+    fn collect_text(&self, ctx: &Ctx, tree: Node, out: &mut Vec<TextBlock>) {
         for node in shapes(tree) {
-            let position = |n: Node| {
-                at.or_else(|| {
-                    let x = n
-                        .children()
-                        .find(|c| c.local().ends_with("SpPr") || c.local() == "spPr")
-                        .and_then(|p| p.child("xfrm"))
-                        .or_else(|| n.child("xfrm"))
-                        .and_then(drawing::xfrm)?;
-                    Some((x.0.x, x.0.y))
-                })
-                .unwrap_or((0.0, 0.0))
+            // Where a shape sits on the slide, through the groups around it.
+            let rect = |n: Node| {
+                Ctx::props(n)
+                    .and_then(|p| p.child("xfrm"))
+                    .or_else(|| n.child("xfrm"))
+                    .and_then(drawing::xfrm)
+                    .map(|(r, ..)| ctx.mapped(r))
+                    .unwrap_or_default()
             };
             match node.local() {
                 "sp" => {
@@ -251,23 +228,44 @@ impl Deck {
                     };
                     let ph = placeholder(node);
                     let (master_ph, layout_ph) = ctx.inherited(ph);
-                    let (x, y) = at.unwrap_or_else(|| {
-                        ctx.xfrm(node, master_ph, layout_ph)
-                            .map(|(r, ..)| (r.x, r.y))
-                            .unwrap_or((0.0, 0.0))
-                    });
-                    let heading = ph
+                    let rect = ctx
+                        .xfrm(node, master_ph, layout_ph)
+                        .map(|(r, ..)| r)
+                        .unwrap_or_default();
+                    let title = ph
                         .and_then(|(kind, _)| kind)
-                        .filter(|k| matches!(*k, "title" | "ctrTitle"))
-                        .map(|_| 2);
+                        .is_some_and(|k| matches!(k, "title" | "ctrTitle"));
                     let cascade = ctx.cascade(node, ph, master_ph, layout_ph, &ctx.theme.clone());
-                    let md = drawing::body_markdown(body, heading, &cascade, ctx.theme);
-                    out.push((x, y, md));
+                    let md = drawing::body_markdown(body, title.then_some(2), &cascade, ctx.theme);
+                    // Its largest size set in the text, else the size it inherits.
+                    let size = body
+                        .descendants()
+                        .filter(|n| n.has_tag_name_local("rPr"))
+                        .filter_map(|n| n.attribute("sz")?.parse::<f32>().ok())
+                        .fold(0.0f32, f32::max)
+                        / 100.0;
+                    let size = if size > 0.0 {
+                        size
+                    } else {
+                        cascade.level(0, ctx.theme, None).run.size.unwrap_or(0.0)
+                    };
+                    out.push(TextBlock {
+                        rect,
+                        kind: if title {
+                            BlockKind::Title
+                        } else {
+                            BlockKind::Text { size }
+                        },
+                        md,
+                    });
                 }
-                "grpSp" => {
-                    let pos = position(node);
-                    self.collect_text(ctx, node, out, Some(pos));
-                }
+                "grpSp" => match ctx.enter_group(node) {
+                    Some((_, _, outer)) => {
+                        self.collect_text(ctx, node, out);
+                        ctx.map.set(outer);
+                    }
+                    None => self.collect_text(ctx, node, out),
+                },
                 "pic" => {
                     let Some(id) = node.child("blipFill").and_then(drawing::blip) else {
                         continue;
@@ -275,20 +273,26 @@ impl Deck {
                     let Some(rel) = rel_by_id(&ctx.part.rels, id) else {
                         continue;
                     };
-                    let (x, y) = position(node);
-                    out.push((
-                        x,
-                        y,
-                        format!("![]({})", Doc::image_href(&self.picture_id(&rel.target))),
-                    ));
+                    out.push(TextBlock {
+                        rect: rect(node),
+                        kind: BlockKind::Picture,
+                        md: format!("![]({})", Doc::image_href(&self.picture_id(&rel.target))),
+                    });
                 }
                 "graphicFrame" => {
-                    let (x, y) = position(node);
+                    let rect = rect(node);
                     let Some(data) = node.path(&["graphic", "graphicData"]) else {
                         continue;
                     };
+                    let mut push = |md: String| {
+                        out.push(TextBlock {
+                            rect,
+                            kind: BlockKind::Other,
+                            md,
+                        })
+                    };
                     if let Some(tbl) = data.child("tbl") {
-                        out.push((x, y, table_markdown(tbl)));
+                        push(table_markdown(tbl));
                     } else if let Some(chart) = data.child("chart") {
                         let md = chart
                             .attr("id")
@@ -296,7 +300,7 @@ impl Deck {
                             .and_then(|r| self.package.text(&r.target))
                             .map(|xml| crate::chart::markdown(&xml, ctx.theme))
                             .unwrap_or_default();
-                        out.push((x, y, md));
+                        push(md);
                     } else if let Some(xml) = smartart(&self.package, &ctx.part.rels, data) {
                         let lines: Vec<String> = Document::parse(&xml.0)
                             .ok()
@@ -314,7 +318,7 @@ impl Deck {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        out.push((x, y, lines.join("\n")));
+                        push(lines.join("\n"));
                     }
                 }
                 _ => {}
@@ -555,10 +559,13 @@ struct Ctx<'a, 'i> {
     number: usize,
     /// How the group being drawn maps its children's coordinates onto the
     /// slide: scale x and y, then offset x and y.
-    map: Cell<(f32, f32, f32, f32)>,
+    map: Cell<Map>,
 }
 
-const NO_MAP: (f32, f32, f32, f32) = (1.0, 1.0, 0.0, 0.0);
+/// How a group maps its children onto the slide: scale x and y, then shift x and y.
+type Map = (f32, f32, f32, f32);
+
+const NO_MAP: Map = (1.0, 1.0, 0.0, 0.0);
 
 impl<'a, 'i> Ctx<'a, 'i> {
     fn mapped(&self, r: Rect) -> Rect {
@@ -906,14 +913,27 @@ impl<'a, 'i> Ctx<'a, 'i> {
     }
 
     fn group(&self, canvas: &mut Canvas, node: Node<'a, 'i>, skip_placeholders: bool) {
-        let Some(x) = Self::props(node).and_then(|p| p.child("xfrm")) else {
+        let Some((rect, rot, outer)) = self.enter_group(node) else {
             self.draw_tree(canvas, node, skip_placeholders);
             return;
         };
-        let Some((own, rot, ..)) = drawing::xfrm(x) else {
-            self.draw_tree(canvas, node, skip_placeholders);
-            return;
-        };
+        let _ = write!(
+            canvas.body,
+            r#"<g transform="rotate({rot:.2} {:.2} {:.2})">"#,
+            rect.x + rect.w / 2.0,
+            rect.y + rect.h / 2.0
+        );
+        self.draw_tree(canvas, node, skip_placeholders);
+        canvas.body.push_str("</g>");
+        self.map.set(outer);
+    }
+
+    /// Maps a group's children into its box, through the groups around it.
+    /// Gives the group's box on the slide, its rotation, and the mapping to
+    /// put back once its children are done.
+    fn enter_group(&self, node: Node<'a, 'i>) -> Option<(Rect, f32, Map)> {
+        let x = Self::props(node).and_then(|p| p.child("xfrm"))?;
+        let (own, rot, ..) = drawing::xfrm(x)?;
         let child = |name: &str, a: &str, b: &str| {
             let n = x.child(name)?;
             Some((n.attribute(a).and_then(emu)?, n.attribute(b).and_then(emu)?))
@@ -933,15 +953,7 @@ impl<'a, 'i> Ctx<'a, 'i> {
             outer.2 + outer.0 * (own.x - cx * gx),
             outer.3 + outer.1 * (own.y - cy * gy),
         ));
-        let _ = write!(
-            canvas.body,
-            r#"<g transform="rotate({rot:.2} {:.2} {:.2})">"#,
-            rect.x + rect.w / 2.0,
-            rect.y + rect.h / 2.0
-        );
-        self.draw_tree(canvas, node, skip_placeholders);
-        canvas.body.push_str("</g>");
-        self.map.set(outer);
+        Some((rect, rot, outer))
     }
 
     fn frame(&self, canvas: &mut Canvas, node: Node<'a, 'i>) {
@@ -1246,6 +1258,148 @@ fn table_markdown(tbl: Node) -> String {
     md
 }
 
+/// A piece of a slide read as text, and where it sits on the slide.
+#[derive(Debug, Clone)]
+struct TextBlock {
+    rect: Rect,
+    kind: BlockKind,
+    md: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BlockKind {
+    /// The slide's title placeholder.
+    Title,
+    /// A text box, with its largest font size in points (0 when it inherits it).
+    Text {
+        size: f32,
+    },
+    Picture,
+    /// A table, chart or SmartArt.
+    Other,
+}
+
+/// Smallest a picture is, as a share of the slide's width and height, to
+/// be worth showing as text: smaller ones are icons and bullets.
+const ICON_SHARE: f32 = 0.12;
+/// Thinner than this share of the slide, a picture is a rule or an accent bar.
+const RULE_SHARE: f32 = 0.03;
+/// Share of the slide a picture covers to count as its background.
+const BACKGROUND_SHARE: f32 = 0.45;
+
+/// A slide's blocks as markdown: decoration left out, the title first, the
+/// rest in reading order.
+fn slide_markdown(blocks: Vec<TextBlock>, (w, h): (f32, f32)) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut blocks: Vec<TextBlock> = blocks
+        .into_iter()
+        .filter(|b| !b.md.trim().is_empty())
+        .filter(|b| {
+            let r = b.rect;
+            // Off the slide: notes to self, parked shapes.
+            let sized = r.w > 0.0 || r.h > 0.0;
+            !(sized && (r.x >= w || r.y >= h || r.x + r.w <= 0.0 || r.y + r.h <= 0.0))
+        })
+        .filter(|b| {
+            if b.kind != BlockKind::Picture {
+                return true;
+            }
+            let r = b.rect;
+            let icon = r.w < w * ICON_SHARE && r.h < h * ICON_SHARE;
+            let rule = r.w < w * RULE_SHARE || r.h < h * RULE_SHARE;
+            let background = r.w * r.h > w * h * BACKGROUND_SHARE;
+            !icon && !rule && !background && seen.insert(b.md.clone())
+        })
+        // A color written down while designing, such as `#D4C8FF`.
+        .filter(|b| {
+            let text = b.md.trim().trim_start_matches('\\');
+            !(text.len() == 7
+                && text.starts_with('#')
+                && text[1..].chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .collect();
+    // Without a title placeholder, the one short line set larger than any
+    // other text is the title.
+    if !blocks.iter().any(|b| b.kind == BlockKind::Title) {
+        let size = |b: &TextBlock| match b.kind {
+            BlockKind::Text { size } => size,
+            _ => 0.0,
+        };
+        let largest = blocks.iter().map(size).fold(0.0f32, f32::max);
+        let at_largest: Vec<usize> = (0..blocks.len())
+            .filter(|&i| size(&blocks[i]) == largest)
+            .collect();
+        if largest >= 18.0
+            && let [i] = at_largest[..]
+            && !blocks[i].md.contains('\n')
+            && blocks[i].md.chars().count() <= 120
+        {
+            let text = blocks[i].md.trim().trim_matches('*').trim().to_owned();
+            blocks[i].md = format!("## {text}");
+            blocks[i].kind = BlockKind::Title;
+        }
+    }
+    let mut ordered = reading_order(blocks);
+    // The title leads, whatever sits above it (a kicker such as "01 — PROBLEM").
+    if let Some(i) = ordered.iter().position(|b| b.kind == BlockKind::Title) {
+        let title = ordered.remove(i);
+        ordered.insert(0, title);
+    }
+    ordered
+        .into_iter()
+        .map(|b| b.md)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Blocks in the order a reader takes them. The slide is cut in two at its
+/// widest clear gap, across or down, and each side is read the same way:
+/// the top before the bottom, the left before the right. So cards side by
+/// side are read one card at a time, not row by row across all of them.
+fn reading_order(blocks: Vec<TextBlock>) -> Vec<TextBlock> {
+    if blocks.len() <= 1 {
+        return blocks;
+    }
+    let span_y: fn(&TextBlock) -> (f32, f32) = |b| (b.rect.y, b.rect.y + b.rect.h);
+    let span_x: fn(&TextBlock) -> (f32, f32) = |b| (b.rect.x, b.rect.x + b.rect.w);
+    let cut = [span_y, span_x]
+        .into_iter()
+        .filter_map(|span| widest_gap(&blocks, span).map(|(gap, at)| (gap, at, span)))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    let Some((_, at, span)) = cut else {
+        let mut blocks = blocks;
+        blocks.sort_by(|a, b| {
+            a.rect
+                .y
+                .total_cmp(&b.rect.y)
+                .then(a.rect.x.total_cmp(&b.rect.x))
+        });
+        return blocks;
+    };
+    let (before, after): (Vec<_>, Vec<_>) = blocks.into_iter().partition(|b| span(b).0 < at);
+    let mut ordered = reading_order(before);
+    ordered.extend(reading_order(after));
+    ordered
+}
+
+/// The widest gap along one axis that no block spans, and where it ends.
+/// Shapes that overlap by a hair still count as apart.
+fn widest_gap(blocks: &[TextBlock], span: fn(&TextBlock) -> (f32, f32)) -> Option<(f32, f32)> {
+    const TOUCH: f32 = 2.0;
+    let mut spans: Vec<(f32, f32)> = blocks.iter().map(span).collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut end = spans.first()?.1;
+    let mut widest: Option<(f32, f32)> = None;
+    for &(start, stop) in &spans[1..] {
+        let gap = start - end;
+        if gap > -TOUCH && widest.is_none_or(|(w, _)| gap > w) {
+            widest = Some((gap, start));
+        }
+        end = end.max(stop);
+    }
+    widest
+}
+
 impl Source for Deck {
     fn page(&self, index: usize) -> Rc<str> {
         if self.slides.is_empty() {
@@ -1291,6 +1445,10 @@ impl Source for Deck {
             return crate::typeset::rasterize(&svg, width.clamp(1, MAX_WIDTH));
         }
         crate::office::picture_pixels(&self.picture(id.strip_prefix("pic:")?)?, width)
+    }
+
+    fn is_page(&self, id: &str) -> bool {
+        id.starts_with("slide-")
     }
 
     fn look(&self) -> Option<Look> {
@@ -1413,7 +1571,7 @@ mod tests {
         let doc = open(&path).unwrap();
         assert_eq!(doc.page_count, Some(1));
         assert_eq!(&*doc.source.page(0), "![](leaf-image:slide-0)");
-        assert_eq!(doc.source.image_size("slide-0"), Some((1920, 1080)));
+        assert_eq!(doc.source.image_size("slide-0"), Some((1600, 900)));
         let image = doc.source.decode("slide-0", 400).unwrap();
         assert_eq!(image.dimensions(), (400, 225));
         // The master's dark background, and the box's orange.
@@ -1494,5 +1652,72 @@ mod tests {
             table_markdown(doc.root_element()),
             "| Name | Score |\n| --- | --- |\n| Ada | 42 |\n"
         );
+    }
+
+    fn block(x: f32, y: f32, w: f32, h: f32, kind: BlockKind, md: &str) -> TextBlock {
+        TextBlock {
+            rect: Rect { x, y, w, h },
+            kind,
+            md: md.into(),
+        }
+    }
+
+    #[test]
+    fn cards_side_by_side_read_one_card_at_a_time() {
+        let text = BlockKind::Text { size: 14.0 };
+        let blocks = vec![
+            block(40.0, 120.0, 200.0, 20.0, text, "Left head"),
+            block(400.0, 120.0, 200.0, 20.0, text, "Right head"),
+            block(40.0, 150.0, 200.0, 60.0, text, "Left body"),
+            block(400.0, 150.0, 200.0, 60.0, text, "Right body"),
+            block(
+                40.0,
+                40.0,
+                560.0,
+                40.0,
+                BlockKind::Text { size: 32.0 },
+                "Big title",
+            ),
+            block(
+                40.0,
+                10.0,
+                100.0,
+                12.0,
+                BlockKind::Text { size: 9.0 },
+                "01 — KICKER",
+            ),
+        ];
+        assert_eq!(
+            slide_markdown(blocks, (720.0, 405.0)),
+            "## Big title\n\n01 — KICKER\n\nLeft head\n\nLeft body\n\nRight head\n\nRight body"
+        );
+    }
+
+    #[test]
+    fn decoration_is_left_out_of_the_text() {
+        let blocks = vec![
+            block(0.0, 0.0, 720.0, 405.0, BlockKind::Picture, "![](bg)"),
+            block(10.0, 10.0, 30.0, 30.0, BlockKind::Picture, "![](icon)"),
+            block(10.0, 60.0, 4.0, 200.0, BlockKind::Picture, "![](bar)"),
+            block(100.0, 60.0, 300.0, 200.0, BlockKind::Picture, "![](chart)"),
+            block(100.0, 300.0, 300.0, 200.0, BlockKind::Picture, "![](chart)"),
+            block(
+                800.0,
+                60.0,
+                100.0,
+                20.0,
+                BlockKind::Text { size: 12.0 },
+                "parked",
+            ),
+            block(
+                100.0,
+                380.0,
+                60.0,
+                20.0,
+                BlockKind::Text { size: 12.0 },
+                "\\#D4C8FF",
+            ),
+        ];
+        assert_eq!(slide_markdown(blocks, (720.0, 405.0)), "![](chart)");
     }
 }

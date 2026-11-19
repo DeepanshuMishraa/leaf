@@ -140,6 +140,11 @@ pub trait Source {
     fn is_diagram(&self, _id: &str) -> bool {
         false
     }
+    /// Whether an embedded image is a whole page drawn as designed, shown
+    /// as tall as the column's width makes it rather than capped.
+    fn is_page(&self, _id: &str) -> bool {
+        false
+    }
     /// A diagram drawn in `ink` on a transparent `paper`, at most `width` pixels wide.
     fn draw(&self, _id: &str, _width: u32, _ink: Rgb, _paper: Rgb) -> Option<RgbaImage> {
         None

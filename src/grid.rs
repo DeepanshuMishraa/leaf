@@ -13,9 +13,8 @@ use crate::ooxml::{Color, Local, Package, Theme, rel_by_id, rel_by_kind, roxmltr
 use crate::typeset::{self, Run, Style};
 use roxmltree::Document;
 
-/// Narrowest a drawn page is, in points, so a sheet of two columns isn't
-/// blown up to the screen's width.
-pub const MIN_WIDTH: f32 = 560.0;
+/// Furthest text in a page's last column runs on past it, in points.
+const MAX_SPILL: f32 = 300.0;
 /// The column letters' band, in points.
 const HEADER_HEIGHT: f32 = 18.0;
 /// A row with nothing to say about its height.
@@ -468,11 +467,36 @@ impl Grid<'_> {
         (typeset::measure(&last_row.to_string(), style) + 14.0).max(28.0)
     }
 
+    /// Room past the last column for left-aligned text that runs on, as
+    /// a spreadsheet lets it run into the empty columns beyond the page.
+    fn spill(&self, widths: &[f32]) -> f32 {
+        let (Some(last), Some(&room)) = (self.columns.len().checked_sub(1), widths.last()) else {
+            return 0.0;
+        };
+        (0..self.rows.len())
+            .map(|r| {
+                let text = self.text(r, last).trim();
+                let look = self.look((self.rows[r].0, self.columns[last].0));
+                let left = look.align.unwrap_or(if numeric(text) {
+                    HAlign::Right
+                } else {
+                    HAlign::Left
+                }) == HAlign::Left;
+                if text.is_empty() || !left {
+                    return 0.0;
+                }
+                typeset::measure(text, &look.font) + 8.0 - room
+            })
+            .fold(0.0f32, f32::max)
+            .min(MAX_SPILL)
+    }
+
     /// The page's size in points.
     pub fn size(&self) -> (f32, f32) {
-        let w = self.gutter(&Self::gutter_style()) + self.widths().iter().sum::<f32>();
+        let widths = self.widths();
+        let w = self.gutter(&Self::gutter_style()) + widths.iter().sum::<f32>();
         let h = HEADER_HEIGHT + self.heights().iter().sum::<f32>();
-        (w.max(MIN_WIDTH), h)
+        (w + self.spill(&widths), h)
     }
 
     /// The page as SVG.
@@ -491,7 +515,7 @@ impl Grid<'_> {
         }
         let content_w = xs[xs.len() - 1];
         let content_h = ys[ys.len() - 1];
-        let width = content_w.max(MIN_WIDTH);
+        let width = content_w + self.spill(&widths);
         let height = content_h;
         let mut svg = String::new();
         let _ = write!(

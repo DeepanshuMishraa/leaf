@@ -23,7 +23,7 @@ use crate::typeset::{self, Line, Run, Style};
 use roxmltree::{Document, Node};
 
 /// Width pages are measured at before the screen picks the real one.
-const MEASURE_WIDTH: u32 = 1600;
+const MEASURE_WIDTH: u32 = crate::render::PAGE_PIXELS;
 /// Widest a page is drawn, in pixels.
 const MAX_WIDTH: u32 = 3200;
 /// A tab, as the room it takes.
@@ -1593,6 +1593,10 @@ impl Source for Words {
             return typeset::rasterize(&svg, width.clamp(1, MAX_WIDTH));
         }
         crate::office::picture_pixels(&self.package.bytes(id.strip_prefix("pic:")?)?, width)
+    }
+
+    fn is_page(&self, id: &str) -> bool {
+        id.starts_with("page-")
     }
 
     fn look(&self) -> Option<Look> {

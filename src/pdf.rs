@@ -1506,6 +1506,12 @@ impl Source for Worker {
         self.read(move |source| source.decode(&id, width)).flatten()
     }
 
+    fn is_page(&self, id: &str) -> bool {
+        let id = id.to_owned();
+        self.read(move |source| source.is_page(&id))
+            .unwrap_or(false)
+    }
+
     fn look(&self) -> Option<crate::doc::Look> {
         self.read(|source| source.look()).flatten()
     }

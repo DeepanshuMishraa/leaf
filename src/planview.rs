@@ -145,7 +145,7 @@ fn hue_of(edit: &PlanEdit) -> Color {
     }
 }
 
-fn no_images(_: &str) -> Option<(u32, u32)> {
+fn no_images(_: &str) -> Option<render::ImageSize> {
     None
 }
 
