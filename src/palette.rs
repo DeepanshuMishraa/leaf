@@ -54,10 +54,15 @@ pub fn documents(path: &str, recent: Option<&[(String, usize)]>) -> Result<Listi
             expanded.display()
         )
     })?;
+    // Rex ids are text, so a path that isn't UTF-8 couldn't come back intact.
+    let Some(shown_dir) = dir.to_str().map(str::to_owned) else {
+        return Err(format!(
+            "{} has a name that isn't UTF-8, which Rex's palette can't pass back. Open it with leaf open in a terminal.",
+            dir.display()
+        ));
+    };
     if !dir.is_dir() {
-        return Ok(Listing::Document {
-            target: dir.display().to_string(),
-        });
+        return Ok(Listing::Document { target: shown_dir });
     }
     let mut items = Vec::new();
     let mut listed = HashSet::new();
@@ -81,11 +86,11 @@ pub fn documents(path: &str, recent: Option<&[(String, usize)]>) -> Result<Listi
             detail: format!("{percent}%"),
         });
     }
-    if let Some(parent) = dir.parent() {
+    if let Some(parent) = dir.parent().and_then(Path::to_str) {
         items.push(Item {
-            id: format!("dir:{}", parent.display()),
+            id: format!("dir:{parent}"),
             title: "..".to_owned(),
-            subtitle: picker::tilde(&parent.display().to_string()),
+            subtitle: picker::tilde(parent),
             icon: "folder",
             detail: String::new(),
         });
@@ -95,33 +100,39 @@ pub fn documents(path: &str, recent: Option<&[(String, usize)]>) -> Result<Listi
         picker::children(&dir, "")
             .into_iter()
             .filter_map(|entry| match entry {
-                Entry::Folder(path) => Some(row("dir", &path, "folder")),
-                Entry::Document(path) if !listed.contains(&path.display().to_string()) => {
-                    Some(row("open", &path, "document"))
+                Entry::Folder(path) => row("dir", &path, "folder"),
+                Entry::Document(path)
+                    if !path.to_str().is_some_and(|path| listed.contains(path)) =>
+                {
+                    row("open", &path, "document")
                 }
                 _ => None,
             })
             .take(room),
     );
-    let shown = picker::tilde(&dir.display().to_string());
+    let shown = picker::tilde(&shown_dir);
     Ok(Listing::Folder {
-        dir: dir.display().to_string(),
+        dir: shown_dir,
         title: format!("Open Document · {shown}"),
         items,
     })
 }
 
-fn row(kind: &str, path: &Path, icon: &'static str) -> Item {
-    Item {
-        id: format!("{kind}:{}", path.display()),
+/// A folder or document row; `None` for a path that isn't UTF-8, since the
+/// id Rex sends back couldn't name it.
+fn row(kind: &str, path: &Path, icon: &'static str) -> Option<Item> {
+    let text = path.to_str()?;
+    Some(Item {
+        id: format!("{kind}:{text}"),
         title: path
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string()),
+            .and_then(|name| name.to_str())
+            .unwrap_or(text)
+            .to_owned(),
         subtitle: String::new(),
         icon,
         detail: String::new(),
-    }
+    })
 }
 
 /// The voices, the one reading now first. Ids are voice names.
@@ -253,6 +264,16 @@ mod tests {
             serde_json::json!({"kind": "document", "target": "/a.pdf"})
         );
         let item = serde_json::to_value(row("dir", Path::new("/a/b"), "folder")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let odd = Path::new(std::ffi::OsStr::from_bytes(b"/a/b\xff.pdf"));
+            assert_eq!(
+                row("open", odd, "document"),
+                None,
+                "a lossy id couldn't open it"
+            );
+        }
         assert_eq!(
             item,
             serde_json::json!({"id": "dir:/a/b", "title": "b", "icon": "folder"})

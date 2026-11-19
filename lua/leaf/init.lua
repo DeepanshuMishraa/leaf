@@ -156,11 +156,15 @@ function M.setup(opts)
   -- Reasons a prompt couldn't be shown, for which leaf's own picker stands in.
   local FALL_BACK = { unsupported = true, failed = true }
 
+  -- Whether this Rex has palette prompts at all, checked before listing
+  -- anything slow, so an older Rex goes straight to leaf's picker.
+  local function can_ask()
+    return type(rex.ui) == "table" and type(rex.ui.pick) == "function"
+  end
+
   -- The answer; or nil and a reason, `fallback` when leaf's picker should ask.
   local function ask(spec)
-    if type(rex.ui) ~= "table" or type(rex.ui.pick) ~= "function" then
-      return nil, "fallback"
-    end
+    if not can_ask() then return nil, "fallback" end
     local answer, reason, detail = rex.ui.pick(spec)
     if answer ~= nil then return answer end
     if FALL_BACK[reason] then
@@ -189,17 +193,35 @@ function M.setup(opts)
     return value
   end
 
+  -- Asks with the rows `leaf <command> --list` prints; `fallback` when the
+  -- palette can't ask or the list didn't come, so leaf's picker still opens.
+  local function ask_from(command, spec)
+    if not can_ask() then return nil, "fallback" end
+    local items, err = leaf_json(command, "--list")
+    if items == nil then
+      rex.log("warn", "leaf: couldn't list " .. command .. ": " .. tostring(err))
+      return nil, "fallback"
+    end
+    spec.items = items
+    return ask(spec)
+  end
+
   -- Browses for a document in the palette, from `dir`: folders open in place,
   -- and a path or link can be typed. The target; or nil and a reason.
+  -- A first listing that fails (the pane's folder is gone, say) hands over to
+  -- leaf's home screen; a later one keeps the folder shown and says why.
   local function pick_document(dir)
+    if not can_ask() then return nil, "fallback" end
     local listing, err = leaf_json("open", "--list", dir, "--recent")
+    if listing == nil then
+      rex.log("warn", "leaf: couldn't list " .. tostring(dir) .. ": " .. tostring(err))
+      return nil, "fallback"
+    end
+    local title = listing.title
     while true do
-      if listing == nil then
-        error("leaf: couldn't list documents: " .. tostring(err), 0)
-      end
       if listing.kind == "document" then return listing.target end
       local answer, reason = ask{
-        title = listing.title,
+        title = title,
         placeholder = "Filter, or type a path or a link",
         items = listing.items,
         allow_other = true,
@@ -217,7 +239,12 @@ function M.setup(opts)
       else
         return (answer:gsub("^open:", ""))
       end
-      listing, err = leaf_json("open", "--list", next_path)
+      local next_listing, next_err = leaf_json("open", "--list", next_path)
+      if next_listing == nil then
+        title = tostring(next_err):gsub("^leaf: ", "")
+      else
+        listing, title = next_listing, next_listing.title
+      end
     end
   end
 
@@ -400,13 +427,10 @@ function M.setup(opts)
     keywords = "leaf agent claude codex opencode gemini grok pi cursor default send ask picker",
     run = function(ctx)
       if ctx.server == nil then
-        local items, err = leaf_json("agents", "--list")
-        if items == nil then error("leaf: couldn't list the agents: " .. tostring(err), 0) end
-        local picked, reason = ask{
+        local picked, reason = ask_from("agents", {
           title = "Send questions to",
           placeholder = "Search installed agents",
-          items = items,
-        }
+        })
         if picked ~= nil then
           local result = rex.exec(argv("agents", "--set", picked), { env = env, timeout = 5 })
           if result == nil or not result.ok then
@@ -504,13 +528,10 @@ function M.setup(opts)
       local reader = find_reader(ctx)
       if reader == nil then error(NO_READER, 0) end
       if ctx.server == nil then
-        local items, err = leaf_json("voices", "--list")
-        if items == nil then error("leaf: couldn't list the voices: " .. tostring(err), 0) end
-        local picked, reason = ask{
+        local picked, reason = ask_from("voices", {
           title = "Read aloud in",
           placeholder = "Search by name, language or gender",
-          items = items,
-        }
+        })
         -- The reader switches, and saves it as the default.
         if picked ~= nil then tell(reader, "voice " .. picked) return end
         if reason ~= "fallback" then return end
