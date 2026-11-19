@@ -3,17 +3,20 @@ mod agentpick;
 mod aloud;
 mod art;
 mod article;
+mod chart;
 mod comment;
 mod config;
 mod diff;
 mod diffreview;
 mod diffview;
 mod doc;
+mod drawing;
 mod edge;
 mod find;
 mod font;
 mod gec;
 mod github;
+mod grid;
 mod highlight;
 mod home;
 mod hook;
@@ -27,6 +30,8 @@ mod memory;
 mod mermaid;
 mod mono;
 mod news;
+mod office;
+mod ooxml;
 mod pdf;
 mod picker;
 mod picture;
@@ -47,17 +52,21 @@ mod review;
 mod rextheme;
 mod scheme;
 mod shape;
+mod sheet;
 mod skills;
+mod slides;
 mod spinner;
 mod stroke;
 mod syntax;
 mod tempo;
 mod theme;
+mod typeset;
 mod upgrade;
 mod usage;
 mod video;
 mod viewer;
 mod voicepick;
+mod word;
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -69,7 +78,7 @@ use doc::Doc;
 use progress::Store;
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | picture | url]   (nothing named: pick one)
+const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | office file | picture | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
@@ -142,8 +151,14 @@ fn load_file(path: &Path) -> Result<Doc, String> {
     if picture::is_picture(path) {
         return picture::open(path).map_err(|e| e.to_string());
     }
+    if office::Kind::of(path).is_some() {
+        return office::open(path);
+    }
+    if let Some(advice) = office::older(path) {
+        return Err(advice);
+    }
     Err(format!(
-        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), Word documents (.docx), slide decks (.pptx), spreadsheets (.xlsx, .xls, .ods, .csv, .tsv), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
     ))
 }
 

@@ -1505,6 +1505,14 @@ impl Source for Worker {
         let id = id.to_owned();
         self.read(move |source| source.decode(&id, width)).flatten()
     }
+
+    fn look(&self) -> Option<crate::doc::Look> {
+        self.read(|source| source.look()).flatten()
+    }
+
+    fn set_look(&self, look: crate::doc::Look) {
+        self.read(move |source| source.set_look(look));
+    }
 }
 
 pub struct Loading {
@@ -1513,8 +1521,10 @@ pub struct Loading {
 }
 
 impl Loading {
-    pub fn open(path: PathBuf) -> Self {
-        Self::spawn(move || open(&path))
+    /// Loads `path` with `load` in the background, for any document whose
+    /// source must stay on the thread that made it.
+    pub fn with(path: PathBuf, load: fn(&Path) -> Result<Doc, String>) -> Self {
+        Self::spawn(move || load(&path).map_err(|message| PdfOpenFailed { message }))
     }
 
     fn spawn(load: impl FnOnce() -> Result<Doc, PdfOpenFailed> + Send + 'static) -> Self {

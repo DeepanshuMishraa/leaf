@@ -52,7 +52,8 @@ _leaf() {
       # HEIC, HEIF, AVIF and JPEG XL need macOS's sips.
       local pictures='png|jpg|jpeg|jpe|jfif|gif|webp|bmp|ico|tif|tiff|tga|pnm|pbm|pgm|ppm|pam|qoi|hdr|exr|dds|ff|svg'
       [[ $OSTYPE == darwin* ]] && pictures+='|jxl|heic|heif|avif'
-      _arguments "*:document:_files -g \"(#i)*.(pdf|epub|md|markdown|$pictures)\""
+      local office='docx|docm|dotx|dotm|pptx|pptm|ppsx|ppsm|potx|potm|xlsx|xlsm|xlsb|xls|xla|xlam|ods|csv|tsv'
+      _arguments "*:document:_files -g \"(#i)*.(pdf|epub|md|markdown|$office|$pictures)\""
       ;;
     diff)
       _leaf_diff

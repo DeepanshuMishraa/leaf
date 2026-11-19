@@ -398,6 +398,8 @@ pub struct App {
     /// Rows the text area shows.
     view_height: u16,
     image_mode: ImageMode,
+    /// How an office document is shown (`o` switches); `None` for other documents.
+    shown_as: Option<crate::doc::Look>,
     ink: Option<Rgb>,
     paper: Option<Rgb>,
     /// The theme and the UI setting, followed while the document is open.
@@ -538,6 +540,7 @@ impl App {
             picked: None,
             ink_drawn: HashMap::new(),
             image_mode: options.image_mode,
+            shown_as: doc.source.look(),
             highlights: options.highlights.clone(),
             hue: Hue::default(),
             notice: None,
@@ -632,6 +635,9 @@ impl App {
         }
         self.hold_anchor();
         self.doc = doc;
+        if let Some(look) = self.shown_as {
+            self.doc.source.set_look(look);
+        }
         self.current = self.current.min(self.last());
         self.laid.clear();
         self.retain_protocols(|_| false);
@@ -816,6 +822,16 @@ impl App {
             let pages: HashSet<usize> = self.screen.iter().flatten().map(|s| s.page).collect();
             self.strokes.iter().any(|i| pages.contains(&i.stroke.page))
         };
+        if let Some(look) = self.shown_as {
+            let images = match self.image_mode {
+                ImageMode::Color => "i paint",
+                ImageMode::Mono => "i real colors",
+            };
+            footer = match look {
+                crate::doc::Look::Original => format!("{footer} · {images} · o terminal font"),
+                crate::doc::Look::Terminal => format!("{footer} · o original look"),
+            };
+        }
         match &self.notice {
             Some(notice) => format!("{footer} · {notice}"),
             None if hidden => format!("{footer} · drawings here need Kitty graphics to show"),
@@ -1528,6 +1544,15 @@ impl App {
             ("s", "pick a voice"),
             ("<  >  =", "narrower / wider / fit column"),
         ]);
+        if let Some(look) = self.shown_as {
+            rows.push((
+                "o",
+                match look {
+                    crate::doc::Look::Original => "show in the terminal's font",
+                    crate::doc::Look::Terminal => "show as designed",
+                },
+            ));
+        }
         rows.push((
             "i",
             if self.image_mode == ImageMode::Color {
@@ -2660,6 +2685,7 @@ impl App {
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
+            Some('o') => self.toggle_look(),
             Some('d') | Some('D') => self.take_tool(Tool::Pen),
             Some('e') | Some('E') => self.take_tool(Tool::Eraser),
             Some('v') | Some('V') => self.take_tool(Tool::Move),
@@ -2752,6 +2778,22 @@ impl App {
         } else {
             self.scroll_by(-self.screen_step());
         }
+    }
+
+    /// Switches an office document between its own design and terminal text,
+    /// staying on the same page.
+    fn toggle_look(&mut self) {
+        let Some(look) = self.shown_as.map(crate::doc::Look::other) else {
+            return;
+        };
+        self.shown_as = Some(look);
+        self.doc.source.set_look(look);
+        self.laid.clear();
+        self.retain_protocols(|_| false);
+        self.pixels.clear();
+        self.selection = None;
+        self.search = None;
+        self.offset = 0;
     }
 
     fn toggle_images(&mut self) {

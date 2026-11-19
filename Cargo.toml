@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"
+calamine = "0.38"
 crossterm = "0.29"
 dither-ratatui = "0.1.0"
 dom_smoothie = "0.18"
@@ -28,12 +29,13 @@ pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30"
 ratatui-image = { version = "12.0.0-rc.2", default-features = false, features = ["crossterm"] }
 regex = "1"
-resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha2 = "0.11.1"
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }
 thiserror = "2"
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
@@ -43,6 +45,7 @@ unicode-width = "0.2"
 ureq = "3"
 url = "2"
 wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
+zip = { version = "9.7", default-features = false, features = ["deflate"] }
 
 # Load fontconfig at run time instead of linking it, so building on Linux
 # doesn't need its development package (libfontconfig1-dev). mupdf's

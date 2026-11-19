@@ -37,6 +37,7 @@ fn readable(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .is_some_and(|e| READABLE.iter().any(|r| e.eq_ignore_ascii_case(r)))
         || crate::picture::is_picture(path)
+        || crate::office::Kind::of(path).is_some()
 }
 
 pub fn is_link(text: &str) -> bool {
