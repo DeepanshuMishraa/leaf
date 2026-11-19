@@ -2245,4 +2245,34 @@ mod epub_tests {
             "got: {text}"
         );
     }
+
+    #[test]
+    fn an_office_file_loaded_in_the_background_switches_looks_through_the_worker() {
+        let dir = std::env::temp_dir().join(format!("leaf-loading-office-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("people.csv");
+        std::fs::write(&path, "name,age\nAda,36\n").unwrap();
+        let loading = Loading::with(path, crate::office::open);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let doc = loop {
+            if let Some(result) = loading.poll() {
+                break result.unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the loader never finished"
+            );
+            std::thread::yield_now();
+        };
+        use crate::doc::Look;
+        assert_eq!(doc.source.look(), Some(Look::Original));
+        assert!(doc.source.is_page("grid-0"));
+        assert!(!doc.source.is_page("pic:x.png"));
+        doc.source.set_look(Look::Terminal);
+        assert_eq!(doc.source.look(), Some(Look::Terminal));
+        assert!(doc.source.page(0).starts_with("| name | age |"));
+        drop(doc);
+        drop(loading);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

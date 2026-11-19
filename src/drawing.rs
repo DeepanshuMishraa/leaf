@@ -326,10 +326,21 @@ pub fn geometry(props: Option<Node>, w: f32, h: f32) -> String {
                 h - r
             )
         }
-        "ellipse" | "flowChartConnector" | "donut" => {
+        "ellipse" | "flowChartConnector" => {
             let (rx, ry) = (w / 2.0, h / 2.0);
             format!(
                 "M0 {ry:.2} A{rx:.2} {ry:.2} 0 1 0 {w:.2} {ry:.2} A{rx:.2} {ry:.2} 0 1 0 0 {ry:.2} Z"
+            )
+        }
+        "donut" => {
+            let (rx, ry) = (w / 2.0, h / 2.0);
+            let ring = (ss * adjust(geom, "adj", 25_000.0)).min(ss / 2.0);
+            let (ix, iy) = ((rx - ring).max(0.0), (ry - ring).max(0.0));
+            // The hole runs the other way round, so it stays empty under
+            // the nonzero fill rule.
+            format!(
+                "M0 {ry:.2} A{rx:.2} {ry:.2} 0 1 0 {w:.2} {ry:.2} A{rx:.2} {ry:.2} 0 1 0 0 {ry:.2} Z M{ring:.2} {ry:.2} A{ix:.2} {iy:.2} 0 1 1 {:.2} {ry:.2} A{ix:.2} {iy:.2} 0 1 1 {ring:.2} {ry:.2} Z",
+                w - ring
             )
         }
         "line" | "straightConnector1" | "bentConnector2" | "bentConnector3"
@@ -1102,6 +1113,12 @@ pub fn lay_body(
                 None
             }
         };
+        // A paragraph at one level ends the lists nested under it.
+        if has_text {
+            for deeper in counters.iter_mut().skip(level + 1) {
+                *deeper = 0;
+            }
+        }
         let bullet = bullet_text.map(|text| {
             let style = Style {
                 family: para

@@ -210,16 +210,27 @@ fn number(f: f64) -> String {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         return format!("{}", f as i64);
     }
-    // Ten places hide binary rounding (0.1 + 0.2) without losing real digits.
-    let text = format!("{f:.10}");
-    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    // Fifteen significant digits, as a spreadsheet shows them: binary
+    // rounding (0.1 + 0.2) goes, small values keep their digits.
+    if !f.is_finite() || f == 0.0 {
+        return f.to_string();
+    }
+    let places = (14 - f.abs().log10().floor() as i32).clamp(0, 40) as usize;
+    let text = format!("{f:.places$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
+    }
 }
 
 /// An Excel serial date (days since 1899-12-30) as `YYYY-MM-DD`, with the
 /// time when it has one.
 fn date(serial: f64) -> String {
-    let days = serial.floor() as i64;
-    let seconds = ((serial - serial.floor()) * 86_400.0).round() as i64;
+    // Rounded to the second first, so 23:59:59.6 carries into the next day.
+    let total = (serial * 86_400.0).round() as i64;
+    let days = total.div_euclid(86_400);
+    let seconds = total.rem_euclid(86_400);
     // Days from 1970-01-01, then Howard Hinnant's civil-from-days.
     let z = days - 25_569 + 719_468;
     let era = z.div_euclid(146_097);
@@ -233,8 +244,8 @@ fn date(serial: f64) -> String {
     let date = format!("{year:04}-{month:02}-{day:02}");
     match seconds {
         0 => date,
-        s if s >= 86_400 => date,
-        s => format!("{date} {:02}:{:02}", s / 3600, s / 60 % 60),
+        s if s % 60 == 0 => format!("{date} {:02}:{:02}", s / 3600, s / 60 % 60),
+        s => format!("{date} {:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60),
     }
 }
 
@@ -460,14 +471,17 @@ fn sheet_parts(sheet: &Sheet, named: bool) -> Vec<Page> {
             if paged {
                 let first_row = sheet.origin.0 + 2;
                 let col = |c: usize| letters(sheet.origin.1 + c);
+                // Both sides in the sheet's own row numbers and column letters.
                 intro.push_str(&format!(
-                    "*Rows {}–{} of {} · columns {}–{} of {}*\n\n",
+                    "*Rows {}–{} of {}–{} · columns {}–{} of {}–{}*\n\n",
                     thousands(first_row + row_start),
                     thousands(first_row + row_end.max(row_start + 1) - 1),
-                    thousands(body.len()),
+                    thousands(first_row),
+                    thousands(first_row + body.len().max(1) - 1),
                     col(col_start),
                     col(col_end - 1),
-                    width,
+                    col(0),
+                    col(width.max(1) - 1),
                 ));
             }
             let mut table = line(head);
@@ -523,8 +537,14 @@ mod tests {
         assert_eq!(number(42.0), "42");
         assert_eq!(number(7.5), "7.5");
         assert_eq!(number(0.1 + 0.2), "0.3");
+        assert_eq!(number(0.001234), "0.001234");
+        assert_eq!(number(0.123456789012345), "0.123456789012345");
+        assert_eq!(number(-2.5), "-2.5");
         assert_eq!(date(45_000.0), "2023-03-15");
         assert_eq!(date(45_000.5), "2023-03-15 12:00");
+        assert_eq!(date(45_000.5 + 7.0 / 86_400.0), "2023-03-15 12:00:07");
+        // A hair before midnight rounds into the next day, not 24:00.
+        assert_eq!(date(45_000.999_999_9), "2023-03-16");
         assert_eq!(date(1.0), "1899-12-31");
         assert_eq!(duration(1.5), "36:00:00");
     }
@@ -593,9 +613,9 @@ mod tests {
         // Two row spans × two column spans.
         assert_eq!(pages.len(), 4);
         assert!(pages[0].starts_with(&format!(
-            "*Rows 2–{} of {} · columns A–H of {width}*",
+            "*Rows 2–{} of 2–{} · columns A–H of A–K*",
             ROWS + 1,
-            ROWS + 1
+            ROWS + 2
         )));
         let second_columns = &pages[1];
         assert!(second_columns.contains("| r0c0 | r0c8 | r0c9 | r0c10 |"));

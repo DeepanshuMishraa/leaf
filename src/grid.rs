@@ -136,7 +136,7 @@ impl Looks {
 /// An Excel color element: `rgb`, `theme` with `tint`, or `indexed`.
 fn excel_color(node: roxmltree::Node, theme: &Theme) -> Option<Color> {
     if let Some(rgb) = node.attribute("rgb") {
-        return Color::hex(&rgb[rgb.len().saturating_sub(6)..]);
+        return Color::hex(rgb.get(rgb.len().saturating_sub(6)..)?);
     }
     let tint = node
         .attribute("tint")
@@ -324,7 +324,8 @@ fn parse_sheet(xml: &str) -> SheetLooks {
             };
             let hidden = matches!(col.attribute("hidden"), Some("1" | "true"));
             // Ranges such as min=1 max=16384 style a whole sheet; stop at a sane edge.
-            for c in min..=max.min(min + 1024) {
+            // Columns count from 1; a damaged file may say 0.
+            for c in min.max(1)..=max.min(min.saturating_add(1024)) {
                 looks
                     .widths
                     .insert(c - 1, if hidden { 0.0 } else { width_points(width) });
@@ -337,8 +338,14 @@ fn parse_sheet(xml: &str) -> SheetLooks {
                 .attribute("r")
                 .and_then(|v| v.parse::<usize>().ok())
                 .and_then(|r| r.checked_sub(1));
-            if let (Some(r), Some(ht)) = (r, row.attribute("ht").and_then(|h| h.parse().ok())) {
-                looks.heights.insert(r, ht);
+            let hidden = matches!(row.attribute("hidden"), Some("1" | "true"));
+            let height = if hidden {
+                Some(0.0)
+            } else {
+                row.attribute("ht").and_then(|h| h.parse().ok())
+            };
+            if let (Some(r), Some(height)) = (r, height) {
+                looks.heights.insert(r, height);
             }
             for c in row.kids("c") {
                 if let (Some(at), Some(s)) = (
@@ -357,7 +364,7 @@ fn parse_sheet(xml: &str) -> SheetLooks {
 fn numeric(text: &str) -> bool {
     let t = text.trim().trim_end_matches('%').replace(',', "");
     !t.is_empty()
-        && (t.parse::<f64>().is_ok()
+        && (t.parse::<f64>().is_ok_and(f64::is_finite)
             || (t.len() >= 10
                 && t.as_bytes()[4] == b'-'
                 && t.as_bytes()[7] == b'-'
@@ -366,13 +373,27 @@ fn numeric(text: &str) -> bool {
 
 /// One line of `text` in `style`, cut to fit `room` points.
 fn fitted(text: &str, style: &Rc<Style>, room: f32) -> Option<typeset::Line> {
-    let mut text: String = text.replace(['\n', '\r', '\t'], " ").trim().to_owned();
-    while !text.is_empty() && typeset::measure(&text, style) > room {
-        text.pop();
+    let whole: String = text.replace(['\n', '\r', '\t'], " ").trim().to_owned();
+    // The longest prefix that fits, found by halving rather than one letter
+    // at a time, so a long cell costs a few measurements, not hundreds.
+    let ends: Vec<usize> = whole
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .collect();
+    let fits = |n: usize| n == 0 || typeset::measure(&whole[..ends[n - 1]], style) <= room;
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
     }
-    if text.is_empty() {
+    if lo == 0 {
         return None;
     }
+    let text = whole[..ends[lo - 1]].to_owned();
     let run = Run {
         text,
         style: style.clone(),
@@ -602,7 +623,8 @@ impl Grid<'_> {
                     let _ = write!(borders, "M{x0:.2} {y1:.2}H{x1:.2}");
                 }
                 let text = self.text(r, c);
-                if text.trim().is_empty() {
+                // Hidden rows and columns have no room to show text in.
+                if text.trim().is_empty() || y1 - y0 <= 0.0 || x1 - x0 <= 0.0 {
                     continue;
                 }
                 let align = look.align.unwrap_or(if numeric(text) {
@@ -631,15 +653,23 @@ impl Grid<'_> {
                     HAlign::Center => x0 + ((x1 - x0) - line.width) / 2.0,
                     HAlign::Right => x1 - pad - line.width,
                 };
-                // Spilled text hides the gridlines it crosses.
+                // Spilled text hides the gridlines it crosses, painted over in
+                // the color of the cell each line opens, so fills stay.
                 let end = x + line.width;
-                if end > x1 {
+                for (k, &line_x) in xs.iter().enumerate().skip(c + 1) {
+                    if line_x >= end {
+                        break;
+                    }
+                    let under = self
+                        .columns
+                        .get(k)
+                        .and_then(|(col, _)| self.look((*row, *col)).fill)
+                        .map_or_else(|| "#ffffff".to_owned(), |f| f.css());
                     let _ = write!(
                         svg,
-                        r##"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="#ffffff"/>"##,
-                        x1 - 0.5,
+                        r#"<rect x="{:.2}" y="{:.2}" width="1" height="{:.2}" fill="{under}"/>"#,
+                        line_x - 0.5,
                         y0 + 0.5,
-                        end - x1 + 1.0,
                         y1 - y0 - 1.0
                     );
                 }

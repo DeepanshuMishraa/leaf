@@ -2096,6 +2096,17 @@ impl App {
         if self.narrator.active() {
             return self.narrator.toggle();
         }
+        // A page drawn as designed is a picture, with no words to read, so
+        // reading aloud shows the words and starts at the top of the page.
+        if self.shown_as == Some(crate::doc::Look::Original) {
+            self.toggle_look();
+            self.notice = Some("reading the text aloud; o shows the design again".into());
+            self.narrator.start(Spot {
+                page: self.current,
+                offset: 0,
+            });
+            return;
+        }
         let from = match self.selection.map(Selection::range) {
             Some((start, end)) if start != end => {
                 self.selection = None;
@@ -2801,6 +2812,11 @@ impl App {
         let Some(look) = self.shown_as.map(crate::doc::Look::other) else {
             return;
         };
+        // What was being read aloud is gone from the page, as on a reload.
+        if self.narrator.active() {
+            self.narrator.stop();
+            self.notice = Some("the page changed, so reading aloud stopped".into());
+        }
         self.shown_as = Some(look);
         self.doc.source.set_look(look);
         self.laid.clear();

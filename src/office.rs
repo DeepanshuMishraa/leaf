@@ -88,13 +88,27 @@ pub fn open(path: &Path) -> Result<Doc, String> {
     }
 }
 
-/// A picture's size in pixels, read without decoding all of it.
+/// A picture's size in pixels as `picture_pixels` gives it, turned upright
+/// by its EXIF orientation, read from its header without decoding it.
 pub fn picture_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    image::ImageReader::new(std::io::Cursor::new(bytes))
+    use image::ImageDecoder;
+    use image::metadata::Orientation;
+    let header = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()
-        .and_then(|r| r.into_dimensions().ok())
-        .or_else(|| crate::prmedia::decode(bytes).map(|p| p.dimensions()))
+        .and_then(|r| r.into_decoder().ok())
+        .map(|mut d| {
+            let (w, h) = d.dimensions();
+            let turned = matches!(
+                d.orientation(),
+                Ok(Orientation::Rotate90
+                    | Orientation::Rotate270
+                    | Orientation::Rotate90FlipH
+                    | Orientation::Rotate270FlipH)
+            );
+            if turned { (h, w) } else { (w, h) }
+        });
+    header.or_else(|| crate::prmedia::decode(bytes).map(|p| p.dimensions()))
 }
 
 /// A picture's pixels, scaled down to at most `width` pixels wide.

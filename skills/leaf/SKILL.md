@@ -1,6 +1,6 @@
 ---
 name: leaf
-description: Use leaf, a terminal reader and code reviewer, to show the person documents, diffs and pull requests, read the comments they leave, and hand plans or changes to them for review. Use when the person mentions leaf, asks to read or show a PDF, Markdown file, article, diff or pull request in the terminal, or asks for their review.
+description: Use leaf, a terminal reader and code reviewer, to show the person documents, diffs and pull requests, read the comments they leave, and hand plans or changes to them for review. Use when the person mentions leaf, asks to read or show a PDF, Markdown file, Word document, slide deck, spreadsheet, article, diff or pull request in the terminal, or asks for their review.
 ---
 
 # leaf

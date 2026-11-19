@@ -81,11 +81,11 @@ Markdown files (`.md`, `.markdown`) show as written, with GitHub's extensions: t
 
 Office files open too, for reading. leaf reads them itself, the same on macOS and Linux, with nothing else installed:
 
-- **Slide decks** (`.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.potx`, `.potm`) show one slide per page, with speaker notes beneath. `←/→` move between slides, and `=` widens a slide to the screen.
+- **Slide decks** (`.pptx`, `.pptm`, `.ppsx`, `.ppsm`, `.potx`, `.potm`) show one slide per page, with speaker notes beneath. `←/→` move between slides.
 - **Word documents** (`.docx`, `.docm`, `.dotx`, `.dotm`) show page by page, on the document's own page size and margins, with its lists, tables and pictures.
-- **Spreadsheets** (`.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`) and **CSV/TSV** files show each sheet in pages of 60 rows and 8 columns. The header row tops every page, and the first column starts every page of a wide sheet. Semicolon-separated CSV is detected.
+- **Spreadsheets** (`.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.xla`, `.xlam`, `.ods`) and **CSV/TSV** files show each sheet in pages of 60 rows and 8 columns. The header row tops every page, and the first column starts every page of a wide sheet. Semicolon-separated CSV is detected.
 
-Each opens as designed: drawn as a picture in its own fonts, colors and layout, with an Excel workbook's cell fills, borders and column widths. `o` switches to the terminal's font and colors, as markdown text and tables; the page stays the same. In the designed look, `i` switches between real colors and the picture painted in the terminal's colors, as with PDFs. The footer shows both keys.
+Decks and Word documents open as designed, drawn as a picture in their own fonts, colors and layout. Spreadsheets open as a grid: `.xlsx` and `.xlsm` workbooks keep their cell fonts, fills, borders, column widths and row heights; other spreadsheets and CSV/TSV files get a plain grid sized to their cells. `+` and `-` zoom (as `>` and `<` do), and `=` fits a page to the screen. `o` switches to the terminal's font and colors, as markdown text and tables; the page stays the same. In the designed look, `i` switches between real colors and the picture painted in the terminal's colors, as with PDFs. The footer shows these keys.
 
 Older formats (`.doc`, `.ppt`, `.rtf`, `.odt`, `.odp`) and Apple's (`.pages`, `.key`, `.numbers`) aren't read; save them as `.docx`, `.pptx` or `.xlsx` from the app that made them.
 

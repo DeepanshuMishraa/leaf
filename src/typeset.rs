@@ -452,34 +452,61 @@ pub fn wrap(runs: &[Run], first: f32, width: f32, empty: &Style) -> Vec<Line> {
         }
         lines.push(std::mem::take(line));
     };
-    for (text, style, spacing) in tokens(runs) {
+    let tokens = tokens(runs);
+    let widths: Vec<f32> = tokens
+        .iter()
+        .map(|(t, s, _)| if t == "\n" { 0.0 } else { measure(t, s) })
+        .collect();
+    // A token that continues the word before it, in another style (a bold
+    // letter inside a word): no line breaks there.
+    let glued = |i: usize| {
+        i > 0 && !tokens[i].2 && !tokens[i - 1].2 && tokens[i].0 != "\n" && tokens[i - 1].0 != "\n"
+    };
+    for (i, (text, style, spacing)) in tokens.iter().enumerate() {
         if text == "\n" {
             finish(&mut line, &mut lines);
             continue;
         }
-        let w = measure(&text, &style);
-        if spacing {
+        let w = widths[i];
+        if *spacing {
             if !line.pieces.is_empty() {
-                push_piece(&mut line, &text, &style, w);
+                push_piece(&mut line, text, style, w);
             }
             continue;
         }
         let room = limit(&lines);
-        if line.width + w > room + 0.01 && !line.pieces.is_empty() {
-            finish(&mut line, &mut lines);
-        }
-        let room = limit(&lines);
-        if w <= room || room <= 0.0 {
-            push_piece(&mut line, &text, &style, w);
-            continue;
+        if glued(i) {
+            if line.width + w <= room + 0.01 || room <= 0.0 {
+                push_piece(&mut line, text, style, w);
+                continue;
+            }
+        } else {
+            // The whole word, across its style changes, decides the break.
+            let word: f32 = w
+                + (i + 1..tokens.len())
+                    .take_while(|&j| glued(j))
+                    .map(|j| widths[j])
+                    .sum::<f32>();
+            if line.width + word > room + 0.01 && !line.pieces.is_empty() {
+                finish(&mut line, &mut lines);
+            }
+            let room = limit(&lines);
+            if w <= room || room <= 0.0 {
+                push_piece(&mut line, text, style, w);
+                continue;
+            }
         }
         // A word wider than the line breaks between letters.
         let mut part = String::new();
         let mut part_w = 0.0;
         for c in text.chars() {
-            let cw = measure(&c.to_string(), &style);
-            if part_w + cw > limit(&lines) && !part.is_empty() {
-                push_piece(&mut line, &part, &style, part_w);
+            let cw = measure(&c.to_string(), style);
+            if line.width + part_w + cw > limit(&lines)
+                && !(part.is_empty() && line.pieces.is_empty())
+            {
+                if !part.is_empty() {
+                    push_piece(&mut line, &part, style, part_w);
+                }
                 finish(&mut line, &mut lines);
                 part.clear();
                 part_w = 0.0;
@@ -488,7 +515,7 @@ pub fn wrap(runs: &[Run], first: f32, width: f32, empty: &Style) -> Vec<Line> {
             part_w += cw;
         }
         if !part.is_empty() {
-            push_piece(&mut line, &part, &style, part_w);
+            push_piece(&mut line, &part, style, part_w);
         }
     }
     if !line.pieces.is_empty() || lines.is_empty() {
@@ -500,7 +527,9 @@ pub fn wrap(runs: &[Run], first: f32, width: f32, empty: &Style) -> Vec<Line> {
 /// SVG for a line whose start is at `x` and baseline at `y`, in points.
 pub fn svg_line(out: &mut String, line: &Line, x: f32, y: f32) {
     for piece in &line.pieces {
-        if piece.text.trim().is_empty() {
+        // Spaces draw nothing, unless they carry an underline or a strike.
+        let decorated = piece.style.underline || piece.style.strike;
+        if piece.text.is_empty() || (piece.text.trim().is_empty() && !decorated) {
             continue;
         }
         let style = &piece.style;
@@ -510,7 +539,7 @@ pub fn svg_line(out: &mut String, line: &Line, x: f32, y: f32) {
             .map(|f| f.family.clone())
             .unwrap_or_else(|| style.family.clone());
         let fitted = match found {
-            Some(f) if f.squeeze != 1.0 && piece.text.chars().count() > 1 => format!(
+            Some(f) if f.squeeze != 1.0 && piece.text.trim().chars().count() > 1 => format!(
                 r#" textLength="{:.2}" lengthAdjust="spacingAndGlyphs""#,
                 piece.width - measure(&piece.text[piece.text.trim_end().len()..], style)
             ),
@@ -633,6 +662,50 @@ mod tests {
             words.join(" "),
             "the quick brown fox jumps over the lazy dog"
         );
+    }
+
+    #[test]
+    fn a_word_in_two_styles_stays_whole_at_a_line_end() {
+        let bold = Run {
+            text: "bar".into(),
+            style: Rc::new(Style {
+                bold: true,
+                ..Style::default()
+            }),
+        };
+        let first = run("aaa foo");
+        // Room for "aaa foo" but not "aaa foobar": the whole word moves down.
+        let room = measure("aaa foo", &Style::default()) + 2.0;
+        let lines = wrap(&[first, bold], room, room, &Style::default());
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.pieces.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, ["aaa", "foobar"]);
+    }
+
+    #[test]
+    fn underlined_spaces_keep_their_line() {
+        let underlined = Rc::new(Style {
+            underline: true,
+            ..Style::default()
+        });
+        let lines = wrap(
+            &[
+                run("a"),
+                Run {
+                    text: "   ".into(),
+                    style: underlined,
+                },
+                run("b"),
+            ],
+            500.0,
+            500.0,
+            &Style::default(),
+        );
+        let mut svg = String::new();
+        svg_line(&mut svg, &lines[0], 0.0, 10.0);
+        assert!(svg.contains("text-decoration=\"underline\""), "{svg}");
     }
 
     #[test]

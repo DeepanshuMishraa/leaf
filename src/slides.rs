@@ -235,7 +235,7 @@ impl Deck {
                     let title = ph
                         .and_then(|(kind, _)| kind)
                         .is_some_and(|k| matches!(k, "title" | "ctrTitle"));
-                    let cascade = ctx.cascade(node, ph, master_ph, layout_ph, &ctx.theme.clone());
+                    let cascade = ctx.cascade(node, ph, master_ph, layout_ph);
                     let md = drawing::body_markdown(body, title.then_some(2), &cascade, ctx.theme);
                     // Its largest size set in the text, else the size it inherits.
                     let size = body
@@ -695,7 +695,6 @@ impl<'a, 'i> Ctx<'a, 'i> {
         ph: Option<(Option<&str>, Option<&str>)>,
         master: Option<Node<'a, 'i>>,
         layout: Option<Node<'a, 'i>>,
-        _theme: &Theme,
     ) -> Cascade<'a, 'i> {
         let mut lists = Vec::new();
         match ph {
@@ -855,7 +854,7 @@ impl<'a, 'i> Ctx<'a, 'i> {
                     body_props.apply(b);
                 }
             }
-            let cascade = self.cascade(node, ph, master_ph, layout_ph, self.theme);
+            let cascade = self.cascade(node, ph, master_ph, layout_ph);
             let text_rect = node
                 .child("txXfrm")
                 .and_then(drawing::xfrm)
@@ -965,7 +964,26 @@ impl<'a, 'i> Ctx<'a, 'i> {
             return;
         };
         if let Some(tbl) = data.child("tbl") {
-            self.table(canvas, tbl, rect);
+            // In a scaled group, the table is laid out at its own size and
+            // scaled with the group, text and all.
+            let (sx, sy, ..) = self.map.get();
+            if (sx - 1.0).abs() > 1e-3 || (sy - 1.0).abs() > 1e-3 {
+                let _ = write!(
+                    canvas.body,
+                    r#"<g transform="translate({:.2} {:.2}) scale({sx:.4} {sy:.4})">"#,
+                    rect.x, rect.y
+                );
+                let own = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: rect.w / sx.max(1e-3),
+                    h: rect.h / sy.max(1e-3),
+                };
+                self.table(canvas, tbl, own);
+                canvas.body.push_str("</g>");
+            } else {
+                self.table(canvas, tbl, rect);
+            }
         } else if let Some(chart) = data.child("chart") {
             if let Some(xml) = chart
                 .attr("id")
@@ -1011,7 +1029,7 @@ impl<'a, 'i> Ctx<'a, 'i> {
             })
             .unwrap_or_default();
         let props = tbl.child("tblPr");
-        let flag = |n: &str| props.and_then(|p| p.attribute(n)) == Some("1");
+        let flag = |n: &str| matches!(props.and_then(|p| p.attribute(n)), Some("1" | "true"));
         let style_id = props
             .and_then(|p| p.child("tableStyleId"))
             .and_then(|s| s.text())

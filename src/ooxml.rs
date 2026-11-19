@@ -20,6 +20,9 @@ pub fn emu(value: &str) -> Option<f32> {
         .map(|v| (v / EMU_PER_PT as f64) as f32)
 }
 
+/// Largest part read, uncompressed: past any real slide, sheet or picture.
+const MAX_PART_BYTES: u64 = 512 << 20;
+
 /// An open package. Parts are read on demand.
 pub struct Package {
     zip: RefCell<zip::ZipArchive<Cursor<Vec<u8>>>>,
@@ -68,10 +71,12 @@ impl Package {
 
     pub fn bytes(&self, part: &str) -> Option<Vec<u8>> {
         let mut zip = self.zip.borrow_mut();
-        let mut file = zip.by_name(part.trim_start_matches('/')).ok()?;
-        let mut out = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut out).ok()?;
-        Some(out)
+        let file = zip.by_name(part.trim_start_matches('/')).ok()?;
+        // The size a part claims isn't trusted: a damaged or hostile file
+        // could claim terabytes. Read up to the limit, and give up past it.
+        let mut out = Vec::with_capacity((file.size() as usize).min(1 << 20));
+        file.take(MAX_PART_BYTES + 1).read_to_end(&mut out).ok()?;
+        (out.len() as u64 <= MAX_PART_BYTES).then_some(out)
     }
 
     pub fn text(&self, part: &str) -> Option<String> {

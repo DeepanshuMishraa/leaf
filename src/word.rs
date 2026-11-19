@@ -409,11 +409,25 @@ struct Level {
     para: ParaFmt,
 }
 
+/// A list (`w:num`): the abstract definition it counts with, and the levels
+/// it restarts at a given number the first time it's used.
+#[derive(Debug, Clone)]
+struct List {
+    definition: String,
+    levels: Vec<Level>,
+    restarts: HashMap<usize, u32>,
+}
+
+/// Lists and their counts. As in Word, lists sharing a definition share a
+/// count, so a list continues the one before it unless it restarts
+/// (`startOverride`), which is how Word writes "Restart at 1".
 #[derive(Debug, Default)]
 struct Numbering {
-    /// Each list's abstract definition and its levels.
-    lists: HashMap<String, (String, Vec<Level>)>,
+    lists: HashMap<String, List>,
+    /// Counts by abstract definition.
     counters: HashMap<String, [u32; 9]>,
+    /// The list levels whose restart has been applied.
+    restarted: std::collections::HashSet<(String, usize)>,
 }
 
 impl Numbering {
@@ -465,33 +479,55 @@ impl Numbering {
                 continue;
             };
             if let Some(levels) = abstracts.get(abs) {
-                numbering
-                    .lists
-                    .insert(id.to_owned(), (abs.to_owned(), levels.clone()));
+                let restarts = num
+                    .kids("lvlOverride")
+                    .filter_map(|o| {
+                        let level = o.attr("ilvl")?.parse::<usize>().ok()?;
+                        let start = o.child("startOverride")?.attr("val")?.parse().ok()?;
+                        Some((level, start))
+                    })
+                    .collect();
+                numbering.lists.insert(
+                    id.to_owned(),
+                    List {
+                        definition: abs.to_owned(),
+                        levels: levels.clone(),
+                        restarts,
+                    },
+                );
             }
         }
         numbering
     }
 
     fn level(&self, id: &str, level: u8) -> Option<&Level> {
-        self.lists.get(id)?.1.get(level as usize)
+        self.lists.get(id)?.levels.get(level as usize)
     }
 
     /// The next label for a list item, counting it.
     fn label(&mut self, id: &str, level: u8) -> Option<Mark> {
-        let (key, levels) = self.lists.get(id)?;
+        let list = self.lists.get(id)?;
+        let levels = &list.levels;
         let at = level as usize;
         let this = levels.get(at)?;
-        let counters = self.counters.entry(key.clone()).or_insert([0; 9]);
+        let restart = list
+            .restarts
+            .get(&at)
+            .copied()
+            .filter(|_| self.restarted.insert((id.to_owned(), at)));
+        let counters = self
+            .counters
+            .entry(list.definition.clone())
+            .or_insert([0; 9]);
         for (i, counter) in counters.iter_mut().enumerate() {
             if i < at && *counter == 0 {
                 *counter = levels[i].start;
             }
         }
-        counters[at] = if counters[at] == 0 {
-            this.start
-        } else {
-            counters[at] + 1
+        counters[at] = match restart {
+            Some(start) => start,
+            None if counters[at] == 0 => this.start,
+            None => counters[at] + 1,
         };
         for counter in counters.iter_mut().skip(at + 1) {
             *counter = 0;
@@ -1414,11 +1450,13 @@ fn para_markdown(para: &Para) -> String {
 fn plain(paras: &[Para]) -> String {
     paras
         .iter()
+        // A table row is one line: line breaks, and the blank lines around a
+        // picture, become single spaces.
         .map(|p| {
             inline_markdown(&p.items, true)
-                .replace("  \n", " ")
-                .trim()
-                .to_owned()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         })
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
@@ -1798,6 +1836,49 @@ mod tests {
             &*doc.source.page(0),
             "1. one\n  - a) sub\n2. two\n  - a) again\n- dot"
         );
+    }
+
+    #[test]
+    fn lists_sharing_a_definition_continue_unless_they_restart() {
+        let dir = tempdir("restart");
+        let numbering = r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="3"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>"#;
+        let item = |id: u8, text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{id}"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let body = [
+            item(1, "a"),
+            item(1, "b"),
+            item(2, "c"),
+            item(3, "d"),
+            item(3, "e"),
+        ]
+        .concat();
+        let doc = open(&docx(&dir, &body, "", numbering)).unwrap();
+        doc.source.set_look(Look::Terminal);
+        assert_eq!(&*doc.source.page(0), "1. a\n2. b\n3. c\n1. d\n2. e");
+    }
+
+    #[test]
+    fn a_table_cell_with_lines_and_a_picture_stays_on_one_row() {
+        let paras = vec![Para {
+            fmt: ParaFmt::default(),
+            mark: Rc::new(Style::default()),
+            heading: None,
+            list: None,
+            items: vec![
+                Inline::Text("one\ntwo".into(), Rc::new(Style::default())),
+                Inline::Picture {
+                    part: "word/media/a.png".into(),
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ],
+        }];
+        let text = plain(&paras);
+        assert!(!text.contains('\n'), "{text:?}");
+        assert!(text.starts_with("one two ![]("), "{text:?}");
     }
 
     #[test]

@@ -37,6 +37,10 @@ struct Chart {
     legend: bool,
 }
 
+/// Most points a series is read with: a chart past this is past reading,
+/// and a damaged file naming a huge index can't make leaf allocate for it.
+const MAX_POINTS: usize = 100_000;
+
 fn cached(node: Option<Node>) -> Vec<(usize, String)> {
     let Some(node) = node else { return Vec::new() };
     let Some(cache) = node
@@ -48,7 +52,11 @@ fn cached(node: Option<Node>) -> Vec<(usize, String)> {
     cache
         .kids("pt")
         .filter_map(|pt| {
-            let idx = pt.attribute("idx")?.parse().ok()?;
+            let idx = pt
+                .attribute("idx")?
+                .parse()
+                .ok()
+                .filter(|i| *i < MAX_POINTS)?;
             let v = pt.child("v")?.text().unwrap_or("").to_owned();
             Some((idx, v))
         })
@@ -150,9 +158,21 @@ fn parse(xml: &str, theme: &Theme) -> Option<Chart> {
         .child("autoTitleDeleted")
         .and_then(|d| d.attribute("val"))
         == Some("1");
+    // A title is written out, or taken from a cell and cached.
     let title = chart
         .child("title")
-        .map(rich_text)
+        .map(|t| {
+            let rich = rich_text(t);
+            if rich.trim().is_empty() {
+                cached(t.child("tx"))
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                rich
+            }
+        })
         .filter(|t| !t.trim().is_empty())
         .or_else(|| {
             (!deleted && chart.child("title").is_some() && series.len() == 1)
@@ -673,7 +693,7 @@ pub fn markdown(xml: &str, theme: &Theme) -> String {
                     .get(i)
                     .copied()
                     .flatten()
-                    .map(trim)
+                    .map(|v| v.to_string())
                     .unwrap_or_default()
             })
             .collect();
