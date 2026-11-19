@@ -1401,16 +1401,18 @@ fn reading_order(blocks: Vec<TextBlock>) -> Vec<TextBlock> {
 }
 
 /// The widest gap along one axis that no block spans, and where it ends.
-/// Shapes that overlap by a hair still count as apart.
+/// Shapes that overlap by a hair still count as apart. A cut always has
+/// blocks on both sides of it, so cutting there always makes progress, even
+/// when shapes share a start (or have no position at all).
 fn widest_gap(blocks: &[TextBlock], span: fn(&TextBlock) -> (f32, f32)) -> Option<(f32, f32)> {
     const TOUCH: f32 = 2.0;
     let mut spans: Vec<(f32, f32)> = blocks.iter().map(span).collect();
     spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut end = spans.first()?.1;
+    let &(first, mut end) = spans.first()?;
     let mut widest: Option<(f32, f32)> = None;
     for &(start, stop) in &spans[1..] {
         let gap = start - end;
-        if gap > -TOUCH && widest.is_none_or(|(w, _)| gap > w) {
+        if start > first && gap > -TOUCH && widest.is_none_or(|(w, _)| gap > w) {
             widest = Some((gap, start));
         }
         end = end.max(stop);
@@ -1708,6 +1710,20 @@ mod tests {
         assert_eq!(
             slide_markdown(blocks, (720.0, 405.0)),
             "## Big title\n\n01 — KICKER\n\nLeft head\n\nLeft body\n\nRight head\n\nRight body"
+        );
+    }
+
+    #[test]
+    fn shapes_without_a_position_are_read_in_order_without_looping() {
+        let text = BlockKind::Text { size: 12.0 };
+        let blocks = vec![
+            block(0.0, 0.0, 0.0, 0.0, text, "one"),
+            block(0.0, 0.0, 0.0, 0.0, text, "two"),
+            block(0.0, 0.0, 0.0, 0.0, text, "three"),
+        ];
+        assert_eq!(
+            slide_markdown(blocks, (720.0, 405.0)),
+            "one\n\ntwo\n\nthree"
         );
     }
 

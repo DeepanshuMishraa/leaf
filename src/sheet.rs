@@ -69,6 +69,7 @@ impl Book {
             columns: span.columns.iter().map(|&c| (left + c, c)).collect(),
             looks: self.looks.as_ref(),
             sheet: self.looks.as_ref().and_then(|l| l.sheet(&sheet.name)),
+            open_right: span.columns.last() == Some(&head.len().saturating_sub(1)),
         })
     }
 }

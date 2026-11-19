@@ -411,6 +411,10 @@ pub struct Grid<'a> {
     pub columns: Vec<(usize, usize)>,
     pub looks: Option<&'a Looks>,
     pub sheet: Option<&'a SheetLooks>,
+    /// Whether the last column shown is the sheet's last, so text may run
+    /// on past it. On a wide sheet split across pages, the next column
+    /// belongs to the next page and may hold data.
+    pub open_right: bool,
 }
 
 impl Grid<'_> {
@@ -494,6 +498,9 @@ impl Grid<'_> {
         let (Some(last), Some(&room)) = (self.columns.len().checked_sub(1), widths.last()) else {
             return 0.0;
         };
+        if !self.open_right {
+            return 0.0;
+        }
         (0..self.rows.len())
             .map(|r| {
                 let text = self.text(r, last).trim();
@@ -546,7 +553,7 @@ impl Grid<'_> {
         // Headers.
         let _ = write!(
             svg,
-            r#"<rect x="0" y="0" width="{content_w:.2}" height="{HEADER_HEIGHT}" fill="{HEADER_FILL}"/><rect x="0" y="0" width="{gutter:.2}" height="{content_h:.2}" fill="{HEADER_FILL}"/>"#
+            r#"<rect x="0" y="0" width="{width:.2}" height="{HEADER_HEIGHT}" fill="{HEADER_FILL}"/><rect x="0" y="0" width="{gutter:.2}" height="{content_h:.2}" fill="{HEADER_FILL}"/>"#
         );
         let centered = |svg: &mut String, text: &str, x0: f32, x1: f32, y0: f32, y1: f32| {
             if let Some(line) = fitted(text, &gutter_style, x1 - x0 - 2.0) {
@@ -640,7 +647,7 @@ impl Grid<'_> {
                         reach = xs[next + 1];
                         next += 1;
                     }
-                    if next == self.columns.len() {
+                    if next == self.columns.len() && self.open_right {
                         reach = width;
                     }
                 }
@@ -762,6 +769,7 @@ mod tests {
             columns: vec![(0, 0), (1, 1)],
             looks: None,
             sheet: None,
+            open_right: true,
         };
         let svg = grid.svg();
         assert!(svg.contains(">Ada<") && svg.contains(">42<") && svg.contains(">B<"));

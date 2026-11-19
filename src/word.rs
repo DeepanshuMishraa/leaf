@@ -629,6 +629,12 @@ enum Block {
     Para(Para),
     Table(Table),
     PageBreak,
+    /// The end of a section laid out on `geo`; the next section starts on a
+    /// new page unless it's continuous.
+    Section {
+        geo: Geometry,
+        new_page: bool,
+    },
 }
 
 struct Reader<'a> {
@@ -697,15 +703,17 @@ impl Reader<'_> {
             list,
             items,
         }));
-        // A section break inside a paragraph starts a new page, unless continuous.
+        // A section break inside a paragraph ends a section with its own page
+        // size and margins; the next starts a new page, unless continuous.
         if let Some(sect) = ppr.and_then(|n| n.child("sectPr")) {
             let continuous = sect
                 .child("type")
                 .and_then(|t| t.attr("val"))
                 .is_some_and(|v| v == "continuous");
-            if !continuous {
-                out.push(Block::PageBreak);
-            }
+            out.push(Block::Section {
+                geo: Geometry::parse(Some(sect)),
+                new_page: !continuous,
+            });
         }
     }
 
@@ -905,7 +913,7 @@ fn flatten(blocks: Vec<Block>) -> Vec<Para> {
                     out.extend(cell.paras);
                 }
             }
-            Block::PageBreak => {}
+            Block::PageBreak | Block::Section { .. } => {}
         }
     }
     out
@@ -1160,8 +1168,17 @@ fn lay_para(para: &Para, width: f32) -> (f32, Vec<Row>, f32) {
             .next()
             .unwrap_or_default();
         let mut row = row_for(line, text_x, width - right - text_x, label.as_ref());
-        row.page_break = break_next;
+        row.page_break = std::mem::take(&mut break_next);
         rows.push(row);
+    }
+    // A break after the last words: an empty row that starts the next page,
+    // so what follows the paragraph begins there.
+    if break_next {
+        rows.push(Row {
+            height: 0.0,
+            items: Vec::new(),
+            page_break: true,
+        });
     }
     if let Some(color) = fmt.shade {
         let total: f32 = rows.iter().map(|r| r.height).sum();
@@ -1203,9 +1220,17 @@ fn stack(paras: &[Para], width: f32) -> (Vec<Item>, f32) {
     (items, y)
 }
 
-struct Pager {
+/// A laid-out page: its section's size and margins, and what's drawn on it.
+#[derive(Debug, Clone)]
+struct Page {
     geo: Geometry,
-    pages: Vec<Vec<Item>>,
+    items: Vec<Item>,
+}
+
+struct Pager {
+    /// The current section's size and margins.
+    geo: Geometry,
+    pages: Vec<Page>,
     y: f32,
 }
 
@@ -1213,9 +1238,30 @@ impl Pager {
     fn new(geo: Geometry) -> Pager {
         Pager {
             geo,
-            pages: vec![Vec::new()],
+            pages: vec![Page {
+                geo,
+                items: Vec::new(),
+            }],
             y: geo.top,
         }
+    }
+
+    /// Starts the next section on `geo`: on a new page, or on this one when
+    /// it's still empty or the section is continuous.
+    fn section(&mut self, geo: Geometry, new_page: bool) {
+        self.geo = geo;
+        if self.at_top_of_empty_page() {
+            if let Some(page) = self.pages.last_mut() {
+                page.geo = geo;
+            }
+            self.y = geo.top;
+        } else if new_page {
+            self.new_page();
+        }
+    }
+
+    fn at_top_of_empty_page(&self) -> bool {
+        self.pages.last().is_none_or(|p| p.items.is_empty())
     }
 
     fn page(&self) -> usize {
@@ -1231,14 +1277,18 @@ impl Pager {
     }
 
     fn new_page(&mut self) {
-        self.pages.push(Vec::new());
+        self.pages.push(Page {
+            geo: self.geo,
+            items: Vec::new(),
+        });
         self.y = self.geo.top;
     }
 
     fn put(&mut self, items: Vec<Item>, dx: f32) {
         let y = self.y;
         if let Some(page) = self.pages.last_mut() {
-            page.extend(items.into_iter().map(|it| it.moved(dx, y)));
+            page.items
+                .extend(items.into_iter().map(|it| it.moved(dx, y)));
         }
     }
 
@@ -1501,7 +1551,7 @@ fn block_markdown(block: &Block) -> String {
     match block {
         Block::Para(p) => para_markdown(p),
         Block::Table(t) => table_markdown(t),
-        Block::PageBreak => String::new(),
+        Block::PageBreak | Block::Section { .. } => String::new(),
     }
 }
 
@@ -1533,8 +1583,7 @@ fn picture_id(part: &str) -> String {
 
 struct Words {
     package: Package,
-    geo: Geometry,
-    pages: Vec<Vec<Item>>,
+    pages: Vec<Page>,
     text: Vec<String>,
     look: Cell<Look>,
     pictures: RefCell<HashMap<String, (u32, u32)>>,
@@ -1542,8 +1591,9 @@ struct Words {
 
 impl Words {
     fn render(&self, index: usize) -> Option<String> {
-        let items = self.pages.get(index)?;
-        let (w, h) = (self.geo.width, self.geo.height);
+        let page = self.pages.get(index)?;
+        let items = &page.items;
+        let (w, h) = (page.geo.width, page.geo.height);
         let mut canvas = Canvas::default();
         let _ = write!(
             canvas.body,
@@ -1609,8 +1659,9 @@ impl Source for Words {
     }
 
     fn image_size(&self, id: &str) -> Option<(u32, u32)> {
-        if id.starts_with("page-") {
-            let ratio = self.geo.height / self.geo.width.max(1.0);
+        if let Some(index) = id.strip_prefix("page-") {
+            let geo = self.pages.get(index.parse::<usize>().ok()?)?.geo;
+            let ratio = geo.height / geo.width.max(1.0);
             return Some((
                 MEASURE_WIDTH,
                 (MEASURE_WIDTH as f32 * ratio).round().max(1.0) as u32,
@@ -1697,7 +1748,6 @@ pub fn open(path: &Path) -> Result<Doc, PackageFailed> {
         page_count: Some(pages.len()),
         source: Box::new(Words {
             package,
-            geo,
             pages,
             text,
             look: Cell::new(Look::Original),
@@ -1708,8 +1758,19 @@ pub fn open(path: &Path) -> Result<Doc, PackageFailed> {
 
 /// The blocks laid out on pages, and each page's markdown: the blocks that
 /// start on it.
-fn paginate(blocks: &[Block], geo: Geometry) -> (Vec<Vec<Item>>, Vec<String>) {
-    let mut pager = Pager::new(geo);
+/// `last` is the final section's geometry, from the body's own `sectPr`;
+/// each earlier section's comes from the break that ends it.
+fn paginate(blocks: &[Block], last: Geometry) -> (Vec<Page>, Vec<String>) {
+    let sections: Vec<Geometry> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Section { geo, .. } => Some(*geo),
+            _ => None,
+        })
+        .chain([last])
+        .collect();
+    let mut section = 0;
+    let mut pager = Pager::new(sections[0]);
     let mut starts = Vec::with_capacity(blocks.len());
     for block in blocks {
         match block {
@@ -1729,6 +1790,11 @@ fn paginate(blocks: &[Block], geo: Geometry) -> (Vec<Vec<Item>>, Vec<String>) {
                 if !pager.at_top() {
                     pager.new_page();
                 }
+                starts.push(pager.page());
+            }
+            Block::Section { new_page, .. } => {
+                section += 1;
+                pager.section(sections[section.min(sections.len() - 1)], *new_page);
                 starts.push(pager.page());
             }
         }
@@ -1936,6 +2002,36 @@ mod tests {
     }
 
     #[test]
+    fn each_section_keeps_its_own_page_size() {
+        let dir = tempdir("sections");
+        // A landscape section, then the body's own letter-size one.
+        let body = format!(
+            r#"{}<w:p><w:pPr><w:sectPr><w:pgSz w:w="15840" w:h="12240"/></w:sectPr></w:pPr><w:r><w:t>Wide end</w:t></w:r></w:p>{}"#,
+            para("Wide"),
+            para("Tall")
+        );
+        let doc = open(&docx(&dir, &body, HEADING_STYLE, "")).unwrap();
+        assert_eq!(doc.page_count, Some(2));
+        let (w0, h0) = doc.source.image_size("page-0").unwrap();
+        let (w1, h1) = doc.source.image_size("page-1").unwrap();
+        assert!(w0 > h0, "the first section is landscape");
+        assert!(w1 < h1, "the last section is portrait");
+        doc.source.set_look(Look::Terminal);
+        assert_eq!(&*doc.source.page(1), "Tall");
+    }
+
+    #[test]
+    fn a_page_break_after_the_last_words_moves_what_follows() {
+        let dir = tempdir("trailing-break");
+        let body = format!(
+            r#"<w:p><w:r><w:t>Before</w:t><w:br w:type="page"/></w:r></w:p>{}"#,
+            para("After")
+        );
+        let doc = open(&docx(&dir, &body, HEADING_STYLE, "")).unwrap();
+        assert_eq!(doc.page_count, Some(2));
+    }
+
+    #[test]
     fn draws_text_in_the_document_font() {
         let dir = tempdir("draw");
         let body = r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Times New Roman"/><w:color w:val="FF0000"/></w:rPr><w:t>Hello &amp; welcome</w:t></w:r></w:p>"#;
@@ -1980,7 +2076,6 @@ mod tests {
         let (pages, _) = paginate(&blocks, geo);
         let words = Words {
             package,
-            geo,
             pages,
             text: Vec::new(),
             look: Cell::new(Look::Original),

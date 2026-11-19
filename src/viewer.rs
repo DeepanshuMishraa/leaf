@@ -837,9 +837,15 @@ impl App {
                 ImageMode::Color => "i paint",
                 ImageMode::Mono => "i real colors",
             };
+            // While a drawing is picked, + and - resize it instead.
+            let zoom = if self.picked.is_some() {
+                ""
+            } else {
+                " · + - zoom"
+            };
             footer = match look {
                 crate::doc::Look::Original => {
-                    format!("{footer} · + - zoom · {images} · o terminal font")
+                    format!("{footer}{zoom} · {images} · o terminal font")
                 }
                 crate::doc::Look::Terminal => format!("{footer} · o original look"),
             };
@@ -1554,11 +1560,8 @@ impl App {
             ("[  ]", "read slower / faster"),
             (",  .", "previous / next sentence aloud"),
             ("s", "pick a voice"),
-            ("<  >  =", "narrower / wider / fit column"),
+            ("<  >  =", "narrower / wider / fit column (- + too)"),
         ]);
-        if self.shown_as.is_some() {
-            rows.push(("+  -", "zoom in / out"));
-        }
         if let Some(look) = self.shown_as {
             rows.push((
                 "o",
