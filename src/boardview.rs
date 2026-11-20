@@ -1843,8 +1843,9 @@ impl App {
                     return;
                 }
                 self.checkpoint();
-                if matches!(element.shape, Shape::Arrow { .. }) {
-                    attach(&self.board, &mut element, self.view.scale);
+                if matches!(element.shape, Shape::Arrow { .. } | Shape::Line { .. }) {
+                    // Ends let go within about a row of a shape still meet it.
+                    attach(&self.board, &mut element, self.view.row() * 1.5);
                 }
                 self.selected = vec![element.id.clone()];
                 let id = element.id.clone();
@@ -2378,25 +2379,35 @@ fn decode_picture(url: &str) -> Option<RgbaImage> {
 
 /// Attaches a new arrow's ends to the shapes they're on, and pulls each end
 /// back to the shape's edge.
-fn attach(board: &Board, arrow: &mut Element, slack: f64) {
-    let mut path = arrow.path();
+fn attach(board: &Board, connector: &mut Element, slack: f64) {
+    let mut path = connector.path();
     let n = path.len();
     if n < 2 {
         return;
     }
+    // Excalidraw binds only arrows; a line's ends are put on the edge but
+    // don't follow the shape.
+    let binds = matches!(connector.shape, Shape::Arrow { .. });
+    let mut first: Option<usize> = None;
     for (end, index, other) in [(End::Start, 0, 1), (End::End, n - 1, n - 2)] {
-        let Some(holder) = board
-            .holder(path[index], slack, &arrow.id)
-            .map(|i| &board.elements[i])
-        else {
+        let Some(at) = board.holder(path[index], slack, &connector.id) else {
             continue;
         };
-        arrow.bind(end, Some(&holder.id));
+        // Both ends in one shape is a mark inside it, not a connection.
+        if first == Some(at) {
+            continue;
+        }
+        first = Some(at);
+        let holder = &board.elements[at];
+        if binds {
+            connector.bind(end, Some(&holder.id));
+        }
+        // The end goes onto the edge, on the way to the shape's middle.
         if let Some(edge) = holder.edge(path[other], 4.0) {
             path[index] = edge;
         }
     }
-    arrow.set_path(&path);
+    connector.set_path(&path);
 }
 
 /// Fits a shape being drawn between `start` and `p`; `square` keeps boxes
@@ -3107,6 +3118,60 @@ mod tests {
         drag(&mut app, (12, 6), (17, 6));
         let board = on_disk(&path);
         assert_eq!(board.elements[1].x, label.x + 50.0);
+    }
+
+    /// A box from column 10 to 30 and an ellipse from 50 to 70, rows 5–10.
+    fn two_shapes(app: &mut App) {
+        boxed(app);
+        press(app, KeyCode::Char('o'));
+        drag(app, (50, 5), (70, 10));
+    }
+
+    #[test]
+    fn an_arrow_let_go_near_shapes_snaps_onto_their_edges() {
+        let path = temp("snap-arrow");
+        let (mut app, _) = app(&path);
+        two_shapes(&mut app);
+        // Both ends land two columns (20 board pixels) short of the shapes.
+        press(&mut app, KeyCode::Char('a'));
+        drag(&mut app, (32, 7), (48, 7));
+        let board = on_disk(&path);
+        let (a, b, arrow) = (&board.elements[0], &board.elements[1], &board.elements[2]);
+        assert_eq!(arrow.binding(End::Start), Some(a.id.as_str()));
+        assert_eq!(arrow.binding(End::End), Some(b.id.as_str()));
+        let ends = arrow.path();
+        let last = ends[ends.len() - 1];
+        assert!((ends[0].x - (a.frame().x1 + 4.0)).abs() < 1.0, "{ends:?}");
+        assert!((last.x - (b.frame().x0 - 4.0)).abs() < 1.0, "{ends:?}");
+    }
+
+    #[test]
+    fn a_line_snaps_onto_edges_without_binding() {
+        let path = temp("snap-line");
+        let (mut app, _) = app(&path);
+        two_shapes(&mut app);
+        press(&mut app, KeyCode::Char('l'));
+        drag(&mut app, (32, 7), (48, 7));
+        let board = on_disk(&path);
+        let (a, b, line) = (&board.elements[0], &board.elements[1], &board.elements[2]);
+        assert_eq!(line.binding(End::Start), None);
+        assert_eq!(line.binding(End::End), None);
+        let ends = line.path();
+        let last = ends[ends.len() - 1];
+        assert!((ends[0].x - (a.frame().x1 + 4.0)).abs() < 1.0, "{ends:?}");
+        assert!((last.x - (b.frame().x0 - 4.0)).abs() < 1.0, "{ends:?}");
+    }
+
+    #[test]
+    fn an_arrow_far_from_any_shape_stays_where_it_was_drawn() {
+        let path = temp("snap-far");
+        let (mut app, _) = app(&path);
+        two_shapes(&mut app);
+        press(&mut app, KeyCode::Char('a'));
+        drag(&mut app, (20, 20), (60, 20));
+        let arrow = &on_disk(&path).elements[2];
+        assert_eq!(arrow.binding(End::Start), None);
+        assert_eq!(arrow.binding(End::End), None);
     }
 
     #[test]
