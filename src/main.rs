@@ -88,8 +88,8 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | office
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
-       leaf board [file.excalidraw]   draw on a whiteboard with the agent (default: board.excalidraw here)
-       leaf board [file.excalidraw] --export <out.png | out.svg>   save the board as a picture
+       leaf board [file.excalidraw]   draw on a whiteboard with the agent (default: a new board-<words>.excalidraw here)
+       leaf board <file.excalidraw> --export <out.png | out.svg>   save the board as a picture
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -291,15 +291,21 @@ fn resume(
     options
 }
 
-/// The board `leaf board` opens when none is named, in this folder.
-const DEFAULT_BOARD: &str = "board.excalidraw";
-
 fn is_board(target: &str) -> bool {
     target.to_ascii_lowercase().ends_with(".excalidraw")
 }
 
 /// Writes the board at `path` as an SVG or PNG picture at `to`.
 fn export_board(path: &Path, to: &Path) -> ExitCode {
+    if let (Ok(board), Ok(picture)) = (std::fs::canonicalize(path), std::fs::canonicalize(to))
+        && board == picture
+    {
+        eprintln!(
+            "leaf: exporting to {} would write over the board itself. Name a different .png or .svg file.",
+            to.display()
+        );
+        return ExitCode::from(2);
+    }
     if !path.exists() {
         eprintln!(
             "leaf: there's no board at {}. Name an existing .excalidraw file.",
@@ -327,7 +333,7 @@ fn export_board(path: &Path, to: &Path) -> ExitCode {
 }
 
 fn board_command(path: &Path) -> ExitCode {
-    if !std::io::stdout().is_terminal() {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!("leaf: the board needs a terminal to draw in. Run leaf board in one.");
         return ExitCode::from(2);
     }
@@ -338,6 +344,14 @@ fn board_command(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The file exists from the start, so an agent can be pointed at it
+    // before anything is drawn.
+    if !path.exists()
+        && let Err(e) = board.save(path)
+    {
+        eprintln!("leaf: {e}");
+        return ExitCode::FAILURE;
+    }
     match boardview::run(path.to_owned(), board) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -419,11 +433,14 @@ fn main() -> ExitCode {
         }
         "ui" => ui_command(rest),
         "board" | "whiteboard" => match rest {
-            [] => board_command(Path::new(DEFAULT_BOARD)),
+            [] => board_command(&board::fresh_path(Path::new("."))),
             [path] if !path.starts_with('-') => board_command(Path::new(path)),
             [path, flag, to] if flag == "--export" => export_board(Path::new(path), Path::new(to)),
-            [flag, to] if flag == "--export" => {
-                export_board(Path::new(DEFAULT_BOARD), Path::new(to))
+            [flag, _] if flag == "--export" => {
+                eprintln!(
+                    "leaf: name the board to export, as in leaf board sketch.excalidraw --export sketch.png."
+                );
+                ExitCode::from(2)
             }
             _ => {
                 eprintln!("{USAGE}");

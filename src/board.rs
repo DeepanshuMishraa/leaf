@@ -5,7 +5,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -213,6 +213,7 @@ impl End {
 pub enum Head {
     Arrow,
     Triangle,
+    Diamond,
     Bar,
     Dot,
 }
@@ -220,7 +221,8 @@ pub enum Head {
 impl Head {
     fn parse(name: &str) -> Head {
         match name {
-            "triangle" | "triangle_outline" | "diamond" | "diamond_outline" => Head::Triangle,
+            "triangle" | "triangle_outline" => Head::Triangle,
+            "diamond" | "diamond_outline" => Head::Diamond,
             "bar" => Head::Bar,
             "dot" | "circle" | "circle_outline" => Head::Dot,
             _ => Head::Arrow,
@@ -260,6 +262,16 @@ impl Tip {
                     self.at,
                     along(back + 0.4, self.size),
                     along(back - 0.4, self.size),
+                    self.at,
+                ]],
+                true,
+            ),
+            Head::Diamond => (
+                vec![vec![
+                    self.at,
+                    along(back + 0.45, self.size * 0.6),
+                    along(back, self.size * 1.1),
+                    along(back - 0.45, self.size * 0.6),
                     self.at,
                 ]],
                 true,
@@ -511,14 +523,14 @@ impl Element {
         }
     }
 
-    /// An element of an Excalidraw file; `None` for a deleted one or
-    /// anything that isn't an element.
-    fn from_value(value: Value) -> Option<Self> {
+    /// An element of an Excalidraw file; `None` for a deleted one, and an
+    /// error for a record that isn't an element at all.
+    fn from_value(value: Value) -> Result<Option<Self>, String> {
         let Value::Object(raw) = value else {
-            return None;
+            return Err(format!("{value} isn't an element object"));
         };
         if raw.get("isDeleted").and_then(Value::as_bool) == Some(true) {
-            return None;
+            return Ok(None);
         }
         let number = |key: &str| raw.get(key).and_then(Value::as_f64).unwrap_or(0.0);
         let string = |key: &str| raw.get(key).and_then(Value::as_str).unwrap_or_default();
@@ -534,7 +546,13 @@ impl Element {
                 .unwrap_or_default()
         };
         let (w, h) = (number("width"), number("height"));
-        let kind = raw.get("type").and_then(Value::as_str)?.to_owned();
+        let Some(kind) = raw.get("type").and_then(Value::as_str).map(str::to_owned) else {
+            let id = raw
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("without an id");
+            return Err(format!("the element {id} has no \"type\""));
+        };
         let shape = match kind.as_str() {
             "rectangle" => Shape::Rectangle { w, h },
             "ellipse" => Shape::Ellipse { w, h },
@@ -563,7 +581,7 @@ impl Element {
             color: background.to_owned(),
             style: FillStyle::parse(string("fillStyle")),
         });
-        Some(Element {
+        Ok(Some(Element {
             id: raw
                 .get("id")
                 .and_then(Value::as_str)
@@ -597,7 +615,7 @@ impl Element {
                 .map(str::to_owned),
             shape,
             raw,
-        })
+        }))
     }
 
     fn to_value(&self) -> Value {
@@ -1113,6 +1131,41 @@ pub fn new_id() -> String {
     format!("{:016x}", random())
 }
 
+/// A file name for a new board in `dir` that nothing there has yet, like
+/// `board-misty-harbor.excalidraw`.
+pub fn fresh_path(dir: &Path) -> PathBuf {
+    const FIRST: &[&str] = &[
+        "amber", "brisk", "calm", "dusky", "eager", "fern", "gentle", "hazy", "ivory", "jolly",
+        "keen", "lucky", "misty", "nimble", "olive", "plum", "quiet", "rapid", "sunny", "tidy",
+        "umber", "vivid", "windy", "young", "zesty",
+    ];
+    const SECOND: &[&str] = &[
+        "atlas", "brook", "cedar", "delta", "ember", "field", "grove", "harbor", "island",
+        "jungle", "kite", "lagoon", "meadow", "nebula", "orbit", "pebble", "quarry", "river",
+        "summit", "tundra", "valley", "willow", "yarrow", "zephyr",
+    ];
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let n = random() as usize;
+        let words = format!(
+            "{}-{}",
+            FIRST[n % FIRST.len()],
+            SECOND[(n / FIRST.len()) % SECOND.len()]
+        );
+        // After many taken names, a number keeps the name free.
+        let name = if attempt < 32 {
+            format!("board-{words}.excalidraw")
+        } else {
+            format!("board-{words}-{:04x}.excalidraw", (n >> 16) & 0xffff)
+        };
+        let path = dir.join(name);
+        if !path.exists() {
+            return path;
+        }
+    }
+}
+
 /// Which way `reorder` moves elements in the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
@@ -1137,11 +1190,27 @@ impl Board {
         else {
             return Err("the top level isn't a JSON object".into());
         };
+        // Agents sometimes write only the elements, so a missing type is
+        // fine as long as there are elements.
+        match raw.get("type") {
+            Some(Value::String(kind)) if kind == "excalidraw" || kind == "excalidraw/clipboard" => {
+            }
+            None if raw.contains_key("elements") => {}
+            None => {
+                return Err(
+                    "it has neither \"type\": \"excalidraw\" nor \"elements\", so it isn't an Excalidraw board".into(),
+                );
+            }
+            Some(kind) => return Err(format!("its \"type\" is {kind}, not \"excalidraw\"")),
+        }
         let elements = match raw.remove("elements") {
-            Some(Value::Array(elements)) => elements
-                .into_iter()
-                .filter_map(Element::from_value)
-                .collect(),
+            Some(Value::Array(elements)) => {
+                let mut kept = Vec::with_capacity(elements.len());
+                for value in elements {
+                    kept.extend(Element::from_value(value)?);
+                }
+                kept
+            }
             None => Vec::new(),
             Some(_) => return Err("\"elements\" isn't a list".into()),
         };
@@ -1193,6 +1262,10 @@ impl Board {
             .unwrap_or_default();
         let staging = path.with_file_name(format!(".{name}.leaf-saving"));
         std::fs::write(&staging, self.to_json()).map_err(failed)?;
+        // The new file takes the old one's permissions, so a private board stays private.
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&staging, meta.permissions()).map_err(failed)?;
+        }
         std::fs::rename(&staging, path).map_err(failed)
     }
 
@@ -1439,42 +1512,52 @@ impl Board {
         }
     }
 
-    /// Moves the ends of arrows attached to shapes that moved or changed
-    /// size since `before`, so arrows stay attached. Arrows in `moved` were
-    /// moved themselves and are left where they were put.
+    /// Moves the ends of arrows attached to shapes that moved, changed size
+    /// or turned since `before`, so arrows stay attached. Arrows in `moved`
+    /// were moved themselves and are left where they were put.
     pub fn follow(&mut self, before: &Board, moved: &[String]) {
-        let frames: Vec<(String, Frame, Frame)> = self
+        // Each changed shape's frame and turn, before and now.
+        let changes: Vec<_> = self
             .elements
             .iter()
             .filter_map(|e| {
-                let was = before.get(&e.id)?.frame();
-                let now = e.frame();
+                let old = before.get(&e.id)?;
+                let (was, now) = ((old.frame(), old.angle), (e.frame(), e.angle));
                 (was != now).then(|| (e.id.clone(), was, now))
             })
             .collect();
         for element in &mut self.elements {
-            if element.angle != 0.0 || moved.contains(&element.id) {
+            if moved.contains(&element.id) {
                 continue;
             }
             let Some(old) = before.get(&element.id) else {
                 continue;
             };
-            let mut path = old.path();
+            // The arrow's points where they're drawn, so a turned arrow
+            // keeps its look once its turn is written into its points.
+            let middle = old.center();
+            let mut path: Vec<Pt> = old
+                .path()
+                .into_iter()
+                .map(|p| p.turn(middle, old.angle))
+                .collect();
             let mut changed = false;
             for (end, index) in [(End::Start, 0), (End::End, path.len().wrapping_sub(1))] {
-                let Some((_, was, now)) = element
+                let Some((_, (was, was_angle), (now, now_angle))) = element
                     .binding(end)
-                    .and_then(|to| frames.iter().find(|(id, ..)| id == to))
+                    .and_then(|to| changes.iter().find(|(id, ..)| id == to))
                 else {
                     continue;
                 };
                 if let Some(p) = path.get_mut(index) {
-                    *p = was.map(*p, *now);
+                    let upright = p.turn(was.center(), -was_angle);
+                    *p = was.map(upright, *now).turn(now.center(), *now_angle);
                     changed = true;
                 }
             }
             if changed {
                 element.set_path(&path);
+                element.angle = 0.0;
             }
         }
     }
@@ -1799,6 +1882,86 @@ mod tests {
             Board::load(&broken),
             Err(BoardFailed::Parse { .. })
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_board_gets_a_free_word_name() {
+        let dir = std::env::temp_dir().join(format!("leaf-board-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            let path = fresh_path(&dir);
+            let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
+            assert!(
+                name.starts_with("board-") && name.ends_with(".excalidraw"),
+                "{name}"
+            );
+            assert!(!path.exists() && !seen.contains(&path), "{name}");
+            std::fs::write(&path, "{}").expect("take the name");
+            seen.push(path);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn json_that_isnt_a_board_or_has_broken_elements_is_refused() {
+        assert!(Board::parse(r#"{"name": "settings", "debug": true}"#).is_err());
+        assert!(Board::parse(r#"{"type": "geojson", "elements": []}"#).is_err());
+        assert!(Board::parse(r#"{"type": "excalidraw", "elements": [42]}"#).is_err());
+        assert!(Board::parse(r#"{"type": "excalidraw", "elements": [{"id": "a"}]}"#).is_err());
+        // A file an agent writes with only its elements is still a board.
+        let board = Board::parse(r#"{"elements": [{"id": "a", "type": "rectangle"}]}"#)
+            .expect("elements alone");
+        assert_eq!(board.elements.len(), 1);
+        assert!(Board::parse(r#"{"type": "excalidraw/clipboard", "elements": []}"#).is_ok());
+    }
+
+    #[test]
+    fn arrows_follow_a_shape_that_turns() {
+        let mut board = Board::default();
+        board.elements.push(rect("a", 0.0, 0.0, 100.0, 100.0));
+        let mut arrow = Element::new(
+            Shape::Arrow {
+                points: vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0)],
+            },
+            Pt::new(100.0, 50.0),
+            INK,
+        );
+        arrow.id = "go".into();
+        arrow.bind(End::Start, Some("a"));
+        board.elements.push(arrow);
+        let before = board.clone();
+        board.elements[0].angle = std::f64::consts::FRAC_PI_2;
+        board.follow(&before, &["a".into()]);
+        // The right edge's middle turns a quarter about the middle, to the bottom.
+        let start = board.get("go").expect("arrow").path()[0];
+        assert!(
+            (start.x - 50.0).abs() < 1e-6 && (start.y - 100.0).abs() < 1e-6,
+            "{start:?}"
+        );
+        assert_eq!(
+            board.get("go").expect("arrow").path()[1],
+            Pt::new(200.0, 50.0)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("leaf-board-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("private.excalidraw");
+        Board::default().save(&path).expect("first save");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        board().save(&path).expect("second save");
+        let mode = std::fs::metadata(&path)
+            .expect("saved")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

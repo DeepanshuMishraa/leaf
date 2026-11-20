@@ -29,6 +29,7 @@ _leaf() {
     'review:Review changes file by file and send a verdict'
     'agent:Set up agents, skills and plan review hooks'
     'board:Draw on a whiteboard with the agent'
+    'whiteboard:Draw on a whiteboard with the agent'
     'comments:List saved diff comments'
     'ask:Ask an open agent about selected text'
     'rex:Add or remove the Rex command palette actions'
@@ -97,7 +98,9 @@ _leaf() {
       _arguments '--json[machine-readable JSON]'
       ;;
     board|whiteboard)
-      _files -g '*.excalidraw'
+      _arguments \
+        '--export[save the board as a picture]:picture:_files -g "(#i)*.(png|svg)"' \
+        '1:board:_files -g "(#i)*.excalidraw"'
       ;;
     ask)
       _arguments \

@@ -37,7 +37,7 @@ use crate::board::{
     Board, Dash, Element, End, Fill, FillStyle, Frame, INK, Order, Pt, Shape, text_size,
 };
 use crate::boardsvg::{self, Overlay, Paint};
-use crate::doc::{WATCH_TICK, Watch};
+use crate::doc::{LIVE_TICK, Watch};
 use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
 use crate::mono::Rgb;
@@ -54,6 +54,11 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const SNAP: f64 = std::f64::consts::PI / 12.0;
 /// Pictures pasted in are made at most this wide or tall.
 const PICTURE_SIZE: f64 = 400.0;
+/// About how many pixels the board is painted with while the mouse is held:
+/// a few milliseconds to paint, where a full Retina screen takes tens.
+const PREVIEW_PIXELS: f64 = 1_000_000.0;
+/// How long after the last key or click the board is painted sharp again.
+const SETTLE: Duration = Duration::from_millis(150);
 /// Where selection, handles and the caret are drawn when the terminal
 /// doesn't say its own accent.
 const ACCENT: Rgb = [80, 160, 255];
@@ -387,6 +392,10 @@ struct App {
     dots: bool,
     /// Pictures decoded for the dots view, by file id.
     pictures: HashMap<String, Option<RgbaImage>>,
+    /// The last key or click, for painting quickly while input keeps coming.
+    active: Instant,
+    /// Whether the picture on screen is the quick one, to be painted sharp.
+    blurry: bool,
     send: Send,
     quit: bool,
 }
@@ -427,7 +436,7 @@ impl App {
             f64::from(font.height.max(1)) / f64::from(font.width.max(1))
         });
         App {
-            watch: Watch::new(path.clone()),
+            watch: Watch::live(path.clone()),
             path,
             board,
             view: View {
@@ -457,6 +466,8 @@ impl App {
             pixels,
             dots: false,
             pictures: HashMap::new(),
+            active: Instant::now(),
+            blurry: false,
             send,
             quit: false,
         }
@@ -487,20 +498,30 @@ impl App {
         }
     }
 
-    /// Picks up the board from disk when someone else changed it.
-    fn reload(&mut self) {
+    /// Picks up the board from disk when someone else changed it, and says
+    /// whether it did.
+    fn reload(&mut self) -> bool {
         if !matches!(self.gesture, Gesture::Idle) || matches!(self.mode, Mode::Typing(_)) {
-            return;
+            return false;
         }
-        if let Some(board) = self.watch.read(Board::load) {
-            if board.to_json() == self.board.to_json() {
-                return;
-            }
-            self.checkpoint();
-            self.board = board;
-            self.forget_missing();
-            self.message = Some("The board changed on disk. u undoes the change.".into());
+        // An empty file is one being written, not a board wiped clean: an
+        // agent that clears the board still writes its JSON.
+        let written = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(text) if text.trim().is_empty() => Err("still being written".to_owned()),
+            Ok(text) => Board::parse(&text),
+            Err(e) => Err(e.to_string()),
+        };
+        let Some(board) = self.watch.read(written) else {
+            return false;
+        };
+        if board.to_json() == self.board.to_json() {
+            return false;
         }
+        self.checkpoint();
+        self.board = board;
+        self.forget_missing();
+        self.message = Some("The board changed on disk. u undoes the change.".into());
+        true
     }
 
     fn forget_missing(&mut self) {
@@ -990,6 +1011,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        self.active = Instant::now();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match &mut self.mode {
             Mode::Typing(typing) => match key.code {
@@ -1292,6 +1314,9 @@ impl App {
         if on_canvas {
             self.pointer = Some(p);
         }
+        if mouse.kind != MouseEventKind::Moved {
+            self.active = Instant::now();
+        }
         let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1477,7 +1502,9 @@ impl App {
                     *moved = true;
                     self.checkpoint();
                 }
-                let Some(before) = self.undo.last().cloned() else {
+                // Borrowed off the undo stack rather than copied, as this
+                // runs for every step of the drag.
+                let Some(before) = self.undo.pop() else {
                     return;
                 };
                 let picked = self.board.closure(&self.selected);
@@ -1490,6 +1517,7 @@ impl App {
                     }
                 }
                 self.after_move(&before, &picked);
+                self.undo.push(before);
             }
             Gesture::Resizing {
                 handle,
@@ -1503,7 +1531,7 @@ impl App {
             Gesture::Turning { center, from, ids } => {
                 let (center, from, ids) = (*center, *from, ids.clone());
                 let mut by = (p.y - center.y).atan2(p.x - center.x) - from;
-                let Some(before) = self.undo.last().cloned() else {
+                let Some(before) = self.undo.pop() else {
                     return;
                 };
                 let base = self
@@ -1527,6 +1555,7 @@ impl App {
                     element.angle = (was.angle + by).rem_euclid(std::f64::consts::TAU);
                 }
                 self.board.follow(&before, &ids);
+                self.undo.push(before);
             }
         }
     }
@@ -1541,7 +1570,7 @@ impl App {
         p: Pt,
         keep: bool,
     ) {
-        let Some(before) = self.undo.last().cloned() else {
+        let Some(before) = self.undo.pop() else {
             return;
         };
         let f = outline.frame;
@@ -1613,6 +1642,7 @@ impl App {
             self.board.recenter(id);
         }
         self.board.follow(&before, ids);
+        self.undo.push(before);
     }
 
     fn release(&mut self) {
@@ -1805,6 +1835,15 @@ impl App {
             u32::from(area.width) * u32::from(font.width),
             u32::from(area.height) * u32::from(font.height),
         );
+        // While the mouse is held or keys come quickly, kitty gets a smaller
+        // picture it stretches over the same cells, so the board keeps up;
+        // once things settle it's painted sharp.
+        let held = !matches!(self.gesture, Gesture::Idle);
+        let stretches = self.pixels.as_ref().is_some_and(|p| p.kitty.is_some());
+        let quick = stretches && (held || self.active.elapsed() < SETTLE);
+        let full = size;
+        let size = if quick { preview_size(full) } else { full };
+        self.blurry = size != full;
         let window = self.view.window(area);
         let (selection, handles, turn) = self.overlay_parts();
         let typing = match &self.mode {
@@ -2096,6 +2135,18 @@ impl App {
         };
         f.render_widget(Paragraph::new(line), area);
     }
+}
+
+/// The picture size used while dragging: `size` cut down to about
+/// `PREVIEW_PIXELS`, keeping its shape.
+fn preview_size((width, height): (u32, u32)) -> (u32, u32) {
+    let pixels = f64::from(width) * f64::from(height);
+    if pixels <= PREVIEW_PIXELS {
+        return (width, height);
+    }
+    let k = (PREVIEW_PIXELS / pixels).sqrt();
+    let cut = |side: u32| (f64::from(side) * k).round().max(1.0) as u32;
+    (cut(width), cut(height))
 }
 
 /// The screen cells `frame` covers, cut to `area`.
@@ -2402,9 +2453,20 @@ fn export(board: &Board, path: &Path) -> Result<String, String> {
 
 /// Writes `board` as a picture at `to`: SVG, or PNG at twice the size.
 pub fn export_to(board: &Board, to: &Path) -> Result<(), String> {
-    let png = to
+    let format = to
         .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let png = match format.as_deref() {
+        Some("png") => true,
+        Some("svg") => false,
+        _ => {
+            return Err(format!(
+                "{} doesn't end in .png or .svg, so leaf can't tell which picture to write. Nothing was written.",
+                to.display()
+            ));
+        }
+    };
     let svg = boardsvg::export(board, if png { 2.0 } else { 1.0 })
         .ok_or("The board is empty, so there's nothing to export.")?;
     let failed = |e: &dyn std::fmt::Display| {
@@ -2493,10 +2555,18 @@ pub fn run(path: PathBuf, board: Board) -> io::Result<()> {
 }
 
 fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+    // Draws only after input or a change on disk, so the file can be
+    // looked at often without repainting an unchanged board.
+    let mut dirty = true;
     loop {
-        app.reload();
-        terminal.draw(|f| app.draw(f))?;
-        app.flush()?;
+        dirty |= app.reload();
+        // The quick picture shown while working is painted sharp once input stops.
+        dirty |= app.blurry && app.active.elapsed() >= SETTLE;
+        if dirty {
+            dirty = false;
+            terminal.draw(|f| app.draw(f))?;
+            app.flush()?;
+        }
         if let Some(text) = app.copy.take() {
             let encoded = base64::engine::general_purpose::STANDARD.encode(text);
             let mut out = io::stdout();
@@ -2506,9 +2576,10 @@ fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Res
         if app.quit {
             return Ok(());
         }
-        if !event::poll(WATCH_TICK)? {
+        if !event::poll(LIVE_TICK)? {
             continue;
         }
+        dirty = true;
         // Takes every waiting event before drawing again, so a fast drag
         // paints once per batch rather than once per step.
         loop {
@@ -2959,17 +3030,27 @@ mod tests {
             Pt::new(100.0, 0.0),
             INK,
         ));
-        // A later modification time than our own save, as a real edit would have.
-        std::thread::sleep(Duration::from_millis(20));
+        // Written right after our own save, and still picked up at the next look.
         std::fs::write(&path, theirs.to_json()).expect("agent writes");
-        for _ in 0..3 {
-            std::thread::sleep(WATCH_TICK);
-            app.reload();
-        }
+        std::thread::sleep(LIVE_TICK);
+        assert!(app.reload(), "the agent's write shows at the next look");
         assert_eq!(app.board.elements.len(), 2);
         assert!(draw(&mut app).contains("from the agent"));
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(on_disk(&path).elements.len(), 1);
+    }
+
+    #[test]
+    fn a_half_written_file_leaves_the_board_as_it_is() {
+        let path = temp("half");
+        let (mut app, _) = app(&path);
+        boxed(&mut app);
+        for half in ["", r#"{"type": "excalidraw", "elements": [{"id": "#] {
+            std::fs::write(&path, half).expect("agent starts writing");
+            std::thread::sleep(LIVE_TICK);
+            assert!(!app.reload());
+            assert_eq!(app.board.elements.len(), 1);
+        }
     }
 
     #[test]
@@ -2981,6 +3062,26 @@ mod tests {
         assert!(path.with_extension("svg").is_file());
         let png = image::open(path.with_extension("png")).expect("png opens");
         assert!(png.width() > 400);
+    }
+
+    #[test]
+    fn exporting_to_anything_but_png_or_svg_writes_nothing() {
+        let path = temp("export-kind");
+        let (mut app, _) = app(&path);
+        boxed(&mut app);
+        let before = std::fs::read_to_string(&path).expect("saved");
+        assert!(export_to(&app.board, &path).is_err());
+        assert!(export_to(&app.board, &path.with_extension("txt")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("still there"), before);
+        assert!(!path.with_extension("txt").exists());
+    }
+
+    #[test]
+    fn the_quick_picture_keeps_the_shape_and_small_ones_stay_as_they_are() {
+        assert_eq!(preview_size((800, 400)), (800, 400));
+        let (w, h) = preview_size((4000, 2000));
+        assert!(f64::from(w) * f64::from(h) <= PREVIEW_PIXELS * 1.01);
+        assert_eq!(w, h * 2);
     }
 
     #[test]

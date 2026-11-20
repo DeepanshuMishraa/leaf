@@ -319,7 +319,7 @@ fn element(out: &mut String, board: &Board, e: &Element, paint: Paint, patterns:
                     escape(url)
                 );
             }
-            None => labelled_box(out, e, &color, "picture missing"),
+            None => labelled_box(out, e, &color, "picture missing", &turn),
         },
         Shape::Frame { name, .. } => {
             let _ = write!(
@@ -333,22 +333,22 @@ fn element(out: &mut String, board: &Board, e: &Element, paint: Paint, patterns:
             let name = if name.is_empty() { "Frame" } else { name };
             let _ = write!(
                 out,
-                r#"<text x="{:.2}" y="{:.2}" font-size="14" font-family="{}" fill="{color}" fill-opacity="0.6">{}</text>"#,
+                r#"<text x="{:.2}" y="{:.2}" font-size="14" font-family="{}" fill="{color}" fill-opacity="0.6"{turn}>{}</text>"#,
                 f.x0,
                 f.y0 - 6.0,
                 family(2),
                 escape(name)
             );
         }
-        Shape::Other { kind, .. } => labelled_box(out, e, &color, kind),
+        Shape::Other { kind, .. } => labelled_box(out, e, &color, kind, &turn),
         Shape::Draw { .. } => {
+            // Ink is drawn a little heavier than outlines, as Excalidraw does.
+            let ink_attrs = format!(
+                r#"fill="none" stroke="{color}" stroke-width="{:.2}" stroke-linecap="round" stroke-linejoin="round"{dash}"#,
+                width * 1.25
+            );
             for (points, _) in e.paths() {
-                let _ = write!(
-                    out,
-                    r#"<path d="{}" {stroke_attrs} stroke-width="{:.2}"/>"#,
-                    smooth_path(&points),
-                    width * 1.25
-                );
+                let _ = write!(out, r#"<path d="{}" {ink_attrs}/>"#, smooth_path(&points));
             }
         }
         _ => {
@@ -412,11 +412,13 @@ fn smooth_path_or_straight(points: &[Pt], smooth: bool) -> String {
     out
 }
 
-fn labelled_box(out: &mut String, e: &Element, color: &str, label: &str) {
+/// A dashed outline and a label in place of something that can't be drawn,
+/// turned with the element by `turn`.
+fn labelled_box(out: &mut String, e: &Element, color: &str, label: &str, turn: &str) {
     let f = e.frame();
     let _ = write!(
         out,
-        r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="none" stroke="{color}" stroke-width="1" stroke-dasharray="6 6"/><text x="{:.2}" y="{:.2}" font-size="14" font-family="{}" fill="{color}">[{}]</text>"#,
+        r#"<g{turn}><rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="none" stroke="{color}" stroke-width="1" stroke-dasharray="6 6"/><text x="{:.2}" y="{:.2}" font-size="14" font-family="{}" fill="{color}">[{}]</text></g>"#,
         f.x0,
         f.y0,
         f.width(),
@@ -567,7 +569,9 @@ pub fn export(board: &Board, scale: f64) -> Option<String> {
     Some(svg(board, window, size, Paint::LIGHT, &Overlay::default()))
 }
 
-/// Paints an SVG made here.
+/// Paints an SVG made here. The picture is cut into bands painted at once,
+/// one per core, since a full-screen board is millions of pixels and the
+/// board repaints while the mouse moves.
 pub fn rasterize(svg: &str) -> Option<RgbaImage> {
     let options = usvg::Options {
         fontdb: crate::mermaid::FONTS.clone(),
@@ -575,17 +579,46 @@ pub fn rasterize(svg: &str) -> Option<RgbaImage> {
     };
     let tree = usvg::Tree::from_str(svg, &options).ok()?;
     let size = tree.size().to_int_size();
-    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())?;
-    resvg::render(
-        &tree,
-        tiny_skia::Transform::identity(),
-        &mut pixmap.as_mut(),
-    );
-    let pixels = pixmap.pixels().iter().flat_map(|p| {
-        let c = p.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
+    let (width, height) = (size.width(), size.height());
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+    let band = height.div_ceil(cores.clamp(1, 16)).max(1);
+    let tops: Vec<u32> = (0..height).step_by(band as usize).collect();
+    let bands: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+        let tree = &tree;
+        let painting: Vec<_> = tops
+            .iter()
+            .map(|&top| {
+                scope.spawn(move || {
+                    let rows = band.min(height - top);
+                    let mut pixmap = tiny_skia::Pixmap::new(width, rows)?;
+                    resvg::render(
+                        tree,
+                        tiny_skia::Transform::from_translate(0.0, -(top as f32)),
+                        &mut pixmap.as_mut(),
+                    );
+                    Some(
+                        pixmap
+                            .pixels()
+                            .iter()
+                            .flat_map(|p| {
+                                let c = p.demultiply();
+                                [c.red(), c.green(), c.blue(), c.alpha()]
+                            })
+                            .collect(),
+                    )
+                })
+            })
+            .collect();
+        painting
+            .into_iter()
+            .map(|band| band.join().ok().flatten())
+            .collect()
     });
-    RgbaImage::from_raw(pixmap.width(), pixmap.height(), pixels.collect())
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    for band in bands {
+        pixels.extend(band?);
+    }
+    RgbaImage::from_raw(width, height, pixels)
 }
 
 #[cfg(test)]
@@ -678,5 +711,41 @@ mod tests {
         ));
         let svg = export(&board, 2.0).expect("has content");
         assert!(svg.contains(r#"width="180" height="140""#), "{svg}");
+    }
+
+    #[test]
+    fn pen_ink_names_its_width_once_so_the_picture_still_paints() {
+        let mut board = Board::default();
+        board.elements.push(Element::new(
+            Shape::Draw {
+                points: vec![Pt::new(0.0, 0.0), Pt::new(30.0, 20.0), Pt::new(60.0, 0.0)],
+            },
+            Pt::new(10.0, 10.0),
+            "#e03131",
+        ));
+        let svg = export(&board, 1.0).expect("has content");
+        let ink = svg.split("<path").nth(1).expect("an ink path");
+        let ink = &ink[..ink.find("/>").expect("closed")];
+        assert_eq!(ink.matches("stroke-width=").count(), 1, "{ink}");
+        assert!(rasterize(&svg).is_some());
+    }
+
+    #[test]
+    fn a_turned_frame_turns_its_title_too() {
+        let mut board = Board::default();
+        let mut frame = Element::new(
+            Shape::Frame {
+                w: 100.0,
+                h: 60.0,
+                name: "Plan".into(),
+            },
+            Pt::new(0.0, 0.0),
+            INK,
+        );
+        frame.angle = 0.5;
+        board.elements.push(frame);
+        let svg = export(&board, 1.0).expect("has content");
+        let title = svg.split("<text").nth(1).expect("a title");
+        assert!(title.contains("rotate("), "{title}");
     }
 }

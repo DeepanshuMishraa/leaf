@@ -10,6 +10,8 @@ use crate::mono::Rgb;
 
 const IMAGE_SCHEME: &str = "leaf-image:";
 pub const WATCH_TICK: Duration = Duration::from_millis(250);
+/// How often a live file, like a board an agent draws on, is looked at.
+pub const LIVE_TICK: Duration = Duration::from_millis(30);
 const RETRY: Duration = Duration::from_secs(5);
 
 type Stamp = (SystemTime, u64);
@@ -21,6 +23,11 @@ pub struct Watch {
     checked: Instant,
     failed: Option<(Stamp, Instant)>,
     pending: Option<(Stamp, crate::pdf::Loading)>,
+    tick: Duration,
+    /// Whether a change waits for the file to look the same twice before
+    /// it's read. A live file is read at once and a half-written one is
+    /// refused by its loader instead.
+    settle: bool,
 }
 
 fn stamp(path: &Path) -> Option<Stamp> {
@@ -38,16 +45,28 @@ impl Watch {
             checked: Instant::now(),
             failed: None,
             pending: None,
+            tick: WATCH_TICK,
+            settle: true,
+        }
+    }
+
+    /// Watches a file that changes while it's open, picking up each write
+    /// within `LIVE_TICK`.
+    pub fn live(path: PathBuf) -> Self {
+        Self {
+            tick: LIVE_TICK,
+            settle: false,
+            ..Self::new(path)
         }
     }
 
     fn changed(&mut self) -> Option<Stamp> {
-        if self.checked.elapsed() < WATCH_TICK {
+        if self.checked.elapsed() < self.tick {
             return None;
         }
         self.checked = Instant::now();
         let now = stamp(&self.path);
-        let settled = now == self.seen;
+        let settled = !self.settle || now == self.seen;
         self.seen = now;
         if !settled || now.is_none() || now == self.loaded {
             return None;
@@ -61,12 +80,11 @@ impl Watch {
         now
     }
 
-    /// Takes the file as it is now as loaded, so a write of our own isn't
-    /// read back as a change.
+    /// Notes a write of our own. The file is read again on the next look
+    /// rather than taken as ours, since someone else may have written it
+    /// right after; the reader drops it when it matches what it wrote.
     pub fn saved(&mut self) {
-        let now = stamp(&self.path);
-        self.loaded = now;
-        self.seen = now;
+        self.loaded = None;
         self.failed = None;
     }
 
