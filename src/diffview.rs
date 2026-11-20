@@ -942,6 +942,7 @@ impl App {
                 added,
             } => match result {
                 Ok(pull) => {
+                    self.dialog = Dialog::None;
                     self.set_state(index, State::Github);
                     self.toast(format!("Comment posted to {pull}"));
                 }
@@ -4634,6 +4635,47 @@ diff --git a/b.rs b/b.rs
         assert_eq!(
             app.composer.as_ref().map(Composer::body).as_deref(),
             Some("post me")
+        );
+    }
+
+    #[test]
+    fn github_success_closes_posting_dialog() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('C'));
+        type_text(&mut app, "post me");
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        let Dialog::Confirm(confirm) = std::mem::replace(
+            &mut app.dialog,
+            Dialog::Loading("Posting to GitHub…".to_owned()),
+        ) else {
+            panic!("posting must ask for confirmation first");
+        };
+        let index = app.add_comment(Comment {
+            anchor: confirm.anchor,
+            body: confirm.body,
+            state: State::Draft,
+        });
+        // Substitute only the network worker's response; use the real receiver
+        // and completion handler that the event loop calls.
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job::Post {
+            rx,
+            index,
+            composer: confirm.composer,
+            added: true,
+        });
+        tx.send(Ok("owner/repo#12".to_owned())).unwrap();
+        app.receive_job();
+
+        assert!(app.job.is_none(), "the successful response was received");
+        assert_eq!(app.comments[index].comment.state, State::Github);
+        assert_eq!(
+            app.toast.as_ref().unwrap().text,
+            "Comment posted to owner/repo#12"
+        );
+        assert!(
+            matches!(app.dialog, Dialog::None),
+            "the Posting to GitHub dialog must close after success"
         );
     }
 
