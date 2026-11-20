@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.17.3
 
+- Zooming the board with a trackpad is smoother: each scroll step zooms less, and the sideways part of a zoom swipe no longer pans the board while it zooms. `option+↑` and `option+↓` zoom too.
+- Drawing and zooming on the board keep up better in kitty-protocol terminals. Each frame goes to the terminal as compressed pixels, which terminals take in several times faster than PNG, and moving the mouse over the board without clicking no longer redraws it.
 - Open Word documents (`.docx`), slide decks (`.pptx`) and spreadsheets (`.xlsx`, `.xls`, `.ods`, `.csv`, `.tsv`). leaf reads them itself on macOS and Linux, with no LibreOffice, Keynote or Numbers. Decks and documents show as designed, in their own fonts, colors and layout, and spreadsheets as a grid; `+`/`-` zoom, `o` switches to the terminal's font, and `i` paints the designed page in the terminal's colors. Decks show one slide per page with speaker notes, Word documents keep their pages, and `.xlsx`/`.xlsm` workbooks keep their cell styles, column widths and row heights.
 - Configure the document reader's maximum width in `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config.toml`). Omitted settings keep the 76-column layout.
 - Keep the reading position within PDF and EPUB pages when resizing in scroll mode.

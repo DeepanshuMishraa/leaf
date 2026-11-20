@@ -51,26 +51,25 @@ impl Kitty {
         rows: u16,
         layer: i32,
     ) -> Option<Image> {
-        use image::ImageEncoder;
-        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-        let mut png = Vec::new();
-        // Fast compression: ink is redrawn while the mouse moves.
-        PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
-            .write_image(
-                pixels.as_raw(),
-                pixels.width(),
-                pixels.height(),
-                image::ExtendedColorType::Rgba8,
-            )
-            .ok()?;
+        // Raw pixels, zlib-compressed, rather than PNG: about as small for a
+        // board, cheaper to make, and several times quicker for the terminal
+        // to take in (Rex: under 1ms against 3-4ms a frame), which matters
+        // as the board is redrawn on every step of a drag or zoom.
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        zlib.write_all(pixels.as_raw()).ok()?;
+        let compressed = zlib.finish().ok()?;
+        let (width, height) = pixels.dimensions();
         self.next_id += 1;
         let id = self.next_id;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
         let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(CHUNK).collect();
         for (i, chunk) in chunks.iter().enumerate() {
             let more = u8::from(i + 1 < chunks.len());
             let _ = if i == 0 {
-                write!(self.pending, "\x1b_Ga=t,f=100,i={id},q=2,m={more};")
+                write!(
+                    self.pending,
+                    "\x1b_Ga=t,f=32,o=z,s={width},v={height},i={id},q=2,m={more};"
+                )
             } else {
                 write!(self.pending, "\x1b_Gm={more};")
             };
@@ -212,11 +211,33 @@ mod tests {
         let rect = Rect::new(3, 5, 2, 1);
         let first = flushed(&mut kitty, &[(image, rect)]);
         let (upload, place) = (
-            first.find("a=t,f=100,i=1").unwrap(),
+            first.find("a=t,f=32,o=z,s=4,v=4,i=1").unwrap(),
             first.find("\x1b[6;4H\x1b_Ga=p,i=1,c=2,r=1").unwrap(),
         );
         assert!(upload < place);
         assert_eq!(flushed(&mut kitty, &[(image, rect)]), "");
+    }
+
+    #[test]
+    fn an_upload_carries_the_pixels_zlib_compressed() {
+        use std::io::Read as _;
+        let mut kitty = Kitty::default();
+        let pixels = RgbaImage::from_fn(3, 2, |x, y| image::Rgba([x as u8, y as u8, 7, 255]));
+        kitty.upload(&pixels, 2, 1, 0).unwrap();
+        let out = flushed(&mut kitty, &[]);
+        let payload = out
+            .split_once(';')
+            .and_then(|(_, rest)| rest.split_once("\x1b\\"))
+            .map(|(payload, _)| payload)
+            .unwrap();
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap();
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(compressed.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(raw, pixels.into_raw());
     }
 
     #[test]
@@ -238,7 +259,7 @@ mod tests {
         kitty.free(old);
         let new = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 0).unwrap();
         let out = flushed(&mut kitty, &[(new, rect)]);
-        let upload = out.find("a=t,f=100,i=2").unwrap();
+        let upload = out.find("a=t,f=32,o=z,s=8,v=8,i=2").unwrap();
         let place = out.find("a=p,i=2").unwrap();
         let drop = out.find("a=d,d=I,i=1").unwrap();
         assert!(upload < place && place < drop);

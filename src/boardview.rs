@@ -57,6 +57,9 @@ const PICTURE_SIZE: f64 = 400.0;
 /// About how many pixels the board is painted with while the mouse is held:
 /// a few milliseconds to paint, where a full Retina screen takes tens.
 const PREVIEW_PIXELS: f64 = 1_000_000.0;
+/// How much one scroll event zooms. Trackpads send several per frame, so a
+/// small step keeps a zoom gliding instead of jumping.
+const ZOOM_STEP: f64 = 1.05;
 /// How long after the last key or click the board is painted sharp again.
 const SETTLE: Duration = Duration::from_millis(150);
 /// Where selection, handles and the caret are drawn when the terminal
@@ -1248,6 +1251,10 @@ impl App {
                     }
                 }
             }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.zoom_middle(1.1),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.zoom_middle(1.0 / 1.1);
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
                 let (dx, dy) = match key.code {
                     KeyCode::Left => (-1.0, 0.0),
@@ -1463,22 +1470,28 @@ impl App {
             MouseEventKind::Down(_) => self.gesture = Gesture::Panning { column, row },
             MouseEventKind::Drag(_) => self.drag(p, column, row, shift),
             MouseEventKind::Up(_) => self.release(),
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let up = mouse.kind == MouseEventKind::ScrollUp;
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
                 let zooms = (self.scroll == Scroll::Zoom && !shift)
                     || mouse
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-                if zooms {
-                    self.zoom(if up { 1.1 } else { 1.0 / 1.1 }, p);
-                } else if shift {
-                    self.pan(if up { 3.0 } else { -3.0 }, 0.0);
-                } else {
-                    self.pan(0.0, if up { 2.0 } else { -2.0 });
+                match mouse.kind {
+                    MouseEventKind::ScrollUp if zooms => self.zoom(ZOOM_STEP, p),
+                    MouseEventKind::ScrollDown if zooms => self.zoom(1.0 / ZOOM_STEP, p),
+                    // A trackpad's zoom swipe is never quite vertical; its
+                    // sideways part used to pan the board while it zoomed.
+                    _ if zooms => {}
+                    MouseEventKind::ScrollUp if shift => self.pan(3.0, 0.0),
+                    MouseEventKind::ScrollDown if shift => self.pan(-3.0, 0.0),
+                    MouseEventKind::ScrollUp => self.pan(0.0, 2.0),
+                    MouseEventKind::ScrollDown => self.pan(0.0, -2.0),
+                    MouseEventKind::ScrollLeft => self.pan(3.0, 0.0),
+                    _ => self.pan(-3.0, 0.0),
                 }
             }
-            MouseEventKind::ScrollLeft => self.pan(3.0, 0.0),
-            MouseEventKind::ScrollRight => self.pan(-3.0, 0.0),
             MouseEventKind::Moved => {}
         }
     }
@@ -2578,7 +2591,10 @@ const KEYS: &[(&str, &str)] = &[
     ("x del", "delete"),
     ("u U", "undo, redo"),
     ("arrows", "nudge the selection, or pan"),
-    ("scroll", "pan; ctrl/option+scroll or + - zoom; f fits"),
+    (
+        "scroll",
+        "pan; ctrl/option+scroll, option+↑↓ or + - zoom; f fits",
+    ),
     ("z", "scroll zooms instead of panning (for trackpads)"),
     ("i", "pictures or dots"),
     ("E", "export SVG and PNG beside the board"),
@@ -2806,16 +2822,23 @@ fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Res
         if !event::poll(LIVE_TICK)? {
             continue;
         }
-        dirty = true;
         // Takes every waiting event before drawing again, so a fast drag
         // paints once per batch rather than once per step.
         loop {
             match event::read()? {
-                Event::Key(key) => app.key(key),
-                Event::Mouse(mouse) => app.mouse(mouse),
-                Event::Paste(text) => app.paste(&text),
-                Event::Resize(..) => app.reset_pixels(),
-                _ => {}
+                // Hovering changes nothing on screen; repainting for it kept
+                // the board busy while the mouse merely crossed it.
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => app.mouse(mouse),
+                event => {
+                    dirty = true;
+                    match event {
+                        Event::Key(key) => app.key(key),
+                        Event::Mouse(mouse) => app.mouse(mouse),
+                        Event::Paste(text) => app.paste(&text),
+                        Event::Resize(..) => app.reset_pixels(),
+                        _ => {}
+                    }
+                }
             }
             if app.quit || !event::poll(Duration::ZERO)? {
                 break;
@@ -2974,6 +2997,33 @@ mod tests {
             KeyModifiers::ALT,
         );
         assert!(app.view.scale > zoomed, "option+scroll zooms either way");
+    }
+
+    #[test]
+    fn a_zoom_swipe_does_not_pan_sideways() {
+        let (mut app, _) = app(&temp("zoom-swipe"));
+        let before = app.view;
+        mouse_with(
+            &mut app,
+            MouseEventKind::ScrollLeft,
+            20,
+            8,
+            KeyModifiers::ALT,
+        );
+        assert_eq!((app.view.x, app.view.y), (before.x, before.y));
+        mouse(&mut app, MouseEventKind::ScrollLeft, 20, 8);
+        assert_ne!(app.view.x, before.x, "a plain sideways scroll still pans");
+    }
+
+    #[test]
+    fn option_up_and_down_zoom() {
+        let (mut app, _) = app(&temp("option-arrows"));
+        let start = app.view.scale;
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert!(app.view.scale < start, "option+up zooms in");
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert!(app.view.scale > start, "option+down zooms out");
     }
 
     /// Draws a box from cell (10, 5) to (30, 10): 200 × 100 board pixels at
