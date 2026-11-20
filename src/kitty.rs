@@ -33,8 +33,8 @@ pub struct Kitty {
     /// Images to drop once what replaces them is on screen.
     freed: Vec<u32>,
     /// Images replaced on screen, left under their successor until it has
-    /// had time to show, and when each was replaced.
-    retired: Vec<(u32, Instant)>,
+    /// had time to show, and since when the successor has been placed.
+    retired: Vec<(u32, Option<Instant>)>,
 }
 
 /// How long a replaced image stays under its successor. A terminal may draw
@@ -94,7 +94,9 @@ impl Kitty {
     /// Frees an image a successor replaces on screen, leaving it in place
     /// beneath for a moment. The successor must sit in a higher layer.
     pub fn retire(&mut self, image: Image) {
-        self.retired.push((image.id, Instant::now()));
+        // The wait starts once the successor is placed, not now: uploading
+        // it can take longer than the wait itself.
+        self.retired.push((image.id, None));
     }
 
     /// Forgets what's on screen, so the next flush places everything again.
@@ -125,13 +127,18 @@ impl Kitty {
         if ids != self.placed {
             // New placements go up before old ones come down; deleting first
             // leaves the screen empty while a large upload is still arriving,
-            // which shows as a flicker. Placement id 1 makes re-placing an
-            // image move it rather than draw it twice.
+            // which shows as a flicker. Each showing of an image keeps its
+            // placement id, so re-placing one moves it rather than drawing it
+            // twice, while a second showing of the same image stays its own.
             self.pending.extend_from_slice(b"\x1b7");
-            for (image, rect) in wanted {
+            for (n, (image, rect)) in wanted.iter().enumerate() {
+                let placement = 1 + wanted[..n]
+                    .iter()
+                    .filter(|(earlier, _)| earlier.id == image.id)
+                    .count();
                 let _ = write!(
                     self.pending,
-                    "\x1b[{};{}H\x1b_Ga=p,i={},c={},r={},z={},C=1,p=1,q=2\x1b\\",
+                    "\x1b[{};{}H\x1b_Ga=p,i={},c={},r={},z={},C=1,p={placement},q=2\x1b\\",
                     rect.y + 1,
                     rect.x + 1,
                     image.id,
@@ -157,8 +164,9 @@ impl Kitty {
         // With nothing left to cover them, replaced images go at once.
         let everything = wanted.is_empty();
         let pending = &mut self.pending;
-        self.retired.retain(|(id, at)| {
-            let keep = !everything && now.duration_since(*at) < LINGER;
+        self.retired.retain_mut(|(id, at)| {
+            let since = *at.get_or_insert(now);
+            let keep = !everything && now.duration_since(since) < LINGER;
             if !keep {
                 let _ = write!(pending, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
             }
@@ -245,6 +253,45 @@ mod tests {
             String::from_utf8(later).unwrap(),
             "\x1b_Ga=d,d=I,i=1,q=2\x1b\\"
         );
+    }
+
+    #[test]
+    fn the_linger_starts_when_the_successor_is_placed_not_when_retired() {
+        let mut kitty = Kitty::default();
+        let rect = Rect::new(0, 0, 4, 4);
+        let old = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 0).unwrap();
+        flushed(&mut kitty, &[(old, rect)]);
+        kitty.retire(old);
+        let new = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 1).unwrap();
+        // A slow upload: the successor is placed well after the retirement.
+        let placed = Instant::now() + LINGER * 4;
+        let mut out = Vec::new();
+        kitty.flush_at(&mut out, &[(new, rect)], placed).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("a=p,i=2") && !out.contains("d=I,i=1"),
+            "{out:?}"
+        );
+        let mut later = Vec::new();
+        kitty
+            .flush_at(&mut later, &[(new, rect)], placed + LINGER)
+            .unwrap();
+        assert!(String::from_utf8(later).unwrap().contains("d=I,i=1"));
+    }
+
+    #[test]
+    fn two_showings_of_one_image_get_their_own_placements() {
+        let mut kitty = Kitty::default();
+        let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1, 0).unwrap();
+        let out = flushed(
+            &mut kitty,
+            &[
+                (image, Rect::new(0, 0, 2, 1)),
+                (image, Rect::new(0, 5, 2, 1)),
+            ],
+        );
+        assert!(out.contains("i=1,c=2,r=1,z=0,C=1,p=1,"), "{out:?}");
+        assert!(out.contains("i=1,c=2,r=1,z=0,C=1,p=2,"), "{out:?}");
     }
 
     #[test]

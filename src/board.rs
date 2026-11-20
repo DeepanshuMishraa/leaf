@@ -1173,13 +1173,18 @@ pub fn fresh_path(dir: &Path) -> Result<PathBuf, BoardFailed> {
         {
             Ok(mut file) => {
                 use std::io::Write;
-                return file
-                    .write_all(Board::default().to_json().as_bytes())
-                    .map(|()| path.clone())
-                    .map_err(|cause| BoardFailed::Create {
-                        path: path.display().to_string(),
-                        cause,
-                    });
+                return match file.write_all(Board::default().to_json().as_bytes()) {
+                    Ok(()) => Ok(path),
+                    Err(cause) => {
+                        // A half-written board would hold the name forever.
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        Err(BoardFailed::Create {
+                            path: path.display().to_string(),
+                            cause,
+                        })
+                    }
+                };
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(cause) => {
