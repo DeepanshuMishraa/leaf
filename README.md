@@ -143,6 +143,18 @@ Keys: `j/k` move between code lines, `d/u` half page, `space/b` page, `f` opens 
 
 The message names the file, the side, and the line range, and includes the hunk around that range, then the comment. It is sent, not left sitting in the agent's input. An agent pane is found from `LEAF_AGENT_PANE`, otherwise by looking for a pane running `claude`, `codex`, `opencode`, `gemini`, `grok`, `pi` or another known agent. With no Rex session or no agent, the prompt is copied through OSC 52 instead. Posting to GitHub asks first and uses `gh` when it is signed in, or `GH_TOKEN`/`GITHUB_TOKEN` for the pull request behind the current branch or link. Comments are saved in the same SQLite file as reading progress.
 
+## Whiteboard
+
+`leaf board [file.excalidraw]` turns the terminal into a whiteboard you share with your agent. With no file named it opens `board.excalidraw` in the current folder, creating it on the first stroke; `leaf sketch.excalidraw` opens one directly. The board is a plain Excalidraw file, so it also opens on excalidraw.com.
+
+Pick a tool from the top bar or by key: `v` select, `h` hand, `r` box, `d` diamond, `o` ellipse, `a` arrow, `l` line, `p` pen, `t` text, `F` frame, `e` eraser. Drag to draw; drawing a shape goes back to select. An arrow drawn from one shape to another stays attached when either moves. With select, click or drag a box around things to pick them (shift adds), drag to move them, drag a handle to resize (shift keeps the proportions), and drag the knob above to turn (shift snaps to 15°). Double-click or `enter` writes text, inside a shape when one is picked. `x` deletes.
+
+`1`–`6` color the selection and new strokes, `0` goes back to plain ink; `b` cycles the fill (hachure, cross-hatch, solid, none), `s` dashes, `w` stroke width, `k` how hand-drawn it looks, `m` arrowheads, `n` the font, `<`/`>` text size. `[` `]` `{` `}` move things through the stack, `g`/`G` group and ungroup, `ctrl+d` duplicates, `ctrl+c`/`x`/`v` copy, cut and paste (Excalidraw clipboard JSON too). Pasting or dropping a picture's path puts it on the board. `u`/`U` undo and redo. Arrows nudge the selection, or pan with nothing picked; scrolling or a right-drag pan; `ctrl`+scroll or `+`/`-` zoom; `f` fits the whole board.
+
+In kitty, Ghostty, WezTerm, iTerm2 and other terminals that show pictures, the board is painted as a picture with hand-drawn strokes, fills and pictures; elsewhere it's drawn in Braille dots with tinted fills and half-block pictures. `i` switches between the two. `E` writes the board beside its file as SVG and PNG, and `leaf board file.excalidraw --export out.png` does the same from the shell.
+
+`@` (or `c`) asks the agent pane: type a question and press enter. The agent gets the board's path, how the file is laid out, and what you selected, and it draws by editing the file. Every change you make is saved at once, and the board redraws whenever the file changes, so the agent's edits appear as it writes them; `u` undoes one.
+
 ## Pull requests and issues
 
 `leaf pr` lists the pull requests and issues that concern you, in two tabs; `←/→` switches. **Pull requests** holds yours across GitHub, the ones in repositories you own, the ones waiting on your review, the ones assigned to you, and this repository's. **Issues** holds the ones you opened, the ones opened in repositories you own, and the ones assigned to you. Each tab is one list, newest first, and each row's dot says whose it is: green is yours in your own repository, blue is yours in someone else's, yellow is someone else's in yours, and grey is the rest. The legend beside the filter names the colors on screen.

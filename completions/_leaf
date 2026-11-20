@@ -28,6 +28,7 @@ _leaf() {
     'plan:Review a plan block by block and send a verdict'
     'review:Review changes file by file and send a verdict'
     'agent:Set up agents, skills and plan review hooks'
+    'board:Draw on a whiteboard with the agent'
     'comments:List saved diff comments'
     'ask:Ask an open agent about selected text'
     'rex:Add or remove the Rex command palette actions'
@@ -94,6 +95,9 @@ _leaf() {
       ;;
     comments)
       _arguments '--json[machine-readable JSON]'
+      ;;
+    board|whiteboard)
+      _files -g '*.excalidraw'
       ;;
     ask)
       _arguments \

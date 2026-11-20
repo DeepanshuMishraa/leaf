@@ -61,6 +61,15 @@ impl Watch {
         now
     }
 
+    /// Takes the file as it is now as loaded, so a write of our own isn't
+    /// read back as a change.
+    pub fn saved(&mut self) {
+        let now = stamp(&self.path);
+        self.loaded = now;
+        self.seen = now;
+        self.failed = None;
+    }
+
     pub fn read<T, E>(&mut self, load: impl FnOnce(&Path) -> Result<T, E>) -> Option<T> {
         let at = self.changed()?;
         let value = match load(&self.path) {
