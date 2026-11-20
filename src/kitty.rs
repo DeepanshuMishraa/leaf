@@ -148,12 +148,26 @@ impl Kitty {
                 );
             }
             self.pending.extend_from_slice(b"\x1b8");
-            for (id, _) in &self.placed {
-                let leaving = !ids.iter().any(|(kept, _)| kept == id)
-                    && !self.freed.contains(id)
-                    && !self.retired.iter().any(|(old, _)| old == id);
-                if leaving {
-                    let _ = write!(self.pending, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\");
+            for (n, (id, _)) in self.placed.iter().enumerate() {
+                let kept = ids.iter().filter(|(kept, _)| kept == id).count();
+                let going =
+                    self.freed.contains(id) || self.retired.iter().any(|(old, _)| old == id);
+                let placement = 1 + self.placed[..n]
+                    .iter()
+                    .filter(|(earlier, _)| earlier == id)
+                    .count();
+                if going {
+                    continue;
+                }
+                if kept == 0 {
+                    // One deletion takes every placement of the image.
+                    if placement == 1 {
+                        let _ = write!(self.pending, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\");
+                    }
+                } else if placement > kept {
+                    // Shown fewer times than before: the extra placements,
+                    // numbered as they were placed, come down.
+                    let _ = write!(self.pending, "\x1b_Ga=d,d=i,i={id},p={placement},q=2\x1b\\");
                 }
             }
             self.placed = ids;
@@ -292,6 +306,18 @@ mod tests {
         );
         assert!(out.contains("i=1,c=2,r=1,z=0,C=1,p=1,"), "{out:?}");
         assert!(out.contains("i=1,c=2,r=1,z=0,C=1,p=2,"), "{out:?}");
+    }
+
+    #[test]
+    fn an_image_shown_once_instead_of_twice_loses_its_second_placement() {
+        let mut kitty = Kitty::default();
+        let image = kitty.upload(&RgbaImage::new(4, 4), 2, 1, 0).unwrap();
+        let (top, low) = (Rect::new(0, 0, 2, 1), Rect::new(0, 5, 2, 1));
+        flushed(&mut kitty, &[(image, top), (image, low)]);
+        let out = flushed(&mut kitty, &[(image, low)]);
+        assert!(out.contains("a=p,i=1,c=2,r=1,z=0,C=1,p=1,"), "{out:?}");
+        assert!(out.contains("a=d,d=i,i=1,p=2,"), "{out:?}");
+        assert!(!out.contains("a=d,d=i,i=1,q"), "the image stays: {out:?}");
     }
 
     #[test]

@@ -57,6 +57,8 @@ const PICTURE_SIZE: f64 = 400.0;
 /// About how many pixels the board is painted with while the mouse is held:
 /// a few milliseconds to paint, where a full Retina screen takes tens.
 const PREVIEW_PIXELS: f64 = 1_000_000.0;
+/// Rows the full toolbar takes: the bar of tools, then two rows of styles.
+const TOOLBAR: u16 = 5;
 /// How long after the last key or click the board is painted sharp again.
 const SETTLE: Duration = Duration::from_millis(150);
 /// Where selection, handles and the caret are drawn when the terminal
@@ -176,9 +178,10 @@ enum Button {
     /// A background for shapes; `None` is gray.
     Fill(Option<Hue>),
     NoFill,
-    FillStyle,
-    Dash,
-    Stroke,
+    FillStyle(FillStyle),
+    Dash(Dash),
+    /// A stroke width, in board pixels.
+    Stroke(u8),
 }
 
 /// Which part of the board is on screen.
@@ -741,12 +744,17 @@ impl App {
             Some(e) => e.fill.as_ref().map(|f| f.style),
             None => self.fill_style,
         };
-        let next = match first {
+        self.set_fill(match first {
             None => Some(FillStyle::Hachure),
             Some(FillStyle::Hachure) => Some(FillStyle::CrossHatch),
             Some(FillStyle::CrossHatch) => Some(FillStyle::Solid),
             Some(FillStyle::Solid) => None,
-        };
+        });
+    }
+
+    /// Fills new shapes and the selected ones in `next`'s style, keeping
+    /// their colors; `None` leaves them empty.
+    fn set_fill(&mut self, next: Option<FillStyle>) {
         self.fill_style = next;
         let color = pale(self.fill_hue).to_owned();
         self.message = Some(format!("Fill: {}", fill_name(next)));
@@ -765,23 +773,30 @@ impl App {
     }
 
     fn cycle_dash(&mut self) {
-        self.dash = match self.dash {
+        self.set_dash(match self.dash {
             Dash::Solid => Dash::Dashed,
             Dash::Dashed => Dash::Dotted,
             Dash::Dotted => Dash::Solid,
-        };
-        let dash = self.dash;
+        });
+    }
+
+    fn set_dash(&mut self, dash: Dash) {
+        self.dash = dash;
         self.message = Some(format!("Stroke: {}", dash.name()));
         self.restyle(|e| e.dash = dash);
     }
 
     fn cycle_stroke(&mut self) {
-        self.stroke = match self.stroke {
-            s if s < 2.0 => 2.0,
-            s if s < 4.0 => 4.0,
-            _ => 1.0,
-        };
-        let stroke = self.stroke;
+        self.set_stroke(match self.stroke {
+            s if s < 2.0 => 2,
+            s if s < 4.0 => 4,
+            _ => 1,
+        });
+    }
+
+    fn set_stroke(&mut self, width: u8) {
+        let stroke = f64::from(width);
+        self.stroke = stroke;
         self.message = Some(format!("Stroke width: {stroke}"));
         self.restyle(|e| e.stroke = stroke);
     }
@@ -1503,9 +1518,9 @@ impl App {
             Button::Ink(hue) => self.recolor(hue),
             Button::Fill(hue) => self.refill(hue),
             Button::NoFill => self.unfill(),
-            Button::FillStyle => self.cycle_fill(),
-            Button::Dash => self.cycle_dash(),
-            Button::Stroke => self.cycle_stroke(),
+            Button::FillStyle(style) => self.set_fill(Some(style)),
+            Button::Dash(dash) => self.set_dash(dash),
+            Button::Stroke(width) => self.set_stroke(width),
         }
     }
 
@@ -1623,7 +1638,7 @@ impl App {
                     element.dash = self.dash;
                     element.stroke = self.stroke;
                     if let Some(style) = self.fill_style
-                        && element.shape.holds()
+                        && fillable(&element)
                     {
                         element.fill = Some(Fill {
                             color: pale(self.fill_hue).to_owned(),
@@ -1920,7 +1935,11 @@ impl App {
             return;
         }
         // A floating bar and a row of styles where there's room; one row where not.
-        let top = if area.height >= 12 { 4 } else { 1 };
+        let top = if area.height >= TOOLBAR + 8 {
+            TOOLBAR
+        } else {
+            1
+        };
         let toolbar = Rect {
             height: top,
             ..area
@@ -1952,81 +1971,123 @@ impl App {
     }
 
     /// The tool bar, Excalidraw's way: a rounded bar of icons in the middle
-    /// with a lock on the left, and below it the ink, background, fill, line
-    /// and width, each one clickable. Short screens get it all on one row.
+    /// with a lock on the left; below it the stroke and background colors,
+    /// then every fill, line and width, with what's in use highlighted.
+    /// Short screens get it all on one row.
     fn draw_toolbar(&mut self, f: &mut Screen, area: Rect) {
         self.buttons.clear();
         let [r, g, b] = self.paint.accent;
         let accent = Color::Rgb(r, g, b);
         let picked = Style::new()
             .fg(accent)
-            .bg(mix(self.paint.paper, self.paint.accent, 0.25))
+            .bg(mix(self.paint.paper, self.paint.accent, 0.3))
             .add_modifier(Modifier::BOLD);
         let dim = Style::new().add_modifier(Modifier::DIM);
-        let chip = Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         let divider = || (None, vec![Span::styled(" │ ", dim)]);
+        let gap = |width: usize| (None, vec![Span::raw(" ".repeat(width))]);
+        // Every icon gets the same five cells, however wide it draws.
+        let cell = |icon: &str| {
+            let pad = 5usize.saturating_sub(Span::raw(icon).width());
+            let left = pad / 2;
+            format!("{}{icon}{}", " ".repeat(left), " ".repeat(pad - left))
+        };
 
         let mut tools: Vec<Item> = vec![(
             Some(Button::Lock),
             vec![Span::styled(
-                if self.locked { " 🔒 " } else { " 🔓 " },
+                cell(if self.locked { "🔒" } else { "🔓" }),
                 if self.locked { picked } else { Style::new() },
             )],
         )];
         tools.push(divider());
         for tool in Tool::ALL {
-            let on = tool == self.tool;
-            let base = if on { picked } else { Style::new() };
+            let style = if tool == self.tool {
+                picked
+            } else {
+                Style::new()
+            };
             tools.push((
                 Some(Button::Tool(tool)),
-                vec![
-                    Span::styled(format!(" {}", tool.icon()), base),
-                    Span::styled(format!("{} ", tool.key()), base.add_modifier(Modifier::DIM)),
-                ],
+                vec![Span::styled(cell(tool.icon()), style)],
             ));
         }
         tools.push(divider());
-        tools.push((Some(Button::Help), vec![Span::raw(" ⋮ ")]));
+        tools.push((Some(Button::Help), vec![Span::raw(cell("⋮"))]));
 
-        let swatch = |chosen: bool, color: Color| {
-            Span::styled(if chosen { " ◉" } else { " ●" }, Style::new().fg(color))
+        // A color swatch: a block of the color, bracketed and lit when chosen.
+        let swatch = |button: Button, chosen: bool, color: Color| -> Item {
+            let block = Span::styled("██", Style::new().fg(color).bg(Color::Reset));
+            let (open, close) = if chosen {
+                (Span::styled("[", picked), Span::styled("]", picked))
+            } else {
+                (Span::raw(" "), Span::raw(" "))
+            };
+            let block = if chosen {
+                block.patch_style(Style::new().bg(mix(self.paint.paper, self.paint.accent, 0.3)))
+            } else {
+                block
+            };
+            (Some(button), vec![open, block, close])
         };
-        let mut styles: Vec<Item> = vec![(None, vec![Span::styled("stroke", dim)])];
-        styles.push((
-            Some(Button::Ink(None)),
-            vec![swatch(self.color.is_none(), Color::Reset)],
+        // A word to pick, lit when it's what's in use.
+        let option = |button: Button, chosen: bool, word: &str| -> Item {
+            (
+                Some(button),
+                vec![Span::styled(
+                    format!(" {word} "),
+                    if chosen { picked } else { dim },
+                )],
+            )
+        };
+
+        let mut colors: Vec<Item> = vec![(None, vec![Span::styled("stroke ", dim)])];
+        colors.push(swatch(
+            Button::Ink(None),
+            self.color.is_none(),
+            Color::Reset,
         ));
         for hue in Hue::ALL {
             let color = self.screen_color(&hex(hue.ink()));
-            styles.push((
-                Some(Button::Ink(Some(hue))),
-                vec![swatch(self.color == Some(hue), color)],
+            colors.push(swatch(
+                Button::Ink(Some(hue)),
+                self.color == Some(hue),
+                color,
             ));
         }
         let filled = self.fill_style.is_some();
-        styles.push((None, vec![Span::styled("   background", dim)]));
-        styles.push((
-            Some(Button::NoFill),
-            vec![Span::styled(" ⊘", if filled { dim } else { picked })],
-        ));
+        colors.push(gap(4));
+        colors.push((None, vec![Span::styled("background ", dim)]));
+        colors.push(option(Button::NoFill, !filled, "⊘"));
         for hue in std::iter::once(None).chain(Hue::ALL.map(Some)) {
             let color = self.screen_color(pale(hue));
-            styles.push((
-                Some(Button::Fill(hue)),
-                vec![swatch(filled && self.fill_hue == hue, color)],
+            colors.push(swatch(
+                Button::Fill(hue),
+                filled && self.fill_hue == hue,
+                color,
             ));
         }
-        for (label, button, value) in [
-            (
-                "   fill ",
-                Button::FillStyle,
-                fill_name(self.fill_style).to_owned(),
-            ),
-            ("   line ", Button::Dash, self.dash.name().to_owned()),
-            ("   width ", Button::Stroke, format!("{}px", self.stroke)),
-        ] {
-            styles.push((None, vec![Span::styled(label, dim)]));
-            styles.push((Some(button), vec![Span::styled(value, chip)]));
+
+        let mut shapes: Vec<Item> = vec![(None, vec![Span::styled("fill ", dim)])];
+        for style in [FillStyle::Hachure, FillStyle::CrossHatch, FillStyle::Solid] {
+            shapes.push(option(
+                Button::FillStyle(style),
+                self.fill_style == Some(style),
+                fill_name(Some(style)),
+            ));
+        }
+        shapes.push(gap(4));
+        shapes.push((None, vec![Span::styled("line ", dim)]));
+        for dash in [Dash::Solid, Dash::Dashed, Dash::Dotted] {
+            shapes.push(option(Button::Dash(dash), self.dash == dash, dash.name()));
+        }
+        shapes.push(gap(4));
+        shapes.push((None, vec![Span::styled("width ", dim)]));
+        for width in [1u8, 2, 4] {
+            shapes.push(option(
+                Button::Stroke(width),
+                self.stroke == f64::from(width),
+                &format!("{width}px"),
+            ));
         }
 
         let width = |items: &[Item]| -> u16 {
@@ -2037,24 +2098,24 @@ impl App {
                 .sum()
         };
         let bar = width(&tools) + 2;
-        if area.height >= 4 && bar <= area.width {
+        if area.height >= TOOLBAR && bar <= area.width {
             let x = area.x + (area.width - bar) / 2;
-            let outline = Rect::new(x, area.y, bar, 3);
             f.render_widget(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
                     .border_style(dim),
-                outline,
+                Rect::new(x, area.y, bar, 3),
             );
             self.place(f.buffer_mut(), &tools, x + 1, area.y + 1, area);
-            let strip = width(&styles).min(area.width);
-            let x = area.x + (area.width - strip) / 2;
-            self.place(f.buffer_mut(), &styles, x, area.y + 3, area);
+            for (row, items) in [(3, &colors), (4, &shapes)] {
+                let x = area.x + (area.width - width(items).min(area.width)) / 2;
+                self.place(f.buffer_mut(), items, x, area.y + row, area);
+            }
         } else {
             // One row: the tools, then the styles as far as they fit.
             let mut row = tools;
             row.push(divider());
-            row.extend(styles);
+            row.extend(colors);
             self.place(f.buffer_mut(), &row, area.x, area.y, area);
         }
     }
@@ -3260,6 +3321,18 @@ mod tests {
     }
 
     #[test]
+    fn a_new_frame_takes_the_background_too() {
+        let path = temp("frame-fill");
+        let (mut app, _) = app(&path);
+        push(&mut app, Button::Fill(Some(Hue::Green)));
+        press(&mut app, KeyCode::Char('F'));
+        drag(&mut app, (10, 5), (30, 10));
+        let e = &on_disk(&path).elements[0];
+        assert!(matches!(e.shape, Shape::Frame { .. }));
+        assert_eq!(e.fill.as_ref().map(|f| f.color.as_str()), Some("#b2f2bb"));
+    }
+
+    #[test]
     fn ink_and_background_are_picked_apart_and_new_shapes_take_both() {
         let path = temp("colors");
         let (mut app, _) = app(&path);
@@ -3286,18 +3359,25 @@ mod tests {
     }
 
     #[test]
-    fn the_toolbar_picks_tools_and_cycles_line_and_width() {
+    fn the_toolbar_picks_tools_fill_line_and_width() {
         let (mut app, _) = app(&temp("toolbar"));
         let screen = draw(&mut app);
         assert!(screen.contains('╭') && screen.contains('◇'), "{screen}");
         push(&mut app, Button::Tool(Tool::Diamond));
         assert_eq!(app.tool, Tool::Diamond);
         draw(&mut app);
-        push(&mut app, Button::Dash);
+        push(&mut app, Button::Dash(Dash::Dotted));
         draw(&mut app);
-        push(&mut app, Button::Stroke);
-        assert_eq!((app.dash, app.stroke), (Dash::Dashed, 4.0));
-        assert!(draw(&mut app).contains("dashed"));
+        push(&mut app, Button::Stroke(4));
+        draw(&mut app);
+        push(&mut app, Button::FillStyle(FillStyle::CrossHatch));
+        assert_eq!(
+            (app.dash, app.stroke, app.fill_style),
+            (Dash::Dotted, 4.0, Some(FillStyle::CrossHatch))
+        );
+        // The ink and the background in use are the swatches in brackets.
+        let screen = draw(&mut app);
+        assert_eq!(screen.matches("[██]").count(), 2, "{screen}");
     }
 
     #[test]
