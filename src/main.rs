@@ -3,6 +3,9 @@ mod agentpick;
 mod aloud;
 mod art;
 mod article;
+mod board;
+mod boardsvg;
+mod boardview;
 mod chart;
 mod comment;
 mod config;
@@ -85,6 +88,8 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | office
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
+       leaf board [file.excalidraw]   draw on a whiteboard with the agent (default: a new board-<words>.excalidraw here)
+       leaf board <file.excalidraw> --export <out.png | out.svg>   save the board as a picture
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -116,6 +121,13 @@ Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
 
 Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, @ or ctrl+enter send the selection, with the lines around it, to an agent, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit
+
+Board keys: v select, h hand, r box, d diamond, o ellipse, a arrow, l line, p pen, t text,
+F frame, e eraser, drag to draw, move or resize, the knob turns, double-click or enter writes text,
+1-6 color, b fill, s dashes, w width, k hand-drawn, m arrowhead, n font, < > text size,
+[ ] { } stack order, g/G group, ctrl+d duplicate, ctrl+c/x/v copy, cut, paste, x delete,
+u/U undo/redo, arrows nudge or pan, ctrl+scroll or +/- zoom, f fit, i pictures or dots,
+E export, @ ask the agent (it draws by editing the file), ? keys, q quit
 
 Rex: leaf rex install puts Leaf in the command palette: open (with a picker), review diffs, ask the agent pane about a selection, read aloud and pick a voice. In a remote session, leaf is installed on the host with cargo the first time.";
 
@@ -279,6 +291,79 @@ fn resume(
     options
 }
 
+fn is_board(target: &str) -> bool {
+    target.to_ascii_lowercase().ends_with(".excalidraw")
+}
+
+/// Writes the board at `path` as an SVG or PNG picture at `to`.
+fn export_board(path: &Path, to: &Path) -> ExitCode {
+    if let (Ok(board), Ok(picture)) = (std::fs::canonicalize(path), std::fs::canonicalize(to))
+        && board == picture
+    {
+        eprintln!(
+            "leaf: exporting to {} would write over the board itself. Name a different .png or .svg file.",
+            to.display()
+        );
+        return ExitCode::from(2);
+    }
+    if !path.exists() {
+        eprintln!(
+            "leaf: there's no board at {}. Name an existing .excalidraw file.",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let board = match board::Board::load(path) {
+        Ok(board) => board,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match boardview::export_to(&board, to) {
+        Ok(()) => {
+            println!("{}", to.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn board_command(path: &Path) -> ExitCode {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!("leaf: the board needs a terminal to draw in. Run leaf board in one.");
+        return ExitCode::from(2);
+    }
+    let board = match board::Board::load(path) {
+        Ok(board) => board,
+        Err(e) => {
+            eprintln!("leaf: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The file exists from the start, so an agent can be pointed at it
+    // before anything is drawn.
+    if !path.exists()
+        && let Err(e) = board.save(path)
+    {
+        eprintln!("leaf: {e}");
+        return ExitCode::FAILURE;
+    }
+    match boardview::run(path.to_owned(), board) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "leaf: the board closed after a terminal error ({e}). Every change before it was saved to {}.",
+                path.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     memory::without_large_cache();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -347,6 +432,27 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         "ui" => ui_command(rest),
+        "board" | "whiteboard" => match rest {
+            [] => match board::fresh_path(Path::new(".")) {
+                Ok(path) => board_command(&path),
+                Err(e) => {
+                    eprintln!("leaf: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            [path] if !path.starts_with('-') => board_command(Path::new(path)),
+            [path, flag, to] if flag == "--export" => export_board(Path::new(path), Path::new(to)),
+            [flag, _] if flag == "--export" => {
+                eprintln!(
+                    "leaf: name the board to export, as in leaf board sketch.excalidraw --export sketch.png."
+                );
+                ExitCode::from(2)
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         "diff" => {
             if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
                 println!("{USAGE}");
@@ -405,6 +511,7 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
+        target if rest.is_empty() && is_board(target) => board_command(Path::new(target)),
         // Anything else names a document: `leaf README.md` is `leaf open README.md`.
         target if rest.is_empty() && !target.starts_with('-') => open(target),
         _ => {

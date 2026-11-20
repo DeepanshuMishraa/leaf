@@ -40,5 +40,8 @@ complete -c leaf -n '__fish_seen_subcommand_from rex plugin' -a 'install uninsta
 complete -c leaf -n __fish_use_subcommand -a agents -d 'Pick the installed agent questions go to'
 complete -c leaf -n __fish_use_subcommand -a voice -d 'Show or set the voice that reads aloud'
 complete -c leaf -n '__fish_seen_subcommand_from voice' -a 'en-US-EmmaMultilingualNeural en-US-AriaNeural en-US-GuyNeural en-GB-SoniaNeural en-GB-RyanNeural en-AU-NatashaNeural en-IN-NeerjaNeural' -d 'Voice'
+complete -c leaf -n __fish_use_subcommand -a 'board whiteboard' -d 'Draw on a whiteboard with the agent'
+complete -c leaf -n '__fish_use_subcommand; or __fish_seen_subcommand_from board whiteboard' -F -a '(__fish_complete_suffix .excalidraw)'
+complete -c leaf -n '__fish_seen_subcommand_from board whiteboard' -l export -r -F -a '(__fish_complete_suffix .png; __fish_complete_suffix .svg)' -d 'Save the board as a picture'
 complete -c leaf -n __fish_use_subcommand -a comments -d 'List saved diff comments'
 complete -c leaf -n '__fish_seen_subcommand_from comments' -l json -d 'Machine-readable JSON'

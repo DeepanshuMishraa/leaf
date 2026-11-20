@@ -10,6 +10,14 @@
 
 ## 0.17.2
 
+- `leaf board` turns the terminal into a whiteboard you share with your agent. Draw boxes, diamonds, ellipses, arrows, lines, ink, text and frames; move, resize, turn, group and restyle them; and ask the agent to draw with `@`. Boards are plain `.excalidraw` files that also open on excalidraw.com, saved on every change and redrawn when the agent or anyone else edits the file. With no file named, a new board gets a fresh name like `board-misty-harbor.excalidraw`. `E` or `--export out.png` writes SVG or PNG.
+- The board's header names the tool in hand and shows the ink, background, fill, line and width new things get, each with the key that changes it. `tab` and `shift+tab` step through the tools. `L` locks the canvas so it can't be panned or zoomed.
+- Stroke and background colors are set separately: `1`–`6` set the stroke, and `B` steps the background through none, gray and the six colors. Both apply to the selection and to what you draw next, including frames.
+- Arrows and lines let go near a shape snap onto its edge, so a connector drawn a little short still meets the shapes at both ends. Arrows stay attached as the shapes move.
+- A selected shape can be dragged while a box, diamond, ellipse or frame tool is still active.
+- `ctrl+c` quits the board even with something selected; `y` copies.
+- In kitty-protocol terminals, the board picture no longer blinks while you draw. The old picture stays until the new one has had time to show, even when the new one is slow to upload, and a picture shown twice keeps both copies.
+- If a new board can't be fully written, its half-written file is removed instead of being left behind.
 - `leaf diff`, `leaf review` and the PR Code tab remember whether you last used the split or inline layout.
 - `leaf pr` lists pull requests and issues assigned to you. `@` switches the list between All and Assigned.
 - A finished job's log that GitHub failed to send (such as HTTP 503) is asked for again every few seconds while you're on it, instead of showing the error until you reopen it.
