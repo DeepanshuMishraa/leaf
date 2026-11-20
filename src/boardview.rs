@@ -17,8 +17,8 @@ use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::execute;
-use crossterm::terminal::SetTitle;
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate, SetTitle};
+use crossterm::{execute, queue};
 use image::RgbaImage;
 use ratatui::Frame as Screen;
 use ratatui::buffer::Buffer;
@@ -338,6 +338,14 @@ enum Mode {
     Help,
 }
 
+/// What a plain scroll does. Terminals keep trackpad pinches to themselves,
+/// so zooming by scroll stands in for pinching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scroll {
+    Pan,
+    Zoom,
+}
+
 /// Sends a prompt to the agent; says where it went, or why it didn't.
 type Send = Box<dyn FnMut(&str) -> Result<String, String>>;
 
@@ -354,6 +362,9 @@ struct Pixels {
     kitty: Option<Kitty>,
     /// The SVG last shown and what shows it.
     shown: Option<(String, Rect, Shown)>,
+    /// The kitty layer for the next picture, one above the last so each
+    /// new picture covers the one it replaces while that one lingers.
+    layer: i32,
 }
 
 struct App {
@@ -390,6 +401,7 @@ struct App {
     pixels: Option<Pixels>,
     /// Braille dots even where pictures could be shown.
     dots: bool,
+    scroll: Scroll,
     /// Pictures decoded for the dots view, by file id.
     pictures: HashMap<String, Option<RgbaImage>>,
     /// The last key or click, for painting quickly while input keeps coming.
@@ -465,6 +477,7 @@ impl App {
             paint,
             pixels,
             dots: false,
+            scroll: Scroll::Pan,
             pictures: HashMap::new(),
             active: Instant::now(),
             blurry: false,
@@ -1078,6 +1091,16 @@ impl App {
             KeyCode::Char(c @ '1'..='6') => self.recolor(Hue::of_key(c)),
             KeyCode::Char('@' | 'c') => self.mode = Mode::Asking(String::new()),
             KeyCode::Char('f') => self.fit(),
+            KeyCode::Char('z') => {
+                self.scroll = match self.scroll {
+                    Scroll::Pan => Scroll::Zoom,
+                    Scroll::Zoom => Scroll::Pan,
+                };
+                self.message = Some(match self.scroll {
+                    Scroll::Zoom => "Scrolling zooms; shift+scroll pans · z to pan again".into(),
+                    Scroll::Pan => "Scrolling pans · z to zoom by scrolling".into(),
+                });
+            }
             KeyCode::Char('+' | '=') => self.zoom_middle(1.25),
             KeyCode::Char('-') => self.zoom_middle(0.8),
             KeyCode::Char('b') => self.cycle_fill(),
@@ -1335,7 +1358,11 @@ impl App {
             MouseEventKind::Up(_) => self.release(),
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = mouse.kind == MouseEventKind::ScrollUp;
-                if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                let zooms = (self.scroll == Scroll::Zoom && !shift)
+                    || mouse
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                if zooms {
                     self.view.zoom(if up { 1.1 } else { 1.0 / 1.1 }, p);
                 } else if shift {
                     self.pan(if up { 3.0 } else { -3.0 }, 0.0);
@@ -1835,12 +1862,11 @@ impl App {
             u32::from(area.width) * u32::from(font.width),
             u32::from(area.height) * u32::from(font.height),
         );
-        // While the mouse is held or keys come quickly, kitty gets a smaller
-        // picture it stretches over the same cells, so the board keeps up;
-        // once things settle it's painted sharp.
+        // While the mouse is held or keys come quickly, the terminal gets a
+        // smaller picture stretched over the same cells, so the board keeps
+        // up; once things settle it's painted sharp.
         let held = !matches!(self.gesture, Gesture::Idle);
-        let stretches = self.pixels.as_ref().is_some_and(|p| p.kitty.is_some());
-        let quick = stretches && (held || self.active.elapsed() < SETTLE);
+        let quick = held || self.active.elapsed() < SETTLE;
         let full = size;
         let size = if quick { preview_size(full) } else { full };
         self.blurry = size != full;
@@ -1880,11 +1906,14 @@ impl App {
             };
             let shown = match &mut pixels.kitty {
                 Some(kitty) => {
+                    // The old picture stays beneath until the new one shows,
+                    // so a drag doesn't blink while the terminal takes it in.
                     if let Some((_, _, Shown::Kitty(old))) = pixels.shown.take() {
-                        kitty.free(old);
+                        kitty.retire(old);
                     }
+                    pixels.layer = pixels.layer.saturating_add(1);
                     kitty
-                        .upload(&image, area.width, area.height, 0)
+                        .upload(&image, area.width, area.height, pixels.layer)
                         .map(Shown::Kitty)
                 }
                 None => pixels
@@ -1892,7 +1921,8 @@ impl App {
                     .new_protocol(
                         image::DynamicImage::ImageRgba8(image),
                         area.into(),
-                        Resize::Fit(None),
+                        // Scale, unlike Fit, stretches the quick picture to the cells.
+                        Resize::Scale(None),
                     )
                     .ok()
                     .map(Shown::Other),
@@ -2367,7 +2397,8 @@ const KEYS: &[(&str, &str)] = &[
     ("x del", "delete"),
     ("u U", "undo, redo"),
     ("arrows", "nudge the selection, or pan"),
-    ("scroll", "pan; ctrl+scroll or + - zoom; f fits"),
+    ("scroll", "pan; ctrl/option+scroll or + - zoom; f fits"),
+    ("z", "scroll zooms instead of panning (for trackpads)"),
     ("i", "pictures or dots"),
     ("E", "export SVG and PNG beside the board"),
     ("@ c", "ask the agent"),
@@ -2527,6 +2558,7 @@ pub fn run(path: PathBuf, board: Board) -> io::Result<()> {
             picker,
             kitty: Some(Kitty::default()),
             shown: None,
+            layer: 0,
         }),
         // Kitty graphics through tmux need its placeholders; the other
         // protocols are drawn by ratatui-image.
@@ -2534,6 +2566,7 @@ pub fn run(path: PathBuf, board: Board) -> io::Result<()> {
             picker,
             kitty: None,
             shown: None,
+            layer: 0,
         }),
     };
     let send: Send = Box::new(|text| {
@@ -2561,10 +2594,17 @@ fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Res
     loop {
         dirty |= app.reload();
         // The quick picture shown while working is painted sharp once input stops.
-        dirty |= app.blurry && app.active.elapsed() >= SETTLE;
+        dirty |= app.showing_pixels() && app.blurry && app.active.elapsed() >= SETTLE;
         if dirty {
             dirty = false;
+            // One synchronized update covers the cells and the picture, so
+            // the terminal never shows a frame with only half of them.
+            queue!(io::stdout(), BeginSynchronizedUpdate)?;
             terminal.draw(|f| app.draw(f))?;
+            app.flush()?;
+            execute!(io::stdout(), EndSynchronizedUpdate)?;
+        } else {
+            // Clears away replaced pictures once they've been covered long enough.
             app.flush()?;
         }
         if let Some(text) = app.copy.take() {
@@ -2700,6 +2740,40 @@ mod tests {
 
     fn on_disk(path: &Path) -> Board {
         Board::load(path).expect("saved board loads")
+    }
+
+    #[test]
+    fn z_makes_scrolling_zoom_around_the_pointer_and_shift_still_pans() {
+        let (mut app, _) = app(&temp("scroll-zoom"));
+        let start = app.view;
+        mouse(&mut app, MouseEventKind::ScrollUp, 20, 8);
+        assert_eq!(app.view.scale, start.scale, "plain scroll pans");
+        press(&mut app, KeyCode::Char('z'));
+        let before = app.view;
+        let under = before.point(app.canvas, 20, 8);
+        mouse(&mut app, MouseEventKind::ScrollUp, 20, 8);
+        assert!(app.view.scale < before.scale, "scrolling up zooms in");
+        let after = app.view.point(app.canvas, 20, 8);
+        assert!((after.x - under.x).abs() < app.view.scale);
+        assert!((after.y - under.y).abs() < app.view.row());
+        let zoomed = app.view.scale;
+        mouse_with(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            20,
+            8,
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.view.scale, zoomed, "shift+scroll pans");
+        press(&mut app, KeyCode::Char('z'));
+        mouse_with(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            20,
+            8,
+            KeyModifiers::ALT,
+        );
+        assert!(app.view.scale > zoomed, "option+scroll zooms either way");
     }
 
     /// Draws a box from cell (10, 5) to (30, 10): 200 × 100 board pixels at

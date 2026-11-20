@@ -5,6 +5,7 @@
 //! Placing images at the cursor needs nothing written into the cells.
 
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use image::RgbaImage;
@@ -29,7 +30,17 @@ pub struct Kitty {
     /// Uploads and deletions waiting for the next flush.
     pending: Vec<u8>,
     placed: Vec<(u32, Rect)>,
+    /// Images to drop once what replaces them is on screen.
+    freed: Vec<u32>,
+    /// Images replaced on screen, left under their successor until it has
+    /// had time to show, and when each was replaced.
+    retired: Vec<(u32, Instant)>,
 }
+
+/// How long a replaced image stays under its successor. A terminal may draw
+/// nothing for a new image until it has turned it into a texture, so taking
+/// the old one away at once shows a blink on every frame of a drag.
+const LINGER: Duration = Duration::from_millis(250);
 
 impl Kitty {
     /// Queues `pixels` for upload, to be drawn over `cols` × `rows` cells in `layer`.
@@ -74,32 +85,53 @@ impl Kitty {
         })
     }
 
-    /// Frees an uploaded image and its placements.
+    /// Frees an uploaded image and its placements at the next flush, after
+    /// whatever replaces it is placed, so the screen never shows a gap.
     pub fn free(&mut self, image: Image) {
-        let _ = write!(self.pending, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", image.id);
-        self.placed.retain(|(id, _)| *id != image.id);
+        self.freed.push(image.id);
+    }
+
+    /// Frees an image a successor replaces on screen, leaving it in place
+    /// beneath for a moment. The successor must sit in a higher layer.
+    pub fn retire(&mut self, image: Image) {
+        self.retired.push((image.id, Instant::now()));
     }
 
     /// Forgets what's on screen, so the next flush places everything again.
     pub fn reset(&mut self) {
         self.placed.clear();
         self.pending.extend_from_slice(b"\x1b_Ga=d,d=a,q=2\x1b\\");
+        for (id, _) in self.retired.drain(..) {
+            let _ = write!(self.pending, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
+        }
     }
 
     /// Sends queued uploads, then makes `wanted` the images on screen.
+    /// Called with nothing new, it drops replaced images whose time is up.
     pub fn flush(&mut self, out: &mut impl Write, wanted: &[(Image, Rect)]) -> io::Result<()> {
+        self.flush_at(out, wanted, Instant::now())
+    }
+
+    fn flush_at(
+        &mut self,
+        out: &mut impl Write,
+        wanted: &[(Image, Rect)],
+        now: Instant,
+    ) -> io::Result<()> {
         let ids: Vec<(u32, Rect)> = wanted
             .iter()
             .map(|(image, rect)| (image.id, *rect))
             .collect();
         if ids != self.placed {
-            // Placements outlive the text drawn over them, so the old ones go first.
-            self.pending.extend_from_slice(b"\x1b_Ga=d,d=a,q=2\x1b\\");
+            // New placements go up before old ones come down; deleting first
+            // leaves the screen empty while a large upload is still arriving,
+            // which shows as a flicker. Placement id 1 makes re-placing an
+            // image move it rather than draw it twice.
             self.pending.extend_from_slice(b"\x1b7");
             for (image, rect) in wanted {
                 let _ = write!(
                     self.pending,
-                    "\x1b[{};{}H\x1b_Ga=p,i={},c={},r={},z={},C=1,q=2\x1b\\",
+                    "\x1b[{};{}H\x1b_Ga=p,i={},c={},r={},z={},C=1,p=1,q=2\x1b\\",
                     rect.y + 1,
                     rect.x + 1,
                     image.id,
@@ -109,8 +141,29 @@ impl Kitty {
                 );
             }
             self.pending.extend_from_slice(b"\x1b8");
+            for (id, _) in &self.placed {
+                let leaving = !ids.iter().any(|(kept, _)| kept == id)
+                    && !self.freed.contains(id)
+                    && !self.retired.iter().any(|(old, _)| old == id);
+                if leaving {
+                    let _ = write!(self.pending, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\");
+                }
+            }
             self.placed = ids;
         }
+        for id in self.freed.drain(..) {
+            let _ = write!(self.pending, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
+        }
+        // With nothing left to cover them, replaced images go at once.
+        let everything = wanted.is_empty();
+        let pending = &mut self.pending;
+        self.retired.retain(|(id, at)| {
+            let keep = !everything && now.duration_since(*at) < LINGER;
+            if !keep {
+                let _ = write!(pending, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
+            }
+            keep
+        });
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -152,6 +205,56 @@ mod tests {
         flushed(&mut kitty, &wanted);
         kitty.reset();
         assert!(flushed(&mut kitty, &wanted).contains("a=p,i=1"));
+    }
+
+    #[test]
+    fn a_replaced_image_is_dropped_only_after_its_successor_is_placed() {
+        let mut kitty = Kitty::default();
+        let rect = Rect::new(0, 0, 4, 4);
+        let old = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 0).unwrap();
+        flushed(&mut kitty, &[(old, rect)]);
+        kitty.free(old);
+        let new = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 0).unwrap();
+        let out = flushed(&mut kitty, &[(new, rect)]);
+        let upload = out.find("a=t,f=100,i=2").unwrap();
+        let place = out.find("a=p,i=2").unwrap();
+        let drop = out.find("a=d,d=I,i=1").unwrap();
+        assert!(upload < place && place < drop);
+        assert!(!out.contains("d=a"));
+    }
+
+    #[test]
+    fn a_retired_image_stays_under_its_successor_until_its_time_is_up() {
+        let mut kitty = Kitty::default();
+        let rect = Rect::new(0, 0, 4, 4);
+        let old = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 0).unwrap();
+        flushed(&mut kitty, &[(old, rect)]);
+        kitty.retire(old);
+        let new = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 1).unwrap();
+        let out = flushed(&mut kitty, &[(new, rect)]);
+        assert!(out.contains("a=p,i=2"));
+        assert!(
+            !out.contains("i=1,"),
+            "the old image is left alone: {out:?}"
+        );
+        let mut later = Vec::new();
+        kitty
+            .flush_at(&mut later, &[(new, rect)], Instant::now() + LINGER)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(later).unwrap(),
+            "\x1b_Ga=d,d=I,i=1,q=2\x1b\\"
+        );
+    }
+
+    #[test]
+    fn retired_images_go_at_once_when_nothing_is_shown() {
+        let mut kitty = Kitty::default();
+        let rect = Rect::new(0, 0, 4, 4);
+        let old = kitty.upload(&RgbaImage::new(8, 8), 4, 4, 0).unwrap();
+        flushed(&mut kitty, &[(old, rect)]);
+        kitty.retire(old);
+        assert!(flushed(&mut kitty, &[]).contains("a=d,d=I,i=1"));
     }
 
     #[test]

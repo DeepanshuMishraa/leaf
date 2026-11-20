@@ -26,6 +26,10 @@ pub enum BoardFailed {
         "Couldn't save the board to {path} ({cause}). The board is still open with your changes; try again once the file can be written."
     )]
     Write { path: String, cause: std::io::Error },
+    #[error(
+        "Couldn't start a new board at {path} ({cause}). Check that the folder can be written, or name a board file to open."
+    )]
+    Create { path: String, cause: std::io::Error },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1132,8 +1136,8 @@ pub fn new_id() -> String {
 }
 
 /// A file name for a new board in `dir` that nothing there has yet, like
-/// `board-misty-harbor.excalidraw`.
-pub fn fresh_path(dir: &Path) -> PathBuf {
+/// `board-misty-harbor.excalidraw`, created as an empty board to claim it.
+pub fn fresh_path(dir: &Path) -> Result<PathBuf, BoardFailed> {
     const FIRST: &[&str] = &[
         "amber", "brisk", "calm", "dusky", "eager", "fern", "gentle", "hazy", "ivory", "jolly",
         "keen", "lucky", "misty", "nimble", "olive", "plum", "quiet", "rapid", "sunny", "tidy",
@@ -1160,8 +1164,30 @@ pub fn fresh_path(dir: &Path) -> PathBuf {
             format!("board-{words}-{:04x}.excalidraw", (n >> 16) & 0xffff)
         };
         let path = dir.join(name);
-        if !path.exists() {
-            return path;
+        // Creating the file claims the name, so two boards started at once
+        // can't both pick it and save over each other.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                return file
+                    .write_all(Board::default().to_json().as_bytes())
+                    .map(|()| path.clone())
+                    .map_err(|cause| BoardFailed::Create {
+                        path: path.display().to_string(),
+                        cause,
+                    });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(cause) => {
+                return Err(BoardFailed::Create {
+                    path: path.display().to_string(),
+                    cause,
+                });
+            }
         }
     }
 }
@@ -1891,16 +1917,37 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut seen = Vec::new();
         for _ in 0..20 {
-            let path = fresh_path(&dir);
+            let path = fresh_path(&dir).expect("a free name");
             let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
             assert!(
                 name.starts_with("board-") && name.ends_with(".excalidraw"),
                 "{name}"
             );
-            assert!(!path.exists() && !seen.contains(&path), "{name}");
-            std::fs::write(&path, "{}").expect("take the name");
+            assert!(!seen.contains(&path), "{name}");
+            // The name is claimed with an empty board that opens.
+            assert!(Board::load(&path).expect("loads").elements.is_empty());
             seen.push(path);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_board_name_is_claimed_even_when_boards_start_together() {
+        let dir = std::env::temp_dir().join(format!("leaf-board-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || fresh_path(&dir).expect("a free name"))
+            })
+            .collect();
+        let mut paths: Vec<PathBuf> = threads
+            .into_iter()
+            .map(|t| t.join().expect("thread"))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 16);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -433,7 +433,13 @@ fn main() -> ExitCode {
         }
         "ui" => ui_command(rest),
         "board" | "whiteboard" => match rest {
-            [] => board_command(&board::fresh_path(Path::new("."))),
+            [] => match board::fresh_path(Path::new(".")) {
+                Ok(path) => board_command(&path),
+                Err(e) => {
+                    eprintln!("leaf: {e}");
+                    ExitCode::FAILURE
+                }
+            },
             [path] if !path.starts_with('-') => board_command(Path::new(path)),
             [path, flag, to] if flag == "--export" => export_board(Path::new(path), Path::new(to)),
             [flag, _] if flag == "--export" => {
