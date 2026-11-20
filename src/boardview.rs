@@ -57,8 +57,6 @@ const PICTURE_SIZE: f64 = 400.0;
 /// About how many pixels the board is painted with while the mouse is held:
 /// a few milliseconds to paint, where a full Retina screen takes tens.
 const PREVIEW_PIXELS: f64 = 1_000_000.0;
-/// Rows the full toolbar takes: the bar of tools, then two rows of styles.
-const TOOLBAR: u16 = 5;
 /// How long after the last key or click the board is painted sharp again.
 const SETTLE: Duration = Duration::from_millis(150);
 /// Where selection, handles and the caret are drawn when the terminal
@@ -127,22 +125,6 @@ impl Tool {
         }
     }
 
-    fn icon(self) -> &'static str {
-        match self {
-            Tool::Select => "↖",
-            Tool::Hand => "✋",
-            Tool::Rectangle => "□",
-            Tool::Diamond => "◇",
-            Tool::Ellipse => "○",
-            Tool::Arrow => "→",
-            Tool::Line => "─",
-            Tool::Pen => "✎",
-            Tool::Text => "A",
-            Tool::Frame => "⌗",
-            Tool::Eraser => "⌫",
-        }
-    }
-
     fn of_key(c: char) -> Option<Tool> {
         Tool::ALL.into_iter().find(|tool| tool.key() == c)
     }
@@ -165,23 +147,6 @@ impl Tool {
             Tool::Select | Tool::Hand | Tool::Text | Tool::Eraser => return None,
         })
     }
-}
-
-/// Something on the toolbar that a click acts on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Button {
-    Lock,
-    Tool(Tool),
-    Help,
-    /// Ink for strokes and text; `None` is the default ink.
-    Ink(Option<Hue>),
-    /// A background for shapes; `None` is gray.
-    Fill(Option<Hue>),
-    NoFill,
-    FillStyle(FillStyle),
-    Dash(Dash),
-    /// A stroke width, in board pixels.
-    Stroke(u8),
 }
 
 /// Which part of the board is on screen.
@@ -429,7 +394,7 @@ struct App {
     message: Option<String>,
     /// Where the canvas and each toolbar button were last drawn.
     canvas: Rect,
-    buttons: Vec<(Button, Rect)>,
+    buttons: Vec<(Tool, u16, u16)>,
     /// The last click, for double clicks.
     clicked: Option<(Instant, u16, u16)>,
     /// Where the mouse last was on the board, where pastes land.
@@ -470,9 +435,6 @@ fn pale(hue: Option<Hue>) -> &'static str {
     }
 }
 
-/// A toolbar entry: what clicking it does, if anything, and how it looks.
-type Item = (Option<Button>, Vec<Span<'static>>);
-
 /// Whether a background can go on `element`.
 fn fillable(element: &Element) -> bool {
     element.shape.holds() || matches!(element.shape, Shape::Frame { .. })
@@ -485,15 +447,6 @@ fn fill_name(style: Option<FillStyle>) -> &'static str {
         Some(FillStyle::CrossHatch) => "cross-hatch",
         Some(FillStyle::Solid) => "solid",
     }
-}
-
-/// `a` moved `amount` of the way to `b`.
-fn mix(a: Rgb, b: Rgb, amount: f64) -> Color {
-    let [r, g, bl] = [0, 1, 2].map(|i| {
-        let (x, y) = (f64::from(a[i]), f64::from(b[i]));
-        (x + (y - x) * amount).round() as u8
-    });
-    Color::Rgb(r, g, bl)
 }
 
 fn picture_mime(path: &Path) -> Option<&'static str> {
@@ -639,7 +592,7 @@ impl App {
     /// Whether the view may move; says why not when it's locked.
     fn movable(&mut self) -> bool {
         if self.locked {
-            self.message = Some("The canvas is locked. Press L or click 🔒 to unlock it.".into());
+            self.message = Some("The canvas is locked. Press L to unlock it.".into());
         }
         !self.locked
     }
@@ -728,6 +681,23 @@ impl App {
                 });
             }
         });
+    }
+
+    /// Steps the background: none, gray, then each hue, then none again.
+    fn cycle_background(&mut self) {
+        let hues = Hue::ALL.map(Some);
+        let next = match (self.fill_style, self.fill_hue) {
+            (None, _) => Some(None),
+            (Some(_), None) => Some(hues[0]),
+            (Some(_), Some(hue)) => hues
+                .iter()
+                .position(|h| *h == Some(hue))
+                .and_then(|at| hues.get(at + 1).copied()),
+        };
+        match next {
+            Some(hue) => self.refill(hue),
+            None => self.unfill(),
+        }
     }
 
     /// Leaves new shapes and the selected ones empty.
@@ -1234,6 +1204,13 @@ impl App {
             KeyCode::Char('+' | '=') => self.zoom_middle(1.25),
             KeyCode::Char('-') => self.zoom_middle(0.8),
             KeyCode::Char('b') => self.cycle_fill(),
+            KeyCode::Char('B') => self.cycle_background(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                let back = key.code == KeyCode::BackTab || shift;
+                let n = Tool::ALL.len();
+                let at = Tool::ALL.iter().position(|t| *t == self.tool).unwrap_or(0);
+                self.pick(Tool::ALL[if back { (at + n - 1) % n } else { (at + 1) % n }]);
+            }
             KeyCode::Char('s') => self.cycle_dash(),
             KeyCode::Char('w') => self.cycle_stroke(),
             KeyCode::Char('k') => self.cycle_roughness(),
@@ -1449,11 +1426,14 @@ impl App {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
             && !on_canvas
         {
-            let at = ratatui::layout::Position::new(column, row);
-            if let Some(&(button, _)) = self.buttons.iter().find(|(_, r)| r.contains(at)) {
+            if row < area.y
+                && let Some(&(tool, _, _)) = self
+                    .buttons
+                    .iter()
+                    .find(|(_, from, to)| (*from..*to).contains(&column))
+            {
                 self.finish_typing();
-                self.active = Instant::now();
-                self.push(button);
+                self.pick(tool);
             }
             return;
         }
@@ -1506,22 +1486,6 @@ impl App {
     fn pick(&mut self, tool: Tool) {
         self.tool = tool;
         self.message = Some(format!("{} ({})", tool.name(), tool.key()));
-    }
-
-    /// Does what a toolbar button is for.
-    fn push(&mut self, button: Button) {
-        self.message = None;
-        match button {
-            Button::Lock => self.toggle_lock(),
-            Button::Tool(tool) => self.pick(tool),
-            Button::Help => self.mode = Mode::Help,
-            Button::Ink(hue) => self.recolor(hue),
-            Button::Fill(hue) => self.refill(hue),
-            Button::NoFill => self.unfill(),
-            Button::FillStyle(style) => self.set_fill(Some(style)),
-            Button::Dash(dash) => self.set_dash(dash),
-            Button::Stroke(width) => self.set_stroke(width),
-        }
     }
 
     /// A double click edits text, writes inside a shape, or starts new text.
@@ -1934,12 +1898,7 @@ impl App {
         if area.height < 3 {
             return;
         }
-        // A floating bar and a row of styles where there's room; one row where not.
-        let top = if area.height >= TOOLBAR + 8 {
-            TOOLBAR
-        } else {
-            1
-        };
+        let top = 1;
         let toolbar = Rect {
             height: top,
             ..area
@@ -1970,175 +1929,63 @@ impl App {
         }
     }
 
-    /// The tool bar, Excalidraw's way: a rounded bar of icons in the middle
-    /// with a lock on the left; below it the stroke and background colors,
-    /// then every fill, line and width, with what's in use highlighted.
-    /// Short screens get it all on one row.
+    /// One row: the tools by key, the one in hand named, then the styles new
+    /// things get, each followed by the key that changes it.
     fn draw_toolbar(&mut self, f: &mut Screen, area: Rect) {
-        self.buttons.clear();
-        let [r, g, b] = self.paint.accent;
-        let accent = Color::Rgb(r, g, b);
-        let picked = Style::new()
-            .fg(accent)
-            .bg(mix(self.paint.paper, self.paint.accent, 0.3))
-            .add_modifier(Modifier::BOLD);
         let dim = Style::new().add_modifier(Modifier::DIM);
-        let divider = || (None, vec![Span::styled(" │ ", dim)]);
-        let gap = |width: usize| (None, vec![Span::raw(" ".repeat(width))]);
-        // Every icon gets the same five cells, however wide it draws.
-        let cell = |icon: &str| {
-            let pad = 5usize.saturating_sub(Span::raw(icon).width());
-            let left = pad / 2;
-            format!("{}{icon}{}", " ".repeat(left), " ".repeat(pad - left))
-        };
-
-        let mut tools: Vec<Item> = vec![(
-            Some(Button::Lock),
-            vec![Span::styled(
-                cell(if self.locked { "🔒" } else { "🔓" }),
-                if self.locked { picked } else { Style::new() },
-            )],
-        )];
-        tools.push(divider());
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let mut spans = Vec::new();
+        let mut at = area.x;
+        self.buttons.clear();
         for tool in Tool::ALL {
-            let style = if tool == self.tool {
-                picked
+            let (label, style) = if tool == self.tool {
+                (
+                    format!(" {} {} ", tool.key(), tool.name()),
+                    Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                )
             } else {
-                Style::new()
+                (format!(" {}", tool.key()), dim)
             };
-            tools.push((
-                Some(Button::Tool(tool)),
-                vec![Span::styled(cell(tool.icon()), style)],
-            ));
+            let width = label.chars().count() as u16;
+            self.buttons.push((tool, at, at + width));
+            at += width;
+            spans.push(Span::styled(label, style));
         }
-        tools.push(divider());
-        tools.push((Some(Button::Help), vec![Span::raw(cell("⋮"))]));
-
-        // A color swatch: a block of the color, bracketed and lit when chosen.
-        let swatch = |button: Button, chosen: bool, color: Color| -> Item {
-            let block = Span::styled("██", Style::new().fg(color).bg(Color::Reset));
-            let (open, close) = if chosen {
-                (Span::styled("[", picked), Span::styled("]", picked))
-            } else {
-                (Span::raw(" "), Span::raw(" "))
-            };
-            let block = if chosen {
-                block.patch_style(Style::new().bg(mix(self.paint.paper, self.paint.accent, 0.3)))
-            } else {
-                block
-            };
-            (Some(button), vec![open, block, close])
+        let (ink, ink_color) = match self.color {
+            Some(hue) => (hue.name(), self.screen_color(&hex(hue.ink()))),
+            None => ("ink", Color::Reset),
         };
-        // A word to pick, lit when it's what's in use.
-        let option = |button: Button, chosen: bool, word: &str| -> Item {
-            (
-                Some(button),
-                vec![Span::styled(
-                    format!(" {word} "),
-                    if chosen { picked } else { dim },
-                )],
-            )
+        let (bg, bg_color) = match self.fill_style {
+            Some(_) => (
+                self.fill_hue.map_or("gray", Hue::name),
+                self.screen_color(pale(self.fill_hue)),
+            ),
+            None => ("none", Color::Reset),
         };
-
-        let mut colors: Vec<Item> = vec![(None, vec![Span::styled("stroke ", dim)])];
-        colors.push(swatch(
-            Button::Ink(None),
-            self.color.is_none(),
-            Color::Reset,
-        ));
-        for hue in Hue::ALL {
-            let color = self.screen_color(&hex(hue.ink()));
-            colors.push(swatch(
-                Button::Ink(Some(hue)),
-                self.color == Some(hue),
-                color,
-            ));
-        }
-        let filled = self.fill_style.is_some();
-        colors.push(gap(4));
-        colors.push((None, vec![Span::styled("background ", dim)]));
-        colors.push(option(Button::NoFill, !filled, "⊘"));
-        for hue in std::iter::once(None).chain(Hue::ALL.map(Some)) {
-            let color = self.screen_color(pale(hue));
-            colors.push(swatch(
-                Button::Fill(hue),
-                filled && self.fill_hue == hue,
-                color,
-            ));
-        }
-
-        let mut shapes: Vec<Item> = vec![(None, vec![Span::styled("fill ", dim)])];
-        for style in [FillStyle::Hachure, FillStyle::CrossHatch, FillStyle::Solid] {
-            shapes.push(option(
-                Button::FillStyle(style),
-                self.fill_style == Some(style),
-                fill_name(Some(style)),
-            ));
-        }
-        shapes.push(gap(4));
-        shapes.push((None, vec![Span::styled("line ", dim)]));
-        for dash in [Dash::Solid, Dash::Dashed, Dash::Dotted] {
-            shapes.push(option(Button::Dash(dash), self.dash == dash, dash.name()));
-        }
-        shapes.push(gap(4));
-        shapes.push((None, vec![Span::styled("width ", dim)]));
-        for width in [1u8, 2, 4] {
-            shapes.push(option(
-                Button::Stroke(width),
-                self.stroke == f64::from(width),
-                &format!("{width}px"),
-            ));
-        }
-
-        let width = |items: &[Item]| -> u16 {
-            items
-                .iter()
-                .flat_map(|(_, spans)| spans)
-                .map(|s| s.width() as u16)
-                .sum()
-        };
-        let bar = width(&tools) + 2;
-        if area.height >= TOOLBAR && bar <= area.width {
-            let x = area.x + (area.width - bar) / 2;
-            f.render_widget(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(dim),
-                Rect::new(x, area.y, bar, 3),
-            );
-            self.place(f.buffer_mut(), &tools, x + 1, area.y + 1, area);
-            for (row, items) in [(3, &colors), (4, &shapes)] {
-                let x = area.x + (area.width - width(items).min(area.width)) / 2;
-                self.place(f.buffer_mut(), items, x, area.y + row, area);
-            }
+        let swatch = if self.fill_style.is_some() {
+            "■"
         } else {
-            // One row: the tools, then the styles as far as they fit.
-            let mut row = tools;
-            row.push(divider());
-            row.extend(colors);
-            self.place(f.buffer_mut(), &row, area.x, area.y, area);
-        }
-    }
-
-    /// Writes `items` from (`x`, `y`) and remembers where each button went.
-    /// Whatever runs past `area` is left off.
-    fn place(&mut self, buf: &mut Buffer, items: &[Item], mut x: u16, y: u16, area: Rect) {
-        let right = area.x + area.width;
-        for (button, spans) in items {
-            let start = x;
-            for span in spans {
-                let width = span.width() as u16;
-                if x + width > right {
-                    return;
-                }
-                buf.set_span(x, y, span, width);
-                x += width;
+            "□"
+        };
+        let mut style = |mark: Option<(&'static str, Color)>, text: String, key: &str| {
+            spans.push(Span::raw("  "));
+            if let Some((mark, color)) = mark {
+                spans.push(Span::styled(format!("{mark} "), Style::new().fg(color)));
             }
-            if let Some(button) = button {
-                self.buttons
-                    .push((*button, Rect::new(start, y, x - start, 1)));
-            }
-        }
+            spans.push(Span::styled(text, dim));
+            spans.push(Span::styled(format!(" {key}"), bold));
+        };
+        style(Some(("●", ink_color)), ink.to_owned(), "1-6");
+        style(Some((swatch, bg_color)), format!("bg {bg}"), "B");
+        style(None, format!("fill {}", fill_name(self.fill_style)), "b");
+        style(None, self.dash.name().to_owned(), "s");
+        style(None, format!("{}px", self.stroke), "w");
+        style(
+            None,
+            if self.locked { "locked" } else { "lock" }.to_owned(),
+            "L",
+        );
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// A board color as a terminal color: near-black ink is the terminal's
@@ -2476,7 +2323,7 @@ impl App {
                 Some(message) => Line::raw(message.clone()),
                 None => Line::styled(
                     format!(
-                        "drag to draw · double-click to write · drag a selection to move it · 1-6 ink · b fill · @ ask agent · ? keys · q quit   {} elements · {:.0}%",
+                        "drag to draw · double-click to write · 1-6 ink · B background · @ ask agent · ? keys · q quit   {} elements · {:.0}%",
                         self.board.elements.len(),
                         SCALE / self.view.scale * 100.0
                     ),
@@ -2699,6 +2546,7 @@ fn dashed(ctx: &mut Context, from: Pt, to: Pt, dash: f64, color: Color) {
 }
 
 const KEYS: &[(&str, &str)] = &[
+    ("tab shift+tab", "next, previous tool"),
     ("v h", "select, hand (pan)"),
     ("r d o", "box, diamond, ellipse"),
     ("a l p", "arrow, line, pen"),
@@ -2707,10 +2555,8 @@ const KEYS: &[(&str, &str)] = &[
     ("double-click", "write text, or inside a shape"),
     ("enter", "edit the selected text or shape's text"),
     ("handles", "drag to resize (shift keeps shape), knob turns"),
-    (
-        "1-6 0",
-        "ink color, back to ink (click swatches for background)",
-    ),
+    ("1-6 0", "ink color, back to ink"),
+    ("B", "next background color: none, gray, 1-6 colors"),
     ("b s w k", "fill, dashes, width, hand-drawn"),
     ("m", "arrowhead"),
     ("n < >", "font, smaller, bigger text"),
@@ -3039,19 +2885,16 @@ mod tests {
         });
     }
 
-    /// Clicks a toolbar button where it was last drawn.
-    fn push(app: &mut App, button: Button) {
-        let (_, at) = *app
-            .buttons
-            .iter()
-            .find(|(b, _)| *b == button)
-            .expect("the button is on the toolbar");
-        app.mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: at.x,
-            row: at.y,
-            modifiers: KeyModifiers::NONE,
-        });
+    /// Presses `B` until the background is `hue` (`None` for gray), and
+    /// says how many presses that took.
+    fn background(app: &mut App, hue: Option<Hue>) -> usize {
+        for presses in 1..=8 {
+            press(app, KeyCode::Char('B'));
+            if app.fill_style.is_some() && app.fill_hue == hue {
+                return presses;
+            }
+        }
+        panic!("B never reached {hue:?}");
     }
 
     fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
@@ -3299,8 +3142,7 @@ mod tests {
         press(&mut app, KeyCode::Char('b'));
         press(&mut app, KeyCode::Char('b'));
         // The background color keeps the fill style already picked.
-        draw(&mut app);
-        push(&mut app, Button::Fill(Some(Hue::Blue)));
+        background(&mut app, Some(Hue::Blue));
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('w'));
         let e = &on_disk(&path).elements[0];
@@ -3324,7 +3166,7 @@ mod tests {
     fn a_new_frame_takes_the_background_too() {
         let path = temp("frame-fill");
         let (mut app, _) = app(&path);
-        push(&mut app, Button::Fill(Some(Hue::Green)));
+        background(&mut app, Some(Hue::Green));
         press(&mut app, KeyCode::Char('F'));
         drag(&mut app, (10, 5), (30, 10));
         let e = &on_disk(&path).elements[0];
@@ -3336,8 +3178,8 @@ mod tests {
     fn ink_and_background_are_picked_apart_and_new_shapes_take_both() {
         let path = temp("colors");
         let (mut app, _) = app(&path);
-        push(&mut app, Button::Ink(Some(Hue::Red)));
-        push(&mut app, Button::Fill(Some(Hue::Yellow)));
+        press(&mut app, KeyCode::Char('6'));
+        background(&mut app, Some(Hue::Yellow));
         boxed(&mut app);
         let e = &on_disk(&path).elements[0];
         assert_eq!(e.color, hex(Hue::Red.ink()));
@@ -3353,37 +3195,50 @@ mod tests {
         let e = &on_disk(&path).elements[0];
         assert_eq!(e.color, hex(Hue::Blue.ink()));
         assert_eq!(e.fill.as_ref().map(|f| f.color.as_str()), Some("#ffec99"));
-        draw(&mut app);
-        push(&mut app, Button::NoFill);
+        // Past the last color, `B` takes the background away.
+        background(&mut app, Some(Hue::Red));
+        press(&mut app, KeyCode::Char('B'));
         assert_eq!(on_disk(&path).elements[0].fill, None);
+        // And from none it starts again at gray, then the first color.
+        assert_eq!(background(&mut app, None), 1);
+        assert_eq!(background(&mut app, Some(Hue::ALL[0])), 1);
     }
 
     #[test]
-    fn the_toolbar_picks_tools_fill_line_and_width() {
-        let (mut app, _) = app(&temp("toolbar"));
+    fn the_header_names_the_tool_and_the_styles_in_use() {
+        let (mut app, _) = app(&temp("header"));
+        press(&mut app, KeyCode::Char('d'));
+        background(&mut app, Some(Hue::Blue));
+        press(&mut app, KeyCode::Char('L'));
         let screen = draw(&mut app);
-        assert!(screen.contains('╭') && screen.contains('◇'), "{screen}");
-        push(&mut app, Button::Tool(Tool::Diamond));
-        assert_eq!(app.tool, Tool::Diamond);
-        draw(&mut app);
-        push(&mut app, Button::Dash(Dash::Dotted));
-        draw(&mut app);
-        push(&mut app, Button::Stroke(4));
-        draw(&mut app);
-        push(&mut app, Button::FillStyle(FillStyle::CrossHatch));
-        assert_eq!(
-            (app.dash, app.stroke, app.fill_style),
-            (Dash::Dotted, 4.0, Some(FillStyle::CrossHatch))
-        );
-        // The ink and the background in use are the swatches in brackets.
-        let screen = draw(&mut app);
-        assert_eq!(screen.matches("[██]").count(), 2, "{screen}");
+        let header = screen.lines().next().expect("header row");
+        assert!(header.contains(" d diamond "), "{header}");
+        // Tab steps through the tools, both ways, wrapping at the ends.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tool, Tool::Ellipse);
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tool, Tool::Rectangle);
+        app.tool = Tool::Eraser;
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tool, Tool::Select);
+        // Each style shows the key that changes it.
+        for hint in [
+            "ink 1-6",
+            "bg blue B",
+            "fill solid b",
+            "solid s",
+            "2px w",
+            "locked L",
+        ] {
+            assert!(header.contains(hint), "{hint:?} missing from {header}");
+        }
     }
 
     #[test]
     fn a_locked_canvas_neither_pans_nor_zooms() {
         let (mut app, _) = app(&temp("lock"));
-        push(&mut app, Button::Lock);
+        press(&mut app, KeyCode::Char('L'));
         let view = app.view;
         mouse(&mut app, MouseEventKind::ScrollUp, 20, 8);
         press(&mut app, KeyCode::Char('+'));

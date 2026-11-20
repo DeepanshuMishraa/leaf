@@ -11,8 +11,8 @@
 ## 0.17.2
 
 - `leaf board` turns the terminal into a whiteboard you share with your agent. Draw boxes, diamonds, ellipses, arrows, lines, ink, text and frames; move, resize, turn, group and restyle them; and ask the agent to draw with `@`. Boards are plain `.excalidraw` files that also open on excalidraw.com, saved on every change and redrawn when the agent or anyone else edits the file. With no file named, a new board gets a fresh name like `board-misty-harbor.excalidraw`. `E` or `--export out.png` writes SVG or PNG.
-- The board's toolbar floats at the top like Excalidraw's: tool icons, a lock (`L`) that stops panning and zooming, and `⋮` for the keys.
-- Below the toolbar, pick a stroke color, a background color, and the fill, line style and width, with the current choice of each highlighted. Choices apply to the selection and to what you draw next, including frames. Stroke and background colors are set separately; `1`–`6` set only the stroke color.
+- The board's header names the tool in hand and shows the ink, background, fill, line and width new things get, each with the key that changes it. `tab` and `shift+tab` step through the tools. `L` locks the canvas so it can't be panned or zoomed.
+- Stroke and background colors are set separately: `1`–`6` set the stroke, and `B` steps the background through none, gray and the six colors. Both apply to the selection and to what you draw next, including frames.
 - A selected shape can be dragged while a box, diamond, ellipse or frame tool is still active.
 - `ctrl+c` quits the board even with something selected; `y` copies.
 - In kitty-protocol terminals, the board picture no longer blinks while you draw. The old picture stays until the new one has had time to show, even when the new one is slow to upload, and a picture shown twice keeps both copies.
