@@ -305,6 +305,26 @@ function M.setup(opts)
   -- Opening -----------------------------------------------------------------
 
   rex.action{
+    name = "leaf_browser",
+    title = "Leaf: Open Browser",
+    description = "Open a WebKit browser in a pane beside this one.",
+    category = "Leaf",
+    keywords = "leaf browser web webkit safari website url localhost",
+    args = { url = "string?" },
+    run = function(ctx, args)
+      if ctx.server ~= nil then
+        error("leaf: the browser runs on this Mac, so it isn't available in a session on a remote host.", 0)
+      end
+      local url = args and args.url
+      if url ~= nil and url ~= "" then
+        open_pane(ctx, "browser", argv("browser", url), cwd(ctx))
+      else
+        open_pane(ctx, "browser", argv("browser"), cwd(ctx))
+      end
+    end,
+  }
+
+  rex.action{
     name = "leaf_open",
     title = "Leaf: Open Document…",
     description = "Open leaf's home in this pane: today's reading, a heat map of the days you read,"
