@@ -148,8 +148,10 @@ fn quoted(text: &str) -> String {
 /// A page's title or address on one line, so it can't pose as a marker or
 /// a line of its own.
 fn one_line(text: &str, limit: usize) -> String {
+    // Only what can survive the cut is looked at, however long the input.
     let flat: String = text
         .chars()
+        .take(limit * 2 + 1)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -284,6 +286,20 @@ pub fn run(args: &[String]) -> ExitCode {
             version.0, version.1
         );
         return ExitCode::FAILURE;
+    }
+    // `leaf browser --check`: unpack the helper and print where, so a release
+    // can prove the browser it ships runs, outside Rex.
+    if args == ["--check"] {
+        return match helper() {
+            Ok(path) => {
+                println!("{}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("leaf: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if std::env::var_os("REX_SESSION").is_none() || std::env::var_os("REX_BLOCK").is_none() {
         eprintln!(

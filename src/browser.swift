@@ -136,6 +136,16 @@ struct Chrome: Equatable {
         return chrome
     }
 
+    /// Rex's light or dark choice; nil when it follows macOS.
+    static func appearance() -> NSAppearance? {
+        CFPreferencesAppSynchronize(domain)
+        switch setting("appearance") as? String {
+        case "light": return NSAppearance(named: .aqua)
+        case "dark": return NSAppearance(named: .darkAqua)
+        default: return nil
+        }
+    }
+
     /// The block's body in screen points (top-left origin), inside `window`.
     func body(_ fraction: CGRect, in window: CGRect) -> CGRect {
         let area = CGRect(x: window.minX + left, y: window.minY + top,
@@ -599,6 +609,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         }
         updateControls()
         layout()
+    }
+
+    /// Light or dark like Rex, the page's `prefers-color-scheme` included.
+    func followRexAppearance() {
+        let wanted = Chrome.appearance()
+        guard NSApp.appearance?.name != wanted?.name else { return }
+        NSApp.appearance = wanted
+        applyAppearance()
     }
 
     func applyAppearance() {
@@ -1254,8 +1272,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         guard asking != .sending, !picks.isEmpty else { return }
         let ask: [String: Any] = [
             "question": composer.field.stringValue,
-            "url": pickedPage.url,
-            "title": pickedPage.title,
+            "url": String(pickedPage.url.prefix(2000)),
+            "title": String(pickedPage.title.prefix(300)),
             "elements": picks.map(\.element),
         ]
         guard tellLeaf(["ask": ask]) else {
@@ -1328,12 +1346,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             guard let self else { return }
             if getppid() != self.parent { self.shutDown() }
             self.chrome = Chrome.current()
+            self.followRexAppearance()
             self.refresh()
         }
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) {
             [weak self] note in self?.applicationActivated(note)
         }
+        followRexAppearance()
         watchEvents()
         listenToLeaf()
         askWhichAgent()
