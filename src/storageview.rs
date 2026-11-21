@@ -511,6 +511,8 @@ struct App {
     now: i64,
     /// The one folder measured, when not a whole drive.
     folder: Option<PathBuf>,
+    /// Whether this terminal has Full Disk Access, on macOS.
+    access: Option<bool>,
 }
 
 impl App {
@@ -520,6 +522,7 @@ impl App {
             None => sweep::start(&volumes[drive], &volumes),
         };
         App {
+            access: sweep::full_disk_access(),
             folder,
             volumes,
             drive,
@@ -986,6 +989,12 @@ impl App {
             self.say("Folders owned by other accounts need sudo: sudo leaf storage.");
             return;
         }
+        if self.access == Some(true) {
+            self.say(
+                "This terminal already has Full Disk Access. What's left is protected by macOS, or other accounts'; sudo leaf storage reads those.",
+            );
+            return;
+        }
         let terminal = std::env::var("TERM_PROGRAM").unwrap_or_else(|_| "your terminal".to_owned());
         let _ = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
@@ -1137,7 +1146,9 @@ fn header(buf: &mut Buffer, area: Rect, app: &App, time: f32) {
             dim,
         );
     }
-    let unreadable = app.scan.progress.unreadable.load(Ordering::Relaxed);
+    let progress = &app.scan.progress;
+    let protected = progress.protected.load(Ordering::Relaxed);
+    let private = progress.private.load(Ordering::Relaxed);
     let status = if !app.done {
         let current = app
             .scan
@@ -1152,13 +1163,26 @@ fn header(buf: &mut Buffer, area: Rect, app: &App, time: f32) {
             count(app.scan.progress.files.load(Ordering::Relaxed)),
             clip(&current, 40)
         )
-    } else if unreadable > 0 {
-        let fix = if cfg!(target_os = "macos") {
-            "a grant Full Disk Access"
-        } else {
-            "run with sudo to read them"
-        };
-        format!("{} folders unreadable · {fix}", count(unreadable))
+    } else if protected > 0 && app.access == Some(false) {
+        format!(
+            "{} folders need Full Disk Access · a grant it",
+            count(protected)
+        )
+    } else if protected + private > 0 {
+        // Nothing this terminal can be given would read the rest.
+        let mut parts = Vec::new();
+        if protected > 0 {
+            parts.push(format!("{} protected by macOS", count(protected)));
+        }
+        if private > 0 {
+            parts.push(format!("{} other accounts'", count(private)));
+        }
+        format!(
+            "{} files in {:.1}s · {} folders skipped",
+            count(progress.files.load(Ordering::Relaxed)),
+            app.took.map_or(0.0, |d| d.as_secs_f32()),
+            parts.join(", ")
+        )
     } else {
         format!(
             "{} files in {:.1}s",
@@ -2139,7 +2163,8 @@ pub struct Report {
     used: u64,
     seconds: f64,
     files: u64,
-    unreadable: u64,
+    full_disk_access: Option<bool>,
+    unreadable: Vec<sweep::Unreadable>,
     categories: Vec<CategoryReport>,
     items: Vec<ItemReport>,
 }
@@ -2209,7 +2234,12 @@ pub fn report(volume: &Volume, all: &[Volume], folder: Option<PathBuf>) -> Repor
         used: volume.used(),
         seconds: began.elapsed().as_secs_f64(),
         files: progress.files.load(Ordering::Relaxed),
-        unreadable: progress.unreadable.load(Ordering::Relaxed),
+        full_disk_access: sweep::full_disk_access(),
+        unreadable: progress
+            .unreadable
+            .lock()
+            .map(|kept| kept.clone())
+            .unwrap_or_default(),
         categories,
         items: items
             .into_iter()

@@ -1,5 +1,9 @@
 // leaf.dipxsy.app: the page for browsers, and the install script for
-// `curl -fsSL https://leaf.dipxsy.app | sh`. Every other path is a static file.
+// `curl -fsSL https://leaf.dipxsy.app | sh`, plus the sponsor API. Every other
+// path is a static file.
+
+import { sponsor } from "./sponsor.js";
+import { list, webhook } from "./sponsors.js";
 
 /** Command-line clients that should get the script at the root, not the page. */
 const SHELL_CLIENT = /^(curl|wget|fetch|httpie|xh|powershell)\b/i;
@@ -7,6 +11,9 @@ const SHELL_CLIENT = /^(curl|wget|fetch|httpie|xh|powershell)\b/i;
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/api/sponsor") return sponsor(request, env);
+    if (url.pathname === "/api/sponsors") return list(env);
+    if (url.pathname === "/api/dodo-webhook") return webhook(request, env);
     const agent = request.headers.get("user-agent") ?? "";
     const accept = request.headers.get("accept") ?? "";
     const wantsScript =

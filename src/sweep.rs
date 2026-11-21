@@ -71,16 +71,56 @@ impl Item {
 pub struct Progress {
     pub files: AtomicU64,
     pub bytes: AtomicU64,
-    /// Folders that couldn't be opened: other accounts', or ones macOS
-    /// keeps behind Full Disk Access.
-    pub unreadable: AtomicU64,
+    /// Folders macOS refused to open (EPERM): behind Full Disk Access, or
+    /// protected by System Integrity Protection whatever the access.
+    pub protected: AtomicU64,
+    /// Folders other accounts own (EACCES); only sudo reads them.
+    pub private: AtomicU64,
+    /// The first folders that couldn't be read, and why.
+    pub unreadable: Mutex<Vec<Unreadable>>,
     categories: [AtomicU64; Category::ALL.len()],
     /// The folder being read, near the top of the tree.
     pub current: Mutex<PathBuf>,
     pub cancel: AtomicBool,
 }
 
+/// Most unreadable folders remembered by name.
+const UNREADABLE_KEPT: usize = 200;
+
+/// A folder that couldn't be read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Unreadable {
+    pub path: PathBuf,
+    pub reason: Refusal,
+}
+
+/// Why a folder couldn't be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Refusal {
+    /// macOS privacy or integrity protection (EPERM).
+    Protected,
+    /// Owned by another account (EACCES).
+    Private,
+}
+
 impl Progress {
+    fn refused(&self, path: &Path, reason: Refusal) {
+        let counter = match reason {
+            Refusal::Protected => &self.protected,
+            Refusal::Private => &self.private,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut kept) = self.unreadable.lock()
+            && kept.len() < UNREADABLE_KEPT
+        {
+            kept.push(Unreadable {
+                path: path.to_owned(),
+                reason,
+            });
+        }
+    }
+
     pub fn category(&self, category: Category) -> u64 {
         self.categories[category.index()].load(Ordering::Relaxed)
     }
@@ -407,8 +447,10 @@ impl<'a> Walker<'a> {
         let entries = match dirscan::read(dir) {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == io::ErrorKind::PermissionDenied {
-                    self.progress.unreadable.fetch_add(1, Ordering::Relaxed);
+                match e.raw_os_error() {
+                    Some(libc::EPERM) => self.progress.refused(dir, Refusal::Protected),
+                    Some(libc::EACCES) => self.progress.refused(dir, Refusal::Private),
+                    _ => {}
                 }
                 return Sized::default();
             }
@@ -731,6 +773,23 @@ pub fn delete(path: &Path) -> Result<(), DeleteFailed> {
     })
 }
 
+/// Whether this process (that is, the terminal it runs in) has Full Disk
+/// Access: it can list folders only that access opens, such as Safari's.
+/// `None` off macOS, or when none of them exist to tell by.
+pub fn full_disk_access() -> Option<bool> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let home = home()?;
+    ["Library/Safari", "Library/Mail", "Library/Messages"]
+        .iter()
+        .find_map(|guarded| match std::fs::read_dir(home.join(guarded)) {
+            Ok(_) => Some(true),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => Some(false),
+            Err(_) => None,
+        })
+}
+
 /// Seconds since 1970, now.
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -821,5 +880,18 @@ mod tests {
         let missing = delete(&root.join("nothing-here")).unwrap_err();
         assert!(missing.to_string().contains("nothing-here"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_folders_are_counted_by_why() {
+        let progress = Progress::default();
+        progress.refused(Path::new("/a"), Refusal::Protected);
+        progress.refused(Path::new("/b"), Refusal::Private);
+        progress.refused(Path::new("/c"), Refusal::Private);
+        assert_eq!(progress.protected.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.private.load(Ordering::Relaxed), 2);
+        let kept = progress.unreadable.lock().unwrap();
+        assert_eq!(kept[0].path, PathBuf::from("/a"));
+        assert_eq!(kept[0].reason, Refusal::Protected);
     }
 }
