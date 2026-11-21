@@ -79,6 +79,9 @@ enum SessionView {
                 for item in layer["blocks"] as? [[String: Any]] ?? [] where item["block_id"] as? String == block {
                     return true
                 }
+                // The layout tree names every placed block too; checked as
+                // well so a view without `blocks` never closes the browser.
+                if find(block, in: layer["layout"]) != nil { return true }
             }
         }
         return false
@@ -810,7 +813,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         let session = session, block = block
         window.orderOut(nil)
         Rex.run(["block", "close", "--session", session, block])
-        exit(0)
+        shutDown()
     }
 
     // MARK: Find
@@ -833,11 +836,11 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         window.makeFirstResponder(web)
     }
 
-    @objc func findChanged() { find(backwards: false, fromStart: true) }
+    @objc func findChanged() { find(backwards: false) }
     @objc func findNext() { if findShown { find(backwards: false) } else { showFind() } }
     @objc func findPrevious() { if findShown { find(backwards: true) } else { showFind() } }
 
-    func find(backwards: Bool, fromStart: Bool = false) {
+    func find(backwards: Bool) {
         let text = findField.stringValue
         guard !text.isEmpty else { return }
         let configuration = WKFindConfiguration()
@@ -1072,7 +1075,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             }).call(window);
             window.__REACT_GRAB_DISABLED__ = false;
             const grab = globalThis.__REACT_GRAB_MODULE__;
-            const created = grab.init({ telemetry: false });
+            // No key of its own: ⌘C stays copy, and leaf's ⇧⌘C starts pointing.
+            const created = grab.init({ telemetry: false, activationKey: () => false });
             grab.setGlobalApi(created);
             window.__REACT_GRAB__ = window.__REACT_GRAB__ || created;
           }
@@ -1322,7 +1326,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             .tolerance = 0.002
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            if getppid() != self.parent { exit(0) }
+            if getppid() != self.parent { self.shutDown() }
             self.chrome = Chrome.current()
             self.refresh()
         }
@@ -1401,7 +1405,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             } else {
                 missing += 1
                 // Closed in Rex: nothing is left to show.
-                if missing >= 2 { events?.terminate(); exit(0) }
+                if missing >= 2 { shutDown() }
             }
             let next = SessionView.placement(view, block: block)
             // Rex animates panes into place. Following that animation would
@@ -1501,6 +1505,13 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             if item[kCGWindowOwnerName as String] as? String != ownName { return false }
         }
         return false
+    }
+
+    /// Stops the `rex events` watcher, then exits: every way out goes here.
+    func shutDown() -> Never {
+        events?.terminationHandler = nil
+        events?.terminate()
+        exit(0)
     }
 
     func hide() {

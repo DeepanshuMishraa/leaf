@@ -42,6 +42,15 @@ fn main() {
                 "cargo:warning=Apple's Swift toolchain wasn't found ({error}); `leaf browser` will be unavailable. Install the Xcode Command Line Tools with `xcode-select --install`."
             ),
         }
+        // Without a helper, try again once a toolchain appears: Cargo reruns
+        // this script while a watched path is missing or has changed.
+        println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+        for swiftc in [
+            "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+        ] {
+            println!("cargo:rerun-if-changed={swiftc}");
+        }
     }
     fs::write(&helper, []).expect("write the empty WebKit helper");
 }

@@ -2,8 +2,8 @@
 
 ## 0.18.0
 
-- **Leaf: Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a Rex pane beside you, built into leaf: nothing is installed in Applications. It follows the pane through splits, resizes, zoom and tab switches, steps aside for Rex's palette and Mission Control, and keeps Rex's shortcuts working. Find, zoom, downloads, and the pane's label follows the page title.
-- Point at any part of a page and ask your agent about it. The pointer button (or `shift+cmd+c`) picks elements with [React Grab](https://github.com/aidenybai/react-grab), including the React components and source files behind them on development builds; type a question and press `enter`. It goes to the agent picked with **Leaf: Choose Agent…**, in its pane or a new one beside the browser.
+- On macOS 13 and later, **Leaf: Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a Rex pane beside you, built into leaf: nothing is installed in Applications. It follows the pane through splits, resizes, zoom and tab switches, steps aside for Rex's palette and Mission Control, and keeps Rex's shortcuts working. It has find, zoom and downloads, and the pane's label follows the page title.
+- Point at any part of a page and ask your agent about it. The pointer button (or `shift+cmd+c`) picks elements with [React Grab](https://github.com/aidenybai/react-grab), including the React components and source files behind them on development builds; type a question and press `enter`. It goes to the agent picked with **Leaf: Choose Agent…**, in its pane or a new one beside the browser. Building leaf from source needs Apple's Swift toolchain for the browser.
 - Read saved web pages: `leaf page.html` opens a local HTML file as a readable document, with its inline images. SVG images render sharp at the width they're shown.
 - Posting a review comment to GitHub from the diff viewer no longer leaves the "posting" dialog stuck on screen after it succeeds.
 
