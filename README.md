@@ -249,6 +249,10 @@ Updating leaf updates the plugin too: after `cargo install leaf-reader` installs
 
 Documents and diffs open in the pane the palette was called from. leaf runs in a layer laid exactly over that pane, so nothing is typed into its shell: quitting leaf leaves the shell as it was, with no command on screen or in its history. A document already open there gives way to the new one. A pane busy with something else, such as an editor or an agent, keeps it, and leaf opens beside it.
 
+**Open Browser** opens a WebKit browser in a pane beside you; `leaf browser [url]` does the same from a Rex shell. It follows the pane through splits, resizes, zoom and tab switches, and the pane's label follows the page title. Type an address, a `localhost:3000`-style host and port, or words to search. `cmd+l` focuses the address, `cmd+r` reloads, `cmd+[` / `cmd+]` go back and forward, `cmd+f` finds on the page, `cmd+=` / `cmd+-` / `cmd+0` zoom, and `cmd+w` closes the pane. Rex's own shortcuts, such as moving between panes or opening the command palette, keep working while the page has focus. Downloads go to Downloads. Cookies and site data persist between sessions.
+
+The browser is part of leaf: nothing is installed in Applications. On first use, leaf unpacks its small WebKit helper into `~/Library/Caches/leaf`. It runs on this Mac, not in sessions on remote hosts, and needs macOS 13 or later. Building leaf from source on a Mac needs Apple's Swift toolchain (`xcode-select --install`); without it, leaf builds without the browser.
+
 Always there:
 
 - **Open Document…** floats a picker over the window, like Rex's Go to Directory. The field holds a path, starting at the pane's folder; type to narrow that folder's folders and documents, `tab` or `enter` on a folder goes into it, and `enter` on a document reads it. Documents read lately come first, with how far in. A typed `https://` link opens as it is. `leaf open` with no file, or plain `leaf`, shows the same picker in place.
