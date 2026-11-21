@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use base64::Engine;
 use image::RgbaImage;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use regex::Regex;
@@ -52,35 +53,71 @@ fn is_relative(href: &str) -> bool {
         && !href.starts_with('#')
 }
 
+/// Where an embedded image's bytes are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Image {
+    /// A file beside the document.
+    File(PathBuf),
+    /// Bytes carried in the document itself, as a `data:` URI.
+    Inline(Vec<u8>),
+}
+
+/// The bytes of a `data:image/…` URI, base64 or percent-encoded.
+fn data_uri(href: &str) -> Option<Vec<u8>> {
+    let rest = href.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().starts_with("image/") {
+        return None;
+    }
+    if meta.to_ascii_lowercase().ends_with(";base64") {
+        let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        base64::engine::general_purpose::STANDARD.decode(data).ok()
+    } else {
+        Some(crate::article::percent_decode(data).into_bytes())
+    }
+}
+
+/// Whether `href` is an image the source decodes itself rather than a full address.
+fn is_embedded(href: &str) -> bool {
+    is_relative(href) || data_uri(href).is_some()
+}
+
 /// Points relative images where the viewer finds them: files beside a local
-/// document become embedded ids the source decodes, and paths in a linked
-/// document become full URLs. Returns the markdown and each id's file.
-fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut id = |href: &str| match base {
-        Base::Dir(dir) => {
-            let path = href
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(href)
-                .replace("%20", " ");
-            files.push(dir.join(path));
-            Doc::image_href(&(files.len() - 1).to_string())
-        }
-        Base::Url(url) => url
-            .join(href)
-            .map(String::from)
-            .unwrap_or_else(|_| href.to_owned()),
+/// document and `data:` images become embedded ids the source decodes, and
+/// paths in a linked document become full URLs. Returns the markdown and each
+/// id's image.
+fn localize(markdown: &str, base: Base) -> (String, Vec<Image>) {
+    let mut images: Vec<Image> = Vec::new();
+    let mut id = |href: &str| {
+        let image = match (data_uri(href), base) {
+            (Some(bytes), _) => Image::Inline(bytes),
+            (None, Base::Dir(dir)) => {
+                let path = href
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(href)
+                    .replace("%20", " ");
+                Image::File(dir.join(path))
+            }
+            (None, Base::Url(url)) => {
+                return url
+                    .join(href)
+                    .map(String::from)
+                    .unwrap_or_else(|_| href.to_owned());
+            }
+        };
+        images.push(image);
+        Doc::image_href(&(images.len() - 1).to_string())
     };
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     for (event, range) in Parser::new_ext(markdown, render::MARKDOWN).into_offset_iter() {
         match event {
-            Event::Start(Tag::Image { dest_url, .. }) if is_relative(&dest_url) => {
+            Event::Start(Tag::Image { dest_url, .. }) if is_embedded(&dest_url) => {
                 edits.push((range, format!("![]({})", id(&dest_url))))
             }
             Event::Html(html) | Event::InlineHtml(html) if IMG_SRC.is_match(&html) => {
                 let replaced = IMG_SRC.replace_all(&html, |c: &regex::Captures| {
-                    let src = if is_relative(&c[3]) {
+                    let src = if is_embedded(&c[3]) {
                         id(&c[3])
                     } else {
                         c[3].to_owned()
@@ -92,7 +129,7 @@ fn localize(markdown: &str, base: Base) -> (String, Vec<PathBuf>) {
             _ => {}
         }
     }
-    (splice(markdown, edits), files)
+    (splice(markdown, edits), images)
 }
 
 /// The id of the `index`th diagram in a document.
@@ -197,14 +234,14 @@ fn splice(markdown: &str, edits: Vec<(Range<usize>, String)>) -> String {
 
 struct MarkdownSource {
     text: Rc<str>,
-    images: Vec<PathBuf>,
+    images: Vec<Image>,
     diagrams: Vec<Diagram>,
     /// Pixel sizes read from file headers, asked for on every layout.
     sizes: RefCell<HashMap<usize, Option<(u32, u32)>>>,
 }
 
 impl MarkdownSource {
-    fn path(&self, id: &str) -> Option<(usize, &Path)> {
+    fn image(&self, id: &str) -> Option<(usize, &Image)> {
         let index: usize = id.parse().ok()?;
         Some((index, self.images.get(index)?))
     }
@@ -220,32 +257,46 @@ impl Source for MarkdownSource {
         self.text.clone()
     }
 
-    // An image that's missing or in a format leaf can't decode (SVG) is left
-    // out; the text around it still shows.
+    // An image that's missing or in a format leaf can't decode is left out;
+    // the text around it still shows.
     fn image_size(&self, id: &str) -> Option<(u32, u32)> {
         if let Some(diagram) = self.diagram(id) {
             return Some(diagram.size);
         }
-        let (index, path) = self.path(id)?;
+        let (index, image) = self.image(id)?;
         *self
             .sizes
             .borrow_mut()
             .entry(index)
-            .or_insert_with(|| image::image_dimensions(path).ok())
+            .or_insert_with(|| match image {
+                Image::File(path) => image::image_dimensions(path)
+                    .ok()
+                    .or_else(|| svg_size(&std::fs::read(path).ok()?)),
+                Image::Inline(bytes) => image::load_from_memory(bytes)
+                    .ok()
+                    .map(|i| (i.width(), i.height()))
+                    .or_else(|| svg_size(bytes)),
+            })
     }
 
     fn decode(&self, id: &str, width: u32) -> Option<RgbaImage> {
-        let image = image::open(self.path(id)?.1).ok()?;
-        let image = if image.width() > width.max(1) {
-            image.resize(
-                width.max(1),
-                u32::MAX,
-                image::imageops::FilterType::Triangle,
-            )
-        } else {
-            image
+        let width = width.max(1);
+        let bytes = match self.image(id)?.1 {
+            Image::File(path) => std::fs::read(path).ok()?,
+            Image::Inline(bytes) => bytes.clone(),
         };
-        Some(image.to_rgba8())
+        if let Ok(image) = image::load_from_memory(&bytes) {
+            let image = if image.width() > width {
+                image.resize(width, u32::MAX, image::imageops::FilterType::Triangle)
+            } else {
+                image
+            };
+            return Some(image.to_rgba8());
+        }
+        // An SVG is drawn at its own size or the width shown, whichever is
+        // smaller, so it stays sharp rather than being shrunk from a raster.
+        let tree = crate::prmedia::svg(&bytes)?;
+        crate::prmedia::draw_svg(&tree, width.min(tree.size().width().ceil() as u32))
     }
 
     fn is_diagram(&self, id: &str) -> bool {
@@ -275,6 +326,22 @@ pub fn open(path: &Path) -> Result<Doc, MarkdownFailed> {
         &String::from_utf8_lossy(&bytes),
         Base::Dir(path.parent().unwrap_or(Path::new("."))),
     ))
+}
+
+/// The pixel size an SVG declares, or `None` when `bytes` aren't one.
+fn svg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let size = crate::prmedia::svg(bytes)?.size();
+    Some((size.width().ceil() as u32, size.height().ceil() as u32))
+}
+
+/// A document converted to markdown from a local file (an HTML page, say),
+/// with its images found beside `path`.
+pub fn from_converted(title: String, text: &str, path: &Path) -> Doc {
+    document(
+        title,
+        text,
+        Base::Dir(path.parent().unwrap_or(Path::new("."))),
+    )
 }
 
 /// A markdown document downloaded from `url`.
@@ -312,8 +379,8 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                PathBuf::from("/docs/img/a b.png"),
-                PathBuf::from("/docs/c.png")
+                Image::File(PathBuf::from("/docs/img/a b.png")),
+                Image::File(PathBuf::from("/docs/c.png"))
             ]
         );
     }
@@ -321,7 +388,23 @@ mod tests {
     #[test]
     fn local_hrefs_drop_queries_and_decode_spaces() {
         let (_, files) = localize("![](my%20pic.png?raw=true)", Base::Dir(Path::new("/d")));
-        assert_eq!(files, vec![PathBuf::from("/d/my pic.png")]);
+        assert_eq!(files, vec![Image::File(PathBuf::from("/d/my pic.png"))]);
+    }
+
+    #[test]
+    fn data_uri_images_are_carried_in_the_document() {
+        let url = Url::parse("https://x.org/a.md").expect("valid url");
+        let md = "![](data:image/png;base64,aGk=) <img src=\"data:image/svg+xml,%3Csvg%3E\">";
+        let (out, images) = localize(md, Base::Url(&url));
+        assert_eq!(out, "![](leaf-image:0) <img src=\"leaf-image:1\">");
+        assert_eq!(
+            images,
+            vec![
+                Image::Inline(b"hi".to_vec()),
+                Image::Inline(b"<svg>".to_vec())
+            ]
+        );
+        assert_eq!(data_uri("data:text/plain,hi"), None);
     }
 
     #[test]
