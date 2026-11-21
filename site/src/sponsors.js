@@ -69,32 +69,51 @@ export const webhook = async (request, env) => {
     return json(200, { ok: true, skipped: true });
   }
   const cents = Number.isInteger(data.total_amount) ? data.total_amount : 0;
-  await env.SPONSORS.put(`payment:${data.payment_id}`, "", { metadata: { name, github, cents, at: event.timestamp ?? null } });
+  const payment = { name, github, cents, at: event.timestamp ?? null };
+  await env.SPONSORS.put(`payment:${data.payment_id}`, "", { metadata: payment });
+  // KV listings lag new writes, so this payment is passed in rather than trusted to show up.
+  await rebuild(env, { [`payment:${data.payment_id}`]: payment });
   return json(200, { ok: true });
 };
 
-/** One entry per sponsor (by GitHub login, else by name), biggest total first. */
-export const list = async (env) => {
-  if (!env.SPONSORS) return json(200, [], { "cache-control": "public, max-age=60" });
-  const byKey = new Map();
+/**
+ * The wall: one entry per sponsor (by GitHub login, else by name), biggest
+ * total first, kept under one key so a page view costs a single KV read.
+ * Built from every payment key. To remove a sponsor, delete their payment
+ * keys and the "wall" key; the next visit rebuilds it.
+ */
+const rebuild = async (env, fresh = {}) => {
+  const payments = new Map(Object.entries(fresh));
   let cursor;
   do {
     const page = await env.SPONSORS.list({ prefix: "payment:", cursor });
-    for (const { metadata: m } of page.keys) {
-      if (!m || typeof m.name !== "string") continue;
-      const key = m.github ? `gh:${m.github.toLowerCase()}` : `name:${m.name.toLowerCase()}`;
-      const seen = byKey.get(key);
-      if (seen) {
-        seen.cents += m.cents ?? 0;
-        seen.name = m.name;
-      } else {
-        byKey.set(key, { name: m.name, github: m.github || "", cents: m.cents ?? 0 });
-      }
-    }
+    for (const { name, metadata } of page.keys) if (!payments.has(name)) payments.set(name, metadata);
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
-  const sponsors = [...byKey.values()]
+
+  const byKey = new Map();
+  for (const m of payments.values()) {
+    if (!m || typeof m.name !== "string") continue;
+    const key = m.github ? `gh:${m.github.toLowerCase()}` : `name:${m.name.toLowerCase()}`;
+    const seen = byKey.get(key);
+    if (seen) {
+      seen.cents += m.cents ?? 0;
+      seen.name = m.name;
+    } else {
+      byKey.set(key, { name: m.name, github: m.github || "", cents: m.cents ?? 0 });
+    }
+  }
+  const wall = [...byKey.values()]
     .sort((a, b) => b.cents - a.cents)
     .map(({ name, github }) => (github ? { name, github } : { name }));
-  return json(200, sponsors, { "cache-control": "public, max-age=60" });
+  await env.SPONSORS.put("wall", JSON.stringify(wall));
+  return wall;
+};
+
+const LIST_HEADERS = { "cache-control": "public, max-age=30" };
+
+export const list = async (env) => {
+  if (!env.SPONSORS) return json(200, [], LIST_HEADERS);
+  const wall = (await env.SPONSORS.get("wall", "json")) ?? (await rebuild(env));
+  return json(200, wall, LIST_HEADERS);
 };

@@ -870,6 +870,10 @@
         <span class="field-in"><input name="name" autocomplete="name" maxlength="80" placeholder="Ada Lovelace" required autofocus></span>
       </label>
       <label>
+        <span class="lab">Email <em>· for your receipt</em></span>
+        <span class="field-in"><input name="email" type="email" autocomplete="email" maxlength="254" placeholder="ada@example.com" required></span>
+      </label>
+      <label>
         <span class="lab">GitHub <em>· optional</em></span>
         <span class="field-in"><span class="pre">@</span><input name="github" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="39" placeholder="username"><img id="sp-avatar" alt="" width="24" height="24"></span>
       </label>
@@ -1100,6 +1104,7 @@
   {
     const dialog = $("sp"), form = $("sp-form"), err = $("sp-err"), go = $("sp-go"), avatar = $("sp-avatar");
     const LOGIN = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/i;
+    const PENDING = "leaf-sponsor-pending";
     const avatarOf = (login, size) => `https://avatars.githubusercontent.com/${encodeURIComponent(login)}?s=${size}`;
 
     const open = () => { err.hidden = true; dialog.showModal(); };
@@ -1155,12 +1160,13 @@
       e.preventDefault();
       const nameInput = form.elements.namedItem("name");
       const name = nameInput.value.trim();
+      const email = form.email.value.trim();
       const github = form.github.value.trim().replace(/^@/, "");
       const cents = amount();
       if (!name) { showError("Add the name you'd like shown."); nameInput.focus(); return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showError("Enter a valid email so the receipt reaches you."); form.email.focus(); return; }
       if (github && !LOGIN.test(github)) { showError("That GitHub username doesn't look right. Fix it or leave it empty."); form.github.focus(); return; }
-      // TODO: back to `cents < 100` ($1 minimum) once testing is done.
-      if (!Number.isSafeInteger(cents) || cents < 0) { showError("Enter an amount."); form.custom.focus(); return; }
+      if (!Number.isSafeInteger(cents) || cents < 100) { showError("Enter an amount of $1 or more."); form.custom.focus(); return; }
 
       err.hidden = true;
       go.disabled = true;
@@ -1169,10 +1175,15 @@
         const res = await fetch("/api/sponsor", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ name, github, cents }),
+          body: JSON.stringify({ name, email, github, cents }),
         });
         const data = await res.json().catch(() => null);
-        if (res.ok && typeof data?.url === "string") { location.href = data.url; return; }
+        if (res.ok && typeof data?.url === "string") {
+          // Remembered so the page can show them the moment they return.
+          try { sessionStorage.setItem(PENDING, JSON.stringify(github ? { name, github } : { name })); } catch {}
+          location.href = data.url;
+          return;
+        }
         showError(data?.error?.message ?? `Checkout couldn't be started (${res.status}). Nothing was charged. Try again.`);
       } catch {
         showError("Couldn't reach leaf.dipxsy.app. Check your connection and try again. Nothing was charged.");
@@ -1181,7 +1192,8 @@
       relabel();
     });
 
-    // Fill the seats and the hero row from the sponsor list.
+    // Fill the seats and the hero row from the sponsor list. Safe to call again.
+    const spare = $("seats").firstElementChild.cloneNode(true);
     const render = (sponsors) => {
       if (!sponsors.length) return;
       const seats = $("seats"), stack = $("backer-stack");
@@ -1206,7 +1218,6 @@
         return li;
       });
       // Keep one open seat at the end, and the grid in whole rows of four.
-      const spare = seats.firstElementChild;
       const free = 1 + ((4 - ((filled.length + 1) % 4)) % 4);
       seats.replaceChildren(...filled, ...Array.from({ length: free }, () => spare.cloneNode(true)));
 
@@ -1244,15 +1255,42 @@
       stack.replaceChildren(stack.lastElementChild);
       $("backer-text").innerHTML = "<b>Join them</b>";
     };
-    fetch("/api/sponsors")
-      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`/api/sponsors ${res.status}`))))
-      .then((list) => render(Array.isArray(list) ? list.filter((s) => typeof s?.name === "string" && (!s.github || LOGIN.test(s.github))) : []))
-      .catch((e) => console.warn("Sponsor list unavailable; the open seats still show.", e));
+    const load = (init) =>
+      fetch("/api/sponsors", init)
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`/api/sponsors ${res.status}`))))
+        .then((list) => (Array.isArray(list) ? list.filter((s) => typeof s?.name === "string" && (!s.github || LOGIN.test(s.github))) : []));
+    const same = (a, b) => (a.github && b.github ? a.github.toLowerCase() === b.github.toLowerCase() : !a.github && !b.github && a.name === b.name);
 
     // Back from checkout: say thanks (or say it didn't go through), then tidy the URL.
     const params = new URLSearchParams(location.search);
+    const status = params.get("status");
+    let pending = null;
+    if (params.has("sponsor") && status === "succeeded") {
+      try { pending = JSON.parse(sessionStorage.getItem(PENDING) ?? "null"); } catch {}
+    }
+    if (pending && (typeof pending.name !== "string" || (pending.github && !LOGIN.test(pending.github)))) pending = null;
+
+    if (!pending) {
+      load().then(render).catch((e) => console.warn("Sponsor list unavailable; the open seats still show.", e));
+    } else {
+      // The webhook usually lands after they do, so show them straight away, then
+      // keep checking until the server has them too.
+      const withPending = (list) => (list.some((s) => same(s, pending)) ? list : [pending, ...list]);
+      let tries = 0;
+      const check = () =>
+        load({ cache: "no-store" })
+          .then((list) => {
+            render(withPending(list));
+            if (list.some((s) => same(s, pending))) {
+              try { sessionStorage.removeItem(PENDING); } catch {}
+            } else if (++tries < 20) setTimeout(check, 4000);
+          })
+          .catch((e) => { console.warn("Sponsor list unavailable; retrying.", e); if (++tries < 20) setTimeout(check, 4000); });
+      render([pending]);
+      check();
+    }
+
     if (params.has("sponsor")) {
-      const status = params.get("status");
       const bad = status === "failed" || status === "cancelled";
       const toast = document.createElement("div");
       toast.className = `toast${bad ? " bad" : ""}`;
@@ -1260,7 +1298,9 @@
       toast.innerHTML = `<i class="tile" aria-hidden="true"><svg><use href="#i-heart"/></svg></i><span></span>`;
       toast.querySelector("span").textContent = bad
         ? "The payment didn't go through, so nothing was charged."
-        : "Thank you for sponsoring leaf. Your name goes up shortly.";
+        : pending
+          ? "Thank you for sponsoring leaf. You're on the wall."
+          : "Thank you for sponsoring leaf. Your name goes up shortly.";
       document.body.append(toast);
       setTimeout(() => { toast.classList.add("out"); toast.addEventListener("transitionend", () => toast.remove(), { once: true }); }, 6000);
       history.replaceState(null, "", location.pathname + location.hash);

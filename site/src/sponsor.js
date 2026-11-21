@@ -10,6 +10,7 @@
 
 const DODO_BASE = { live_mode: "https://live.dodopayments.com", test_mode: "https://test.dodopayments.com" };
 const GITHUB_LOGIN = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/i;
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const json = (status, body) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8" } });
@@ -19,7 +20,7 @@ const fail = (status, code, message) => json(status, { error: { code, message } 
 /** Checks the dialog's fields. Returns { ok, value } or { ok: false, response }. */
 const parse = (body) => {
   if (typeof body !== "object" || body === null) {
-    return { ok: false, response: fail(400, "bad_body", "Send a JSON object with name, github and cents.") };
+    return { ok: false, response: fail(400, "bad_body", "Send a JSON object with name, email, github and cents.") };
   }
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (name.length < 1 || name.length > 80) {
@@ -29,12 +30,15 @@ const parse = (body) => {
   if (github !== "" && !GITHUB_LOGIN.test(github)) {
     return { ok: false, response: fail(400, "bad_github", "That isn't a valid GitHub username. Leave it empty or fix it.") };
   }
-  const cents = body.cents;
-  // TODO: back to `cents < 100` ($1 minimum) once testing is done.
-  if (typeof cents !== "number" || !Number.isSafeInteger(cents) || cents < 0) {
-    return { ok: false, response: fail(400, "bad_amount", "Enter an amount of $0 or more.") };
+  const email = typeof body.email === "string" ? body.email.trim() : "";
+  if (!EMAIL.test(email) || email.length > 254) {
+    return { ok: false, response: fail(400, "bad_email", "Enter a valid email address for your receipt.") };
   }
-  return { ok: true, value: { name, github, cents } };
+  const cents = body.cents;
+  if (typeof cents !== "number" || !Number.isSafeInteger(cents) || cents < 100) {
+    return { ok: false, response: fail(400, "bad_amount", "Enter an amount of $1 or more.") };
+  }
+  return { ok: true, value: { name, email, github, cents } };
 };
 
 export const sponsor = async (request, env) => {
@@ -52,11 +56,11 @@ export const sponsor = async (request, env) => {
   try {
     body = await request.json();
   } catch {
-    return fail(400, "bad_body", "Send a JSON object with name, github and cents.");
+    return fail(400, "bad_body", "Send a JSON object with name, email, github and cents.");
   }
   const parsed = parse(body);
   if (!parsed.ok) return parsed.response;
-  const { name, github, cents } = parsed.value;
+  const { name, email, github, cents } = parsed.value;
 
   const origin = new URL(request.url).origin;
   let res;
@@ -66,6 +70,8 @@ export const sponsor = async (request, env) => {
       headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
       body: JSON.stringify({
         product_cart: [{ product_id: product, quantity: 1, amount: cents }],
+        // Prefills the checkout; Dodo needs the email to accept a name.
+        customer: { email, name },
         metadata: { kind: "sponsor", name, github },
         return_url: `${origin}/?sponsor=done`,
       }),
