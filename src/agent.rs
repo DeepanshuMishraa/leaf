@@ -143,6 +143,16 @@ pub fn default_agent() -> Option<String> {
         .flatten()
 }
 
+/// The agent a question from this Rex pane would go to now: the one picked
+/// with Leaf: Choose Agent…, else the one already open in a pane here.
+pub fn current() -> Option<String> {
+    if let Some(picked) = default_agent() {
+        return Some(picked);
+    }
+    let session = rex_session()?;
+    find_rex(&session, None).ok().map(|agent| agent.command)
+}
+
 /// An agent pane the comment can go to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {

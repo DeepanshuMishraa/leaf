@@ -200,6 +200,23 @@ jobs:
           else
             otool -L ./smoke/leaf
             lipo -archs ./smoke/leaf
+            # The browser ships inside leaf: unpack it and check it's built
+            # for this target and starts. Outside Rex it refuses, by design.
+            helper=$($RUN ./smoke/leaf browser --check)
+            want=$([ "$TARGET" = aarch64-apple-darwin ] && echo arm64 || echo x86_64)
+            got=$(lipo -archs "$helper")
+            if [ "$got" != "$want" ]; then
+              echo "::error::The browser helper is built for '$got', expected '$want'."
+              exit 1
+            fi
+            if said=$(env -u REX_SESSION -u REX_BLOCK $RUN "$helper" 2>&1); then
+              echo "::error::The browser helper started outside Rex: $said"
+              exit 1
+            fi
+            case "$said" in
+              *"needs REX_SESSION and REX_BLOCK"*) echo "browser helper OK ($got)" ;;
+              *) echo "::error::The browser helper didn't start: $said"; exit 1 ;;
+            esac
           fi
 
       - uses: actions/upload-artifact@v7
