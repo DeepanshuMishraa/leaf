@@ -31,7 +31,7 @@ const MIN_SPREAD: f32 = 25.0;
 const DEFAULT_HUE: f32 = 250.0;
 
 /// The OKLCH hue of an sRGB color in degrees, or `None` for a grey.
-fn hue([r, g, b]: Rgb) -> Option<f32> {
+pub(crate) fn hue([r, g, b]: Rgb) -> Option<f32> {
     let linear = |c: u8| {
         let c = f32::from(c) / 255.0;
         if c <= 0.04045 {
@@ -126,6 +126,11 @@ impl Ink {
             },
             Ink::of,
         )
+    }
+
+    /// The page color under everything.
+    pub fn paper(self) -> Rgba {
+        self.background
     }
 
     /// `mark` or `accent` for pixel `(x, y)`, dithered between them by `t` (0..1).

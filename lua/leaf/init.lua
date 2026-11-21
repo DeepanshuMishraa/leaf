@@ -419,6 +419,26 @@ function M.setup(opts)
   }
 
   rex.action{
+    name = "leaf_storage",
+    title = "Leaf: Analyze Storage",
+    description = "See what fills a drive, in this pane: caches, build output, node_modules,"
+      .. " package caches and what AI agents leave behind, each labelled junk, unused or yours."
+      .. " Open, reveal, ask the agent pane about, or delete anything after a confirmation.",
+    category = "Leaf",
+    keywords = "leaf storage disk space analyze clean clear free cache caches junk node_modules"
+      .. " target drive usb volume system data agents",
+    args = { target = "string?" },
+    run = function(ctx, args)
+      local target = args.target
+      if target ~= nil and target ~= "" then
+        place(ctx, "storage", "storage", target)
+      else
+        place(ctx, "storage", "storage")
+      end
+    end,
+  }
+
+  rex.action{
     name = "leaf_agent",
     title = "Leaf: Choose Agent…",
     description = "Pick which installed agent CLI gets questions about a selection in a Leaf"

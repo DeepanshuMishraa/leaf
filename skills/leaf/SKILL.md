@@ -27,6 +27,7 @@ leaf is a full-screen terminal app. Your shell tool has no terminal, so a bare `
 | `leaf plan <plan.md>` | Plan review, block by block. |
 | `leaf review [diff source]` | Code review, file by file. |
 | `leaf comments --json` | Every saved diff comment as JSON: key, file, side, line range, body, and state (`draft`, `agent`, `github`). |
+| `leaf storage [drive or folder]` | What fills a drive, with junk to clear. `leaf storage --json` prints categories and the biggest findings (path, bytes, status `junk`/`unused`/`review`/`in-use`, label, why, where most of it is) without opening anything; use it when the person asks what's taking their disk space. Don't delete anything it lists without asking. |
 | `leaf agents` | Picks which agent CLI the person's questions go to. |
 | `leaf rex install` | Adds leaf to Rex's command palette. |
 | `leaf agent setup` | Wires plan review and these skills into every agent CLI installed here. |

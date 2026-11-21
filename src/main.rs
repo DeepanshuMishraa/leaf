@@ -12,6 +12,7 @@ mod config;
 mod diff;
 mod diffreview;
 mod diffview;
+mod dirscan;
 mod doc;
 mod drawing;
 mod edge;
@@ -26,6 +27,7 @@ mod hook;
 mod host;
 mod html;
 mod hue;
+mod junk;
 mod kitty;
 mod look;
 mod margin;
@@ -61,7 +63,9 @@ mod sheet;
 mod skills;
 mod slides;
 mod spinner;
+mod storageview;
 mod stroke;
+mod sweep;
 mod syntax;
 mod tempo;
 mod theme;
@@ -71,6 +75,7 @@ mod usage;
 mod video;
 mod viewer;
 mod voicepick;
+mod volume;
 mod word;
 
 use std::cell::RefCell;
@@ -91,6 +96,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
        leaf board [file.excalidraw]   draw on a whiteboard with the agent (default: a new board-<words>.excalidraw here)
        leaf board <file.excalidraw> --export <out.png | out.svg>   save the board as a picture
+       leaf storage [drive or path]   see what fills a drive and clear junk (--json: print it for agents)
        leaf comments [--json]
        leaf ask --title <name> [--question <text>]   (selection on stdin)
        leaf rex install | uninstall   add leaf to Rex's command palette
@@ -436,6 +442,7 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         "ui" => ui_command(rest),
+        "storage" | "disk" | "space" => storage_command(rest),
         "board" | "whiteboard" => match rest {
             [] => match board::fresh_path(Path::new(".")) {
                 Ok(path) => board_command(&path),
@@ -521,6 +528,53 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `leaf storage [--json] [drive or path]`: what takes space on a drive.
+fn storage_command(args: &[String]) -> ExitCode {
+    let json = args.iter().any(|a| a == "--json");
+    let target = args.iter().find(|a| !a.starts_with('-'));
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-') && *a != "--json") {
+        eprintln!("leaf: unknown option {flag}. Usage: leaf storage [--json] [drive or path]");
+        return ExitCode::from(2);
+    }
+    let volumes = volume::list();
+    let at = match target {
+        Some(target) => match std::fs::canonicalize(target) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "leaf: can't find {target} ({e}). Name a drive's mount point or a folder on it."
+                );
+                return ExitCode::from(2);
+            }
+        },
+        None => PathBuf::from("/"),
+    };
+    let Some(index) = volume::containing(&volumes, &at) else {
+        eprintln!("leaf: {} isn't on a drive leaf can measure.", at.display());
+        return ExitCode::FAILURE;
+    };
+    // A folder that isn't a drive's mount point is measured on its own.
+    let folder = (target.is_some() && volumes[index].mount != at).then(|| at.clone());
+    if json {
+        return print_json(&storageview::report(&volumes[index], &volumes, folder));
+    }
+    if !std::io::stdout().is_terminal() {
+        eprintln!(
+            "leaf: the storage screen needs a terminal. `leaf storage --json` prints the scan instead."
+        );
+        return ExitCode::from(2);
+    }
+    match storageview::run(volumes, index, folder) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "leaf: the storage screen closed after a terminal error ({e}). Nothing was deleted that you didn't confirm."
+            );
+            ExitCode::FAILURE
         }
     }
 }

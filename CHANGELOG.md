@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `leaf storage` shows what fills a drive in a dithered disk map, category meters and a donut, in your theme's colors. It measures millions of files in seconds on macOS and Linux, labels each finding as junk, unused or review, and says where most of its space is. Browse, reveal, ask the agent pane about, or delete anything after a confirmation; `c` clears a category's junk. It knows caches, build output, package stores and what AI agents leave behind. `--json` prints it for agents, and Rex's palette offers **Leaf: Analyze Storage**.
+
 ## 0.17.3
 
 - Zooming the board with a trackpad is smoother: each scroll step zooms less, and the sideways part of a zoom swipe no longer pans the board while it zooms. `option+↑` and `option+↓` zoom too.

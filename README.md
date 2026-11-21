@@ -159,6 +159,20 @@ In kitty, Ghostty, WezTerm, iTerm2 and other terminals that show pictures, the b
 
 `@` (or `c`) asks the agent pane: type a question and press enter. The agent gets the board's path, how the file is laid out, and what you selected, and it draws by editing the file. Every change you make is saved at once, and the file is checked every 30 ms, so the agent's edits appear as it writes them; `u` undoes one.
 
+## Storage
+
+`leaf storage` shows what fills a drive, and clears what's safe to clear. It measures the startup disk's home folder, apps, `/Library`, Homebrew and temporary folders in parallel, a few seconds for millions of files. On macOS it reads whole batches of a folder's entries in one `getattrlistbulk` call. Space is counted as blocks on disk, so cloud-only and sparse files count for what they really take, and hard links count once. `leaf storage /Volumes/USB` measures another drive, `leaf storage ~/Code` one folder, and `v` switches drives. It works on macOS and Linux.
+
+The disk map at the top is the whole drive, dithered in your Rex or terminal theme's colors, with one band per category: Apps, Developer, AI agents, Media, Documents, Caches, Trash, Other files and System data. Pick a category with `tab` or `1`–`9` and its findings are listed biggest first. Each one shows a label, a verdict, where most of its space is ("mostly in Chrome/Default/Cache/Cache_Data/"), and when it last changed:
+
+- **junk** rebuilds or downloads again on its own: app caches, `node_modules`, Cargo `target` folders, Xcode DerivedData and device support, npm, pnpm, yarn, bun, cargo, Go, Gradle, Maven and pip caches, Playwright browsers, Homebrew downloads, and agent logs and scratch files in `/tmp` once nothing has touched them for two days.
+- **unused** is data that hasn't changed in six months.
+- **review** is data that's only gone if you delete it: Claude Code and Codex sessions, Ollama, LM Studio and Hugging Face models, simulators, Docker's disk image, app data.
+
+`→` opens a folder to browse what's in it, `o` reveals it in Finder or the file manager, and `@` asks the agent pane what it is and how best to free it. `d` deletes the picked thing, and `c` clears every junk item in the category. Both first show what will go and how much it frees, and delete only on `y`. Deleting skips the Trash, so it can't be undone. `f` lists only junk and unused things. App bundles and the dependencies of installed tools are never marked as junk.
+
+On macOS, folders such as Mail and Safari's are readable only with Full Disk Access. The header counts unreadable folders, and `a` opens the setting; turn it on for your terminal, not for leaf. `leaf storage --json` prints the whole measurement for agents. In Rex, the palette's **Leaf: Analyze Storage** opens it.
+
 ## Pull requests and issues
 
 `leaf pr` lists the pull requests and issues that concern you, in two tabs; `←/→` switches. **Pull requests** holds yours across GitHub, the ones in repositories you own, the ones waiting on your review, the ones assigned to you, and this repository's. **Issues** holds the ones you opened, the ones opened in repositories you own, and the ones assigned to you. Each tab is one list, newest first, and each row's dot says whose it is: green is yours in your own repository, blue is yours in someone else's, yellow is someone else's in yours, and grey is the rest. The legend beside the filter names the colors on screen.
