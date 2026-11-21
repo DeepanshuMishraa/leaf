@@ -310,9 +310,91 @@ final class PaneWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 }
 
+// MARK: - Asking the agent
+
+/// An element picked with React Grab: a short name and the context it copied.
+struct Pick {
+    let label: String
+    let element: String
+}
+
+/// Where a question to the agent stands. A failed send goes back to
+/// composing, with the reason shown, so Enter tries again.
+enum Asking: Equatable {
+    case composing
+    case sending
+    case sent(agent: String)
+}
+
+/// The card at the bottom of the page: the picked elements, the question and
+/// what became of it. The question is typed here, not in the page, so a page
+/// can't send anything to the agent by itself: only Enter in this field does.
+final class Composer: NSView {
+    let chips = NSStackView()
+    let field = NSTextField()
+    let send: ToolButton
+    let note = NSTextField(labelWithString: "")
+    override var isFlipped: Bool { true }
+
+    init() {
+        send = ToolButton(symbol: "arrow.up.circle.fill", label: "Send", target: nil,
+                          action: #selector(Browser.sendAsk))
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = 1
+        layer?.shadowOpacity = 0.12
+        layer?.shadowRadius = 14
+        layer?.shadowOffset = CGSize(width: 0, height: -4)
+        chips.orientation = .horizontal
+        chips.spacing = 6
+        chips.alignment = .centerY
+        addSubview(chips)
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = .systemFont(ofSize: 13)
+        field.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.lineBreakMode = .byTruncatingHead
+        addSubview(field)
+        send.image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: "Send")?
+            .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
+        addSubview(send)
+        note.font = .systemFont(ofSize: 11)
+        note.lineBreakMode = .byTruncatingTail
+        addSubview(note)
+        applyAppearance()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func applyAppearance() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.1).cgColor
+            layer?.shadowColor = NSColor.black.cgColor
+        }
+    }
+
+    /// The height the card needs at `width`.
+    var preferredHeight: CGFloat { 10 + 24 + 8 + 26 + (note.stringValue.isEmpty ? 0 : 18) + 10 }
+
+    override func layout() {
+        super.layout()
+        let width = bounds.width
+        chips.frame = NSRect(x: 12, y: 10, width: width - 24, height: 24)
+        field.frame = NSRect(x: 14, y: 10 + 24 + 8 + 4, width: width - 14 - 44, height: 18)
+        send.frame = NSRect(x: width - 40, y: 10 + 24 + 8 - 1, width: 30, height: 28)
+        note.frame = NSRect(x: 14, y: 10 + 24 + 8 + 26 + 2, width: width - 28, height: 16)
+    }
+}
+
 // MARK: - Browser
 
-final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSSearchFieldDelegate {
+final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSSearchFieldDelegate,
+    WKScriptMessageHandler {
     let session: String
     let block: String
     let window: PaneWindow
@@ -353,6 +435,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Focus asked for before the window was first placed.
     var focusWhenShown = false
     var ticks = 0
+    /// Rex's palette or another of its windows is over the pane.
+    var coveredByRex = false
 
     // Page
     var failedURL: URL?
@@ -360,6 +444,24 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var titleSent = ""
     var observers: [NSKeyValueObservation] = []
     var downloads: [WKDownload: URL] = [:]
+
+    // Pointing at the page and asking the agent
+    let point: ToolButton
+    let close: ToolButton
+    let composer = Composer()
+    var picks: [Pick] = []
+    var pickedPage = (url: "", title: "")
+    var asking = Asking.composing
+    var composerShown = false
+    var pointing = false
+    /// The last mouse or key event delivered to this window.
+    var lastInputAt = Date.distantPast
+    /// The agent a question would go to. leaf passes the picked one at launch;
+    /// `askWhichAgent` refreshes it, since the pick or the open panes change.
+    var agentName: String = {
+        let name = ProcessInfo.processInfo.environment["LEAF_AGENT"] ?? ""
+        return name.isEmpty ? "your agent" : name
+    }()
 
     static let barHeight: CGFloat = 40
 
@@ -376,8 +478,13 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         back = ToolButton(symbol: "chevron.left", label: "Back", target: nil, action: #selector(Browser.goBack))
         forward = ToolButton(symbol: "chevron.right", label: "Forward", target: nil, action: #selector(Browser.goForward))
         reload = ToolButton(symbol: "arrow.clockwise", label: "Reload", target: nil, action: #selector(Browser.reloadOrStop))
+        point = ToolButton(symbol: "cursorarrow.rays", label: "Point", target: nil, action: #selector(Browser.togglePoint))
+        close = ToolButton(symbol: "xmark", label: "Close Pane (⌘W)", target: nil, action: #selector(Browser.closePane))
         super.init()
-        for button in [back, forward, reload] { button.target = self }
+        for button in [back, forward, reload, point, close, composer.send] { button.target = self }
+        // React Grab runs in the page's own world, where it can read React's
+        // component tree; its messages only ever add picks to the composer.
+        web.configuration.userContentController.add(self, name: "leaf")
         build()
     }
 
@@ -396,7 +503,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         window.backgroundColor = .clear
         window.hasShadow = false
         window.level = .normal
-        window.collectionBehavior = [.managed, .fullScreenAuxiliary, .ignoresCycle]
+        // Transient: part of Rex's window, so Mission Control hides it rather
+        // than laying it out as a window of its own.
+        window.collectionBehavior = [.transient, .fullScreenAuxiliary, .ignoresCycle]
         window.title = "Leaf Browser"
         window.animationBehavior = .none
 
@@ -458,6 +567,15 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         root.addSubview(web)
         window.initialFirstResponder = web
 
+        bar.addSubview(point)
+        bar.addSubview(close)
+        composer.isHidden = true
+        nameAgent()
+        composer.field.delegate = self
+        composer.field.target = self
+        composer.field.action = #selector(sendAsk)
+        root.addSubview(composer)
+
         observers = [
             web.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in self?.updateProgress() },
             web.observe(\.isLoading, options: [.new]) { [weak self] _, _ in self?.updateControls() },
@@ -488,6 +606,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         }
         bar.needsDisplay = true
         findBar.needsDisplay = true
+        composer.applyAppearance()
+        updatePoint()
     }
 
     func layout() {
@@ -500,7 +620,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         forward.frame = NSRect(x: 8 + size + 2, y: top, width: size, height: size)
         reload.frame = NSRect(x: 8 + 2 * (size + 2), y: top, width: size, height: size)
         let pillX = reload.frame.maxX + 8
-        pill.frame = NSRect(x: pillX, y: top, width: max(60, width - pillX - 10), height: size)
+        pill.frame = NSRect(x: pillX, y: top, width: max(60, width - pillX - 10 - 2 * (size + 2)), height: size)
+        point.frame = NSRect(x: pill.frame.maxX + 4, y: top, width: size, height: size)
+        close.frame = NSRect(x: point.frame.maxX + 2, y: top, width: size, height: size)
         badge.frame = NSRect(x: 9, y: (size - 14) / 2, width: 14, height: 14)
         let fieldHeight: CGFloat = 17
         address.frame = NSRect(x: 29, y: (size - fieldHeight) / 2, width: pill.frame.width - 37, height: fieldHeight)
@@ -513,6 +635,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             done.frame = NSRect(x: findField.frame.maxX + 6, y: 4, width: 28, height: 28)
         }
         web.frame = NSRect(x: 0, y: 0, width: width, height: max(0, height - barHeight - findHeight))
+        layoutComposer()
+    }
+
+    func layoutComposer() {
+        let width = min(560, root.bounds.width - 24)
+        let height = composer.preferredHeight
+        composer.frame = NSRect(x: (root.bounds.width - width) / 2, y: 12, width: width, height: height)
+        composer.needsLayout = true
     }
 
     // MARK: Page state
@@ -587,6 +717,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         if control === address, selector == #selector(NSResponder.cancelOperation(_:)) {
             window.makeFirstResponder(web)
             DispatchQueue.main.async { self.showURL() }
+            return true
+        }
+        if control === composer.field, selector == #selector(NSResponder.cancelOperation(_:)) {
+            if asking != .sending { closeComposer() }
             return true
         }
         if control === findField {
@@ -784,6 +918,12 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         if findShown { closeFind() }
     }
 
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        // A new document: React Grab went with the old one.
+        pointing = false
+        updatePoint()
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         showURL()
         sendTitle()
@@ -911,6 +1051,270 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         alert.beginSheetModal(for: window)
     }
 
+    // MARK: Pointing and asking
+
+    /// React Grab's bundle, unpacked by leaf beside this helper.
+    static let grabBundle: String? = {
+        guard let executable = Bundle.main.executableURL else { return nil }
+        let script = executable.deletingLastPathComponent().appendingPathComponent("react-grab.js")
+        return try? String(contentsOf: script, encoding: .utf8)
+    }()
+
+    /// Loads React Grab into the page (or uses one the page already has),
+    /// hooks its copies into this helper, and starts pointing.
+    static func grabSetup(_ bundle: String) -> String {
+        """
+        (() => {
+          if (!window.__REACT_GRAB__) {
+            window.__REACT_GRAB_DISABLED__ = true;
+            (function () {
+        \(bundle)
+            }).call(window);
+            window.__REACT_GRAB_DISABLED__ = false;
+            const grab = globalThis.__REACT_GRAB_MODULE__;
+            const created = grab.init({ telemetry: false });
+            grab.setGlobalApi(created);
+            window.__REACT_GRAB__ = window.__REACT_GRAB__ || created;
+          }
+          const api = window.__REACT_GRAB__;
+          const post = (message) => window.webkit.messageHandlers.leaf.postMessage(message);
+          let quoted = null;
+          api.registerPlugin({
+            name: "leaf",
+            hooks: {
+              onActivate: () => post({ pointing: true }),
+              onDeactivate: () => post({ pointing: false }),
+              transformCopyContent: (content) => { quoted = content; return content; },
+              onCopySuccess: (elements, content) => {
+                const element = quoted ?? content;
+                quoted = null;
+                // A comment typed in React Grab comes first, on its own line.
+                const comment = content !== element && content.endsWith("\\n" + element)
+                  ? content.slice(0, content.length - element.length - 1) : "";
+                const first = elements[0];
+                const name = first ? (api.getDisplayName(first) || "<" + first.tagName.toLowerCase() + ">") : "element";
+                post({ element, comment, label: elements.length > 1 ? elements.length + " elements" : name });
+              },
+            },
+          });
+          window.__leafGrab = api;
+          api.activate();
+          return true;
+        })();
+        """
+    }
+
+    func nameAgent() {
+        point.toolTip = "Point at part of the page to ask \(agentName) about it (⇧⌘C)"
+        composer.field.placeholderString = "Ask \(agentName) about this…"
+    }
+
+    /// Writes one request line for leaf; false when leaf is gone.
+    func tellLeaf(_ request: [String: Any]) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: request) else { return false }
+        do {
+            try FileHandle.standardOutput.write(contentsOf: data + Data("\n".utf8))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Asks leaf which agent a question would go to now; `replied` names it.
+    func askWhichAgent() {
+        _ = tellLeaf(["agent": [String: Any]()])
+    }
+
+    @objc func togglePoint() {
+        askWhichAgent()
+        window.makeFirstResponder(web)
+        let toggle = "window.__leafGrab ? (window.__leafGrab.toggle(), true) : false"
+        web.evaluateJavaScript(toggle) { [weak self] result, _ in
+            guard let self, result as? Bool != true else { return }
+            guard let bundle = Browser.grabBundle else {
+                self.showComposer(note: "Pointing isn't available: leaf's copy of React Grab is missing. Reinstall leaf.",
+                                  failed: true)
+                return
+            }
+            self.web.evaluateJavaScript(Browser.grabSetup(bundle)) { _, error in
+                if let error {
+                    self.showComposer(note: "This page didn't let leaf point at it (\(error.localizedDescription)).",
+                                      failed: true)
+                }
+            }
+        }
+    }
+
+    func updatePoint() {
+        point.contentTintColor = pointing ? .controlAccentColor : .secondaryLabelColor
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame, let body = message.body as? [String: Any] else { return }
+        if let active = body["pointing"] as? Bool {
+            pointing = active
+            updatePoint()
+            return
+        }
+        // A pick follows the person's own click or key in this window; a page
+        // can post at any time but can't make those.
+        guard Date().timeIntervalSince(lastInputAt) < 2, let element = body["element"] as? String,
+              !element.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let label = (body["label"] as? String).map { String($0.prefix(40)) } ?? "element"
+        if picks.isEmpty || asking != .composing {
+            picks = []
+            pickedPage = (web.url?.absoluteString ?? "", web.title ?? "")
+            composer.field.stringValue = ""
+            askWhichAgent()
+        }
+        picks.append(Pick(label: label, element: String(element.prefix(20_000))))
+        let comment = (body["comment"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !comment.isEmpty && composer.field.stringValue.isEmpty { composer.field.stringValue = comment }
+        asking = .composing
+        showComposer(note: nil, failed: false)
+    }
+
+    func showComposer(note: String?, failed: Bool) {
+        renderChips()
+        composer.note.stringValue = note ?? ""
+        composer.note.textColor = failed ? .systemRed : .secondaryLabelColor
+        composer.field.isEnabled = asking != .sending
+        composer.send.isEnabled = asking != .sending && !picks.isEmpty
+        layoutComposer()
+        if !composerShown {
+            composerShown = true
+            composer.isHidden = false
+            composer.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                composer.animator().alphaValue = 1
+            }
+        }
+        if asking == .composing {
+            window.makeFirstResponder(composer.field)
+            composer.field.currentEditor()?.moveToEndOfDocument(nil)
+        }
+    }
+
+    func renderChips() {
+        composer.chips.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for (index, pick) in picks.enumerated() {
+            let chip = NSButton(title: pick.label, target: self, action: #selector(removePick(_:)))
+            chip.tag = index
+            chip.isBordered = false
+            chip.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+            chip.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Remove")?
+                .withSymbolConfiguration(.init(pointSize: 8, weight: .bold))
+            chip.imagePosition = .imageTrailing
+            chip.contentTintColor = .secondaryLabelColor
+            chip.toolTip = String(pick.element.prefix(400))
+            chip.wantsLayer = true
+            chip.layer?.cornerRadius = 6
+            chip.effectiveAppearance.performAsCurrentDrawingAppearance {
+                chip.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor
+            }
+            chip.translatesAutoresizingMaskIntoConstraints = false
+            chip.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            let width = (pick.label as NSString).size(withAttributes: [.font: chip.font as Any]).width + 28
+            chip.widthAnchor.constraint(equalToConstant: ceil(width)).isActive = true
+            composer.chips.addArrangedSubview(chip)
+        }
+        let more = NSButton(title: "Point at more", target: self, action: #selector(togglePoint))
+        more.isBordered = false
+        more.font = .systemFont(ofSize: 11)
+        more.contentTintColor = .tertiaryLabelColor
+        more.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
+        more.imagePosition = .imageLeading
+        composer.chips.addArrangedSubview(more)
+    }
+
+    @objc func removePick(_ sender: NSButton) {
+        guard picks.indices.contains(sender.tag), asking != .sending else { return }
+        picks.remove(at: sender.tag)
+        if picks.isEmpty { closeComposer() } else { showComposer(note: nil, failed: false) }
+    }
+
+    func closeComposer() {
+        picks = []
+        asking = .composing
+        composer.field.stringValue = ""
+        composerShown = false
+        composer.isHidden = true
+        if pointing { web.evaluateJavaScript("window.__leafGrab && window.__leafGrab.deactivate()") }
+        window.makeFirstResponder(web)
+    }
+
+    /// Hands the question to leaf, which sends it to the agent.
+    @objc func sendAsk() {
+        guard asking != .sending, !picks.isEmpty else { return }
+        let ask: [String: Any] = [
+            "question": composer.field.stringValue,
+            "url": pickedPage.url,
+            "title": pickedPage.title,
+            "elements": picks.map(\.element),
+        ]
+        guard tellLeaf(["ask": ask]) else {
+            showComposer(note: "leaf stopped listening, so nothing was sent. Close this pane and open the browser again.",
+                         failed: true)
+            return
+        }
+        asking = .sending
+        if pointing { web.evaluateJavaScript("window.__leafGrab && window.__leafGrab.deactivate()") }
+        showComposer(note: "Sending to \(agentName)…", failed: false)
+    }
+
+    /// leaf's answer to a question, one JSON line.
+    func replied(_ line: Data) {
+        guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return }
+        if let agent = object["agent"] as? [String: Any] {
+            let name = agent["name"] as? String ?? ""
+            agentName = name.isEmpty ? "your agent" : name
+            nameAgent()
+            return
+        }
+        guard asking == .sending else { return }
+        if let sent = object["sent"] as? [String: Any] {
+            let agent = sent["agent"] as? String ?? agentName
+            agentName = agent
+            nameAgent()
+            asking = .sent(agent: agent)
+            showComposer(note: "Sent to \(agent). Its answer is in the \(agent) pane.", failed: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                guard let self, case .sent = self.asking else { return }
+                self.closeComposer()
+            }
+        } else if let failed = object["failed"] as? [String: Any] {
+            let message = failed["message"] as? String ?? "Sending failed for a reason leaf didn't give."
+            var copied = false
+            if let prompt = failed["prompt"] as? String, !prompt.isEmpty {
+                NSPasteboard.general.clearContents()
+                copied = NSPasteboard.general.setString(prompt, forType: .string)
+            }
+            // Still composing: fix what's wrong and press Enter again.
+            asking = .composing
+            let said = message.contains("clipboard") || !copied
+            showComposer(note: said ? message : message + " The question was copied to the clipboard.", failed: true)
+        }
+    }
+
+    func listenToLeaf() {
+        var pending = Data()
+        FileHandle.standardInput.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            pending.append(chunk)
+            while let end = pending.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = Data(pending[pending.startIndex..<end])
+                pending.removeSubrange(pending.startIndex...end)
+                DispatchQueue.main.async { self?.replied(line) }
+            }
+        }
+    }
+
     // MARK: Following the pane
 
     func start() {
@@ -927,6 +1331,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             [weak self] note in self?.applicationActivated(note)
         }
         watchEvents()
+        listenToLeaf()
+        askWhichAgent()
         refresh()
         loadBindings()
     }
@@ -998,7 +1404,12 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                 if missing >= 2 { events?.terminate(); exit(0) }
             }
             let next = SessionView.placement(view, block: block)
-            if next?.rect != placement?.rect { settleUntil = Date().addingTimeInterval(0.12) }
+            // Rex animates panes into place. Following that animation would
+            // lag it, so step out of the way and come back once it settles.
+            if next?.rect != placement?.rect {
+                settleUntil = Date().addingTimeInterval(0.28)
+                hide()
+            }
             placement = next
             syncFocus()
         }
@@ -1027,6 +1438,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
               let primary = NSScreen.screens.first?.frame.height else { hide(); return }
         let body = chrome.body(placement.rect, in: bounds)
         guard body.width > 80, body.height > 60 else { hide(); return }
+        // Rex's palette and dialogs are windows of their own over the pane;
+        // they must stay on top and keep the keyboard, so give way to them.
+        if !watching || ticks % 3 == 0 {
+            let covered = rexOverlay(covering: body, of: target)
+            if !covered && coveredByRex && placement.focused && rexIsActive { focusWhenShown = true }
+            coveredByRex = covered
+        }
+        if coveredByRex { hide(); return }
         let frame = NSRect(x: body.minX.rounded(), y: (primary - body.maxY).rounded(),
                            width: body.width.rounded(), height: body.height.rounded())
         if frame != lastFrame {
@@ -1034,7 +1453,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             lastFrame = frame
         }
         if root.layer?.cornerRadius != chrome.radius { root.layer?.cornerRadius = chrome.radius }
-        if !shown || (ticks % 10 == 0 && !directlyAbove(target.number)) {
+        if !shown {
+            window.alphaValue = 0
+            window.order(.above, relativeTo: Int(target.number))
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                window.animator().alphaValue = 1
+            }
+        } else if ticks % 10 == 0 && !directlyAbove(target.number) {
             window.order(.above, relativeTo: Int(target.number))
         }
         shown = true
@@ -1042,6 +1468,23 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             focusWhenShown = false
             takeFocus()
         }
+    }
+
+    /// Whether another window of Rex's, in front of its main window, overlaps
+    /// `body` (screen points, top-left origin): the palette, a dialog, or a
+    /// second Rex window.
+    func rexOverlay(covering body: CGRect, of rex: RexWindow) -> Bool {
+        for item in WindowServer.list() {
+            guard let number = item[kCGWindowNumber as String] as? CGWindowID else { continue }
+            // The list runs front to back: past Rex's window, nothing covers it.
+            if number == rex.number { return false }
+            guard item[kCGWindowOwnerPID as String] as? pid_t == rex.pid,
+                  item[kCGWindowLayer as String] as? Int == 0,
+                  let dictionary = item[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary) else { continue }
+            if bounds.intersects(body) { return true }
+        }
+        return false
     }
 
     /// Whether only Leaf browser windows lie between this window and Rex's.
@@ -1117,6 +1560,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     static let reserved: Set<Chord> = Set([
         "cmd+c", "cmd+v", "cmd+x", "cmd+a", "cmd+z", "shift+cmd+z", "cmd+l", "cmd+r", "shift+cmd+r", "cmd+w",
         "cmd+f", "cmd+g", "shift+cmd+g", "cmd+[", "cmd+]", "cmd+=", "cmd+-", "cmd+0", "cmd+q", "cmd+.",
+        "shift+cmd+c",
     ].compactMap(Chord.init))
 
     func loadBindings() {
@@ -1191,7 +1635,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         browser.window.delegate = self
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
+            if event.window === self.browser.window { self.browser.lastInputAt = Date() }
             return self.browser.handleRexKey(event) ? nil : event
+        }
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+            if let self, event.window === self.browser.window { self.browser.lastInputAt = Date() }
+            return event
         }
         browser.start()
         let initial = ProcessInfo.processInfo.environment["LEAF_BROWSER_URL"] ?? ""
@@ -1241,6 +1690,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item("Paste", #selector(NSText.paste(_:)), "v"),
             item("Paste and Match Style", #selector(NSTextView.pasteAsPlainText(_:)), "v", [.command, .option, .shift]),
             item("Select All", #selector(NSText.selectAll(_:)), "a"),
+            .separator(),
+            item("Point at Element", #selector(Browser.togglePoint), "c", [.command, .shift], target: b),
             .separator(),
             item("Find…", #selector(Browser.showFind), "f", target: b),
             item("Find Next", #selector(Browser.findNext), "g", target: b),

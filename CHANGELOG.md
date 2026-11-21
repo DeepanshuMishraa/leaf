@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Leaf: Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a Rex pane beside you, built into leaf: nothing is installed in Applications. It follows the pane through splits, resizes, zoom and tab switches, steps aside for Rex's palette and Mission Control, and keeps Rex's shortcuts working. Find, zoom, downloads, and the pane's label follows the page title.
+- Point at any part of a page and ask your agent about it. The pointer button (or `shift+cmd+c`) picks elements with [React Grab](https://github.com/aidenybai/react-grab), including the React components and source files behind them on development builds; type a question and press `enter`. It goes to the agent picked with **Leaf: Choose Agent…**, in its pane or a new one beside the browser.
+
 - `leaf storage` shows what fills a drive in a dithered disk map, category meters and a donut, in your theme's colors. It measures millions of files in seconds on macOS and Linux, labels each finding as junk, unused or review, and says where most of its space is. Browse, reveal, ask the agent pane about, or delete anything after a confirmation; `c` clears a category's junk. It knows caches, build output, package stores and what AI agents leave behind. `--json` prints it for agents, and Rex's palette offers **Leaf: Analyze Storage**.
 
 ## 0.17.3
