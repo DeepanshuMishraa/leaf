@@ -454,6 +454,12 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     // Page
     var failedURL: URL?
     var errorNavigation: WKNavigation?
+    /// The start page is showing; it has no address of its own.
+    var onHome = false
+    var homeNavigation: WKNavigation?
+    var homeLoaded = false
+    /// Local web servers found for the start page, as JSON for its script.
+    var homeServers: String?
     var titleSent = ""
     var observers: [NSKeyValueObservation] = []
     var downloads: [WKDownload: URL] = [:]
@@ -705,7 +711,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var editingAddress: Bool { address.currentEditor() != nil }
 
     func showURL() {
-        let url = failedURL ?? web.url
+        let url = onHome ? nil : (failedURL ?? web.url)
         let secure = url?.scheme == "https"
         let symbol = url == nil ? "magnifyingglass" : (secure ? "lock.fill" : "globe")
         badge.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
@@ -757,7 +763,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     func sendTitle() {
         let title = (web.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let label = title.isEmpty ? (web.url?.host ?? "browser") : String(title.prefix(48))
+        let label = onHome ? "browser" : title.isEmpty ? (web.url?.host ?? "browser") : String(title.prefix(48))
         guard label != titleSent else { return }
         titleSent = label
         let session = session, block = block
@@ -817,7 +823,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         if let failed = failedURL { load(failed) } else { web.reload() }
     }
     @objc func reloadPage() {
-        if let failed = failedURL { load(failed) } else { web.reload() }
+        if onHome { showHome() } else if let failed = failedURL { load(failed) } else { web.reload() }
     }
     @objc func hardReload() { web.reloadFromOrigin() }
     @objc func focusAddress() {
@@ -936,6 +942,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         // The error page keeps showing the address that failed.
         if navigation !== errorNavigation { failedURL = nil }
+        if navigation !== homeNavigation { onHome = false; homeLoaded = false }
         if findShown { closeFind() }
     }
 
@@ -946,6 +953,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if navigation === homeNavigation {
+            homeLoaded = true
+            listServers()
+        }
         showURL()
         sendTitle()
     }
@@ -992,11 +1003,149 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         showURL()
     }
 
-    static func errorPage(title: String, reason: String) -> String {
-        func escape(_ text: String) -> String {
-            text.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
-                .replacingOccurrences(of: ">", with: "&gt;")
+    // MARK: Start page
+
+    /// Shows the start page: leaf's mark, a hint, and the web servers
+    /// running on this Mac, filled in once they're found.
+    func showHome() {
+        onHome = true
+        homeLoaded = false
+        homeServers = nil
+        failedURL = nil
+        homeNavigation = web.loadHTMLString(Browser.homePage(agent: agentName), baseURL: nil)
+        showURL()
+        Browser.findServers { [weak self] json in
+            guard let self, self.onHome else { return }
+            self.homeServers = json
+            self.listServers()
         }
+    }
+
+    /// Hands the servers found to the start page once both are ready.
+    func listServers() {
+        guard onHome, homeLoaded, let json = homeServers else { return }
+        web.evaluateJavaScript("window.leafServers && window.leafServers(\(json))")
+    }
+
+    static func homePage(agent: String) -> String {
+        """
+        <!doctype html><meta charset="utf-8"><meta name="color-scheme" content="light dark"><title>New page</title>
+        <style>
+        :root{--fg:#17171a;--muted:#8b8b90;--line:rgba(128,128,128,.16);--hl:#e8b93a}
+        @media (prefers-color-scheme:dark){:root{--fg:#efefec;--muted:#8e8e93;--line:rgba(255,255,255,.09);--hl:#f3d35f}}
+        html,body{height:100%;margin:0}
+        body{display:grid;place-items:center;background:Canvas;color:var(--fg);font:13px/1.55 -apple-system,system-ui;-webkit-font-smoothing:antialiased;-webkit-user-select:none;cursor:default}
+        main{width:min(400px,84vw);display:flex;flex-direction:column;align-items:center;margin-top:-8vh}
+        .mark{width:40px;height:40px;margin-bottom:22px}
+        .mark rect{fill:var(--fg)} .mark .l{stroke:Canvas} .mark .h{stroke:var(--hl)}
+        .hint{color:var(--muted);text-align:center;margin:0}
+        kbd{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;padding:1px 5px;border:1px solid var(--line);border-radius:5px;color:var(--fg)}
+        #servers{width:100%;margin-top:34px;opacity:0;transition:opacity .25s ease}
+        #servers.on{opacity:1}
+        .label{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:0 10px 6px}
+        a{display:flex;align-items:baseline;gap:12px;padding:7px 10px;border-radius:8px;color:inherit;text-decoration:none}
+        a:hover{background:var(--line)}
+        .port{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);flex:none;min-width:15ch}
+        .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        </style>
+        <main>
+          <svg class="mark" viewBox="0 0 32 32" aria-label="leaf"><rect width="32" height="32" rx="8"/>
+          <path class="l" d="M8.5 10h15" stroke-width="3.5" stroke-linecap="round"/>
+          <path class="h" d="M8.5 16h15" stroke-width="3.5" stroke-linecap="round"/>
+          <path class="l" d="M8.5 22h9" stroke-width="3.5" stroke-linecap="round"/></svg>
+          <p class="hint">Type an address or search above<br><kbd>⇧⌘C</kbd> points at a page to ask \(escape(agent))</p>
+          <section id="servers" hidden><div class="label">Running here</div><div id="list"></div></section>
+        </main>
+        <script>
+        window.leafServers = (servers) => {
+          const list = document.getElementById("list"), box = document.getElementById("servers");
+          list.replaceChildren(...servers.map(({ port, title }) => {
+            const a = document.createElement("a");
+            a.href = "http://localhost:" + port + "/";
+            const p = document.createElement("span"); p.className = "port"; p.textContent = "localhost:" + port;
+            const n = document.createElement("span"); n.className = "name"; n.textContent = title;
+            a.append(p, n);
+            return a;
+          }));
+          box.hidden = servers.length === 0;
+          requestAnimationFrame(() => box.classList.toggle("on", servers.length > 0));
+        };
+        </script>
+        """
+    }
+
+    /// The web servers listening on this Mac for this user: ports from
+    /// `lsof`, kept when they answer HTTP with a page. Calls back on the main
+    /// queue with a JSON array of {port, title}.
+    static func findServers(_ done: @escaping (String) -> Void) {
+        Rex.background {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            task.arguments = ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-u", String(getuid()), "-Fn"]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = FileHandle.nullDevice
+            var ports: [Int] = []
+            if (try? task.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                task.waitUntilExit()
+                for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where line.hasPrefix("n") {
+                    // n*:3000, n127.0.0.1:5173, n[::1]:8080
+                    guard let colon = line.lastIndex(of: ":"), let port = Int(line[line.index(after: colon)...]),
+                          port >= 1024, !ports.contains(port) else { continue }
+                    ports.append(port)
+                }
+            }
+            ports.sort()
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = 1.2
+            configuration.connectionProxyDictionary = [:]
+            let session = URLSession(configuration: configuration)
+            let lock = NSLock()
+            var found: [(port: Int, title: String)] = []
+            let group = DispatchGroup()
+            for port in ports.prefix(24) {
+                guard let url = URL(string: "http://localhost:\(port)/") else { continue }
+                group.enter()
+                session.dataTask(with: url) { data, response, _ in
+                    defer { group.leave() }
+                    guard let http = response as? HTTPURLResponse,
+                          (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased().contains("text/html"),
+                          let data else { return }
+                    let title = Browser.pageTitle(String(decoding: data.prefix(65_536), as: UTF8.self))
+                    lock.lock()
+                    found.append((port, title ?? "Web server"))
+                    lock.unlock()
+                }.resume()
+            }
+            group.wait()
+            session.invalidateAndCancel()
+            let rows = found.sorted { $0.port < $1.port }.prefix(8).map { ["port": $0.port, "title": $0.title] as [String: Any] }
+            let json = (try? JSONSerialization.data(withJSONObject: Array(rows))).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
+            DispatchQueue.main.async { done(json) }
+        }
+    }
+
+    /// A page's `<title>`, tidied, from the start of its HTML.
+    static func pageTitle(_ html: String) -> String? {
+        guard let open = html.range(of: "<title", options: .caseInsensitive),
+              let start = html.range(of: ">", range: open.upperBound..<html.endIndex),
+              let end = html.range(of: "</title>", options: .caseInsensitive, range: start.upperBound..<html.endIndex)
+        else { return nil }
+        let title = html[start.upperBound..<end.lowerBound]
+            .replacingOccurrences(of: "&amp;", with: "&").replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&quot;", with: "\"").replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return title.isEmpty ? nil : String(title.prefix(80))
+    }
+
+    static func escape(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
+    static func errorPage(title: String, reason: String) -> String {
         return """
         <!doctype html><meta charset="utf-8"><meta name="color-scheme" content="light dark">
         <style>
@@ -1679,6 +1828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             self.browser.takeFocus()
             if initial.isEmpty {
+                self.browser.showHome()
                 self.browser.focusAddress()
             } else {
                 self.browser.window.makeFirstResponder(self.browser.web)
