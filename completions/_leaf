@@ -22,7 +22,7 @@ _leaf_diff() {
 _leaf() {
   local -a commands
   commands=(
-    'open:Read a PDF, markdown file or web page'
+    'open:Read a PDF, markdown file, HTML page or web page'
     'diff:Review a diff'
     'pr:Pull requests and issues that concern you'
     'plan:Review a plan block by block and send a verdict'
@@ -55,7 +55,7 @@ _leaf() {
       local pictures='png|jpg|jpeg|jpe|jfif|gif|webp|bmp|ico|tif|tiff|tga|pnm|pbm|pgm|ppm|pam|qoi|hdr|exr|dds|ff|svg'
       [[ $OSTYPE == darwin* ]] && pictures+='|jxl|heic|heif|avif'
       local office='docx|docm|dotx|dotm|pptx|pptm|ppsx|ppsm|potx|potm|xlsx|xlsm|xlsb|xls|xla|xlam|ods|csv|tsv'
-      _arguments "*:document:_files -g \"(#i)*.(pdf|epub|md|markdown|$office|$pictures)\""
+      _arguments "*:document:_files -g \"(#i)*.(pdf|epub|md|markdown|html|htm|xhtml|xht|$office|$pictures)\""
       ;;
     diff)
       _leaf_diff

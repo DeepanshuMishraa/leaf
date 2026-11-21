@@ -24,6 +24,7 @@ mod highlight;
 mod home;
 mod hook;
 mod host;
+mod html;
 mod hue;
 mod kitty;
 mod look;
@@ -82,7 +83,7 @@ use doc::Doc;
 use progress::Store;
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | office file | picture | url]   (nothing named: pick one)
+const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.html | office file | picture | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
@@ -161,6 +162,9 @@ fn load_file(path: &Path) -> Result<Doc, String> {
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(path).map_err(|e| e.to_string());
     }
+    if html::is_html(path) {
+        return html::open(path).map_err(|e| e.to_string());
+    }
     if picture::is_picture(path) {
         return picture::open(path).map_err(|e| e.to_string());
     }
@@ -171,7 +175,7 @@ fn load_file(path: &Path) -> Result<Doc, String> {
         return Err(advice);
     }
     Err(format!(
-        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), Word documents (.docx), slide decks (.pptx), spreadsheets (.xlsx, .xls, .ods, .csv, .tsv), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
+        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), HTML pages (.html, .htm), Word documents (.docx), slide decks (.pptx), spreadsheets (.xlsx, .xls, .ods, .csv, .tsv), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
     ))
 }
 

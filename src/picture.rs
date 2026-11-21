@@ -42,12 +42,22 @@ pub fn is_picture(path: &Path) -> bool {
     })
 }
 
+/// How a picture's pixels come about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Fixed pixels, shrunk to fit.
+    Raster,
+    /// Shapes (SVG), drawn afresh at whatever width is shown.
+    Vector,
+}
+
 /// Holds the path and size, not the pixels: a large photo would otherwise
 /// keep its full-resolution decode in memory while the document is open.
 struct Picture {
     text: Rc<str>,
     path: PathBuf,
     size: (u32, u32),
+    kind: Kind,
 }
 
 impl Source for Picture {
@@ -60,7 +70,11 @@ impl Source for Picture {
     }
 
     fn decode(&self, _id: &str, width: u32) -> Option<RgbaImage> {
-        let pixels = pixels(&self.path, &std::fs::read(&self.path).ok()?)?;
+        let bytes = std::fs::read(&self.path).ok()?;
+        if self.kind == Kind::Vector {
+            return crate::prmedia::draw_svg(&crate::prmedia::svg(&bytes)?, width);
+        }
+        let pixels = pixels(&self.path, &bytes)?;
         let width = width.max(1);
         if pixels.width() <= width {
             return Some(pixels);
@@ -90,9 +104,22 @@ pub fn open(path: &Path) -> Result<Doc, PictureFailed> {
             }
         }
     })?;
-    let size = pixels(path, &bytes)
-        .ok_or_else(|| PictureFailed::Undecodable { path: shown() })?
-        .dimensions();
+    let undecodable = || PictureFailed::Undecodable { path: shown() };
+    let (size, kind) = match crate::prmedia::svg(&bytes) {
+        // An SVG's own size is often icon-sized; laid out at that size and
+        // stretched, it would show small and blurred. It is laid out as large
+        // as leaf draws one instead, keeping its shape, so it fills the window.
+        Some(tree) => {
+            let (w, h) = (tree.size().width(), tree.size().height());
+            let scale = crate::prmedia::MAX_SVG_SIDE / w.max(h);
+            let side = |v: f32| ((v * scale).round() as u32).max(1);
+            ((side(w), side(h)), Kind::Vector)
+        }
+        None => (
+            pixels(path, &bytes).ok_or_else(undecodable)?.dimensions(),
+            Kind::Raster,
+        ),
+    };
     Ok(Doc {
         title: path
             .file_name()
@@ -103,6 +130,7 @@ pub fn open(path: &Path) -> Result<Doc, PictureFailed> {
             text: format!("![]({})", Doc::image_href("0")).into(),
             path: path.to_path_buf(),
             size,
+            kind,
         }),
     })
 }
@@ -231,6 +259,24 @@ mod tests {
             doc.source.decode("0", 100).map(|p| p.dimensions()),
             Some((40, 20))
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_small_svg_is_laid_out_large_and_drawn_sharp_at_any_width() {
+        let dir = std::env::temp_dir().join(format!("leaf-picture-svg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("icon.svg");
+        std::fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"><rect width="24" height="12" fill="#ff0000"/></svg>"##,
+        )
+        .unwrap();
+        let doc = open(&path).unwrap();
+        assert_eq!(doc.source.image_size("0"), Some((4096, 2048)));
+        let drawn = doc.source.decode("0", 800).unwrap();
+        assert_eq!(drawn.dimensions(), (800, 400));
+        assert_eq!(drawn.get_pixel(400, 200), &image::Rgba([255, 0, 0, 255]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

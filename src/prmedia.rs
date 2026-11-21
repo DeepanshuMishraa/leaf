@@ -45,7 +45,7 @@ const GIF_DEFAULT_DELAY: Duration = Duration::from_millis(100);
 const RING_STEP: Duration = Duration::from_millis(80);
 const RING_STEPS: u64 = 12;
 /// An SVG's longer side is drawn at most this many pixels.
-const MAX_SVG_SIDE: f32 = 4096.0;
+pub(crate) const MAX_SVG_SIDE: f32 = 4096.0;
 /// The card a video gets when no frame of it can be taken.
 const CARD: (u32, u32) = (640, 360);
 
@@ -1072,18 +1072,31 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<RgbaImage> {
     if let Some(image) = oriented(bytes) {
         return Some(image.to_rgba8());
     }
+    let tree = svg(bytes)?;
+    let size = tree.size();
+    draw_svg(&tree, size.width().min(MAX_SVG_SIDE).ceil() as u32)
+}
+
+/// An SVG's drawing, or `None` when `bytes` aren't one.
+pub(crate) fn svg(bytes: &[u8]) -> Option<usvg::Tree> {
     let options = usvg::Options {
         fontdb: crate::mermaid::FONTS.clone(),
         ..Default::default()
     };
-    let tree = usvg::Tree::from_data(bytes, &options).ok()?;
+    usvg::Tree::from_data(bytes, &options).ok()
+}
+
+/// An SVG drawn `width` pixels wide, larger or smaller than its own size, so
+/// it stays sharp at any size. Its longer side is held to `MAX_SVG_SIDE`.
+pub(crate) fn draw_svg(tree: &usvg::Tree, width: u32) -> Option<RgbaImage> {
     let size = tree.size();
-    let scale = (MAX_SVG_SIDE / size.width().max(size.height())).min(1.0);
+    let scale =
+        (width.max(1) as f32 / size.width()).min(MAX_SVG_SIDE / size.width().max(size.height()));
     let width = (size.width() * scale).ceil() as u32;
     let height = (size.height() * scale).ceil() as u32;
     let mut pixmap = tiny_skia::Pixmap::new(width.max(1), height.max(1))?;
     resvg::render(
-        &tree,
+        tree,
         tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
