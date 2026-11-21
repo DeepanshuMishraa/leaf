@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Leaf: Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a Rex pane beside you, built into leaf: nothing is installed in Applications. It follows the pane through splits, resizes, zoom and tab switches, steps aside for Rex's palette and Mission Control, and keeps Rex's shortcuts working. Find, zoom, downloads, and the pane's label follows the page title.
+- Point at any part of a page and ask your agent about it. The pointer button (or `shift+cmd+c`) picks elements with [React Grab](https://github.com/aidenybai/react-grab), including the React components and source files behind them on development builds; type a question and press `enter`. It goes to the agent picked with **Leaf: Choose Agent…**, in its pane or a new one beside the browser.
+
 ## 0.17.3
 
 - Zooming the board with a trackpad is smoother: each scroll step zooms less, and the sideways part of a zoom swipe no longer pans the board while it zooms. `option+↑` and `option+↓` zoom too.
