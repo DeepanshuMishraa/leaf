@@ -6,11 +6,26 @@
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": ["/", "/install", "/api/*"]
+    "run_worker_first": [
+      "/",
+      "/install",
+      "/api/*"
+    ]
   },
-  "vars": { "DODO_ENV": "live_mode" },
-  // Sponsor payments, written by the Dodo webhook. Create it with
-  // `bunx wrangler kv namespace create SPONSORS` and paste the id here.
-  "kv_namespaces": [{ "binding": "SPONSORS", "id": "REPLACE_WITH_SPONSORS_KV_ID" }],
-  "routes": [{ "pattern": "leaf.dipxsy.app", "custom_domain": true }]
+  "vars": {
+    "DODO_ENV": "live_mode"
+  },
+  // Sponsor payments, written by the Dodo webhook.
+  "kv_namespaces": [
+    {
+      "binding": "SPONSORS",
+      "id": "06d77f59186841ee8d52e6eb7afa9cd5"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "leaf.dipxsy.app",
+      "custom_domain": true
+    }
+  ]
 }

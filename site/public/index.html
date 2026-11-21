@@ -605,8 +605,6 @@
   .sp .err { margin: -6px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13.5px; line-height: 1.45; color: var(--paper); background: color-mix(in oklab, var(--paper) 9%, transparent); }
   .sp .err[hidden] { display: none; }
   .sp .btn { width: 100%; padding: 14px 20px; }
-  .sp .fine { margin: -6px 0 0; text-align: center; }
-
   /* A thank-you note after checkout. */
   .toast {
     position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); z-index: 20;
@@ -845,8 +843,8 @@
 
   <section id="sponsor">
     <span class="pill">Sponsor</span>
-    <h2>Keep leaf <span class="hl" style="--hl: var(--hl-pink)">free and growing</span>.</h2>
-    <p class="sub">leaf is built in the open by one person and anyone who chips in. Sponsoring pays for the hours behind every release, and your name goes up here.</p>
+    <h2>Help leaf <span class="hl" style="--hl: var(--hl-pink)">keep shipping</span>.</h2>
+    <p class="sub">leaf is open source and always will be. Sponsoring backs the hours behind every release, and your name goes up here.</p>
     <ul class="seats" id="seats">
       <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
       <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
@@ -854,7 +852,7 @@
       <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
     </ul>
     <button class="btn" type="button" data-sponsor><svg aria-hidden="true"><use href="#i-heart"/></svg>Sponsor leaf</button>
-    <p class="fine">One-time, any amount. Checkout by Dodo Payments.</p>
+    <p class="fine">One-time, any amount.</p>
   </section>
 
   <dialog class="sp" id="sp" aria-labelledby="sp-title">
@@ -872,6 +870,10 @@
         <span class="field-in"><input name="name" autocomplete="name" maxlength="80" placeholder="Ada Lovelace" required autofocus></span>
       </label>
       <label>
+        <span class="lab">Email <em>· for your receipt</em></span>
+        <span class="field-in"><input name="email" type="email" autocomplete="email" maxlength="254" placeholder="ada@example.com" required></span>
+      </label>
+      <label>
         <span class="lab">GitHub <em>· optional</em></span>
         <span class="field-in"><span class="pre">@</span><input name="github" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="39" placeholder="username"><img id="sp-avatar" alt="" width="24" height="24"></span>
       </label>
@@ -884,12 +886,10 @@
           <label><input type="radio" name="preset" value="50"><span>$50</span></label>
           <label><input type="radio" name="preset" value="100"><span>$100</span></label>
         </div>
-        <span class="field-in custom"><span class="pre">$</span><input name="custom" inputmode="numeric" placeholder="Other amount" aria-label="Other amount in US dollars"></span>
+        <span class="field-in custom"><span class="pre">$</span><input name="custom" inputmode="decimal" placeholder="Other amount" aria-label="Other amount in US dollars"></span>
       </fieldset>
       <p class="err" id="sp-err" role="alert" hidden></p>
-      <button class="btn" type="submit" id="sp-go"><svg aria-hidden="true"><use href="#i-heart"/></svg><span>Sponsor $25</span></button>
-      <p class="fine">You'll finish on a secure Dodo Payments page.</p>
-    </form>
+      <button class="btn" type="submit" id="sp-go"><svg aria-hidden="true"><use href="#i-heart"/></svg><span>Sponsor $25</span></button>    </form>
   </dialog>
 
   <section id="contributors" hidden>
@@ -1104,6 +1104,7 @@
   {
     const dialog = $("sp"), form = $("sp-form"), err = $("sp-err"), go = $("sp-go"), avatar = $("sp-avatar");
     const LOGIN = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/i;
+    const PENDING = "leaf-sponsor-pending";
     const avatarOf = (login, size) => `https://avatars.githubusercontent.com/${encodeURIComponent(login)}?s=${size}`;
 
     const open = () => { err.hidden = true; dialog.showModal(); };
@@ -1114,19 +1115,25 @@
     // A click on the backdrop lands on the dialog itself, outside the form.
     dialog.addEventListener("click", (e) => { if (e.target === dialog) dialog.close(); });
 
-    // The amount: a preset, or a custom one that clears the presets.
+    // The amount in cents: a preset, or a custom one (up to two decimals) that clears the presets.
     const amount = () => {
       const custom = form.custom.value.trim();
-      if (custom !== "") return /^\d+$/.test(custom) ? Number(custom) : NaN;
-      return Number(form.querySelector("[name=preset]:checked")?.value ?? NaN);
+      const dollars = custom !== "" ? custom : form.querySelector("[name=preset]:checked")?.value;
+      if (!dollars || !/^\d+(\.\d{1,2})?$/.test(dollars)) return NaN;
+      const [whole, frac = ""] = dollars.split(".");
+      return Number(whole) * 100 + Number(frac.padEnd(2, "0"));
     };
+    const usd = (cents) => (cents / 100).toLocaleString("en", { minimumFractionDigits: cents % 100 ? 2 : 0, maximumFractionDigits: 2 });
     const label = go.querySelector("span");
     const relabel = () => {
-      const n = amount();
-      label.textContent = Number.isInteger(n) && n > 0 ? `Sponsor $${n.toLocaleString("en")}` : "Sponsor leaf";
+      const cents = amount();
+      label.textContent = Number.isSafeInteger(cents) && cents >= 0 ? `Sponsor $${usd(cents)}` : "Sponsor leaf";
     };
     form.custom.addEventListener("input", () => {
-      form.custom.value = form.custom.value.replace(/[^\d]/g, "");
+      form.custom.value = form.custom.value
+        .replace(/[^\d.]/g, "")
+        .replace(/(\..*)\./g, "$1")
+        .replace(/^(\d*\.\d{0,2}).*$/, "$1");
       if (form.custom.value) for (const r of form.querySelectorAll("[name=preset]")) r.checked = false;
       relabel();
     });
@@ -1153,11 +1160,13 @@
       e.preventDefault();
       const nameInput = form.elements.namedItem("name");
       const name = nameInput.value.trim();
+      const email = form.email.value.trim();
       const github = form.github.value.trim().replace(/^@/, "");
-      const usd = amount();
+      const cents = amount();
       if (!name) { showError("Add the name you'd like shown."); nameInput.focus(); return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showError("Enter a valid email so the receipt reaches you."); form.email.focus(); return; }
       if (github && !LOGIN.test(github)) { showError("That GitHub username doesn't look right. Fix it or leave it empty."); form.github.focus(); return; }
-      if (!Number.isInteger(usd) || usd < 1 || usd > 10000) { showError("Pick an amount from $1 to $10,000."); return; }
+      if (!Number.isSafeInteger(cents) || cents < 100) { showError("Enter an amount of $1 or more."); form.custom.focus(); return; }
 
       err.hidden = true;
       go.disabled = true;
@@ -1166,10 +1175,15 @@
         const res = await fetch("/api/sponsor", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ name, github, amount: usd }),
+          body: JSON.stringify({ name, email, github, cents }),
         });
         const data = await res.json().catch(() => null);
-        if (res.ok && typeof data?.url === "string") { location.href = data.url; return; }
+        if (res.ok && typeof data?.url === "string") {
+          // Remembered so the page can show them the moment they return.
+          try { sessionStorage.setItem(PENDING, JSON.stringify(github ? { name, github } : { name })); } catch {}
+          location.href = data.url;
+          return;
+        }
         showError(data?.error?.message ?? `Checkout couldn't be started (${res.status}). Nothing was charged. Try again.`);
       } catch {
         showError("Couldn't reach leaf.dipxsy.app. Check your connection and try again. Nothing was charged.");
@@ -1178,7 +1192,8 @@
       relabel();
     });
 
-    // Fill the seats and the hero row from the sponsor list.
+    // Fill the seats and the hero row from the sponsor list. Safe to call again.
+    const spare = $("seats").firstElementChild.cloneNode(true);
     const render = (sponsors) => {
       if (!sponsors.length) return;
       const seats = $("seats"), stack = $("backer-stack");
@@ -1203,7 +1218,6 @@
         return li;
       });
       // Keep one open seat at the end, and the grid in whole rows of four.
-      const spare = seats.firstElementChild;
       const free = 1 + ((4 - ((filled.length + 1) % 4)) % 4);
       seats.replaceChildren(...filled, ...Array.from({ length: free }, () => spare.cloneNode(true)));
 
@@ -1241,15 +1255,42 @@
       stack.replaceChildren(stack.lastElementChild);
       $("backer-text").innerHTML = "<b>Join them</b>";
     };
-    fetch("/api/sponsors")
-      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`/api/sponsors ${res.status}`))))
-      .then((list) => render(Array.isArray(list) ? list.filter((s) => typeof s?.name === "string" && (!s.github || LOGIN.test(s.github))) : []))
-      .catch((e) => console.warn("Sponsor list unavailable; the open seats still show.", e));
+    const load = (init) =>
+      fetch("/api/sponsors", init)
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`/api/sponsors ${res.status}`))))
+        .then((list) => (Array.isArray(list) ? list.filter((s) => typeof s?.name === "string" && (!s.github || LOGIN.test(s.github))) : []));
+    const same = (a, b) => (a.github && b.github ? a.github.toLowerCase() === b.github.toLowerCase() : !a.github && !b.github && a.name === b.name);
 
     // Back from checkout: say thanks (or say it didn't go through), then tidy the URL.
     const params = new URLSearchParams(location.search);
+    const status = params.get("status");
+    let pending = null;
+    if (params.has("sponsor") && status === "succeeded") {
+      try { pending = JSON.parse(sessionStorage.getItem(PENDING) ?? "null"); } catch {}
+    }
+    if (pending && (typeof pending.name !== "string" || (pending.github && !LOGIN.test(pending.github)))) pending = null;
+
+    if (!pending) {
+      load().then(render).catch((e) => console.warn("Sponsor list unavailable; the open seats still show.", e));
+    } else {
+      // The webhook usually lands after they do, so show them straight away, then
+      // keep checking until the server has them too.
+      const withPending = (list) => (list.some((s) => same(s, pending)) ? list : [pending, ...list]);
+      let tries = 0;
+      const check = () =>
+        load({ cache: "no-store" })
+          .then((list) => {
+            render(withPending(list));
+            if (list.some((s) => same(s, pending))) {
+              try { sessionStorage.removeItem(PENDING); } catch {}
+            } else if (++tries < 20) setTimeout(check, 4000);
+          })
+          .catch((e) => { console.warn("Sponsor list unavailable; retrying.", e); if (++tries < 20) setTimeout(check, 4000); });
+      render([pending]);
+      check();
+    }
+
     if (params.has("sponsor")) {
-      const status = params.get("status");
       const bad = status === "failed" || status === "cancelled";
       const toast = document.createElement("div");
       toast.className = `toast${bad ? " bad" : ""}`;
@@ -1257,7 +1298,9 @@
       toast.innerHTML = `<i class="tile" aria-hidden="true"><svg><use href="#i-heart"/></svg></i><span></span>`;
       toast.querySelector("span").textContent = bad
         ? "The payment didn't go through, so nothing was charged."
-        : "Thank you for sponsoring leaf. Your name goes up shortly.";
+        : pending
+          ? "Thank you for sponsoring leaf. You're on the wall."
+          : "Thank you for sponsoring leaf. Your name goes up shortly.";
       document.body.append(toast);
       setTimeout(() => { toast.classList.add("out"); toast.addEventListener("transitionend", () => toast.remove(), { once: true }); }, 6000);
       history.replaceState(null, "", location.pathname + location.hash);
