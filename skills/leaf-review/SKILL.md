@@ -14,7 +14,10 @@ description: Hand your code changes to the person for review in leaf. They go fi
    leaf review --branch        # this branch against its base
    leaf review main...HEAD     # any range
    leaf review https://github.com/owner/repo/pull/12
+   leaf review changes.patch   # a .diff or .patch file
    ```
+
+   GitLab merge request links open too, but notes can't be posted to GitLab.
 
    In Rex, tmux or Herdr this opens the review beside your pane and returns at once.
 3. **End your turn.** Don't wait, sleep, poll or read the pane. The review arrives as your next message.
