@@ -188,6 +188,25 @@ pub fn agents(installed: &[Installed], current: Option<&str>) -> Vec<Item> {
     .collect()
 }
 
+/// The installed iPhone simulators, booted ones first. Ids are udids.
+pub fn simulators(devices: &[crate::simulator::Device]) -> Vec<Item> {
+    devices
+        .iter()
+        .map(|device| Item {
+            id: device.udid.clone(),
+            title: device.name.clone(),
+            subtitle: device.runtime.clone(),
+            icon: "iphone",
+            detail: if device.booted() {
+                "booted".to_owned()
+            } else {
+                String::new()
+            },
+        })
+        .take(MOST)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

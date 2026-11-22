@@ -21,6 +21,7 @@ mod font;
 mod gec;
 mod github;
 mod grid;
+mod helper;
 mod highlight;
 mod home;
 mod hook;
@@ -59,6 +60,7 @@ mod rextheme;
 mod scheme;
 mod shape;
 mod sheet;
+mod simulator;
 mod skills;
 mod slides;
 mod spinner;
@@ -88,6 +90,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf browser [URL]   open a WebKit browser pane in Rex on macOS
+       leaf sim [list | open <udid> | tap | swipe | type | screenshot | …]   an iOS Simulator on a 3D iPhone in Rex (leaf sim help)
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
@@ -431,6 +434,7 @@ fn main() -> ExitCode {
             }
         },
         "browser" => browser::run(rest),
+        "sim" | "simulator" => simulator::run(rest),
         "voices" => match rest {
             [] => voices_command(None),
             [flag, block] if flag == "--reader" => voices_command(Some(block)),

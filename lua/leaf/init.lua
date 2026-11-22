@@ -325,6 +325,46 @@ function M.setup(opts)
   }
 
   rex.action{
+    name = "leaf_simulator",
+    title = "Leaf: Open Simulator…",
+    description = "Pick an installed iPhone simulator and open it on a 3D iPhone in a pane beside"
+      .. " this one. Your agent can tap, swipe and type on it with `leaf sim`.",
+    category = "Leaf",
+    keywords = "leaf simulator ios iphone xcode device app simctl 3d",
+    args = { udid = "string?" },
+    run = function(ctx, args)
+      if ctx.server ~= nil then
+        error("leaf: simulators run on this Mac, so they aren't available in a session on a remote host.", 0)
+      end
+      local udid = args and args.udid
+      if udid == nil or udid == "" then
+        if not can_ask() then
+          error("leaf: picking a simulator needs Rex 17 or later. Run `leaf sim list`, then"
+            .. " `leaf sim open <udid>` in a pane.", 0)
+        end
+        local items, err = leaf_json("sim", "--list")
+        if items == nil then error("leaf: couldn't list simulators: " .. tostring(err), 0) end
+        if #items == 0 then
+          error("leaf: no iPhone simulators are installed. Add an iOS runtime in Xcode → Settings"
+            .. " → Components (or run `xcodebuild -downloadPlatform iOS`), then try again.", 0)
+        end
+        local picked, reason = ask{
+          title = "Open simulator",
+          placeholder = "Search installed iPhone simulators",
+          items = items,
+        }
+        if reason == "fallback" then
+          error("leaf: Rex couldn't show the simulator picker. Run `leaf sim list`, then"
+            .. " `leaf sim open <udid>` in a pane.", 0)
+        end
+        if type(picked) ~= "string" then return end
+        udid = picked
+      end
+      open_pane(ctx, "simulator", argv("sim", "open", udid), cwd(ctx))
+    end,
+  }
+
+  rex.action{
     name = "leaf_open",
     title = "Leaf: Open Document…",
     description = "Open leaf's home in this pane: today's reading, a heat map of the days you read,"

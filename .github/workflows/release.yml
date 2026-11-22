@@ -217,6 +217,25 @@ jobs:
               *"needs REX_SESSION and REX_BLOCK"*) echo "browser helper OK ($got)" ;;
               *) echo "::error::The browser helper didn't start: $said"; exit 1 ;;
             esac
+            # The simulator pane too, with the phone model beside it.
+            helper=$($RUN ./smoke/leaf sim --check)
+            got=$(lipo -archs "$helper")
+            if [ "$got" != "$want" ]; then
+              echo "::error::The simulator helper is built for '$got', expected '$want'."
+              exit 1
+            fi
+            if [ ! -s "$(dirname "$helper")/iphone.usdz" ]; then
+              echo "::error::The simulator helper was unpacked without its phone model."
+              exit 1
+            fi
+            if said=$(env -u REX_SESSION -u REX_BLOCK $RUN "$helper" 2>&1); then
+              echo "::error::The simulator helper started outside Rex: $said"
+              exit 1
+            fi
+            case "$said" in
+              *"needs REX_SESSION and REX_BLOCK"*) echo "simulator helper OK ($got)" ;;
+              *) echo "::error::The simulator helper didn't start: $said"; exit 1 ;;
+            esac
           fi
 
       - uses: actions/upload-artifact@v7

@@ -1,21 +1,22 @@
 //! `leaf browser`: a WebKit page in a Rex pane, on macOS.
 //!
 //! Rex draws its blocks itself, so the page lives in a small native helper
-//! (src/browser.swift, compiled by build.rs and embedded here) whose window
-//! follows the pane. The helper is unpacked once per Leaf version into the
-//! user's cache folder; nothing is installed in Applications.
+//! (src/browser.swift and src/pane.swift, compiled by build.rs and embedded
+//! here) whose window follows the pane; see src/helper.rs for how it's
+//! unpacked.
 //!
 //! Pointing at a page: React Grab (vendor/react-grab) picks elements in the
 //! page, the helper's own composer takes the question, and the helper writes
 //! one JSON line per question to its stdout. This process sends each to the
 //! person's agent and answers on the helper's stdin.
 
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 use serde::{Deserialize, Serialize};
+
+use crate::helper::{Part, macos_version};
 
 const WEBKIT_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-webkit-host"));
 const REACT_GRAB: &[u8] = include_bytes!("../vendor/react-grab/react-grab.js");
@@ -188,89 +189,30 @@ fn answer(line: &str) -> Reply {
     }
 }
 
-/// This Mac's macOS version as (major, minor), when it can be read.
-fn macos_version() -> Option<(u32, u32)> {
-    let output = Command::new("/usr/bin/sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()?;
-    parse_version(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_version(text: &str) -> Option<(u32, u32)> {
-    let mut parts = text.trim().split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().map_or(Some(0), |minor| minor.parse().ok())?;
-    Some((major, minor))
-}
-
-/// FNV-1a, to name the unpacked helper after its contents.
-fn fingerprint(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
 /// The helper on disk, unpacking it the first time this build runs it.
 fn helper() -> Result<PathBuf, String> {
     if WEBKIT_HOST.is_empty() {
         return Err("this leaf was built without the WebKit browser (Apple's Swift toolchain wasn't available). Install the Xcode Command Line Tools with `xcode-select --install`, then reinstall leaf.".into());
     }
-    let home = std::env::var_os("HOME")
-        .ok_or("HOME is unset, so there's nowhere to keep the browser helper")?;
-    let dir = PathBuf::from(home)
-        .join("Library/Caches/leaf")
-        .join(format!(
-            "webkit-{:016x}",
-            fingerprint(WEBKIT_HOST) ^ fingerprint(REACT_GRAB).rotate_left(1)
-        ));
-    // A fixed name: WebKit keys cookies and site data by it, so they last
-    // across Leaf updates.
-    let executable = dir.join("leaf-webkit-host");
-    let script = dir.join("react-grab.js");
-    let unpacked = |path: &PathBuf, bytes: &[u8]| {
-        fs::metadata(path).is_ok_and(|meta| meta.len() == bytes.len() as u64)
-    };
-    if unpacked(&executable, WEBKIT_HOST) && unpacked(&script, REACT_GRAB) {
-        return Ok(executable);
-    }
-    fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
-    // Written beside, then renamed into place, so a second pane opening at
-    // the same moment never runs a half-written file.
-    let place = |target: &PathBuf, bytes: &[u8], mode: u32| -> Result<(), String> {
-        let partial = target.with_extension(format!("{}.part", std::process::id()));
-        fs::write(&partial, bytes)
-            .map_err(|e| format!("couldn't write {}: {e}", partial.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&partial, fs::Permissions::from_mode(mode))
-                .map_err(|e| format!("couldn't set permissions on {}: {e}", partial.display()))?;
-        }
-        #[cfg(not(unix))]
-        let _ = mode;
-        fs::rename(&partial, target)
-            .map_err(|e| format!("couldn't place {}: {e}", target.display()))
-    };
-    place(&script, REACT_GRAB, 0o644)?;
-    place(&executable, WEBKIT_HOST, 0o755)?;
-    // Helpers from earlier Leaf versions are no longer used. Removing them is
-    // best effort: one left behind only takes a little disk space, and a
-    // browser still running from it keeps working.
-    if let Some(cache) = dir.parent()
-        && let Ok(entries) = fs::read_dir(cache)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let stale = path != dir
-                && entry.file_name().to_string_lossy().starts_with("webkit-")
-                && path.is_dir();
-            if stale {
-                let _ = fs::remove_dir_all(path);
-            }
-        }
-    }
-    Ok(executable)
+    // A fixed executable name: WebKit keys cookies and site data by it, so
+    // they last across Leaf updates.
+    let dir = crate::helper::unpack(
+        "webkit",
+        "browser",
+        &[
+            Part {
+                name: "leaf-webkit-host",
+                bytes: WEBKIT_HOST,
+                mode: 0o755,
+            },
+            Part {
+                name: "react-grab.js",
+                bytes: REACT_GRAB,
+                mode: 0o644,
+            },
+        ],
+    )?;
+    Ok(dir.join("leaf-webkit-host"))
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -379,10 +321,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Ask, DATA_END, DATA_START, ELEMENT_LIMIT, ELEMENTS_LIMIT, Reply, Request, answer,
-        fingerprint,
-    };
+    use super::{Ask, DATA_END, DATA_START, ELEMENT_LIMIT, ELEMENTS_LIMIT, Reply, Request, answer};
 
     fn ask(question: &str, elements: &[&str]) -> Ask {
         Ask {
@@ -391,22 +330,6 @@ mod tests {
             title: "Sign in".into(),
             elements: elements.iter().map(|e| (*e).to_owned()).collect(),
         }
-    }
-
-    #[test]
-    fn macos_versions_parse() {
-        use super::parse_version;
-        assert_eq!(parse_version("27.0\n"), Some((27, 0)));
-        assert_eq!(parse_version("12.7.6"), Some((12, 7)));
-        assert_eq!(parse_version("14"), Some((14, 0)));
-        assert_eq!(parse_version(""), None);
-        assert_eq!(parse_version("x.y"), None);
-    }
-
-    #[test]
-    fn fingerprint_tells_builds_apart() {
-        assert_eq!(fingerprint(b""), 0xcbf2_9ce4_8422_2325);
-        assert_ne!(fingerprint(b"a"), fingerprint(b"b"));
     }
 
     /// The part of `prompt` between the data markers.
