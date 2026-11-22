@@ -308,7 +308,7 @@
   section { padding-top: clamp(96px, 14vw, 160px); display: grid; justify-items: center; text-align: center; }
   h2 { margin: 22px 0 0; max-width: 760px; font-size: clamp(30px, 4.4vw, 46px); line-height: 1.1; font-weight: 600; letter-spacing: -.035em; text-wrap: balance; }
   .sub { margin: 18px 0 0; max-width: 580px; color: var(--muted); font-size: 18px; text-wrap: balance; }
-  .sub code { color: var(--ink); }
+  .sub code, .sub a { color: var(--ink); }
   .run { margin-top: 22px; padding: 9px 14px; border-radius: 12px; font: 14px var(--mono); letter-spacing: 0; background: var(--surface); box-shadow: var(--raise); }
   .run::before { content: "$ "; color: var(--faint); }
 
@@ -664,6 +664,7 @@
     <a class="opt" href="#plans">Plans</a>
     <a class="opt" href="#prs">Pull requests</a>
     <a class="opt" href="#board">Whiteboard</a>
+    <a class="opt" href="#browser">Browser</a>
     <a class="opt" href="#rex">Rex</a>
     <a class="opt heart" href="#sponsor"><svg aria-hidden="true"><use href="#i-heart"/></svg>Sponsor</a>
     <a class="gh-stars" id="gh-stars" href="https://github.com/DeepanshuMishraa/leaf" aria-label="leaf on GitHub">
@@ -789,6 +790,17 @@
     <div class="framed">
       <span class="scribble" style="top: 14%; left: 12%; --r: -3deg">just a .excalidraw file</span>
       <img src="shots/board.webp" width="1598" height="1080" loading="lazy" alt="leaf's whiteboard showing a hand-drawn system design for a notification service, with producers, an API gateway, Kafka topics, workers and delivery providers connected by arrows.">
+    </div>
+  </section>
+
+  <section id="browser">
+    <span class="pill">Browser</span>
+    <h2>Point at the page. <span class="hl" style="--hl: var(--hl-blue)">Ask your agent</span>.</h2>
+    <p class="sub">A WebKit browser in the Rex pane beside you. Press the pointer, click any element, and <a href="https://github.com/aidenybai/react-grab">React Grab</a> sends its HTML, the React component and source file behind it, and your question to your agent.</p>
+    <code class="run">leaf browser localhost:3000</code>
+    <div class="stage">
+      <span class="scribble" style="top: 16px; right: 7%; --r: 3deg">your dev server, one pane over</span>
+      <img src="shots/browser.webp" width="1600" height="1020" loading="lazy" alt="Rex split in two: Claude Code on the left and leaf's browser on the right, showing the leaf website.">
     </div>
   </section>
 
