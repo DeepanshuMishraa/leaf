@@ -38,6 +38,7 @@ _leaf() {
     'agents:Pick the installed agent questions go to'
     'version:Print the installed version'
     'upgrade:Install the newest release'
+    'sponsor:Open the sponsor page in the browser'
   )
 
   if (( CURRENT == 2 )); then

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1
+
+- `leaf sponsor` opens leaf's sponsor page in the browser. Sponsor once, any amount, and your name and avatar go on leaf.dipxsy.app.
+
 ## 0.18.0
 
 - On macOS 13 and later, **Leaf: Open Browser** opens a WebKit browser in a Rex pane beside you (`leaf browser [url]` opens it in the current pane instead, until it closes), built into leaf: nothing is installed in Applications. It follows the pane through splits, resizes, zoom and tab switches, steps aside for Rex's palette and Mission Control, and keeps Rex's shortcuts working. It has find, zoom and downloads, is light or dark like Rex, and the pane's label follows the page title. Opened without an address, it starts on a quiet page that lists the web servers running on this Mac.

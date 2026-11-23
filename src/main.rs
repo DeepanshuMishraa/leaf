@@ -102,6 +102,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf ui [dither | classic | toggle]   show or switch the dithered look (classic: as before)
        leaf version             print the installed version
        leaf upgrade [--check]   install the newest release (--check: only say if there is one)
+       leaf sponsor             open leaf's sponsor page in the browser
 
 Diff options:
   --staged           staged changes
@@ -133,6 +134,26 @@ u/U undo/redo, arrows nudge or pan, ctrl+scroll or +/- zoom, f fit, i pictures o
 E export, @ ask the agent (it draws by editing the file), ? keys, q quit
 
 Rex: leaf rex install puts Leaf in the command palette: open (with a picker), review diffs, ask the agent pane about a selection, read aloud and pick a voice. In a remote session, leaf is installed on the host with cargo the first time.";
+
+const SPONSOR_URL: &str = "https://leaf.dipxsy.app/sponsor";
+
+/// `leaf sponsor`: opens the sponsor page, or prints its address if no browser opens.
+fn sponsor_command(rest: &[String]) -> ExitCode {
+    if !rest.is_empty() {
+        eprintln!("Usage: leaf sponsor");
+        return ExitCode::from(2);
+    }
+    match prmedia::open(SPONSOR_URL) {
+        Ok(()) => {
+            println!("Opening {SPONSOR_URL}. Thank you for backing leaf.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("leaf: couldn't open a browser ({e}). Visit {SPONSOR_URL} to sponsor leaf.");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
@@ -514,6 +535,7 @@ fn main() -> ExitCode {
             }
         }
         "voice" => voice_command(rest),
+        "sponsor" => sponsor_command(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS
