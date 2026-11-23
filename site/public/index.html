@@ -442,8 +442,7 @@
   .join { margin: 28px 0 0; font-size: 15px; color: var(--muted); transition: color .2s var(--ease); }
   .join:hover { color: var(--ink); }
 
-  /* Sponsors: empty seats waiting for a name, in the hero and in their own section. */
-  [data-sponsor] { cursor: pointer; }
+  /* Sponsors: faces in the hero and a wall of names; giving happens on /sponsor. */
   nav .opt.heart { display: inline-flex; align-items: center; gap: 6px; }
   nav .opt.heart svg { width: 13px; height: 13px; fill: var(--paper); transition: transform .3s var(--ease); }
   nav .opt.heart:hover svg { transform: scale(1.18); }
@@ -476,8 +475,8 @@
   .faces li:first-child { margin-left: 0; }
   .faces:hover li { margin-left: 2px; }
   .faces:hover li:first-child { margin-left: 0; }
-  .faces a { position: relative; display: block; border-radius: 50%; transition: transform .25s var(--ease); }
-  .faces a:hover, .faces a:focus-visible { transform: translateY(-3px); z-index: 1; }
+  .faces li > * { position: relative; display: block; border-radius: 50%; transition: transform .25s var(--ease); }
+  .faces li > :hover, .faces a:focus-visible { transform: translateY(-3px); z-index: 1; }
   .faces img, .faces .initial { width: 30px; height: 30px; border-radius: 50%; font-size: 13px; box-shadow: 0 0 0 2px var(--surface); }
   .faces img { display: block; background: var(--well); }
   .faces .more { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; font: 500 11px var(--sans); font-variant-numeric: tabular-nums; color: var(--muted); background: var(--well); box-shadow: 0 0 0 2px var(--surface); }
@@ -495,35 +494,72 @@
   [data-name]:hover::after, [data-name]:focus-visible::after { opacity: 1; transform: translate(-50%, 0) scale(1); }
 
   .plus { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+  .initial { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; font-style: normal; font-weight: 600; color: #fff; background: linear-gradient(180deg, color-mix(in oklab, var(--c, var(--paper)) 72%, white), var(--c, var(--paper))); }
 
-  .seats { width: 100%; max-width: 900px; margin: 48px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
-  .seat {
-    width: 100%; height: 100%; min-height: 132px;
-    display: grid; place-items: center; align-content: center; gap: 10px;
-    padding: 18px 12px;
-    border: 0; border-radius: 18px;
-    font: 500 14px var(--sans); letter-spacing: -.01em; color: var(--faint);
-    background: transparent;
-    /* A dashed outline drawn as a background, so the dashes keep their rhythm on any size. */
-    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='18' ry='18' stroke='%23a3a3a9' stroke-opacity='.55' stroke-width='1.5' stroke-dasharray='5 7' stroke-linecap='round'/%3e%3c/svg%3e");
-    transition: color .25s var(--ease), background-color .25s var(--ease), transform .3s var(--ease), box-shadow .3s var(--ease);
+  /* Sponsor orbs: every sponsor's face drifts in the hero's margins, biggest backers biggest,
+     leaning away from the cursor. Laid out by script; hidden when the margins are too narrow. */
+  .hero-top { position: relative; width: 100%; display: grid; justify-items: center; }
+  .hero-top > :not(.orbit) { position: relative; z-index: 1; }
+  .orbit {
+    --mx: 0; --my: 0;
+    position: absolute; top: -48px; bottom: 0; left: 50%; z-index: 0;
+    width: min(100vw - 32px, 1440px); translate: -50% 0;
+    pointer-events: none; visibility: hidden;
   }
-  .seat .ring-plus {
-    width: 38px; height: 38px; display: grid; place-items: center;
-    border-radius: 50%;
-    background: var(--surface); box-shadow: var(--raise);
-    color: var(--muted);
-    transition: transform .35s var(--ease), color .25s var(--ease);
+  .orbiting .orbit { visibility: visible; }
+  .orbiting .faces { display: none; }
+  .orb {
+    position: absolute; left: var(--x); top: var(--y);
+    width: var(--s); height: var(--s); margin: calc(var(--s) / -2) 0 0 calc(var(--s) / -2);
+    translate: calc(var(--mx) * var(--z) * -22px) calc(var(--my) * var(--z) * -14px);
+    transition: translate 1.4s cubic-bezier(.16, 1, .3, 1);
   }
-  .seat .ring-plus svg { width: 15px; height: 15px; }
-  button.seat:hover { color: var(--ink); background-color: rgba(var(--tint), .025); transform: translateY(-2px); }
-  button.seat:hover .ring-plus { color: var(--paper); transform: rotate(90deg); }
-  a.seat { color: var(--ink); background: linear-gradient(180deg, var(--surface), var(--surface-2)); box-shadow: var(--raise); }
-  a.seat:hover { transform: translateY(-3px); box-shadow: var(--raise-hi); }
-  a.seat img { width: 52px; height: 52px; border-radius: 50%; background: var(--well); box-shadow: 0 0 0 1px rgba(var(--tint), .06); }
-  a.seat span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .initial { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; font-style: normal; font-weight: 600; color: #fff; background: linear-gradient(180deg, color-mix(in oklab, var(--paper) 72%, white), var(--paper)); }
-  @media (max-width: 760px) { .seats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .orb:hover { z-index: 2; }
+  .orb .bob { display: block; width: 100%; height: 100%; animation: drift var(--d) ease-in-out var(--w) infinite alternate; }
+  .orb:hover .bob { animation-play-state: paused; }
+  .orb .bob > * {
+    position: relative; display: grid; place-items: center; width: 100%; height: 100%;
+    border-radius: 50%; pointer-events: auto;
+    background: var(--surface); box-shadow: 0 0 0 3px var(--surface), var(--raise-hi);
+    animation: pop .9s cubic-bezier(.34, 1.56, .64, 1) var(--in) both;
+    transition: transform .4s cubic-bezier(.34, 1.56, .64, 1);
+  }
+  .orbit.settled .orb .bob > * { animation: none; }
+  .orb .bob > :hover { transform: scale(1.14); }
+  .orb img { display: block; width: 100%; height: 100%; border-radius: 50%; background: var(--well); }
+  .orb .initial { width: 100%; height: 100%; font-size: calc(var(--s) * .4); }
+  .orb.more .bob > * { font: 500 13px var(--sans); font-variant-numeric: tabular-nums; color: var(--muted); }
+  .orb.ghost .bob > * {
+    color: var(--faint); background: none; box-shadow: none;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3e%3ccircle cx='50' cy='50' r='48' fill='none' stroke='%23a3a3a9' stroke-opacity='.7' stroke-width='2' stroke-dasharray='6 7' stroke-linecap='round'/%3e%3c/svg%3e");
+  }
+  .orb.ghost svg { width: 32%; height: 32%; transition: transform .4s var(--ease); }
+  .orb.ghost .bob > :hover { color: var(--paper); }
+  .orb.ghost .bob > :hover svg { transform: rotate(90deg); }
+  @keyframes drift {
+    0% { transform: translate(0, 0) rotate(0deg); }
+    50% { transform: translate(var(--dx), calc(var(--dy) * -1)) rotate(var(--rot)); }
+    100% { transform: translate(calc(var(--dx) * -.6), var(--dy)) rotate(calc(var(--rot) * -1)); }
+  }
+  @keyframes pop { from { scale: 0; opacity: 0; } to { scale: 1; opacity: 1; } }
+
+  /* The wall: every sponsor by name, with an open spot at the end. */
+  .wall { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; max-width: 820px; margin: 44px 0 0; padding: 0; list-style: none; }
+  .wall li > * {
+    position: relative; display: inline-flex; align-items: center; gap: 10px;
+    padding: 5px 16px 5px 5px; border-radius: 999px;
+    font-size: 15px; font-weight: 500; letter-spacing: -.01em;
+    background: linear-gradient(180deg, var(--surface), var(--surface-2)); box-shadow: var(--raise);
+    transition: transform .25s var(--ease), box-shadow .25s var(--ease), color .2s var(--ease);
+  }
+  .wall a:hover { transform: translateY(-2px); box-shadow: var(--raise-hi); }
+  .wall img, .wall .initial, .wall .ring-plus { width: 32px; height: 32px; border-radius: 50%; font-size: 14px; flex: none; }
+  .wall img { background: var(--well); }
+  .wall .ghost > * { color: var(--faint); background: none; box-shadow: inset 0 0 0 1.5px rgba(var(--tint), .14); }
+  .wall .ghost > :hover { color: var(--ink); }
+  .wall .ring-plus { display: grid; place-items: center; background: rgba(var(--tint), .05); transition: transform .35s var(--ease), color .2s var(--ease); }
+  .wall .ring-plus svg { width: 13px; height: 13px; }
+  .wall .ghost > :hover .ring-plus { color: var(--paper); transform: rotate(90deg); }
 
   .btn {
     display: inline-flex; align-items: center; justify-content: center; gap: 8px;
@@ -538,73 +574,8 @@
   .btn:active { transform: scale(.98); }
   .btn:disabled { opacity: .6; cursor: progress; transform: none; }
   .btn svg { width: 15px; height: 15px; fill: #ff6b81; }
-  #sponsor .btn { margin-top: 36px; }
+  #sponsors .btn { margin-top: 36px; }
   .fine { margin: 14px 0 0; font-size: 13px; color: var(--faint); }
-
-  /* The sponsor dialog. */
-  dialog.sp {
-    width: min(440px, calc(100vw - 32px)); max-height: calc(100dvh - 32px);
-    padding: 0; border: 0; border-radius: 24px;
-    color: var(--ink);
-    background: linear-gradient(180deg, var(--surface), var(--surface-2));
-    box-shadow: var(--raise-hi), 0 40px 80px -20px rgba(0, 0, 0, .35);
-    opacity: 0; transform: translateY(10px) scale(.97);
-    transition: opacity .25s var(--ease), transform .3s var(--ease), overlay .3s allow-discrete, display .3s allow-discrete;
-  }
-  dialog.sp[open] { opacity: 1; transform: none; }
-  @starting-style { dialog.sp[open] { opacity: 0; transform: translateY(10px) scale(.97); } }
-  dialog.sp::backdrop { background: rgba(10, 10, 14, 0); -webkit-backdrop-filter: blur(0); backdrop-filter: blur(0); transition: background-color .3s var(--ease), backdrop-filter .3s var(--ease), overlay .3s allow-discrete, display .3s allow-discrete; }
-  dialog.sp[open]::backdrop { background: rgba(10, 10, 14, .32); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
-  @starting-style { dialog.sp[open]::backdrop { background: rgba(10, 10, 14, 0); -webkit-backdrop-filter: blur(0); backdrop-filter: blur(0); } }
-
-  .sp form { display: grid; gap: 18px; padding: 26px; }
-  .sp header { display: flex; align-items: flex-start; gap: 14px; }
-  .sp header .tile { --c: var(--paper); width: 40px; height: 40px; border-radius: 12px; font-size: 40px; }
-  .sp header .tile svg { fill: currentColor; stroke: none; }
-  .sp h3 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.03em; }
-  .sp header p { margin: 2px 0 0; font-size: 14px; line-height: 1.45; color: var(--muted); }
-  .sp .x {
-    margin-left: auto; flex: none; width: 30px; height: 30px; display: grid; place-items: center;
-    border: 0; border-radius: 50%; color: var(--muted); background: rgba(var(--tint), .05); cursor: pointer;
-    transition: color .2s var(--ease), background-color .2s var(--ease);
-  }
-  .sp .x:hover { color: var(--ink); background: rgba(var(--tint), .09); }
-  .sp .x svg { width: 12px; height: 12px; transform: rotate(45deg); }
-
-  .sp label, .sp fieldset { display: grid; gap: 7px; margin: 0; padding: 0; border: 0; min-width: 0; }
-  .sp .lab, .sp legend { padding: 0; font-size: 13px; font-weight: 500; color: var(--muted); }
-  .sp legend { margin-bottom: 7px; }
-  .sp .lab em { font-style: normal; color: var(--faint); }
-  .field-in {
-    display: flex; align-items: center; gap: 8px;
-    height: 44px; padding: 0 12px;
-    border-radius: 12px;
-    background: var(--surface);
-    box-shadow: inset 0 0 0 1px rgba(var(--tint), .1), inset 0 1px 2px rgba(17, 17, 26, .04);
-    transition: box-shadow .2s var(--ease);
-  }
-  .field-in:focus-within { box-shadow: inset 0 0 0 1.5px var(--ink), 0 0 0 4px rgba(var(--tint), .06); }
-  .field-in input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: none; font: 400 15px var(--sans); letter-spacing: -.01em; color: var(--ink); }
-  .field-in input::placeholder { color: var(--faint); }
-  .field-in .pre { color: var(--faint); font-size: 15px; }
-  .field-in img { width: 24px; height: 24px; flex: none; border-radius: 50%; background: var(--well); opacity: 0; transform: scale(.7); transition: opacity .25s var(--ease), transform .3s var(--ease); }
-  .field-in img.on { opacity: 1; transform: none; }
-
-  .amounts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; padding: 4px; border-radius: 14px; background: rgba(var(--tint), .05); box-shadow: inset 0 1px 2px rgba(17, 17, 26, .06); }
-  .amounts input { position: absolute; opacity: 0; pointer-events: none; }
-  .amounts span {
-    display: grid; place-items: center; height: 38px; border-radius: 10px;
-    font: 500 15px var(--sans); font-variant-numeric: tabular-nums; color: var(--muted); cursor: pointer;
-    transition: color .2s var(--ease), background-color .2s var(--ease), box-shadow .2s var(--ease);
-  }
-  .amounts span:hover { color: var(--ink); }
-  .amounts input:checked + span { color: var(--ink); background: var(--surface); box-shadow: 0 0 0 1px rgba(var(--tint), .06), 0 1px 2px rgba(17, 17, 26, .08), 0 2px 6px -2px rgba(17, 17, 26, .12); }
-  .amounts input:focus-visible + span { outline: 2px solid var(--ink); outline-offset: 1px; }
-  .custom { margin-top: 8px; }
-
-  .sp .err { margin: -6px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13.5px; line-height: 1.45; color: var(--paper); background: color-mix(in oklab, var(--paper) 9%, transparent); }
-  .sp .err[hidden] { display: none; }
-  .sp .btn { width: 100%; padding: 14px 20px; }
   /* A thank-you note after checkout. */
   .toast {
     position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); z-index: 20;
@@ -666,7 +637,7 @@
     <a class="opt" href="#board">Whiteboard</a>
     <a class="opt" href="#browser">Browser</a>
     <a class="opt" href="#rex">Rex</a>
-    <a class="opt heart" href="#sponsor"><svg aria-hidden="true"><use href="#i-heart"/></svg>Sponsor</a>
+    <a class="opt heart" href="/sponsor"><svg aria-hidden="true"><use href="#i-heart"/></svg>Sponsor</a>
     <a class="gh-stars" id="gh-stars" href="https://github.com/DeepanshuMishraa/leaf" aria-label="leaf on GitHub">
       <svg class="gh-logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
       <span class="gh-count"><span class="gh-number">GitHub</span><span class="gh-particles" aria-hidden="true"><svg class="gh-star" viewBox="0 0 24 24" stroke-width="2" stroke-linejoin="round"><path d="M12 2.5l2.9 6.1 6.6.9-4.8 4.6 1.2 6.6L12 17.5l-5.9 3.2 1.2-6.6L2.5 9.5l6.6-.9z"/></svg></span></span>
@@ -674,6 +645,8 @@
   </nav>
 
   <header class="hero">
+    <div class="hero-top" id="hero-top">
+    <div class="orbit" id="orbit" aria-hidden="true"></div>
     <a class="pill ver" href="https://github.com/DeepanshuMishraa/leaf"><svg class="gh-logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>v0.18 · Free and open source</a>
     <h1>
       <span class="line">Read <span class="chip" style="--c: var(--paper); --r: -2deg"><i class="tile"><svg><use href="#i-paper"/></svg></i>papers</span> <span class="chip" style="--c: var(--book); --r: 1.5deg"><i class="tile"><svg><use href="#i-book"/></svg></i>books</span> and <span class="chip" style="--c: var(--docs); --r: -1deg"><i class="tile"><svg><use href="#i-docs"/></svg></i>docs</span></span>
@@ -697,10 +670,11 @@
     <a class="rexlink" href="#rex"><img src="rex.png" width="20" height="20" alt="">Ships as a native Rex plugin →</a>
     <div class="backers">
       <ul class="faces" id="faces" aria-label="Sponsors" hidden></ul>
-      <button class="backers-cta" type="button" data-sponsor>
+      <a class="backers-cta" href="/sponsor">
         <span class="stack" id="backer-stack" aria-hidden="true"><i class="seat-dot"><svg><use href="#i-plus"/></svg></i><i class="seat-dot"><svg><use href="#i-plus"/></svg></i><i class="seat-dot"><svg><use href="#i-plus"/></svg></i></span>
         <span id="backer-text">These seats are open. <b>Be leaf's first sponsor</b></span>
-      </button>
+      </a>
+    </div>
     </div>
 
     <div class="tilt" id="tilt">
@@ -853,56 +827,16 @@
     </div>
   </section>
 
-  <section id="sponsor">
-    <span class="pill">Sponsor</span>
-    <h2>Help leaf <span class="hl" style="--hl: var(--hl-pink)">keep shipping</span>.</h2>
-    <p class="sub">leaf is open source and always will be. Sponsoring backs the hours behind every release, and your name goes up here.</p>
-    <ul class="seats" id="seats">
-      <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
-      <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
-      <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
-      <li><button class="seat" type="button" data-sponsor><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</button></li>
+  <section id="sponsors">
+    <span class="pill">Sponsors</span>
+    <h2>Backed by <span class="hl" style="--hl: var(--hl-pink)">people like you</span>.</h2>
+    <p class="sub">leaf is open source and always will be. Sponsors back the hours behind every release, and their faces float at the top of this page.</p>
+    <ul class="wall" id="wall">
+      <li class="ghost"><a href="/sponsor"><i class="ring-plus"><svg><use href="#i-plus"/></svg></i>Your name here</a></li>
     </ul>
-    <button class="btn" type="button" data-sponsor><svg aria-hidden="true"><use href="#i-heart"/></svg>Sponsor leaf</button>
+    <a class="btn" href="/sponsor"><svg aria-hidden="true"><use href="#i-heart"/></svg>Sponsor leaf</a>
     <p class="fine">One-time, any amount.</p>
   </section>
-
-  <dialog class="sp" id="sp" aria-labelledby="sp-title">
-    <form id="sp-form" novalidate>
-      <header>
-        <i class="tile" aria-hidden="true"><svg><use href="#i-heart"/></svg></i>
-        <div>
-          <h3 id="sp-title">Sponsor leaf</h3>
-          <p>Your name and GitHub avatar go on the site once the payment clears.</p>
-        </div>
-        <button class="x" type="button" id="sp-close" aria-label="Close"><svg aria-hidden="true"><use href="#i-plus"/></svg></button>
-      </header>
-      <label>
-        <span class="lab">Name</span>
-        <span class="field-in"><input name="name" autocomplete="name" maxlength="80" placeholder="Ada Lovelace" required autofocus></span>
-      </label>
-      <label>
-        <span class="lab">Email <em>· for your receipt</em></span>
-        <span class="field-in"><input name="email" type="email" autocomplete="email" maxlength="254" placeholder="ada@example.com" required></span>
-      </label>
-      <label>
-        <span class="lab">GitHub <em>· optional</em></span>
-        <span class="field-in"><span class="pre">@</span><input name="github" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="39" placeholder="username"><img id="sp-avatar" alt="" width="24" height="24"></span>
-      </label>
-      <fieldset>
-        <legend>Amount</legend>
-        <div class="amounts">
-          <label><input type="radio" name="preset" value="5"><span>$5</span></label>
-          <label><input type="radio" name="preset" value="10"><span>$10</span></label>
-          <label><input type="radio" name="preset" value="25" checked><span>$25</span></label>
-          <label><input type="radio" name="preset" value="50"><span>$50</span></label>
-          <label><input type="radio" name="preset" value="100"><span>$100</span></label>
-        </div>
-        <span class="field-in custom"><span class="pre">$</span><input name="custom" inputmode="decimal" placeholder="Other amount" aria-label="Other amount in US dollars"></span>
-      </fieldset>
-      <p class="err" id="sp-err" role="alert" hidden></p>
-      <button class="btn" type="submit" id="sp-go"><svg aria-hidden="true"><use href="#i-heart"/></svg><span>Sponsor $25</span></button>    </form>
-  </dialog>
 
   <section id="contributors" hidden>
     <h2><span class="hl" style="--hl: var(--hl-pink)">Thank you</span> to everyone who helps build leaf.</h2>
@@ -1111,161 +1045,164 @@
     }, 1600);
   }
 
-  // Sponsors: seats and hero faces fill from /api/sponsors ([{ name, github? }]),
-  // and every [data-sponsor] opens the dialog that starts a Dodo checkout.
+  // Sponsors: the hero orbs, the hero pill and the wall all fill from
+  // /api/sponsors ([{ name, github? }], biggest total first). Giving happens on /sponsor.
   {
-    const dialog = $("sp"), form = $("sp-form"), err = $("sp-err"), go = $("sp-go"), avatar = $("sp-avatar");
     const LOGIN = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/i;
     const PENDING = "leaf-sponsor-pending";
     const avatarOf = (login, size) => `https://avatars.githubusercontent.com/${encodeURIComponent(login)}?s=${size}`;
+    const HUES = ["--paper", "--book", "--docs", "--diff", "--pr", "--web"];
+    const el = (tag, props = {}) => Object.assign(document.createElement(tag), props);
+    const plus = () => { const i = el("i", { className: "ring-plus" }); i.innerHTML = '<svg><use href="#i-plus"/></svg>'; return i; };
 
-    const open = () => { err.hidden = true; dialog.showModal(); };
-    document.addEventListener("click", (e) => {
-      if (e.target.closest("[data-sponsor]")) open();
-    });
-    $("sp-close").addEventListener("click", () => dialog.close());
-    // A click on the backdrop lands on the dialog itself, outside the form.
-    dialog.addEventListener("click", (e) => { if (e.target === dialog) dialog.close(); });
+    // A face: their GitHub avatar, or their initial on a color picked from their name.
+    const face = (s, px) => {
+      if (s.github) return el("img", { src: avatarOf(s.github, px * 2), alt: "", width: px, height: px, loading: "lazy" });
+      const hue = HUES[[...s.name].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7) % HUES.length];
+      const i = el("i", { className: "initial", textContent: [...s.name][0].toUpperCase() });
+      i.style.setProperty("--c", `var(${hue})`);
+      return i;
+    };
+    // A sponsor links to their GitHub; one without a login is just a name.
+    const holder = (s) =>
+      s.github
+        ? el("a", { href: `https://github.com/${s.github}`, ariaLabel: `${s.name} (@${s.github}) on GitHub` })
+        : el("span", { ariaLabel: s.name });
 
-    // The amount in cents: a preset, or a custom one (up to two decimals) that clears the presets.
-    const amount = () => {
-      const custom = form.custom.value.trim();
-      const dollars = custom !== "" ? custom : form.querySelector("[name=preset]:checked")?.value;
-      if (!dollars || !/^\d+(\.\d{1,2})?$/.test(dollars)) return NaN;
-      const [whole, frac = ""] = dollars.split(".");
-      return Number(whole) * 100 + Number(frac.padEnd(2, "0"));
+    // The orbs: placed by best-candidate sampling in the margins either side of
+    // the headline, seeded so the layout is the same on every visit.
+    const orbit = $("orbit"), heroTop = $("hero-top");
+    const KEEP_OUT = 900;
+    const seeded = (seed) => () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
-    const usd = (cents) => (cents / 100).toLocaleString("en", { minimumFractionDigits: cents % 100 ? 2 : 0, maximumFractionDigits: 2 });
-    const label = go.querySelector("span");
-    const relabel = () => {
-      const cents = amount();
-      label.textContent = Number.isSafeInteger(cents) && cents >= 0 ? `Sponsor $${usd(cents)}` : "Sponsor leaf";
+    let sponsorsNow = [];
+    const layout = () => {
+      const W = orbit.clientWidth, H = orbit.clientHeight, band = (W - KEEP_OUT) / 2;
+      const on = band >= 90 && H > 200;
+      heroTop.classList.toggle("orbiting", on);
+      if (!on) return orbit.replaceChildren();
+      const rand = seeded(42), placed = [], orbs = [];
+      const place = (size, n) => {
+        const left = n % 2 === 0;
+        let best = null;
+        for (let k = 0; k < 24; k++) {
+          const xIn = size / 2 + 10 + rand() * Math.max(0, band - size - 20);
+          const x = left ? xIn : W - xIn, y = size / 2 + 10 + rand() * (H - size - 20);
+          const gap = Math.min(Infinity, ...placed.map((p) => Math.hypot(p.x - x, p.y - y) - (p.size + size) / 2));
+          if (gap >= 20 && (!best || gap > best.gap)) best = { x, y, size, gap };
+        }
+        if (best) placed.push(best);
+        return best;
+      };
+      const orb = (spot, inner, kind) => {
+        const o = el("div", { className: `orb${kind ? ` ${kind}` : ""}` });
+        const r = rand();
+        for (const [k, v] of Object.entries({
+          x: `${spot.x}px`, y: `${spot.y}px`, s: `${spot.size}px`, z: (spot.size / 76).toFixed(2),
+          d: `${(6 + r * 6).toFixed(2)}s`, w: `${(-r * 12).toFixed(2)}s`, in: `${(.25 + orbs.length * .05).toFixed(2)}s`,
+          dx: `${((rand() * 2 - 1) * 12).toFixed(1)}px`, dy: `${(6 + rand() * 9).toFixed(1)}px`, rot: `${((rand() * 2 - 1) * 4).toFixed(1)}deg`,
+        })) o.style.setProperty(`--${k}`, v);
+        inner.tabIndex = -1;
+        const bob = el("span", { className: "bob" });
+        bob.append(inner);
+        o.append(bob);
+        orbs.push(o);
+      };
+      // Top sponsors float biggest; the size steps down with rank.
+      const cap = Math.min(band * .7, 80);
+      let shown = 0;
+      for (const s of sponsorsNow) {
+        const spot = place(Math.max(38, cap - shown * 4), orbs.length);
+        if (!spot) break;
+        const inner = holder(s);
+        inner.dataset.name = s.name;
+        inner.append(face(s, Math.round(spot.size)));
+        orb(spot, inner);
+        shown++;
+      }
+      const rest = sponsorsNow.length - shown;
+      if (rest > 0) {
+        const spot = place(46, orbs.length);
+        if (spot) orb(spot, el("a", { href: "#sponsors", textContent: `+${rest}`, ariaLabel: `${rest} more sponsors` }), "more");
+      }
+      // Open spots invite the next sponsor: a few when there are few faces, one otherwise.
+      for (let g = 0, want = Math.max(1, 6 - sponsorsNow.length); g < want; g++) {
+        const spot = place(48, orbs.length);
+        if (!spot) break;
+        const a = el("a", { href: "/sponsor", ariaLabel: "Sponsor leaf" });
+        a.dataset.name = sponsorsNow.length ? "Your face here" : "Be the first";
+        a.innerHTML = '<svg aria-hidden="true"><use href="#i-plus"/></svg>';
+        orb(spot, a, "ghost");
+      }
+      orbit.replaceChildren(...orbs);
     };
-    form.custom.addEventListener("input", () => {
-      form.custom.value = form.custom.value
-        .replace(/[^\d.]/g, "")
-        .replace(/(\..*)\./g, "$1")
-        .replace(/^(\d*\.\d{0,2}).*$/, "$1");
-      if (form.custom.value) for (const r of form.querySelectorAll("[name=preset]")) r.checked = false;
-      relabel();
-    });
-    for (const r of form.querySelectorAll("[name=preset]")) {
-      r.addEventListener("change", () => { form.custom.value = ""; relabel(); });
+    // Nothing is laid out until the list arrives, so the orbs pop in once, together.
+    let ready = false, laidOut = false, queued = false;
+    const relayout = () => {
+      if (!ready || queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; if (laidOut) orbit.classList.add("settled"); layout(); laidOut = true; });
+    };
+    new ResizeObserver(relayout).observe(heroTop);
+    // The orbs lean away from the cursor, the big ones most.
+    if (!still && matchMedia("(pointer: fine)").matches) {
+      let frame = 0;
+      addEventListener("pointermove", (e) => {
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(() => {
+          orbit.style.setProperty("--mx", (e.clientX / innerWidth * 2 - 1).toFixed(3));
+          orbit.style.setProperty("--my", (e.clientY / innerHeight * 2 - 1).toFixed(3));
+        });
+      }, { passive: true });
     }
 
-    // The GitHub avatar shows up beside the field once the name is real.
-    let lookup;
-    form.github.addEventListener("input", () => {
-      clearTimeout(lookup);
-      avatar.classList.remove("on");
-      const login = form.github.value.trim().replace(/^@/, "");
-      if (!LOGIN.test(login)) return;
-      lookup = setTimeout(() => {
-        avatar.onload = () => avatar.classList.add("on");
-        avatar.onerror = () => avatar.classList.remove("on");
-        avatar.src = avatarOf(login, 48);
-      }, 350);
-    });
-
-    const showError = (message) => { err.textContent = message; err.hidden = false; };
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const nameInput = form.elements.namedItem("name");
-      const name = nameInput.value.trim();
-      const email = form.email.value.trim();
-      const github = form.github.value.trim().replace(/^@/, "");
-      const cents = amount();
-      if (!name) { showError("Add the name you'd like shown."); nameInput.focus(); return; }
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showError("Enter a valid email so the receipt reaches you."); form.email.focus(); return; }
-      if (github && !LOGIN.test(github)) { showError("That GitHub username doesn't look right. Fix it or leave it empty."); form.github.focus(); return; }
-      if (!Number.isSafeInteger(cents) || cents < 100) { showError("Enter an amount of $1 or more."); form.custom.focus(); return; }
-
-      err.hidden = true;
-      go.disabled = true;
-      label.textContent = "Opening checkout…";
-      try {
-        const res = await fetch("/api/sponsor", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ name, email, github, cents }),
-        });
-        const data = await res.json().catch(() => null);
-        if (res.ok && typeof data?.url === "string") {
-          // Remembered so the page can show them the moment they return.
-          try { sessionStorage.setItem(PENDING, JSON.stringify(github ? { name, github } : { name })); } catch {}
-          location.href = data.url;
-          return;
-        }
-        showError(data?.error?.message ?? `Checkout couldn't be started (${res.status}). Nothing was charged. Try again.`);
-      } catch {
-        showError("Couldn't reach leaf.dipxsy.app. Check your connection and try again. Nothing was charged.");
-      }
-      go.disabled = false;
-      relabel();
-    });
-
-    // Fill the seats and the hero row from the sponsor list. Safe to call again.
-    const spare = $("seats").firstElementChild.cloneNode(true);
+    // Fill the orbs, the hero pill and the wall from the sponsor list. Safe to call again.
     const render = (sponsors) => {
+      sponsorsNow = sponsors;
+      ready = true;
+      relayout();
       if (!sponsors.length) return;
-      const seats = $("seats"), stack = $("backer-stack");
-      const filled = sponsors.map((s) => {
-        const a = document.createElement("a");
-        a.className = "seat";
-        a.href = s.github ? `https://github.com/${s.github}` : "#sponsor";
-        if (s.github) {
-          const img = document.createElement("img");
-          img.src = avatarOf(s.github, 104); img.width = img.height = 52; img.alt = ""; img.loading = "lazy";
-          a.append(img);
-        } else {
-          const i = document.createElement("i");
-          i.className = "initial"; i.textContent = s.name.slice(0, 1).toUpperCase();
-          a.append(i);
-        }
-        const span = document.createElement("span");
-        span.textContent = s.name;
-        a.append(span);
-        const li = document.createElement("li");
-        li.append(a);
+
+      const wall = sponsors.map((s) => {
+        const inner = holder(s);
+        inner.append(face(s, 32), s.name);
+        const li = el("li");
+        li.append(inner);
         return li;
       });
-      // Keep one open seat at the end, and the grid in whole rows of four.
-      const free = 1 + ((4 - ((filled.length + 1) % 4)) % 4);
-      seats.replaceChildren(...filled, ...Array.from({ length: free }, () => spare.cloneNode(true)));
+      const open = el("li", { className: "ghost" });
+      const join = el("a", { href: "/sponsor" });
+      join.append(plus(), "You?");
+      open.append(join);
+      $("wall").replaceChildren(...wall, open);
 
-      // The hero: the first few faces, each linking to its GitHub with the name on hover.
-      const SHOWN = 8;
+      // The pill keeps a short row of faces for screens too narrow for the orbs.
+      const SHOWN = 6;
       const faces = sponsors.slice(0, SHOWN).map((s) => {
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        a.href = s.github ? `https://github.com/${s.github}` : "#sponsor";
-        a.dataset.name = s.name;
-        a.setAttribute("aria-label", s.github ? `${s.name} (@${s.github}) on GitHub` : s.name);
-        if (s.github) {
-          const img = document.createElement("img");
-          img.src = avatarOf(s.github, 60); img.alt = ""; img.width = img.height = 30;
-          a.append(img);
-        } else {
-          const i = document.createElement("i");
-          i.className = "initial"; i.textContent = s.name.slice(0, 1).toUpperCase();
-          a.append(i);
-        }
-        li.append(a);
+        const inner = holder(s);
+        inner.dataset.name = s.name;
+        inner.append(face(s, 30));
+        const li = el("li");
+        li.append(inner);
         return li;
       });
       if (sponsors.length > SHOWN) {
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        a.href = "#sponsor"; a.className = "more"; a.dataset.name = "See everyone";
-        a.textContent = `+${sponsors.length - SHOWN}`;
+        const li = el("li");
+        const a = el("a", { href: "#sponsors", className: "more", textContent: `+${sponsors.length - SHOWN}` });
+        a.dataset.name = "See everyone";
         li.append(a);
         faces.push(li);
       }
-      const row = $("faces");
+      const row = $("faces"), stack = $("backer-stack");
       row.replaceChildren(...faces);
       row.hidden = false;
       stack.replaceChildren(stack.lastElementChild);
-      $("backer-text").innerHTML = "<b>Join them</b>";
+      const n = sponsors.length;
+      $("backer-text").innerHTML = `Backed by ${n} ${n === 1 ? "person" : "people"}. <b>Join them</b>`;
     };
     const load = (init) =>
       fetch("/api/sponsors", init)
@@ -1283,7 +1220,7 @@
     if (pending && (typeof pending.name !== "string" || (pending.github && !LOGIN.test(pending.github)))) pending = null;
 
     if (!pending) {
-      load().then(render).catch((e) => console.warn("Sponsor list unavailable; the open seats still show.", e));
+      load().then(render).catch((e) => { console.warn("Sponsor list unavailable; the open spots still show.", e); render([]); });
     } else {
       // The webhook usually lands after they do, so show them straight away, then
       // keep checking until the server has them too.

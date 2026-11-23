@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sponsor leaf</title>
+<meta name="description" content="Sponsor leaf, the open source terminal reader. One-time, any amount.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111113" media="(prefers-color-scheme: dark)">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap">
+<style>
+  /* The same tokens as the homepage (index.html). */
+  :root {
+    --bg: #f7f7f5;
+    --ink: #17171a;
+    --muted: #6b6b72;
+    --faint: #a3a3a9;
+    --paper: #d93d42;
+    --sans: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --ease: cubic-bezier(.2, .7, .2, 1);
+    --raise:
+      inset 0 1px 0 rgba(255, 255, 255, .9),
+      0 0 0 1px rgba(17, 17, 26, .06),
+      0 1px 1px rgba(17, 17, 26, .04),
+      0 3px 6px -2px rgba(17, 17, 26, .06),
+      0 12px 24px -8px rgba(17, 17, 26, .10);
+    --tint: 17, 17, 26;
+    --surface: #ffffff;
+    --surface-2: #fbfbfa;
+    --well: #f3f3f1;
+    --glass: rgba(255, 255, 255, .78);
+    --btn-top: #3a3a40;
+    --btn-end: #17171a;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111113;
+      --ink: #ededf0;
+      --muted: #9d9da6;
+      --faint: #6a6a73;
+      --paper: #f0595e;
+      --raise:
+        inset 0 1px 0 rgba(255, 255, 255, .06),
+        0 0 0 1px rgba(255, 255, 255, .07),
+        0 1px 1px rgba(0, 0, 0, .3),
+        0 3px 6px -2px rgba(0, 0, 0, .35),
+        0 12px 24px -8px rgba(0, 0, 0, .45);
+      --tint: 255, 255, 255;
+      --surface: #1d1d21;
+      --surface-2: #19191c;
+      --well: #151518;
+      --glass: rgba(29, 29, 33, .72);
+      --btn-top: #3c3c44;
+      --btn-end: #26262c;
+      color-scheme: dark;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    display: flex; flex-direction: column;
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 16px/1.55 var(--sans);
+    letter-spacing: -.012em;
+    -webkit-font-smoothing: antialiased;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  ::selection { background: #ffe58f; color: #17171a; }
+  a { color: inherit; text-decoration: none; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+
+  nav {
+    width: fit-content; max-width: 100%;
+    margin: 14px auto 0;
+    display: flex; align-items: center; gap: 2px;
+    padding: 6px;
+    border-radius: 999px;
+    background: var(--glass);
+    -webkit-backdrop-filter: saturate(1.6) blur(16px); backdrop-filter: saturate(1.6) blur(16px);
+    box-shadow: var(--raise);
+    font-size: 14px;
+  }
+  nav .name { padding: 0 14px 0 12px; font-weight: 700; font-size: 16px; letter-spacing: -.04em; }
+  nav .opt { padding: 7px 12px; border-radius: 999px; color: var(--muted); transition: color .2s var(--ease), background-color .2s var(--ease); }
+  nav .opt:hover { color: var(--ink); background: rgba(var(--tint), .045); }
+
+  main { width: 100%; max-width: 420px; margin: 0 auto; padding: clamp(56px, 10vh, 104px) 0 0; flex: 1; }
+  h1 { margin: 0; font-size: 32px; line-height: 1.15; font-weight: 600; letter-spacing: -.04em; }
+  .sub { margin: 10px 0 0; color: var(--muted); font-size: 15.5px; line-height: 1.55; }
+
+  form { display: grid; gap: 20px; margin-top: 32px; }
+  label, fieldset { display: grid; gap: 7px; margin: 0; padding: 0; border: 0; min-width: 0; }
+  .lab, legend { padding: 0; font-size: 13px; font-weight: 500; color: var(--muted); }
+  legend { margin-bottom: 7px; }
+  .lab em { font-style: normal; color: var(--faint); }
+
+  .field-in {
+    display: flex; align-items: center; gap: 8px;
+    height: 44px; padding: 0 12px;
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: inset 0 0 0 1px rgba(var(--tint), .1), inset 0 1px 2px rgba(17, 17, 26, .04);
+    transition: box-shadow .2s var(--ease);
+  }
+  .field-in:focus-within { box-shadow: inset 0 0 0 1.5px var(--ink), 0 0 0 4px rgba(var(--tint), .06); }
+  .field-in input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: none; font: 400 15px var(--sans); letter-spacing: -.01em; color: var(--ink); }
+  .field-in input::placeholder { color: var(--faint); }
+  .field-in .pre { color: var(--faint); font-size: 15px; }
+  .field-in img { width: 24px; height: 24px; flex: none; border-radius: 50%; background: var(--well); opacity: 0; transform: scale(.7); transition: opacity .25s var(--ease), transform .3s var(--ease); }
+  .field-in img.on { opacity: 1; transform: none; }
+
+  /* The amount switcher: one raised thumb glides to the picked amount, and fades out for a custom one. */
+  .amounts { position: relative; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; padding: 4px; border-radius: 14px; background: rgba(var(--tint), .05); box-shadow: inset 0 1px 2px rgba(17, 17, 26, .06); }
+  .amounts label { position: relative; z-index: 1; }
+  .amounts input { position: absolute; opacity: 0; pointer-events: none; }
+  .amounts span {
+    display: grid; place-items: center; height: 38px; border-radius: 10px;
+    font: 500 15px var(--sans); font-variant-numeric: tabular-nums; color: var(--muted); cursor: pointer;
+    user-select: none; -webkit-tap-highlight-color: transparent;
+    transition: color .2s var(--ease), scale .15s var(--ease);
+  }
+  .amounts span:hover { color: var(--ink); }
+  .amounts span:active { scale: .94; }
+  .amounts input:checked + span { color: var(--ink); }
+  .amounts input:focus-visible + span { outline: 2px solid var(--ink); outline-offset: 1px; }
+  .thumb {
+    --i: 2;
+    position: absolute; top: 4px; left: 4px;
+    width: calc((100% - 24px) / 5); height: 38px; border-radius: 10px;
+    background: var(--surface);
+    box-shadow: 0 0 0 1px rgba(var(--tint), .06), 0 1px 2px rgba(17, 17, 26, .08), 0 2px 6px -2px rgba(17, 17, 26, .12);
+    translate: calc(var(--i) * (100% + 4px)) 0;
+    transition: translate .42s cubic-bezier(.3, 1.25, .5, 1), opacity .2s var(--ease), scale .2s var(--ease);
+  }
+  .amounts:has([value="5"]:checked) .thumb { --i: 0; }
+  .amounts:has([value="10"]:checked) .thumb { --i: 1; }
+  .amounts:has([value="25"]:checked) .thumb { --i: 2; }
+  .amounts:has([value="50"]:checked) .thumb { --i: 3; }
+  .amounts:has([value="100"]:checked) .thumb { --i: 4; }
+  .amounts:not(:has(:checked)) .thumb { opacity: 0; scale: .9; }
+  .btn .label { display: inline-block; }
+  .custom { margin-top: 6px; }
+
+  .err { margin: 0; padding: 10px 12px; border-radius: 10px; font-size: 13.5px; line-height: 1.45; color: var(--paper); background: color-mix(in oklab, var(--paper) 9%, transparent); }
+  .err[hidden] { display: none; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 100%; height: 46px; margin-top: 4px; border: 0; border-radius: 999px;
+    font: 500 15px var(--sans); letter-spacing: -.01em; font-variant-numeric: tabular-nums; color: #fff;
+    background: linear-gradient(180deg, var(--btn-top), var(--btn-end));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), 0 1px 2px rgba(0, 0, 0, .2), 0 6px 14px -4px rgba(0, 0, 0, .35);
+    cursor: pointer;
+    transition: transform .2s var(--ease), opacity .2s var(--ease);
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn:active { transform: scale(.98); }
+  .btn:disabled { opacity: .6; cursor: progress; transform: none; }
+
+  footer { padding: 64px 0 40px; text-align: center; font-size: 13px; color: var(--faint); }
+  footer a { color: var(--muted); transition: color .2s var(--ease); }
+  footer a:hover { color: var(--ink); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<nav>
+  <a class="name" href="/">leaf</a>
+  <a class="opt" href="/#sponsors">Sponsors</a>
+  <a class="opt" href="https://github.com/DeepanshuMishraa/leaf">GitHub</a>
+</nav>
+
+<main>
+  <h1>Sponsor leaf</h1>
+  <p class="sub">leaf is free and open source. A one-time sponsorship of any amount funds the work behind each release, and your name and avatar go on the homepage.</p>
+
+  <form id="sp-form" novalidate>
+    <fieldset>
+      <legend>Amount</legend>
+      <div class="amounts">
+        <i class="thumb" aria-hidden="true"></i>
+        <label><input type="radio" name="preset" value="5"><span>$5</span></label>
+        <label><input type="radio" name="preset" value="10"><span>$10</span></label>
+        <label><input type="radio" name="preset" value="25" checked><span>$25</span></label>
+        <label><input type="radio" name="preset" value="50"><span>$50</span></label>
+        <label><input type="radio" name="preset" value="100"><span>$100</span></label>
+      </div>
+      <span class="field-in custom"><span class="pre">$</span><input name="custom" inputmode="decimal" placeholder="Other amount" aria-label="Other amount in US dollars"></span>
+    </fieldset>
+    <label>
+      <span class="lab">Name</span>
+      <span class="field-in"><input name="name" autocomplete="name" maxlength="80" placeholder="Ada Lovelace" required></span>
+    </label>
+    <label>
+      <span class="lab">Email <em>· for your receipt</em></span>
+      <span class="field-in"><input name="email" type="email" autocomplete="email" maxlength="254" placeholder="ada@example.com" required></span>
+    </label>
+    <label>
+      <span class="lab">GitHub <em>· optional, for your avatar</em></span>
+      <span class="field-in"><span class="pre">@</span><input name="github" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="39" placeholder="username"><img id="sp-avatar" alt="" width="24" height="24"></span>
+    </label>
+    <p class="err" id="sp-err" role="alert" hidden></p>
+    <button class="btn" type="submit" id="sp-go"><span class="label">Sponsor $25</span></button>
+  </form>
+</main>
+
+<footer><a href="/">leaf</a> · MIT licensed</footer>
+
+<script>
+  // Starts a Dodo checkout through POST /api/sponsor. Checkout returns to the
+  // homepage (/?sponsor=done), which thanks them and shows their face.
+  {
+    const $ = (id) => document.getElementById(id);
+    const form = $("sp-form"), err = $("sp-err"), go = $("sp-go"), avatar = $("sp-avatar");
+    const LOGIN = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/i;
+    const PENDING = "leaf-sponsor-pending";
+    const nameInput = form.elements.namedItem("name");
+
+    // The amount in cents: a preset, or a custom one (up to two decimals) that clears the presets.
+    const amount = () => {
+      const custom = form.custom.value.trim();
+      const dollars = custom !== "" ? custom : form.querySelector("[name=preset]:checked")?.value;
+      if (!dollars || !/^\d+(\.\d{1,2})?$/.test(dollars)) return NaN;
+      const [whole, frac = ""] = dollars.split(".");
+      return Number(whole) * 100 + Number(frac.padEnd(2, "0"));
+    };
+    const usd = (cents) => (cents / 100).toLocaleString("en", { minimumFractionDigits: cents % 100 ? 2 : 0, maximumFractionDigits: 2 });
+    // The button's amount rises into place when it changes.
+    const label = go.querySelector(".label");
+    const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const setLabel = (text) => {
+      if (label.textContent === text) return;
+      label.textContent = text;
+      if (!still) label.animate(
+        [{ transform: "translateY(6px)", opacity: 0, filter: "blur(2px)" }, { transform: "none", opacity: 1, filter: "blur(0)" }],
+        { duration: 240, easing: "cubic-bezier(.2, .7, .2, 1)" },
+      );
+    };
+    const relabel = () => {
+      const cents = amount();
+      setLabel(Number.isSafeInteger(cents) && cents >= 0 ? `Sponsor $${usd(cents)}` : "Sponsor leaf");
+    };
+    form.custom.addEventListener("input", () => {
+      form.custom.value = form.custom.value
+        .replace(/[^\d.]/g, "")
+        .replace(/(\..*)\./g, "$1")
+        .replace(/^(\d*\.\d{0,2}).*$/, "$1");
+      if (form.custom.value) for (const r of form.querySelectorAll("[name=preset]")) r.checked = false;
+      relabel();
+    });
+    for (const r of form.querySelectorAll("[name=preset]")) {
+      r.addEventListener("change", () => { form.custom.value = ""; relabel(); });
+    }
+
+    // The GitHub avatar shows up beside the field once the login is real.
+    let lookup;
+    form.github.addEventListener("input", () => {
+      clearTimeout(lookup);
+      avatar.classList.remove("on");
+      const login = form.github.value.trim().replace(/^@/, "");
+      if (!LOGIN.test(login)) return;
+      lookup = setTimeout(() => {
+        avatar.onload = () => avatar.classList.add("on");
+        avatar.onerror = () => avatar.classList.remove("on");
+        avatar.src = `https://avatars.githubusercontent.com/${encodeURIComponent(login)}?s=48`;
+      }, 350);
+    });
+
+    const showError = (message) => { err.textContent = message; err.hidden = false; };
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const name = nameInput.value.trim();
+      const email = form.email.value.trim();
+      const github = form.github.value.trim().replace(/^@/, "");
+      const cents = amount();
+      if (!Number.isSafeInteger(cents) || cents < 100) { showError("Enter an amount of $1 or more."); form.custom.focus(); return; }
+      if (!name) { showError("Add the name you'd like shown."); nameInput.focus(); return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showError("Enter a valid email so the receipt reaches you."); form.email.focus(); return; }
+      if (github && !LOGIN.test(github)) { showError("That GitHub username doesn't look right. Fix it or leave it empty."); form.github.focus(); return; }
+
+      err.hidden = true;
+      go.disabled = true;
+      setLabel("Opening checkout…");
+      try {
+        const res = await fetch("/api/sponsor", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name, email, github, cents }),
+        });
+        const data = await res.json().catch(() => null);
+        if (res.ok && typeof data?.url === "string") {
+          // Remembered so the homepage can show them the moment they return.
+          try { sessionStorage.setItem(PENDING, JSON.stringify(github ? { name, github } : { name })); } catch {}
+          location.href = data.url;
+          return;
+        }
+        showError(data?.error?.message ?? `Checkout couldn't be started (${res.status}). Nothing was charged. Try again.`);
+      } catch {
+        showError("Couldn't reach leaf.dipxsy.app. Check your connection and try again. Nothing was charged.");
+      }
+      go.disabled = false;
+      relabel();
+    });
+  }
+</script>
+</body>
+</html>
