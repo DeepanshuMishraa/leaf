@@ -89,32 +89,44 @@ enum CoreSim {
         }
     }
 
+    /// The object-valued property `key` of `object`, read by sending the
+    /// message. Newer CoreSimulator hands out remote proxies (ROCKRemoteProxy)
+    /// for device ports: they forward messages, but KVC's `value(forKey:)`
+    /// looks the key up on the proxy's own class and throws.
+    static func object(_ object: NSObject, _ key: String) -> AnyObject? {
+        let selector = NSSelectorFromString(key)
+        guard object.responds(to: selector) else { return nil }
+        return object.perform(selector)?.takeUnretainedValue()
+    }
+
+    private typealias UInt16Fn = @convention(c) (AnyObject, Selector) -> UInt16
+
     /// The main display's port descriptor: the one that renders to an
     /// IOSurface, preferring display class 0 (the built-in screen).
     static func mainDisplay(of device: NSObject) -> NSObject? {
-        guard device.responds(to: NSSelectorFromString("io")),
-              let io = device.value(forKey: "io") as? NSObject,
-              io.responds(to: NSSelectorFromString("ioPorts")),
-              let ports = io.value(forKey: "ioPorts") as? [NSObject] else { return nil }
+        guard let io = object(device, "io") as? NSObject,
+              let ports = object(io, "ioPorts") as? [NSObject] else { return nil }
         var found: [NSObject] = []
-        for port in ports where port.responds(to: NSSelectorFromString("descriptor")) {
-            guard let descriptor = port.value(forKey: "descriptor") as? NSObject,
+        for port in ports {
+            guard let descriptor = object(port, "descriptor") as? NSObject,
                   descriptor.responds(to: NSSelectorFromString("framebufferSurface"))
                     || descriptor.responds(to: NSSelectorFromString("ioSurface")) else { continue }
             found.append(descriptor)
         }
+        let displayClass = NSSelectorFromString("displayClass")
         return found.first { descriptor in
-            guard descriptor.responds(to: NSSelectorFromString("state")),
-                  let state = descriptor.value(forKey: "state") as? NSObject,
-                  state.responds(to: NSSelectorFromString("displayClass")) else { return false }
-            return (state.value(forKey: "displayClass") as? NSNumber)?.intValue == 0
+            guard let state = object(descriptor, "state") as? NSObject,
+                  state.responds(to: displayClass) else { return false }
+            // displayClass is a small integer, not an object, so it can't go
+            // through perform; the low 16 bits hold it whatever its width.
+            return unsafeBitCast(state.method(for: displayClass), to: UInt16Fn.self)(state, displayClass) == 0
         } ?? found.first
     }
 
     /// The surface `descriptor` draws the screen into right now.
     static func surface(of descriptor: NSObject) -> IOSurface? {
-        for key in ["framebufferSurface", "ioSurface"] where descriptor.responds(to: NSSelectorFromString(key)) {
-            if let surface = descriptor.value(forKey: key) as? IOSurface { return surface }
+        for key in ["framebufferSurface", "ioSurface"] {
+            if let surface = object(descriptor, key) as? IOSurface { return surface }
         }
         return nil
     }
@@ -1042,7 +1054,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         self.device = device
         let state = device.responds(to: NSSelectorFromString("stateString")) ? device.value(forKey: "stateString") as? String : nil
         let booted = state == "Booted"
-        bootedHere = !booted
+        // Booted, but by a leaf pane that's gone: still leaf's to shut down.
+        bootedHere = !booted || BootOwner.orphaned(ownerFile)
+        if bootedHere { guardShutdown() }
         if !booted {
             showStatus("Booting \(name)…", busy: true)
             simctl(["boot", udid]) { [weak self] status, output in
@@ -1050,6 +1064,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
                 // "Unable to boot device in current state: Booted" is fine.
                 if status != 0 && !output.contains("current state: Booted") {
                     self.bootedHere = false
+                    if let owner = self.ownerFile { BootOwner.release(owner) }
                     self.fail(SimFailure(message: "\(self.name) didn't boot: \(Simulator.lastLine(output) ?? "simctl exited with \(status)"). Try `xcrun simctl boot \(self.udid)` in a terminal to see more."))
                     return
                 }
@@ -1469,18 +1484,80 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         boot()
     }
 
-    /// A device leaf booted is shut down with its pane; one that was already
-    /// running is left running.
+    /// A device leaf booted is shut down by its guardian once this helper
+    /// exits (see `guardShutdown`); one that was already running is left
+    /// running.
     override func willShutDown() {
         server?.stop()
-        guard bootedHere else { return }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-        task.arguments = ["simctl", "shutdown", udid]
-        task.environment = simctlEnvironment()
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        try? task.run()
+    }
+
+    /// Records this helper as the device's owner, next to the control
+    /// socket. Nil without a socket path.
+    var ownerFile: String? {
+        guard let socket = ProcessInfo.processInfo.environment["LEAF_SIM_SOCKET"], !socket.isEmpty else { return nil }
+        return socket + ".owner"
+    }
+
+    /// Starts a guardian that shuts the device down once this helper exits,
+    /// however it goes. Closing the pane hangs up its processes and quitting
+    /// Rex can kill them outright, so the helper can't count on running its
+    /// own cleanup. The guardian runs in its own session, out of reach of
+    /// that hangup, and stands down if another pane has taken the device.
+    func guardShutdown() {
+        guard let owner = ownerFile else { return }
+        let pid = getpid()
+        guard BootOwner.claim(owner, pid: pid) else { return }
+        let script = """
+        while kill -0 "$1" 2>/dev/null; do sleep 0.5; done
+        [ "$(cat "$3" 2>/dev/null)" = "$1" ] || exit 0
+        rm -f "$3"
+        exec /usr/bin/xcrun simctl shutdown "$2"
+        """
+        BootOwner.spawnDetached(["/bin/sh", "-c", script, "leaf-sim-guardian", "\(pid)", udid, owner],
+                                environment: simctlEnvironment())
+    }
+}
+
+// MARK: - Boot ownership
+
+/// Which helper booted a device: a file holding that helper's pid, so the
+/// device is shut down when it goes, even after a crash.
+enum BootOwner {
+    /// True when `file` names a helper that has exited: leaf booted the
+    /// device, and nothing shut it down.
+    static func orphaned(_ file: String?) -> Bool {
+        guard let file, let text = try? String(contentsOfFile: file, encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        return kill(pid, 0) != 0 && errno == ESRCH
+    }
+
+    static func claim(_ file: String, pid: pid_t) -> Bool {
+        (try? "\(pid)".write(toFile: file, atomically: true, encoding: .utf8)) != nil
+    }
+
+    static func release(_ file: String) {
+        try? FileManager.default.removeItem(atPath: file)
+    }
+
+    /// Starts `arguments` in a new session with no open files but /dev/null,
+    /// so neither the pane's hangup nor its pipes tie it to this process.
+    @discardableResult
+    static func spawnDetached(_ arguments: [String], environment: [String: String]) -> Bool {
+        var attributes: posix_spawnattr_t?
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        for fd: Int32 in 0...2 {
+            posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0)
+        }
+        let argv = arguments.map { strdup($0) } + [nil]
+        let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { (argv + envp).forEach { free($0) } }
+        var pid: pid_t = 0
+        return posix_spawn(&pid, arguments[0], &actions, &attributes, argv, envp) == 0
     }
 }
 
