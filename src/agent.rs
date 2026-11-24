@@ -456,7 +456,7 @@ pub fn recall(selection: &str) -> Option<String> {
 /// Tells Rex what leaf is doing, when this process is one of its panes.
 /// Other terminals ignore the sequence.
 pub fn report_status(state: &str, msg: &str) {
-    if rex_session().is_none() {
+    if !inside_rex() {
         return;
     }
     let msg: String = msg.chars().filter(|c| !c.is_control()).take(180).collect();
@@ -474,11 +474,38 @@ pub fn report_status(state: &str, msg: &str) {
     let _ = out.flush();
 }
 
-fn rex_session() -> Option<String> {
-    std::env::var("REX_SESSION")
+fn rex_var(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .map(|session| session.trim().to_owned())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The session to pass to `rex -s`: `REX_SESSION`, else this pane's
+/// `REX_BLOCK`. Rex servers from preview.23 on set only `REX_BLOCK` in new
+/// panes, and the rex CLI takes a block ID wherever it takes a session.
+fn rex_session() -> Option<String> {
+    rex_var("REX_SESSION").or_else(|| rex_var("REX_BLOCK"))
+}
+
+/// Whether this process runs in a Rex pane.
+pub(crate) fn inside_rex() -> bool {
+    rex_session().is_some()
+}
+
+/// This pane's session ID itself, for Rex's API, which (unlike the CLI)
+/// doesn't take a block ID: `REX_SESSION`, else what `rex whoami` says.
+pub(crate) fn rex_session_api_id() -> Option<String> {
+    if let Some(session) = rex_var("REX_SESSION") {
+        return Some(session);
+    }
+    rex_var("REX_BLOCK")?;
+    let said = rex_output(&["whoami".into(), "--json".into()]).ok()?;
+    serde_json::from_str::<serde_json::Value>(&said).ok()?["session_id"]
+        .as_str()
+        .map(str::trim)
         .filter(|session| !session.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) fn rex_program() -> Result<PathBuf, String> {
@@ -552,7 +579,8 @@ pub(crate) fn rex_output(args: &[String]) -> Result<String, String> {
 
 /// Types `data` into a Rex block in this session, as if from the keyboard.
 pub(crate) fn rex_write(block: &str, data: &str) -> Result<(), String> {
-    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let session =
+        rex_session().ok_or("this isn't a Rex pane (REX_SESSION and REX_BLOCK are unset)")?;
     let payload = serde_json::json!({ "data": data }).to_string();
     rex_run(
         &[
@@ -931,7 +959,8 @@ pub fn split_beside(
     label: &str,
     argv: &[String],
 ) -> Result<String, String> {
-    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let session =
+        rex_session().ok_or("this isn't a Rex pane (REX_SESSION and REX_BLOCK are unset)")?;
     let mut args: Vec<String> = vec!["split".into(), "-s".into(), session];
     let own = std::env::var("REX_BLOCK")
         .ok()
