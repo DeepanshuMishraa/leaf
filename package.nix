@@ -1,31 +1,49 @@
 {
   lib,
+  stdenv,
   rustPlatform,
+  installShellFiles,
   pkg-config,
   fontconfig,
+  alsa-lib,
+  ...
 }:
-rustPlatform.buildRustPackage {
-  pname = "leaf";
-  version = "0.16.2";
+let
+  manifest = lib.importTOML ./Cargo.toml;
+  program = (lib.head manifest.bin).name;
+in
+rustPlatform.buildRustPackage (finalAttrs: {
+  pname = manifest.package.name;
+  version = manifest.package.version;
   src = lib.cleanSource ./.;
 
   cargoLock.lockFile = ./Cargo.lock;
 
+  doCheck = false;
+
   nativeBuildInputs = [
     pkg-config
     rustPlatform.bindgenHook
+    installShellFiles
   ];
 
   buildInputs = [
     fontconfig
-  ];
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isLinux [ alsa-lib ];
+
+  postInstall = ''
+    installShellCompletion           \
+        --cmd ${program}             \
+        --fish completions/leaf.fish \
+        --zsh completions/_leaf
+  '';
 
   meta = with lib; {
-    description = "Read PDFs, markdown files and web articles in the terminal.";
-    homepage = "https://github.com/DeepanshuMishraa/leaf";
+    description = manifest.package.description;
+    homepage = manifest.package.repository;
     license = licenses.mit;
-    maintainers = with maintainers; [ kleindotc ];
     platforms = platforms.unix;
-    mainProgram = "leaf";
+    mainProgram = program;
   };
-}
+})
