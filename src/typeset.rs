@@ -158,6 +158,13 @@ fn stand_ins(family: &str) -> &'static [&'static str] {
         "georgia" => &["Georgia", "Gelasio", "Liberation Serif"],
         "verdana" => &["Verdana", "DejaVu Sans"],
         "century gothic" => &["Century Gothic", "URW Gothic", "Avenir"],
+        "menlo" => &["Menlo", "Cascadia Code", "DejaVu Sans Mono"],
+        "chalkboard se" => &[
+            "Chalkboard SE",
+            "Comic Sans MS",
+            "Comic Neue",
+            "Bradley Hand",
+        ],
         _ => &[],
     }
 }

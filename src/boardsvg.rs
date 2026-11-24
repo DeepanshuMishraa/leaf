@@ -534,7 +534,9 @@ pub fn svg(
         let row = lines.len().saturating_sub(1) as f64;
         // The caret goes after the last line, placed by the same measure text is.
         let x = at.x
-            + lines.last().map_or(0, |l| l.chars().count()) as f64 * size * crate::board::ADVANCE;
+            + lines
+                .last()
+                .map_or(0.0, |l| crate::board::line_width(l, size, 1));
         let y = at.y + row * size * LEADING;
         let _ = write!(
             body,

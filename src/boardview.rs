@@ -1006,7 +1006,7 @@ impl App {
     fn typing_at(&self, typing: &Typing) -> Pt {
         match typing.container.as_deref().and_then(|c| self.board.get(c)) {
             Some(holder) => {
-                let (w, h) = text_size(&typing.text, typing.size);
+                let (w, h) = text_size(&typing.text, typing.size, 1);
                 let c = holder.center();
                 Pt::new(c.x - w / 2.0, c.y - h / 2.0)
             }
