@@ -682,11 +682,12 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
-        let laid = Rc::new(render::layout(
+        let laid = Rc::new(render::layout_with_heading_color(
             &markdown,
             self.width,
             (font.width, font.height),
             &sizes,
+            self.look.colors().heading_color(),
         ));
         self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
@@ -3416,7 +3417,11 @@ impl App {
             }
             // Following the terminal's theme reads its reply from stdin, so it's
             // asked only after a wait that no key broke.
+            let heading_color = self.look.colors().heading_color();
             if self.look.refresh(quiet && !event::poll(Duration::ZERO)?) {
+                if self.look.colors().heading_color() != heading_color {
+                    self.laid.clear();
+                }
                 quiet = false;
             }
             // Between words nothing on screen changes, so there's nothing to draw.

@@ -79,6 +79,8 @@ PDFs are converted to markdown (headings from font size, paragraphs rejoined, ru
 
 Markdown files (`.md`, `.markdown`) show as written, with GitHub's extensions: tables, task lists, strikethrough, footnotes and alerts (`> [!NOTE]`), plus definition lists and math (kept as source). Front matter is hidden, HTML blocks such as a README's centered logo are read as markdown, and images next to the file show inline (PNG, JPEG, GIF, WebP, SVG), as do `data:` images.
 
+Headings use the theme's blue. Wikilinks such as `[[note]]`, `[[path/note|label]]`, and `![[note]]` show as underlined text.
+
 HTML pages saved on disk (`.html`, `.htm`, `.xhtml`) read like markdown: headings, lists, tables, links and pictures, in the terminal's font and colors. Pictures beside the page and pictures bundled into it as `data:` URIs both show. Stylesheets and scripts are left out, so a page that builds its content with JavaScript shows an error instead.
 
 An SVG picture is drawn afresh at the width it's shown, so it stays sharp however small its own size.
