@@ -2,6 +2,7 @@
 
 ## 0.18.1
 
+- **Leaf: Minimal Address Bar** in Rex's command palette hides the browser's address bar until the pointer is at the top of the page. `cmd+l` brings it back. The page fills the pane the rest of the time.
 - `leaf sponsor` opens leaf's sponsor page in the browser. Sponsor once, any amount, and your name and avatar go on leaf.dipxsy.app.
 
 ## 0.18.0

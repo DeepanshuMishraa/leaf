@@ -482,6 +482,30 @@ function M.setup(opts)
 
   local open = open_kinds()
 
+  -- Rex's palette has no checkbox, so the title says whether the page is
+  -- drawn edge to edge. `leaf browser bar toggle` saves the choice, every
+  -- open browser pane picks it up, and leaf reloads this config so the
+  -- title follows. Off unless leaf says it's on.
+  local minimal_bar = open.minimal == true
+  rex.action{
+    name = "leaf_browser_bar",
+    title = minimal_bar and "Leaf: Minimal Address Bar ✓" or "Leaf: Minimal Address Bar (Off)",
+    description = minimal_bar
+      and "The address bar stays hidden until the pointer is at the top of the page, or you press cmd+l."
+        .. " Run to show it all the time."
+      or "The address bar is always visible. Run to hide it until the pointer is at the top of the page.",
+    category = "Leaf",
+    keywords = "leaf browser address bar url chrome toolbar hide hover minimal compact omnibox",
+    run = function()
+      -- Detached: switching reloads this config, which would stop a command
+      -- this action is still waiting on.
+      local _, err = rex.exec.start(argv("browser", "bar", "toggle"), { env = env, detach = true })
+      if err ~= nil then
+        error("leaf: couldn't switch the address bar (" .. tostring(err) .. "). It is unchanged.", 0)
+      end
+    end,
+  }
+
   if open.document or open.diff then
     rex.action{
       name = "leaf_ask",

@@ -424,6 +424,15 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     let findBar = Bar()
     let findField = NSSearchField()
     var findShown = false
+    /// Hide the address bar until the pointer is at the top of the page.
+    /// Saved by `leaf browser bar`, read from `LEAF_BROWSER_BAR`.
+    var minimalBar = false
+    /// The bar is on screen. When minimal, this follows the pointer.
+    var addressBarShown = true
+    /// When the pointer left the top, hide the bar after this moment.
+    var barHideAt: Date?
+    /// Last text read from the bar setting, so an unchanged file does no work.
+    var barModeStamp = ""
 
     // Layout tracking
     var chrome = Chrome.current()
@@ -483,6 +492,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     }()
 
     static let barHeight: CGFloat = 40
+    /// How close to the top, in points, the pointer has to be before a hidden bar returns.
+    static let revealHeight: CGFloat = 28
 
     init(session: String, block: String) {
         self.session = session
@@ -584,6 +595,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         web.allowsMagnification = true
         if #available(macOS 13.3, *) { web.isInspectable = true }
         root.addSubview(web)
+        // The page fills the pane. The bar floats over its top when shown,
+        // so revealing it doesn't shove the page down.
+        root.addSubview(bar, positioned: .above, relativeTo: web)
+        root.addSubview(findBar, positioned: .above, relativeTo: web)
         window.initialFirstResponder = web
 
         bar.addSubview(point)
@@ -614,6 +629,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self?.applyAppearance() }
         }
         updateControls()
+        pollBarMode(animated: false)
         layout()
     }
 
@@ -628,6 +644,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func applyAppearance() {
         root.effectiveAppearance.performAsCurrentDrawingAppearance {
             root.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+            bar.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
             pill.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
             progress.backgroundColor = NSColor.controlAccentColor.cgColor
         }
@@ -636,6 +653,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         composer.applyAppearance()
         updatePoint()
     }
+
+    /// The address is being edited, or find is open: the bar stays up either way.
+    var barPinned: Bool { editingAddress || findShown }
 
     func layout() {
         let width = root.bounds.width, height = root.bounds.height
@@ -655,14 +675,115 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         address.frame = NSRect(x: 29, y: (size - fieldHeight) / 2, width: pill.frame.width - 37, height: fieldHeight)
         layoutProgress(animated: false)
 
+        // The always-on bar keeps its row, as before. A minimal bar floats
+        // over the page, so hovering it into view doesn't shove the page down.
         let findHeight: CGFloat = findShown ? 36 : 0
-        findBar.frame = NSRect(x: 0, y: height - barHeight - findHeight, width: width, height: findHeight)
+        let inFlow = addressBarShown && !minimalBar
+        let aboveFind = (findShown && addressBarShown) ? barHeight : (inFlow ? barHeight : 0)
+        findBar.frame = NSRect(x: 0, y: height - aboveFind - findHeight, width: width, height: findHeight)
         findField.frame = NSRect(x: 10, y: 6, width: min(320, width - 56), height: 24)
         if let done = findBar.subviews.first(where: { $0.identifier?.rawValue == "done" }) {
             done.frame = NSRect(x: findField.frame.maxX + 6, y: 4, width: 28, height: 28)
         }
-        web.frame = NSRect(x: 0, y: 0, width: width, height: max(0, height - barHeight - findHeight))
+        web.frame = NSRect(x: 0, y: 0, width: width, height: max(0, height - aboveFind - findHeight))
         layoutComposer()
+    }
+
+    /// The saved address-bar mode, or `full` when the file isn't there yet.
+    func currentBarFile() -> String {
+        guard let path = ProcessInfo.processInfo.environment["LEAF_BROWSER_BAR"], !path.isEmpty,
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return "full" }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "full" : trimmed
+    }
+
+    /// Picks up `leaf browser bar` while this pane is open.
+    func pollBarMode(animated: Bool) {
+        let text = currentBarFile()
+        guard text != barModeStamp else { return }
+        barModeStamp = text
+        let minimal = text == "minimal"
+        guard minimal != minimalBar else { return }
+        minimalBar = minimal
+        syncAddressBar(animated: animated)
+        // The always-on bar takes a row; the minimal one doesn't. Reflow
+        // even when the bar was already visible and only the mode changed.
+        layout()
+    }
+
+    func syncAddressBar(animated: Bool) {
+        let show = !minimalBar || barPinned || (shown && pointerInTopRegion())
+        setAddressBarShown(show, animated: animated)
+    }
+
+    /// Shows the bar while the pointer is in the top strip, and hides it
+    /// shortly after the pointer leaves. Does nothing when the bar is always on.
+    func updateAddressBarHover() {
+        guard minimalBar, shown else { return }
+        if barPinned || pointerInTopRegion() {
+            barHideAt = nil
+            if !addressBarShown { setAddressBarShown(true, animated: true) }
+        } else if addressBarShown {
+            if barHideAt == nil { barHideAt = Date().addingTimeInterval(0.2) }
+            if let barHideAt, Date() >= barHideAt {
+                self.barHideAt = nil
+                setAddressBarShown(false, animated: true)
+            }
+        }
+    }
+
+    /// Whether the pointer is over this pane's top strip. The page keeps the
+    /// clicks there; only the position is read, so the strip isn't a view.
+    func pointerInTopRegion() -> Bool {
+        guard shown else { return false }
+        let mouse = NSEvent.mouseLocation
+        let frame = window.frame
+        guard mouse.x >= frame.minX, mouse.x < frame.maxX, mouse.y >= frame.minY, mouse.y < frame.maxY else {
+            return false
+        }
+        let fromTop = frame.maxY - mouse.y
+        let zone = addressBarShown ? Browser.barHeight : Browser.revealHeight
+        return fromTop >= 0 && fromTop <= zone
+    }
+
+    func setAddressBarShown(_ show: Bool, animated: Bool) {
+        let changed = show != addressBarShown || bar.isHidden == show
+        addressBarShown = show
+        guard changed else { return }
+        if !animated {
+            bar.isHidden = !show
+            bar.alphaValue = show ? 1 : 0
+            layout()
+            return
+        }
+        if show {
+            bar.alphaValue = 0
+            bar.isHidden = false
+            layout()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.14
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                bar.animator().alphaValue = 1
+            }
+        } else {
+            // The page takes the bar's row as the bar fades, in the mode
+            // where the bar was part of the layout.
+            layout()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                bar.animator().alphaValue = 0
+            } completionHandler: { [weak self] in
+                guard let self, !self.addressBarShown else { return }
+                self.bar.isHidden = true
+            }
+        }
+    }
+
+    /// Brings the bar back for the address field or find, even while minimal.
+    func revealAddressBar() {
+        barHideAt = nil
+        guard minimalBar else { return }
+        setAddressBarShown(true, animated: false)
     }
 
     func layoutComposer() {
@@ -827,6 +948,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     }
     @objc func hardReload() { web.reloadFromOrigin() }
     @objc func focusAddress() {
+        revealAddressBar()
         window.makeFirstResponder(address)
     }
     @objc func zoomIn() { web.pageZoom = min(3, web.pageZoom + 0.1) }
@@ -843,6 +965,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     // MARK: Find
 
     @objc func showFind() {
+        revealAddressBar()
         if !findShown {
             findShown = true
             findBar.isHidden = false
@@ -1496,6 +1619,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             if getppid() != self.parent { self.shutDown() }
             self.chrome = Chrome.current()
             self.followRexAppearance()
+            self.pollBarMode(animated: true)
             self.refresh()
         }
         let center = NSWorkspace.shared.notificationCenter
@@ -1597,6 +1721,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     func follow() {
         ticks &+= 1
+        if ticks % 8 == 0 { pollBarMode(animated: true) }
         // Rex's window only moves while Rex (or this pane) is in front;
         // otherwise a few checks a second are enough.
         let watching = NSApp.isActive || rexIsActive
@@ -1641,6 +1766,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             focusWhenShown = false
             takeFocus()
         }
+        if shown { updateAddressBarHover() }
     }
 
     /// Whether another window of Rex's, in front of its main window, overlaps

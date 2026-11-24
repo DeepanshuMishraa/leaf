@@ -273,7 +273,119 @@ fn helper() -> Result<PathBuf, String> {
     Ok(executable)
 }
 
+/// Whether the browser's address bar is always on screen.
+///
+/// `minimal` draws the page edge to edge and brings the bar back only while
+/// the pointer is at the top, or while the address is being edited. The
+/// palette's "Minimal Address Bar" action writes this, and every open
+/// browser pane reads the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarMode {
+    #[default]
+    Full,
+    Minimal,
+}
+
+impl BarMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BarMode::Full => "full",
+            BarMode::Minimal => "minimal",
+        }
+    }
+
+    /// Anything other than `minimal` is the full bar, including a missing file.
+    pub fn parse(text: &str) -> Self {
+        match text.trim() {
+            "minimal" | "on" => BarMode::Minimal,
+            _ => BarMode::Full,
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            BarMode::Full => BarMode::Minimal,
+            BarMode::Minimal => BarMode::Full,
+        }
+    }
+}
+
+/// `$XDG_DATA_HOME/leaf/browser-bar`, beside the reading database.
+pub fn bar_path() -> PathBuf {
+    crate::progress::default_path().with_file_name("browser-bar")
+}
+
+pub fn load_bar_mode(path: &std::path::Path) -> BarMode {
+    fs::read_to_string(path)
+        .map(|text| BarMode::parse(&text))
+        .unwrap_or_default()
+}
+
+/// `true` when the address bar should stay hidden until the pointer is at the top.
+pub fn minimal_bar() -> bool {
+    load_bar_mode(&bar_path()) == BarMode::Minimal
+}
+
+fn save_bar_mode(path: &std::path::Path, mode: BarMode) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("couldn't create {}: {e}", parent.display()))?;
+    }
+    let partial = path.with_extension(format!("part-{}", std::process::id()));
+    fs::write(&partial, mode.as_str())
+        .map_err(|e| format!("couldn't write {}: {e}", partial.display()))?;
+    fs::rename(&partial, path).map_err(|e| {
+        let _ = fs::remove_file(&partial);
+        format!("couldn't save the address bar setting ({e})")
+    })
+}
+
+/// `leaf browser bar [minimal | full | toggle]`.
+fn bar_command(args: &[String]) -> ExitCode {
+    let path = bar_path();
+    let current = load_bar_mode(&path);
+    let next = match args {
+        [] => {
+            println!("{}", current.as_str());
+            return ExitCode::SUCCESS;
+        }
+        [word] if word == "toggle" => current.toggled(),
+        [word] => match word.as_str() {
+            "minimal" | "on" => BarMode::Minimal,
+            "full" | "off" => BarMode::Full,
+            _ => {
+                eprintln!("Usage: leaf browser bar [minimal | full | toggle]");
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("Usage: leaf browser bar [minimal | full | toggle]");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = save_bar_mode(&path, next) {
+        eprintln!("leaf: {error} The address bar is unchanged.");
+        return ExitCode::FAILURE;
+    }
+    // Rex refetches palette actions when this rewrites the plugin's open line,
+    // so the check mark follows the setting.
+    let _ = crate::plugin::note_open(&crate::remote::state());
+    println!(
+        "{}",
+        match next {
+            BarMode::Minimal => {
+                "Minimal address bar on. It shows when the pointer is at the top of the page."
+            }
+            BarMode::Full => "Address bar always shown.",
+        }
+    );
+    ExitCode::SUCCESS
+}
+
 pub fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|arg| arg == "bar") {
+        return bar_command(&args[1..]);
+    }
     if !cfg!(target_os = "macos") {
         eprintln!("leaf: the WebKit browser runs on macOS only.");
         return ExitCode::FAILURE;
@@ -333,7 +445,8 @@ pub fn run(args: &[String]) -> ExitCode {
         .env(
             "LEAF_AGENT",
             crate::agent::default_agent().unwrap_or_default(),
-        );
+        )
+        .env("LEAF_BROWSER_BAR", bar_path());
     if let Some(url) = args.first() {
         command.env("LEAF_BROWSER_URL", url);
     }
@@ -380,8 +493,8 @@ pub fn run(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Ask, DATA_END, DATA_START, ELEMENT_LIMIT, ELEMENTS_LIMIT, Reply, Request, answer,
-        fingerprint,
+        Ask, BarMode, DATA_END, DATA_START, ELEMENT_LIMIT, ELEMENTS_LIMIT, Reply, Request, answer,
+        fingerprint, load_bar_mode, save_bar_mode,
     };
 
     fn ask(question: &str, elements: &[&str]) -> Ask {
@@ -391,6 +504,23 @@ mod tests {
             title: "Sign in".into(),
             elements: elements.iter().map(|e| (*e).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn the_address_bar_is_full_until_minimal_is_saved() {
+        assert_eq!(BarMode::parse(""), BarMode::Full);
+        assert_eq!(BarMode::parse("full"), BarMode::Full);
+        assert_eq!(BarMode::parse("minimal\n"), BarMode::Minimal);
+        assert_eq!(BarMode::Full.toggled(), BarMode::Minimal);
+        assert_eq!(BarMode::Minimal.toggled(), BarMode::Full);
+        let dir = std::env::temp_dir().join(format!("leaf-bar-{}", std::process::id()));
+        let path = dir.join("browser-bar");
+        assert_eq!(load_bar_mode(&path), BarMode::Full);
+        save_bar_mode(&path, BarMode::Minimal).expect("saves");
+        assert_eq!(load_bar_mode(&path), BarMode::Minimal);
+        save_bar_mode(&path, BarMode::Full).expect("saves");
+        assert_eq!(load_bar_mode(&path), BarMode::Full);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -88,6 +88,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf browser [URL]   open a WebKit browser pane in Rex on macOS
+       leaf browser bar [minimal | full | toggle]   hide the address bar until the pointer is at the top
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
