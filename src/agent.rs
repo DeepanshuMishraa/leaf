@@ -495,6 +495,11 @@ fn session_from(var: impl Fn(&str) -> Option<String>) -> Option<String> {
     nonblank(var("REX_SESSION")).or_else(|| nonblank(var("REX_BLOCK")))
 }
 
+/// This pane's Rex block ID, when Rex set one.
+pub(crate) fn rex_block() -> Option<String> {
+    rex_var("REX_BLOCK")
+}
+
 /// Whether this process runs in a Rex pane.
 pub(crate) fn inside_rex() -> bool {
     rex_session().is_some()
