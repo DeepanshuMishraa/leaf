@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- In `leaf browser`, keys typed into the address bar or a text field on the page stay there, even when Rex binds them, and bindings inside a Rex key mode are no longer forwarded. Typing `n` no longer switches tabs, and `enter` navigates again.
+- The browser lines up with its pane in Rex's compact density again: it no longer sits 1pt low and overflows the pane on the right.
+
 - leaf finds Rex again in panes from Rex server preview.23 on, which set only `REX_BLOCK`, not `REX_SESSION`. Asking the agent, opening beside you, the browser, and Rex's theme and status all work there again.
 
 ## 0.18.1

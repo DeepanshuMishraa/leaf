@@ -122,8 +122,10 @@ struct Chrome: Equatable {
         CFPreferencesAppSynchronize(domain)
         let compact = setting("paneDensity") as? String == "compact"
         let edge: CGFloat = compact ? 0 : 8
+        // Measured from Rex 0.1.0-preview.23. Compact panes are split by a
+        // 1pt rule under a 34pt header.
         var chrome = Chrome(top: compact ? 41 : 46, left: edge, right: edge, bottom: edge,
-                            gap: compact ? 2 : 8, header: compact ? 35 : 36, radius: compact ? 0 : 10)
+                            gap: compact ? 1 : 8, header: compact ? 34 : 36, radius: compact ? 0 : 10)
         let headers = setting("paneHeaderVisibility") as? String
             ?? (((setting("showsPaneHeaders") as? NSNumber)?.boolValue ?? true) ? "always" : "never")
         if headers != "always" { chrome.header = 0 }
@@ -207,6 +209,11 @@ struct Chord: Hashable {
     let key: String
 
     static let relevant: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
+
+    /// No ⌘, ⌥ or ⌃: a key that types (shift only picks the letter).
+    var isPlain: Bool {
+        NSEvent.ModifierFlags(rawValue: modifiers).isDisjoint(with: [.command, .option, .control])
+    }
 
     init?(_ text: String) {
         var flags: NSEvent.ModifierFlags = []
@@ -454,6 +461,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var appClient: String?
     var bindings: [Binding] = []
     var pendingPrefix: [Chord] = []
+    /// Whether a text field on the page has focus, as `Browser.focusScript` reports it.
+    var pageEditing = false
     var forwardedAt = Date.distantPast
     /// Focus asked for before the window was first placed.
     var focusWhenShown = false
@@ -516,8 +525,34 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         // React Grab runs in the page's own world, where it can read React's
         // component tree; its messages only ever add picks to the composer.
         web.configuration.userContentController.add(self, name: "leaf")
+        web.configuration.userContentController.addUserScript(
+            WKUserScript(source: Browser.focusScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         build()
     }
+
+    /// Tells this helper whether the page's focus is somewhere text is typed,
+    /// so plain keys typed there stay with the page (see `handleRexKey`).
+    /// A frame with focus counts, since its fields can't be seen from here.
+    static let focusScript = """
+        (() => {
+          const plain = ["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"];
+          const typedIn = (el) => !!el && (el.isContentEditable || el.tagName === "TEXTAREA" ||
+            el.tagName === "SELECT" || el.tagName === "IFRAME" ||
+            (el.tagName === "INPUT" && !plain.includes((el.type || "").toLowerCase())));
+          let last = false;
+          const report = () => {
+            let el = document.activeElement;
+            while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+            const now = typedIn(el);
+            if (now !== last) {
+              last = now;
+              window.webkit.messageHandlers.leaf.postMessage({ editing: now });
+            }
+          };
+          document.addEventListener("focusin", report, true);
+          document.addEventListener("focusout", () => setTimeout(report, 0), true);
+        })();
+        """
 
     /// Sites sniff for "Safari" and serve worse pages without it.
     static func userAgentSuffix() -> String {
@@ -1071,8 +1106,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        // A new document: React Grab went with the old one.
+        // A new document: React Grab and the focused field went with the old one.
         pointing = false
+        pageEditing = false
         updatePoint()
     }
 
@@ -1446,6 +1482,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.frameInfo.isMainFrame, let body = message.body as? [String: Any] else { return }
+        if let editing = body["editing"] as? Bool {
+            pageEditing = editing
+            return
+        }
         if let active = body["pointing"] as? Bool {
             pointing = active
             updatePoint()
@@ -1879,6 +1919,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                 for item in object["bindings"] as? [[String: Any]] ?? [] {
                     guard let action = item["action"] as? String, action != "pane.send_key",
                           let keys = item["keys"] as? [String] else { continue }
+                    // A key mode's bindings apply only while Rex is in that mode,
+                    // which this window can't see; outside it the key is the page's.
+                    if let mode = item["mode"] as? String, !mode.isEmpty { continue }
                     let chords = keys.compactMap(Chord.init)
                     guard !chords.isEmpty, chords.count == keys.count,
                           !(chords.count == 1 && Browser.reserved.contains(chords[0])) else { continue }
@@ -1900,6 +1943,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Handles a key that Rex binds; false lets the page and menus have it.
     func handleRexKey(_ event: NSEvent) -> Bool {
         guard let chord = Chord(event), !bindings.isEmpty else { return false }
+        // A plain key typed into a field is text, even when Rex binds it.
+        if pendingPrefix.isEmpty, chord.isPlain, typingInField { return false }
         let typed = pendingPrefix + [chord]
         if let binding = bindings.first(where: { $0.keys == typed }) {
             pendingPrefix = []
@@ -1913,6 +1958,15 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         let swallowed = !pendingPrefix.isEmpty
         pendingPrefix = []
         return swallowed
+    }
+
+    /// Whether the focus is somewhere text is typed: the address bar, find
+    /// bar or composer (their field editor), or a field on the page.
+    var typingInField: Bool {
+        let responder = window.firstResponder
+        if responder is NSText { return true }
+        if let view = responder as? NSView, view === web || view.isDescendant(of: web) { return pageEditing }
+        return false
     }
 
     func perform(_ binding: Binding) {
