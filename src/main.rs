@@ -815,6 +815,8 @@ fn open(first: &str) -> ExitCode {
     std::thread::spawn(syntax::warm);
     let mut target = first.to_owned();
     let mut path_override: Option<PathBuf> = None;
+    let mut pending = None;
+    let mut history = viewer::ReaderHistory::default();
     let mut seen = std::collections::HashSet::new();
     // Moving along a folder of pictures opens the reader again on each one, so
     // every picture keeps its own place, ink and bookmarks. Set while moving:
@@ -825,12 +827,14 @@ fn open(first: &str) -> ExitCode {
             .clone()
             .unwrap_or_else(|| PathBuf::from(&target));
         let watch = (!is_url(&target)).then(|| doc::Watch::new(source_path.clone()));
-        let doc = match path_override
-            .as_deref()
-            .map(load_file)
-            .unwrap_or_else(|| load(&target))
-        {
-            Ok(doc) => doc,
+        let (doc, viewport, notice) = match pending.take().map(Ok).unwrap_or_else(|| {
+            path_override
+                .as_deref()
+                .map(load_file)
+                .unwrap_or_else(|| load(&target))
+                .map(|doc| (doc, None, None))
+        }) {
+            Ok(loaded) => loaded,
             Err(message) => {
                 if let Some((step, left)) = moving.filter(|(_, left)| *left > 0)
                     && let Some(next) = picture::neighbour(&source_path, step)
@@ -852,9 +856,11 @@ fn open(first: &str) -> ExitCode {
         seen.insert(source_path.clone());
         let mut options = resume(&target, doc.page_count, &failure);
         options.max_text_width = config.reader.max_width;
-        options.picture_path = Some(source_path.clone());
+        options.picture_path = watch.as_ref().map(|_| source_path);
         options.watch = watch;
-        let result = viewer::run(doc, options);
+        options.start_viewport = viewport;
+        options.start_notice = notice;
+        let result = viewer::run(doc, options, &mut history);
         if let Some(message) = failure.borrow().as_ref() {
             eprintln!("leaf: {message}");
         }
@@ -870,10 +876,16 @@ fn open(first: &str) -> ExitCode {
                     None => return ExitCode::SUCCESS,
                 }
             }
-            Ok(Some(viewer::Go::Open(next))) => {
+            Ok(Some(viewer::Go::Open {
+                path,
+                doc,
+                viewport,
+                notice,
+            })) => {
                 moving = None;
-                target = next.to_string_lossy().into_owned();
-                path_override = Some(next);
+                target = path.to_string_lossy().into_owned();
+                path_override = Some(path);
+                pending = Some((doc, viewport, notice));
             }
             Err(e) => {
                 eprintln!(
