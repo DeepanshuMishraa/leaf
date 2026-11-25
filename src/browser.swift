@@ -1868,7 +1868,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         }
     }
 
-    /// Send the latest pointer position once the previous resize finishes, including the final mouse-up.
+    /// Send queued resizes one at a time, oldest first. Keep mouse-up bounds until
+    /// delivery or a later mouse-up on the same layer.
     func sendPendingResize() {
         guard resizeInFlight == nil, !pendingResizes.isEmpty else { return }
         let next = pendingResizes.removeFirst()
