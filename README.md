@@ -103,6 +103,31 @@ Adds Leaf to Rex's command palette (`cmd+shift+p`): open documents, review diffs
 
 **Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a pane, macOS 13+. Its start page lists local dev servers. Press the pointer button (`shift+cmd+c`) to pick an element with [React Grab](https://github.com/aidenybai/react-grab) and ask your agent about it.
 
+### With Amber
+
+With [Amber](https://github.com/rawnly/amber) installed, add Leaf to your Rex config instead:
+
+```lua
+local amber = dofile(os.getenv("HOME") .. "/.local/share/rex/amber/amber.lua")
+
+amber.setup({
+  plugins = {
+    {
+      "DeepanshuMishraa/leaf",
+      main = "leaf",
+      -- Installs the leaf release matching this checkout, like the install script above.
+      build = [[LEAF_VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml) sh site/public/install.sh]],
+    },
+  },
+})
+```
+
+Run `amber install`: it clones the plugin, installs the matching `leaf` command and reloads Rex. `amber update` keeps both in step. Loading the config alone does not install.
+
+- Already ran `leaf rex install`? Run `leaf rex uninstall` first, or the palette lists Leaf twice.
+- Installed leaf with Homebrew? Leave out `build` and update it with `brew upgrade`.
+- leaf not on the default path (`~/.local/bin`, `~/.cargo/bin`, Homebrew)? Pass its location: `opts = { bin = { "/path/to/leaf" } }`.
+
 ## Development
 
 ```sh
