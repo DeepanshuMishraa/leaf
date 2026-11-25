@@ -210,9 +210,16 @@ struct Chord: Hashable {
 
     static let relevant: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
 
-    /// No ⌘, ⌥ or ⌃: a key that types (shift only picks the letter).
-    var isPlain: Bool {
-        NSEvent.ModifierFlags(rawValue: modifiers).isDisjoint(with: [.command, .option, .control])
+    /// Whether `event` types text: no ⌘ or ⌃, and either no ⌥ or a ⌥ that
+    /// makes a character (€ or @ on many layouts). ⌥ with a key that makes
+    /// only whitespace, such as ⌥space, stays a shortcut.
+    static func types(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags
+        if !flags.isDisjoint(with: [.command, .control]) { return false }
+        guard flags.contains(.option) else { return true }
+        return event.characters?.unicodeScalars.contains {
+            !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.controlCharacters.contains($0)
+        } ?? false
     }
 
     init?(_ text: String) {
@@ -532,25 +539,31 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     /// Tells this helper whether the page's focus is somewhere text is typed,
     /// so plain keys typed there stay with the page (see `handleRexKey`).
-    /// A frame with focus counts, since its fields can't be seen from here.
+    /// A frame with focus counts, since its fields can't be seen from here, and
+    /// so does a focused custom element whose shadow root is closed.
+    /// Focus is checked again on keys and clicks, since a field removed from
+    /// the page takes focus with it without a `focusout`, and on `pageshow`,
+    /// since a page back from the back-forward cache keeps its own state.
     static let focusScript = """
         (() => {
           const plain = ["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"];
           const typedIn = (el) => !!el && (el.isContentEditable || el.tagName === "TEXTAREA" ||
             el.tagName === "SELECT" || el.tagName === "IFRAME" ||
-            (el.tagName === "INPUT" && !plain.includes((el.type || "").toLowerCase())));
-          let last = false;
-          const report = () => {
+            (el.tagName === "INPUT" && !plain.includes((el.type || "").toLowerCase())) ||
+            (el.tagName.includes("-") && !el.shadowRoot));
+          let last;
+          const report = (force) => {
             let el = document.activeElement;
             while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
             const now = typedIn(el);
-            if (now !== last) {
+            if (force === true || now !== last) {
               last = now;
               window.webkit.messageHandlers.leaf.postMessage({ editing: now });
             }
           };
-          document.addEventListener("focusin", report, true);
+          for (const type of ["focusin", "keydown", "pointerdown"]) document.addEventListener(type, report, true);
           document.addEventListener("focusout", () => setTimeout(report, 0), true);
+          window.addEventListener("pageshow", () => report(true));
         })();
         """
 
@@ -1944,7 +1957,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func handleRexKey(_ event: NSEvent) -> Bool {
         guard let chord = Chord(event), !bindings.isEmpty else { return false }
         // A plain key typed into a field is text, even when Rex binds it.
-        if pendingPrefix.isEmpty, chord.isPlain, typingInField { return false }
+        if pendingPrefix.isEmpty, Chord.types(event), typingInField { return false }
         let typed = pendingPrefix + [chord]
         if let binding = bindings.first(where: { $0.keys == typed }) {
             pendingPrefix = []
