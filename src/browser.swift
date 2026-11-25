@@ -652,7 +652,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var wasFocusedInRex = false
     var appClient: String?
     var bindings: [Binding] = []
-    var pendingPrefix: [Chord] = []
+    /// The start of a multi-key binding, and whether it was typed in a field.
+    var pendingPrefix: (keys: [Chord], inField: Bool)?
     /// Whether a text field on the page has focus, as `Browser.focusScript` reports it.
     var pageEditing = false
     var forwardedAt = Date.distantPast
@@ -2301,20 +2302,24 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Handles a key that Rex binds; false lets the page and menus have it.
     func handleRexKey(_ event: NSEvent) -> Bool {
         guard let chord = Chord(event), !bindings.isEmpty else { return false }
+        let inField = typingInField
+        // Focus moved into a field after a multi-key binding began, such as a
+        // click on the address bar: drop the binding so the key is text.
+        if inField, pendingPrefix?.inField == false { pendingPrefix = nil }
         // A plain key typed into a field is text, even when Rex binds it.
-        if pendingPrefix.isEmpty, Chord.types(event), typingInField { return false }
-        let typed = pendingPrefix + [chord]
+        if pendingPrefix == nil, Chord.types(event), inField { return false }
+        let typed = (pendingPrefix?.keys ?? []) + [chord]
         if let binding = bindings.first(where: { $0.keys == typed }) {
-            pendingPrefix = []
+            pendingPrefix = nil
             perform(binding)
             return true
         }
         if bindings.contains(where: { $0.keys.count > typed.count && Array($0.keys.prefix(typed.count)) == typed }) {
-            pendingPrefix = typed
+            pendingPrefix = (typed, pendingPrefix?.inField ?? inField)
             return true
         }
-        let swallowed = !pendingPrefix.isEmpty
-        pendingPrefix = []
+        let swallowed = pendingPrefix != nil
+        pendingPrefix = nil
         return swallowed
     }
 
