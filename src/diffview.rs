@@ -32,6 +32,7 @@ use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
 use crate::diffreview::{self, FileNotes, Margin, Reopen, SaveNotes, Sends};
 use crate::github;
+use crate::linediff;
 use crate::look::Look;
 use crate::news::News;
 use crate::progress::{SavedComment, Store, StoreFailed};
@@ -388,11 +389,102 @@ impl SplitRow {
 struct Split {
     lines: Vec<SplitRow>,
     line_of_row: Vec<usize>,
+    /// For a change block whose lines don't pair in Git's order, its first
+    /// removed row and how far its shorter side shifts (see `linediff::alignment`).
+    shifts: HashMap<usize, usize>,
+}
+
+/// The removed rows and the added rows of the change block holding `row`,
+/// which must be a removed or added row inside `hunk`.
+fn change_block(
+    rows: &[diff::Row],
+    hunk: &diff::Hunk,
+    row: usize,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let is = |at: usize, kind: RowKind| rows.get(at).is_some_and(|r| r.kind == kind);
+    let mut first = row;
+    if is(row, RowKind::Added) {
+        while first > hunk.first && is(first - 1, RowKind::Added) {
+            first -= 1;
+        }
+    } else if !is(row, RowKind::Removed) {
+        return None;
+    }
+    while first > hunk.first && is(first - 1, RowKind::Removed) {
+        first -= 1;
+    }
+    let mut middle = first;
+    while middle < hunk.end && is(middle, RowKind::Removed) {
+        middle += 1;
+    }
+    let mut end = middle;
+    while end < hunk.end && is(end, RowKind::Added) {
+        end += 1;
+    }
+    Some((first..middle, middle..end))
+}
+
+/// Each change block with removed and added rows that pair better shifted,
+/// by its first removed row.
+fn block_shifts(diff: &Diff) -> HashMap<usize, usize> {
+    let rows = diff.rows();
+    let mut shifts = HashMap::new();
+    let mut at = 0;
+    while at < rows.len() {
+        if rows[at].kind != RowKind::Removed {
+            at += 1;
+            continue;
+        }
+        let first = at;
+        while at < rows.len() && rows[at].kind == RowKind::Removed {
+            at += 1;
+        }
+        let middle = at;
+        while at < rows.len() && rows[at].kind == RowKind::Added {
+            at += 1;
+        }
+        let old: Vec<&str> = (first..middle).map(|row| diff.content(row)).collect();
+        let new: Vec<&str> = (middle..at).map(|row| diff.content(row)).collect();
+        let shift = linediff::alignment(&old, &new);
+        if shift > 0 {
+            shifts.insert(first, shift);
+        }
+    }
+    shifts
 }
 
 impl Split {
+    /// The row `row` is drawn beside and compared with: the added row paired
+    /// with a removed one, or the other way round.
+    fn partner(&self, diff: &Diff, row: usize) -> Option<usize> {
+        let rows = diff.rows();
+        let r = rows.get(row)?;
+        let hunk = diff.file(r.file as usize)?.hunks.get(r.hunk as usize)?;
+        let (old, new) = change_block(rows, hunk, row)?;
+        let shift = self.shifts.get(&old.start).copied().unwrap_or(0);
+        let new_longer = new.len() > old.len();
+        if r.kind == RowKind::Removed {
+            let k = row - old.start;
+            let index = if new_longer {
+                Some(k + shift)
+            } else {
+                k.checked_sub(shift)
+            };
+            index.filter(|&i| i < new.len()).map(|i| new.start + i)
+        } else {
+            let k = row - new.start;
+            let index = if new_longer {
+                k.checked_sub(shift)
+            } else {
+                Some(k + shift)
+            };
+            index.filter(|&i| i < old.len()).map(|i| old.start + i)
+        }
+    }
+
     fn new(diff: &Diff, layout: Layout) -> Self {
         let rows = diff.rows();
+        let shifts = block_shifts(diff);
         let mut lines = Vec::new();
         let mut line_of_row = vec![0; rows.len()];
         let mut push = |line: SplitRow, line_of_row: &mut Vec<usize>| {
@@ -440,11 +532,18 @@ impl Split {
                     }
                     let old = new_start - old_start;
                     let new = at - new_start;
+                    let shift = shifts.get(&old_start).copied().unwrap_or(0);
+                    let (left_shift, right_shift) = if new > old { (shift, 0) } else { (0, shift) };
                     for pair in 0..old.max(new) {
+                        let side = |shift: usize, len: usize, start: usize| {
+                            pair.checked_sub(shift)
+                                .filter(|&i| i < len)
+                                .map(|i| start + i)
+                        };
                         push(
                             SplitRow {
-                                left: (pair < old).then_some(old_start + pair),
-                                right: (pair < new).then_some(new_start + pair),
+                                left: side(left_shift, old, old_start),
+                                right: side(right_shift, new, new_start),
                                 band: None,
                             },
                             &mut line_of_row,
@@ -480,7 +579,11 @@ impl Split {
                 }
             }
         }
-        Split { lines, line_of_row }
+        Split {
+            lines,
+            line_of_row,
+            shifts,
+        }
     }
 
     fn lines(&self) -> &[SplitRow] {
@@ -2848,7 +2951,7 @@ impl App {
         let available = (width as usize).saturating_sub(gutter);
         let overlay = state.highlighted.then_some(self.palette.focus);
         let used = text_spans(
-            spans, &text, self.left, available, base, kinds_line, emphasis, word, overlay,
+            spans, &text, self.left, available, base, kinds_line, &emphasis, word, overlay,
         );
         let filled = (gutter + used).min(width as usize);
         if filled < width as usize {
@@ -2943,51 +3046,18 @@ impl App {
         self.highlight.insert(key, kinds);
     }
 
-    /// The unchanged prefix and suffix of a changed line, in characters,
-    /// against the line it replaced. The rest is the word-level change.
-    fn emphasis(&self, row_index: usize) -> Option<(usize, usize)> {
+    /// The changed text of a removed or added line, as character ranges,
+    /// against the line it is paired with. Empty when it has no partner.
+    fn emphasis(&self, row_index: usize) -> Vec<std::ops::Range<usize>> {
         let diff = &self.loaded.diff;
-        let row = *diff.rows().get(row_index)?;
-        let hunk = diff.file(row.file as usize)?.hunks.get(row.hunk as usize)?;
-        let rows = diff.rows();
-        let pair = match row.kind {
-            RowKind::Removed => {
-                let mut start = row_index;
-                while start > hunk.first && rows[start - 1].kind == RowKind::Removed {
-                    start -= 1;
-                }
-                let mut added = row_index;
-                while added < hunk.end && rows[added].kind == RowKind::Removed {
-                    added += 1;
-                }
-                let pair = added + (row_index - start);
-                (rows.get(pair)?.kind == RowKind::Added).then_some(pair)?
-            }
-            RowKind::Added => {
-                let mut start = row_index;
-                while start > hunk.first && rows[start - 1].kind == RowKind::Added {
-                    start -= 1;
-                }
-                let mut removed = start;
-                while removed > hunk.first && rows[removed - 1].kind == RowKind::Removed {
-                    removed -= 1;
-                }
-                let pair = removed + (row_index - start);
-                (rows.get(pair)?.kind == RowKind::Removed).then_some(pair)?
-            }
-            _ => return None,
+        let Some(partner) = self.split.partner(diff, row_index) else {
+            return Vec::new();
         };
-        let (a, b) = (diff.content(pair), diff.content(row_index));
-        let prefix = a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count();
-        let suffix = a
-            .chars()
-            .rev()
-            .zip(b.chars().rev())
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(a.chars().count().saturating_sub(prefix))
-            .min(b.chars().count().saturating_sub(prefix));
-        Some((prefix, suffix))
+        let (text, other) = (diff.content(row_index), diff.content(partner));
+        match diff.rows()[row_index].kind {
+            RowKind::Removed => linediff::Changes::between(text, other).old,
+            _ => linediff::Changes::between(other, text).new,
+        }
     }
 
     fn draw_composer(&mut self, f: &mut Frame, area: Rect) {
@@ -3348,16 +3418,10 @@ fn text_spans(
     avail: usize,
     base: Style,
     kinds: Option<&[syntax::Kind]>,
-    emphasis: Option<(usize, usize)>,
+    emphasis: &[std::ops::Range<usize>],
     word: Color,
     selection: Option<Color>,
 ) -> usize {
-    let (changed_from, suffix) = emphasis.unwrap_or((0, 0));
-    let changed_to = if suffix == 0 {
-        usize::MAX
-    } else {
-        text.chars().count().saturating_sub(suffix)
-    };
     let end = start.saturating_add(avail);
     let mut column = 0;
     let mut used = 0;
@@ -3381,7 +3445,7 @@ fn text_spans(
         {
             style = style.patch(crate::render::code_style(*kind));
         }
-        if at >= changed_from && at < changed_to {
+        if emphasis.iter().any(|range| range.contains(&at)) {
             style = style.bg(word);
         }
         if let Some(selection) = selection {
@@ -4116,6 +4180,74 @@ diff --git a/b.rs b/b.rs
             },
             github: None,
             branch: Some("main".to_owned()),
+        }
+    }
+
+    const SHIFTED: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+-    let total = sum(items);
++
++    let total = sum(items) + tax;
+ }
+";
+
+    #[test]
+    fn a_line_inserted_above_an_edit_pairs_the_edit_with_its_old_line() {
+        let diff = Diff::parse(SHIFTED.to_owned());
+        let split = Split::new(&diff, Layout::Split);
+        let rows: Vec<(Option<&str>, Option<&str>)> = split
+            .lines()
+            .iter()
+            .filter(|line| line.band.is_none())
+            .map(|line| {
+                (
+                    line.left.map(|row| diff.content(row)),
+                    line.right.map(|row| diff.content(row)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("fn main() {"), Some("fn main() {")),
+                (None, Some("")),
+                (
+                    Some("    let total = sum(items);"),
+                    Some("    let total = sum(items) + tax;")
+                ),
+                (Some("}"), Some("}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn emphasis_marks_the_changed_words_of_the_paired_line_in_both_layouts() {
+        for layout in [Layout::Split, Layout::Inline] {
+            let mut app = App::new(
+                loaded(SHIFTED),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            let rows = app.loaded.diff.rows().to_vec();
+            let row = |kind: RowKind, nth: usize| {
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.kind == kind)
+                    .nth(nth)
+                    .map(|(i, _)| i)
+                    .unwrap_or(usize::MAX)
+            };
+            assert!(app.emphasis(row(RowKind::Removed, 0)).is_empty());
+            assert!(app.emphasis(row(RowKind::Added, 0)).is_empty());
+            assert_eq!(app.emphasis(row(RowKind::Added, 1)), vec![26..32]);
+            app.toggle_layout();
+            assert_eq!(app.emphasis(row(RowKind::Added, 1)), vec![26..32]);
         }
     }
 
@@ -4945,7 +5077,7 @@ diff --git a/b.rs b/b.rs
                 room,
                 Style::default(),
                 None,
-                None,
+                &[],
                 Color::Reset,
                 None,
             );
