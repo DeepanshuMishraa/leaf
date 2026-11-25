@@ -62,6 +62,21 @@ struct Placement: Equatable {
     let layerBounds: CGRect?
     var layerID: String? = nil
     var upperLayers: [CGRect] = []
+
+    /// The layer changed size, but the block kept its slot within it. All helpers see
+    /// this in session.view, even after the last resize command has completed.
+    func followsOuterResize(from old: Placement?) -> Bool {
+        guard let old, floating, old.floating, let layerID, old.layerID == layerID,
+              let a = old.layerBounds, let b = layerBounds, a.size != b.size,
+              a.width > 0, a.height > 0, b.width > 0, b.height > 0 else { return false }
+        func same(_ x: CGFloat, _ y: CGFloat) -> Bool { abs(x - y) < 0.000001 }
+        return same((old.rect.minX - a.minX) / a.width, (rect.minX - b.minX) / b.width) &&
+               same((old.rect.minY - a.minY) / a.height, (rect.minY - b.minY) / b.height) &&
+               same(old.rect.width / a.width, rect.width / b.width) &&
+               same(old.rect.height / a.height, rect.height / b.height) &&
+               same(old.gapOffset.origin.x, gapOffset.origin.x) && same(old.gapOffset.origin.y, gapOffset.origin.y) &&
+               same(old.gapOffset.size.width, gapOffset.size.width) && same(old.gapOffset.size.height, gapOffset.size.height)
+    }
 }
 
 enum SessionView {
@@ -598,7 +613,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var lastFrame = NSRect.zero
     var resizeStart: (grip: ResizeGrip, mouse: CGPoint, down: NSEvent)?
     var resizingLayer: String?
-    var pendingResize: (id: String, bounds: CGRect)?
+    var pendingResize: (id: String, bounds: CGRect, isFinal: Bool)?
     var resizeInFlight: String?
     var settleUntil = Date.distantPast
     var missing = 0
@@ -1842,7 +1857,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                 }
                 resizingLayer = start.grip.id
             }
-            pendingResize = (start.grip.id, start.grip.resized(dx: dx, dy: dy))
+            pendingResize = (start.grip.id, start.grip.resized(dx: dx, dy: dy), event.type == .leftMouseUp)
             if event.type == .leftMouseUp { resizeStart = nil; resizingLayer = nil }
             sendPendingResize()
             return true
@@ -1976,8 +1991,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             let next = SessionView.placement(view, block: block)
             // Rex animates panes into place. Following that animation would
             // lag it, so step out of the way and come back once it settles.
-            let liveResize = next?.floating == true && next?.layerID != nil &&
-                (next?.layerID == resizingLayer || next?.layerID == resizeInFlight)
+            let liveResize = next?.followsOuterResize(from: placement) == true
             if !liveResize && (next?.rect != placement?.rect || next?.floating != placement?.floating || next?.gapOffset != placement?.gapOffset) {
                 settleUntil = Date().addingTimeInterval(0.28)
                 hide()
@@ -2100,7 +2114,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         guard shown else { return }
         resizeStart = nil
         resizingLayer = nil
-        pendingResize = nil
+        // An accepted mouse-up belongs to its original layer even when the browser is hidden.
+        if pendingResize?.isFinal == false { pendingResize = nil }
         window.orderOut(nil)
         shown = false
     }

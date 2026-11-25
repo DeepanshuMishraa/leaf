@@ -2,6 +2,23 @@
 import AppKit
 
 typealias Object = [String: Any]
+
+// Run this test executable as a stand-in for Rex so we can observe what actually gets sent.
+let args = CommandLine.arguments
+if args.dropFirst().starts(with: ["api", "call"]) {
+    if args.count == 5, args[3] == "session.resize_layer",
+       let log = ProcessInfo.processInfo.environment["LEAF_TEST_RESIZE_LOG"] {
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: log))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((args[4] + "\n").utf8))
+        try handle.close()
+    }
+    exit(0)
+}
+var failures = [String]()
+func checkResize(_ condition: Bool, _ message: String) {
+    if !condition { failures.append(message) }
+}
 let full = [0.0, 0, 1, 1]
 let card = [0.125, 0.25, 0.5, 0.5]
 func layer(_ kind: String, _ rect: [Double], _ id: String) -> Object {
@@ -112,9 +129,13 @@ let roundedChild = SessionView.placement(splitCorner(offsetClamped, first: false
 precondition(offsetClamped.width < offsetLayer.width && chrome.body(roundedChild, in: offsetHost) != nil,
              "rounding the clamped edges hid the split child")
 
-// Mouse-up queues the last position while the preceding resize's completion is still on the main queue.
-func finalResizeSurvivesOldView() -> Bool {
-    setenv("LEAF_REX", "/usr/bin/true", 1) // No real session or subprocess timing dependency.
+// Hold the main queue until mouse-up and a session switch have both happened, then drain the real sender.
+func checkResizeDelivery() throws {
+    let log = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try Data().write(to: log)
+    defer { try? FileManager.default.removeItem(at: log) }
+    setenv("LEAF_REX", URL(fileURLWithPath: args[0]).standardizedFileURL.path, 1)
+    setenv("LEAF_TEST_RESIZE_LOG", log.path, 1)
     _ = NSApplication.shared
     let browser = Browser(session: "fixture", block: "web")
     browser.placement = placed
@@ -131,9 +152,49 @@ func finalResizeSurvivesOldView() -> Bool {
     let final = corner.resized(dx: 70, dy: 0)
     precondition(browser.pendingResize?.bounds == final)
     browser.apply(view([tile, layer("floating", [0.125, 0.25, 0.5125, 0.5], "web")]))
-    return browser.shown && browser.pendingResize?.bounds == final
+    precondition(browser.shown && browser.pendingResize?.bounds == final, "an older layout cancelled mouse-up")
+    browser.shownSession = "another-session"
+    browser.follow()
+    precondition(!browser.shown)
+    let deadline = Date().addingTimeInterval(5)
+    while browser.resizeInFlight != nil && Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+    }
+    let requests = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map {
+        try JSONSerialization.jsonObject(with: Data($0.utf8)) as! Object
+    }
+    let last = requests.last ?? [:]
+    checkResize(requests.count == 2 && last["session_id"] as? String == "fixture" &&
+                last["layer_id"] as? String == corner.id && SessionView.rect(last["bounds"]) == final,
+                "switching sessions dropped the final resize request")
 }
-precondition(finalResizeSurvivesOldView(), "an older layout cancelled the mouse-up target")
+try checkResizeDelivery()
+
+// The same snapshots reach both helpers, including after the sender's async resize has completed.
+let initialLayout = splitCorner(placed.rect, first: true)
+let resizedBounds = corner.resized(dx: 200, dy: 125)
+let resizedLayout = splitCorner(resizedBounds, first: true)
+for block in ["web", "other-col"] {
+    let browser = Browser(session: "fixture", block: block)
+    browser.wasFocusedInRex = block == "web"
+    browser.placement = SessionView.placement(initialLayout, block: block)
+    browser.shown = true
+    browser.apply(resizedLayout)
+    checkResize(browser.shown && browser.settleUntil < Date(), "layer resize hid \(block)")
+    // A different split within the same outer bounds is still a layout transition.
+    browser.apply(splitCorner(resizedBounds, first: false))
+    precondition(!browser.shown && browser.settleUntil > Date())
+    // Coalesced snapshots may change both the layer bounds and the split at once.
+    browser.shown = true
+    browser.settleUntil = .distantPast
+    browser.apply(initialLayout)
+    precondition(!browser.shown && browser.settleUntil > Date())
+}
+
+if !failures.isEmpty {
+    FileHandle.standardError.write(Data((failures.joined(separator: "\n") + "\n").utf8))
+    exit(1)
+}
 
 // A different session in Rex's sidebar doesn't change this session's focused block.
 let selected = #"{"sessionID":"fixture"}"#
