@@ -188,23 +188,50 @@ pub fn agents(installed: &[Installed], current: Option<&str>) -> Vec<Item> {
     .collect()
 }
 
-/// The installed iPhone simulators, booted ones first. Ids are udids.
+/// The installed iPhone simulators, booted ones first, each followed by the
+/// same simulator on an iPhone Duo: open, then folded. A plain id is the
+/// udid. `duo:` and `folded:` name the chassis `leaf sim open` should draw.
 pub fn simulators(devices: &[crate::simulator::Device]) -> Vec<Item> {
-    devices
-        .iter()
-        .map(|device| Item {
+    let mut items = Vec::with_capacity(devices.len() * 3);
+    for device in devices {
+        let booted = device.booted();
+        items.push(Item {
             id: device.udid.clone(),
             title: device.name.clone(),
             subtitle: device.runtime.clone(),
             icon: "iphone",
-            detail: if device.booted() {
+            detail: if booted {
                 "booted".to_owned()
             } else {
                 String::new()
             },
-        })
-        .take(MOST)
-        .collect()
+        });
+        let where_ = format!("{} · {}", device.name, device.runtime);
+        items.push(Item {
+            id: format!("duo:{}", device.udid),
+            title: "iPhone Duo".to_owned(),
+            subtitle: where_.clone(),
+            icon: "iphone",
+            detail: if booted {
+                "open · booted".to_owned()
+            } else {
+                "open".to_owned()
+            },
+        });
+        items.push(Item {
+            id: format!("folded:{}", device.udid),
+            title: "iPhone Duo Folded".to_owned(),
+            subtitle: where_,
+            icon: "iphone",
+            detail: if booted {
+                "folded · booted".to_owned()
+            } else {
+                "folded".to_owned()
+            },
+        });
+    }
+    items.truncate(MOST);
+    items
 }
 
 #[cfg(test)]

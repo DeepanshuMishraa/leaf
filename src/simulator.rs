@@ -3,8 +3,8 @@
 //!
 //! The pane is a native helper (src/simulator.swift and src/pane.swift,
 //! compiled by build.rs and embedded here; see src/helper.rs), unpacked with
-//! leaf's iPhone model beside it. It boots the device, shows its live screen
-//! and sends touches and keys. It also listens on a Unix socket, one per
+//! the iPhone and iPhone Duo models beside it. It boots the device, shows its
+//! live screen and sends touches and keys. It also listens on a Unix socket, one per
 //! device, which `leaf sim tap|swipe|type|key|button|info` talk to.
 //! `screenshot`, `open-url` and `launch` go through `simctl` and work on any
 //! booted simulator.
@@ -26,9 +26,11 @@ use crate::helper::{Part, macos_version};
 
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
 const PHONE: &[u8] = include_bytes!("../vendor/devices/iphone.usdz");
+const DUO_OPEN: &[u8] = include_bytes!("../vendor/devices/iphone-duo-open.usdz");
+const DUO_FOLDED: &[u8] = include_bytes!("../vendor/devices/iphone-duo-folded.usdz");
 
 const USAGE: &str = "Usage: leaf sim list [--json]          installed iPhone simulators
-       leaf sim open <udid>              show one in this Rex pane, on a 3D iPhone
+       leaf sim open <udid> [--duo]      show one in this Rex pane, on a 3D iPhone or the iPhone Duo
        leaf sim info                     the device and its screen size in pixels
        leaf sim screenshot [file.png]    save the screen; prints the file's path
        leaf sim tap <x> <y>              tap, in screenshot pixels (0,0 is the top left)
@@ -241,6 +243,17 @@ fn open_panes() -> Vec<String> {
         .collect();
     udids.sort();
     udids
+}
+
+/// A palette row or `leaf sim open` argument: a udid, `duo:<udid>`, or `folded:<udid>`.
+fn open_target(spec: &str, duo: bool, folded: bool) -> (&str, bool, bool) {
+    if let Some(udid) = spec.strip_prefix("folded:") {
+        (udid, true, true)
+    } else if let Some(udid) = spec.strip_prefix("duo:") {
+        (udid, true, folded)
+    } else {
+        (spec, duo, folded)
+    }
 }
 
 /// `--device <udid>` taken out of `args`.
@@ -511,7 +524,7 @@ fn answer(device: &Device, line: &str) -> Reply {
     }
 }
 
-/// The helper on disk, with the phone model beside it.
+/// The helper on disk, with the phone models beside it.
 fn helper() -> Result<PathBuf, String> {
     if SIM_HOST.is_empty() {
         return Err("this leaf was built without the simulator pane (Apple's Swift toolchain wasn't available). Install Xcode, then reinstall leaf.".into());
@@ -530,13 +543,24 @@ fn helper() -> Result<PathBuf, String> {
                 bytes: PHONE,
                 mode: 0o644,
             },
+            Part {
+                name: "iphone-duo-open.usdz",
+                bytes: DUO_OPEN,
+                mode: 0o644,
+            },
+            Part {
+                name: "iphone-duo-folded.usdz",
+                bytes: DUO_FOLDED,
+                mode: 0o644,
+            },
         ],
     )?;
     Ok(dir.join("leaf-sim-host"))
 }
 
 /// `leaf sim open <udid>`: the device in this Rex pane until it closes.
-fn open(udid: &str) -> Result<(), String> {
+/// `duo` draws the iPhone Duo; `folded` uses its cover instead of the inner display.
+fn open(udid: &str, duo: bool, folded: bool) -> Result<(), String> {
     if std::env::var_os("REX_SESSION").is_none() || std::env::var_os("REX_BLOCK").is_none() {
         return Err("open the simulator from a Rex pane, or with Leaf: Open Simulator… in Rex's command palette.".into());
     }
@@ -562,7 +586,8 @@ fn open(udid: &str) -> Result<(), String> {
     }
     let executable = helper()?;
     let rex = crate::agent::rex_program()?;
-    let mut child = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .env("LEAF_REX", rex)
@@ -574,8 +599,16 @@ fn open(udid: &str) -> Result<(), String> {
         .env("LEAF_SIM_NAME", &device.name)
         .env("LEAF_SIM_RUNTIME", &device.runtime)
         .env("LEAF_SIM_SOCKET", &socket)
-        .env("LEAF_DEVELOPER_DIR", &developer)
-        .spawn()
+        .env("LEAF_DEVELOPER_DIR", &developer);
+    // Absent means the helper decides from the simulator's name.
+    if duo {
+        command.env("LEAF_SIM_CHASSIS", "duo");
+        command.env("LEAF_SIM_POSE", if folded { "folded" } else { "open" });
+    } else {
+        command.env_remove("LEAF_SIM_CHASSIS");
+        command.env_remove("LEAF_SIM_POSE");
+    }
+    let mut child = command.spawn()
         .map_err(|e| {
             format!(
                 "couldn't start the simulator pane at {} ({e}).",
@@ -646,7 +679,18 @@ fn command(args: &[String]) -> Result<(), SimError> {
             println!("{json}");
             Ok(())
         }
-        ["open", udid] => Ok(open(udid)?),
+        ["open", spec] => {
+            let (udid, duo, folded) = open_target(spec, false, false);
+            Ok(open(udid, duo, folded)?)
+        }
+        ["open", spec, "--duo"] | ["open", "--duo", spec] => {
+            let (udid, _, folded) = open_target(spec, true, false);
+            Ok(open(udid, true, folded)?)
+        }
+        ["open", spec, "--folded"] | ["open", "--folded", spec] => {
+            let (udid, _, _) = open_target(spec, true, true);
+            Ok(open(udid, true, true)?)
+        }
         // Unpack the helper and print where, so a release can prove the
         // pane it ships runs, outside Rex.
         ["--check"] => {
@@ -796,6 +840,32 @@ mod tests {
             Some(("iOS", vec![26, 1]))
         );
         assert_eq!(runtime("com.apple.CoreSimulator.SimRuntime.odd-x"), None);
+    }
+
+    #[test]
+    fn the_picker_lists_each_phone_then_its_duo_open_and_folded() {
+        let mut phone = device();
+        phone.udid = "C3".into();
+        phone.state = "Shutdown".into();
+        let rows = crate::palette::simulators(&[device(), phone]);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["B2", "duo:B2", "folded:B2", "C3", "duo:C3", "folded:C3",]
+        );
+        assert_eq!(rows[1].title, "iPhone Duo");
+        assert_eq!(rows[1].detail, "open · booted");
+        assert_eq!(rows[2].title, "iPhone Duo Folded");
+        assert_eq!(rows[2].subtitle, "iPhone 17 Pro · iOS 26.1");
+        assert_eq!(rows[5].detail, "folded");
+    }
+
+    #[test]
+    fn open_target_names_the_chassis() {
+        assert_eq!(open_target("B2", false, false), ("B2", false, false));
+        assert_eq!(open_target("duo:B2", false, false), ("B2", true, false));
+        assert_eq!(open_target("folded:B2", false, false), ("B2", true, true));
+        assert_eq!(open_target("duo:B2", true, true), ("B2", true, true));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // Leaf's iOS Simulator pane: a simulator's live screen on a 3D iPhone, in a
-// window kept over one Rex block (see src/pane.swift).
+// window kept over one Rex block (see src/pane.swift). The iPhone Duo uses
+// the same screen: folded on the cover display, open on the inner one.
 //
 // The screen is the simulator's own framebuffer: CoreSimulator hands out the
 // IOSurface it draws into, and a Metal texture over that surface is the
@@ -523,6 +524,14 @@ final class Marquee: NSView {
     }
 }
 
+/// The body drawn around the simulator's screen.
+enum Chassis {
+    /// The single-screen iPhone.
+    case phone
+    /// The foldable, on its cover or its inner display.
+    case duo
+}
+
 /// The card at the bottom: the question about the screen, and what became of it.
 final class AskCard: NSView {
     let field = NSTextField()
@@ -592,6 +601,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     let home: ToolButton
     let lock: ToolButton
     let turn: ToolButton
+    let model: ToolButton
+    let fold: ToolButton
     let ask: ToolButton
     let close: ToolButton
     let phoneView = PhoneView(frame: .zero, options: nil)
@@ -602,6 +613,10 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     var askCard: AskCard!
 
     var phone: Phone?
+    /// The body the screen is drawn on. A simulator whose name says Duo starts there.
+    var chassis: Chassis
+    /// The Duo's inner display, rather than its cover.
+    var duoOpen = true
     var orbit = Orbit()
     var device: NSObject?
     var display: NSObject?
@@ -644,10 +659,19 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         home = ToolButton(symbol: "house", label: "Home (⇧⌘H)", target: nil, action: #selector(Simulator.pressHome))
         lock = ToolButton(symbol: "lock", label: "Lock (⌘L)", target: nil, action: #selector(Simulator.pressLock))
         turn = ToolButton(symbol: "rotate.3d", label: "Face Front (⌘0)", target: nil, action: #selector(Simulator.toggleFront))
+        model = ToolButton(symbol: "ipad.landscape", label: "iPhone Duo (⌘D)", target: nil, action: #selector(Simulator.toggleChassis))
+        fold = ToolButton(symbol: "book.closed", label: "Fold (⌘F)", target: nil, action: #selector(Simulator.toggleFold))
         ask = ToolButton(symbol: "text.bubble", label: "Ask", target: nil, action: #selector(Simulator.toggleAsk))
         close = ToolButton(symbol: "xmark", label: "Close Pane (⌘W)", target: nil, action: #selector(Simulator.closePane))
+        let environment = ProcessInfo.processInfo.environment
+        switch environment["LEAF_SIM_CHASSIS"] {
+        case "duo": chassis = .duo
+        case "phone": chassis = .phone
+        default: chassis = name.localizedStandardContains("duo") ? .duo : .phone
+        }
+        duoOpen = environment["LEAF_SIM_POSE"] != "folded"
         super.init(session: session, block: block)
-        for button in [home, lock, turn, ask, close] { button.target = self }
+        for button in [home, lock, turn, model, fold, ask, close] { button.target = self }
         askCard = AskCard(target: self, action: #selector(sendAsk))
         build()
     }
@@ -689,7 +713,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.stringValue = runtime.isEmpty ? name : "\(name) · \(runtime)"
         bar.addSubview(titleLabel)
-        for button in [home, lock, turn, ask, close] { bar.addSubview(button) }
+        for button in [home, lock, turn, model, fold, ask, close] { bar.addSubview(button) }
 
         spinner.style = .spinning
         spinner.controlSize = .small
@@ -727,7 +751,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     /// Simulator shortcuts that stay here even when Rex binds them.
     static let reserved: Set<Chord> = Set([
-        "cmd+w", "cmd+q", "shift+cmd+h", "cmd+l", "cmd+v", "cmd+0", "cmd+=", "cmd+-", "shift+cmd+a",
+        "cmd+w", "cmd+q", "shift+cmd+h", "cmd+l", "cmd+v", "cmd+0", "cmd+=", "cmd+-", "cmd+d", "cmd+f", "shift+cmd+a",
     ].compactMap(Chord.init))
 
     override var reservedKeys: Set<Chord> { Simulator.reserved }
@@ -746,7 +770,10 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         bar.frame = NSRect(x: 0, y: height - barHeight, width: width, height: barHeight)
         let size: CGFloat = 28, top = (barHeight - size) / 2
         var x = width - 8 - size
-        for button in [close, ask, turn, lock, home] {
+        for button in [close, ask, model, fold, turn, lock, home] {
+            let shown = button !== fold || chassis == .duo
+            button.isHidden = !shown
+            guard shown else { continue }
             button.frame = NSRect(x: x, y: top, width: size, height: size)
             x -= size + 2
         }
@@ -767,6 +794,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         lock.isEnabled = live
         ask.isEnabled = true
         turn.setSymbol(orbit.front ? "rotate.3d" : "iphone", label: orbit.front ? "Turn in 3D (⌘0)" : "Face Front (⌘0)")
+        model.setSymbol(chassis == .duo ? "iphone" : "ipad.landscape",
+                        label: chassis == .duo ? "iPhone (⌘D)" : "iPhone Duo (⌘D)")
+        fold.setSymbol(duoOpen ? "book.closed" : "book", label: duoOpen ? "Fold (⌘F)" : "Open (⌘F)")
         ask.contentTintColor = askShown ? .controlAccentColor : (ask.isEnabled ? .secondaryLabelColor : .tertiaryLabelColor)
     }
 
@@ -786,9 +816,19 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     // MARK: The phone
 
+    /// Which body to draw, beside the helper the way `iphone.usdz` is.
+    func modelURL() -> URL? {
+        guard let executable = Bundle.main.executableURL else { return nil }
+        let name: String
+        switch chassis {
+        case .phone: name = "iphone.usdz"
+        case .duo: name = duoOpen ? "iphone-duo-open.usdz" : "iphone-duo-folded.usdz"
+        }
+        return executable.deletingLastPathComponent().appendingPathComponent(name)
+    }
+
     func loadPhone() {
-        guard let executable = Bundle.main.executableURL else { return }
-        let url = executable.deletingLastPathComponent().appendingPathComponent("iphone.usdz")
+        guard let url = modelURL() else { return }
         switch Phone.load(url) {
         case .success(let phone):
             self.phone = phone
@@ -801,12 +841,32 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             cameraNode.camera = camera
             phone.scene.rootNode.addChildNode(cameraNode)
             phoneView.pointOfView = cameraNode
-            pulseScreen()
+            if let surface {
+                show(surface)
+            } else {
+                pulseScreen()
+            }
             frameCamera()
             applyOrbit(animated: false)
         case .failure(let failure):
             fail(failure)
         }
+    }
+
+    /// The iPhone, or the iPhone Duo. The live screen comes along.
+    @objc func toggleChassis() {
+        chassis = chassis == .duo ? .phone : .duo
+        loadPhone()
+        updateControls()
+        layout()
+    }
+
+    /// Fold or open the Duo. The cover shows while it's folded, the inner display while it's open.
+    @objc func toggleFold() {
+        guard chassis == .duo else { return }
+        duoOpen.toggle()
+        loadPhone()
+        updateControls()
     }
 
     /// The dark screen breathes while the simulator starts.
@@ -879,6 +939,19 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     @objc func zoomIn() { orbit.zoom = min(3, orbit.zoom * 1.15); frameCamera() }
     @objc func zoomOut() { orbit.zoom = max(0.5, orbit.zoom / 1.15); frameCamera() }
+
+    @objc func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(toggleChassis):
+            item.state = chassis == .duo ? .on : .off
+        case #selector(toggleFold):
+            item.title = duoOpen ? "Fold" : "Open"
+            return chassis == .duo
+        default:
+            break
+        }
+        return true
+    }
 
     /// Where `event` lands on the screen, as fractions from its top left; nil
     /// when it misses the screen. `slide` keeps a finger that's already down
@@ -1729,6 +1802,9 @@ final class SimulatorDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             item("Ask About the Screen", #selector(Simulator.toggleAsk), "a", [.command, .shift], target: s),
         ])
         submenu("Device", [
+            item("iPhone Duo", #selector(Simulator.toggleChassis), "d", target: s),
+            item("Fold", #selector(Simulator.toggleFold), "f", target: s),
+            .separator(),
             item("Home", #selector(Simulator.pressHome), "h", [.command, .shift], target: s),
             item("Lock", #selector(Simulator.pressLock), "l", target: s),
         ])

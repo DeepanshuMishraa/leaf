@@ -70,13 +70,13 @@ Keys to tell the person: `cmd+l` address bar (takes a URL, `localhost:3000`, or 
 
 ## iOS Simulator (Rex, macOS 13+, Xcode)
 
-`leaf sim open <udid>` boots an installed iPhone simulator and shows its live screen on a 3D iPhone in the current Rex pane until it closes. `leaf sim list` prints the installed iPhones (`--json` for tools). Open one beside you:
+`leaf sim open <udid>` boots an installed iPhone simulator and shows its live screen on a 3D iPhone in the current Rex pane until it closes. `cmd+d` switches that model to an iPhone Duo, and `cmd+f` folds and opens it: folded, the screen is the cover display, and open, it is the inner one. A simulator named Duo starts on the Duo. `leaf sim list` prints the installed iPhones (`--json` for tools). Open one beside you:
 
 ```bash
 rex split -s "$REX_SESSION" -b "$REX_BLOCK" --split=right --focus=false -- leaf sim open <udid>
 ```
 
-The person can also use **Leaf: Open Simulator…** in Rex's command palette. With no iOS runtime installed it says so; tell them to add one in Xcode → Settings → Components. A device leaf booted shuts down when its pane closes.
+The person can also use **Leaf: Open Simulator…** in Rex's command palette. That list includes each installed iPhone, then the same phone as an iPhone Duo, open and folded. With no iOS runtime installed it says so; tell them to add one in Xcode → Settings → Components. A device leaf booted shuts down when its pane closes.
 
 **Driving it.** Coordinates are pixels of the screenshot, with 0,0 at the top left. Take a screenshot first and read it, then act, then take another to check:
 
