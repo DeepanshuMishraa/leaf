@@ -209,7 +209,23 @@ for block in ["web", "other-col"] {
     browser.settleUntil = .distantPast
     browser.apply(initialLayout)
     precondition(!browser.shown && browser.settleUntil > Date())
+    // Dragging the float moves the layer without resizing it; the page follows it live.
+    browser.shown = true
+    browser.settleUntil = .distantPast
+    browser.placement = SessionView.placement(initialLayout, block: block)
+    browser.apply(splitCorner(placed.rect.offsetBy(dx: 0.1, dy: -0.05), first: true))
+    checkResize(browser.shown && browser.settleUntil < Date(), "layer move hid \(block)")
 }
+
+// Dragging a float by its header moves the page with the pointer, but not from the resize edge.
+let dragBody = NSRect(x: 300, y: 200, width: 800, height: 460)
+let dragRect = CGRect(x: 0.1, y: 0.2, width: 0.5, height: 0.5)
+let drag = FloatDrag.start(at: NSPoint(x: 600, y: 680), frame: dragBody, header: 36, rect: dragRect)
+precondition(drag?.frame(at: NSPoint(x: 650.4, y: 600)) == NSRect(x: 350, y: 120, width: 800, height: 460))
+precondition(FloatDrag.start(at: NSPoint(x: 600, y: 695), frame: dragBody, header: 36, rect: dragRect) == nil)
+precondition(FloatDrag.start(at: NSPoint(x: 302, y: 680), frame: dragBody, header: 36, rect: dragRect) == nil)
+precondition(FloatDrag.start(at: NSPoint(x: 600, y: 400), frame: dragBody, header: 36, rect: dragRect) == nil)
+precondition(FloatDrag.start(at: NSPoint(x: 600, y: 202), frame: dragBody, header: 0, rect: dragRect) == nil)
 
 if !failures.isEmpty {
     FileHandle.standardError.write(Data((failures.joined(separator: "\n") + "\n").utf8))

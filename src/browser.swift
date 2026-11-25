@@ -63,11 +63,11 @@ struct Placement: Equatable {
     var layerID: String? = nil
     var upperLayers: [CGRect] = []
 
-    /// The layer changed size, but the block kept its slot within it. All helpers see
-    /// this in session.view, even after the last resize command has completed.
-    func followsOuterResize(from old: Placement?) -> Bool {
+    /// The floating layer moved or changed size, but the block kept its slot within it.
+    /// All helpers see this in session.view, even after the last resize command has completed.
+    func followsLayer(from old: Placement?) -> Bool {
         guard let old, floating, old.floating, let layerID, old.layerID == layerID,
-              let a = old.layerBounds, let b = layerBounds, a.size != b.size,
+              let a = old.layerBounds, let b = layerBounds,
               a.width > 0, a.height > 0, b.width > 0, b.height > 0 else { return false }
         func same(_ x: CGFloat, _ y: CGFloat) -> Bool { abs(x - y) < 0.000001 }
         return same((old.rect.minX - a.minX) / a.width, (rect.minX - b.minX) / b.width) &&
@@ -286,6 +286,31 @@ struct Chrome: Equatable {
             if !floatingFrame(layer, in: window).intersection(body).isEmpty { return nil }
         }
         return body
+    }
+}
+
+/// A drag of a floating pane by its header. Rex reports the layer's new place
+/// only once the drag ends, so the browser follows the pointer until then.
+struct FloatDrag {
+    /// `Placement.rect` when the drag began; a different rect means Rex has landed it.
+    let rect: CGRect
+    /// The browser's window frame and the pointer when the drag began, in AppKit screen points.
+    let frame: NSRect
+    let mouse: NSPoint
+    var released: Date?
+
+    /// Starts a drag when `mouse` is on the header above `frame`, clear of the
+    /// outer edge where Rex resizes the float.
+    static func start(at mouse: NSPoint, frame: NSRect, header: CGFloat, rect: CGRect) -> FloatDrag? {
+        let edge: CGFloat = 7
+        guard header > edge else { return nil }
+        let grip = NSRect(x: frame.minX + edge, y: frame.maxY, width: frame.width - 2 * edge, height: header - edge)
+        guard grip.contains(mouse) else { return nil }
+        return FloatDrag(rect: rect, frame: frame, mouse: mouse)
+    }
+
+    func frame(at mouse: NSPoint) -> NSRect {
+        frame.offsetBy(dx: (mouse.x - self.mouse.x).rounded(), dy: (mouse.y - self.mouse.y).rounded())
     }
 }
 
@@ -632,6 +657,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var pageEditing = false
     var forwardedAt = Date.distantPast
     var clickMonitor: Any?
+    var dragMonitor: Any?
+    var floatDrag: FloatDrag?
     var lastExternalClick: (point: NSPoint, time: TimeInterval)?
     var focusRequestedByActivation = false
     /// Focus asked for before the window was first placed.
@@ -1901,8 +1928,16 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         RunLoop.main.add(poll, forMode: .common)
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) {
             [weak self] event in
-            guard let point = event.cgEvent?.location, let primary = NSScreen.screens.first else { return }
-            self?.lastExternalClick = (CGPoint(x: point.x, y: primary.frame.height - point.y), event.timestamp)
+            guard let self, let point = event.cgEvent?.location, let primary = NSScreen.screens.first else { return }
+            self.lastExternalClick = (CGPoint(x: point.x, y: primary.frame.height - point.y), event.timestamp)
+            self.floatDrag = nil
+            if event.type == .leftMouseDown, self.shown, let placement = self.placement, placement.floating {
+                self.floatDrag = FloatDrag.start(at: NSEvent.mouseLocation, frame: self.lastFrame,
+                                                 header: self.chrome.header, rect: placement.rect)
+            }
+        }
+        dragMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) {
+            [weak self] event in self?.followFloatDrag(event)
         }
         Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.follow() }
             .tolerance = 0.002
@@ -1995,8 +2030,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             let next = SessionView.placement(view, block: block)
             // Rex animates panes into place. Following that animation would
             // lag it, so step out of the way and come back once it settles.
-            let liveResize = next?.followsOuterResize(from: placement) == true
-            if !liveResize && (next?.rect != placement?.rect || next?.floating != placement?.floating || next?.gapOffset != placement?.gapOffset) {
+            let followsLayer = next?.followsLayer(from: placement) == true
+            if !followsLayer && (next?.rect != placement?.rect || next?.floating != placement?.floating || next?.gapOffset != placement?.gapOffset) {
                 settleUntil = Date().addingTimeInterval(0.28)
                 hide()
             }
@@ -2012,8 +2047,35 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         return windows.first
     }
 
+    /// Moves the page with a header drag Rex is handling, and keeps it above
+    /// Rex's window, which the click raised.
+    func followFloatDrag(_ event: NSEvent) {
+        guard var drag = floatDrag, drag.released == nil, shown, let rex else { return }
+        if event.type == .leftMouseUp {
+            drag.released = Date()
+            floatDrag = drag
+            refresh()
+            return
+        }
+        let frame = drag.frame(at: NSEvent.mouseLocation)
+        if frame != lastFrame {
+            // Only the origin changes: moving without a redraw keeps up with the pointer.
+            window.setFrameOrigin(frame.origin)
+            lastFrame = frame
+        }
+        if !directlyAbove(rex.number) { window.order(.above, relativeTo: Int(rex.number)) }
+    }
+
     func follow() {
         guard sessionIsShown else { focusWhenShown = false; hide(); return }
+        if let drag = floatDrag {
+            // Hold the dragged frame until Rex reports where the float landed,
+            // or briefly after a click that didn't move it.
+            let landed = placement?.rect != drag.rect
+            let settled = drag.released.map { Date().timeIntervalSince($0) > 0.5 } ?? false
+            if !landed && !settled { return }
+            floatDrag = nil
+        }
         ticks &+= 1
         if ticks % 8 == 0 { pollBarMode(animated: true) }
         // Rex's window only moves while Rex (or this pane) is in front;
@@ -2104,6 +2166,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         sessionPoll = nil
         if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
         clickMonitor = nil
+        if let dragMonitor { NSEvent.removeMonitor(dragMonitor) }
+        dragMonitor = nil
     }
 
     /// Stops the `rex events` watcher, then exits: every way out goes here.
@@ -2116,6 +2180,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     func hide() {
         guard shown else { return }
+        floatDrag = nil
         resizeStart = nil
         resizingLayer = nil
         // An accepted mouse-up belongs to its original layer even when the browser is hidden.
