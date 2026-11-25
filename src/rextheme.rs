@@ -78,9 +78,11 @@ pub fn active() -> Option<Theme> {
     None
 }
 
-/// Whether this is a Rex pane that another machine's Rex app shows, so this
-/// machine's settings aren't the theme on screen and the terminal is asked
-/// instead. Every Rex pane off macOS is: Rex's app runs only on a Mac.
+/// Whether this Rex pane follows the terminal instead of this machine's
+/// settings: another machine's Rex app shows it, or no app has claimed it
+/// yet, so which one will is unknown. Either way, the app that claims it
+/// gives it its theme, which the terminal then answers with. Every Rex pane
+/// off macOS does: Rex's app runs only on a Mac.
 #[cfg_attr(test, allow(dead_code))]
 pub fn shown_elsewhere() -> bool {
     inside_rex() && !shown_here()
@@ -91,10 +93,12 @@ fn shown_here() -> bool {
     false
 }
 
-/// Whether the Rex app showing this pane runs on this machine, so the
-/// settings here are its own. Asked once, since it takes two `rex` calls and
-/// the theme is read again every quarter second. When Rex can't say, the
-/// settings here are used, as before.
+/// Whether a Rex app on this machine shows this pane, so the settings here
+/// are its own. Asked once, since it takes two `rex` calls and the theme is
+/// read again every quarter second; a pane no app has claimed yet counts as
+/// not shown here, since `Scheme::Pushed` takes the theme from whichever app
+/// claims it. When Rex itself can't be asked, the settings here are used, as
+/// before.
 #[cfg(target_os = "macos")]
 fn shown_here() -> bool {
     static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -108,13 +112,14 @@ fn shown_here() -> bool {
         else {
             return true;
         };
-        let Some(blocks) = json(&["block", "ls", "-s", &session, "--json"]) else {
+        let Some(blocks) = json(&["block", "ls", "-s", &session, "--json", "--short=false"]) else {
             return true;
         };
         let Some(clients) = json(&["api", "call", "client.list"]) else {
             return true;
         };
-        shown_by_local_app(&blocks, &clients, &block).unwrap_or(true)
+        // Unclaimed, or claimed by another machine's app: follow the terminal.
+        shown_by_local_app(&blocks, &clients, &block) == Some(true)
     })
 }
 

@@ -85,12 +85,14 @@ pub enum Scheme {
     /// The terminal reports its light or dark theme (Ghostty does), so it is
     /// asked again every `EVERY`, and its colors read again on a switch.
     Followed { light: bool, checked: Instant },
-    /// A Rex pane that another machine's Rex app shows. Until that app claims
-    /// the pane, the terminal answers with Rex's built-in palette and doesn't
-    /// give its background; once it does, every color is the app's theme. So
-    /// the background is asked for every `EVERY`, and all the colors read
-    /// again when it first answers and whenever it changes, as it does when
-    /// the theme is switched. Before that, only light or dark is followed.
+    /// A Rex pane that another machine's Rex app shows, or that no app has
+    /// claimed yet. Until an app claims the pane, the terminal answers with
+    /// Rex's built-in palette and doesn't give its background; once one does,
+    /// every color is that app's theme. So the background is asked for every
+    /// `EVERY`, and all the colors read again when it starts answering and
+    /// whenever it changes, as it does when the theme is switched. While it
+    /// doesn't answer, only light or dark is followed, and the last theme an
+    /// app gave is kept.
     Pushed {
         light: bool,
         background: Option<Rgb>,
@@ -112,7 +114,7 @@ impl Scheme {
         }
         if rextheme::shown_elsewhere() && std::io::stdin().is_terminal() {
             let background = crate::viewer::query_color(11);
-            let colors = pushed(background).unwrap_or(Colors {
+            let colors = pushed(background).unwrap_or_else(|| Colors {
                 theme: None,
                 light: crate::viewer::query_color_scheme().unwrap_or(false),
             });
@@ -176,12 +178,16 @@ impl Scheme {
                 light, background, ..
             } => {
                 let now = crate::viewer::query_color(11);
-                if now.is_some() && now != *background {
-                    // The showing app gave the pane its theme, or a new one.
+                if now != *background {
+                    // Recorded both ways, so a later claim is read again even
+                    // when it brings the same background.
                     *background = now;
-                    let colors = pushed(now)?;
-                    *light = colors.light;
-                    return Some(colors);
+                    if now.is_some() {
+                        // An app gave the pane its theme, or a new one.
+                        let colors = pushed(now)?;
+                        *light = colors.light;
+                        return Some(colors);
+                    }
                 }
                 if now.is_none()
                     && let Some(light_now) = crate::viewer::query_color_scheme()
@@ -206,6 +212,18 @@ impl Scheme {
                 }
                 _ => None,
             },
+        }
+    }
+
+    /// Puts the next check off for another wait, when the caller can't let it
+    /// ask the terminal now (a key is waiting or being typed), so `due` doesn't
+    /// stay at zero and spin the event loop meanwhile.
+    pub fn defer(&mut self) {
+        match self {
+            Scheme::Fixed | Scheme::Rex { .. } => {}
+            Scheme::Followed { checked, .. } | Scheme::Pushed { checked, .. } => {
+                *checked = Instant::now();
+            }
         }
     }
 
@@ -286,5 +304,18 @@ mod tests {
         assert!(pushed.asks_terminal());
         assert!(pushed.due().is_some_and(|wait| wait <= EVERY));
         assert_eq!(pushed.refresh(), None);
+        // Overdue but not allowed to ask: deferring puts it off a whole wait.
+        let long_ago = Instant::now().checked_sub(EVERY * 2).unwrap();
+        let mut overdue = Scheme::Pushed {
+            light: false,
+            background: None,
+            checked: long_ago,
+        };
+        assert_eq!(overdue.due(), Some(Duration::ZERO));
+        overdue.defer();
+        assert!(overdue.due().is_some_and(|wait| wait > EVERY / 2));
+        let mut rex = Scheme::Rex { checked: long_ago };
+        rex.defer();
+        assert_eq!(rex.due(), Some(Duration::ZERO));
     }
 }

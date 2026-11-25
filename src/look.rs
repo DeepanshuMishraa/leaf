@@ -60,9 +60,12 @@ impl Look {
     /// when either changed, so the screen is drawn again.
     pub fn refresh(&mut self, idle: bool) -> bool {
         let mut changed = false;
-        if (idle || !self.scheme.asks_terminal())
-            && let Some(colors) = self.scheme.refresh()
-        {
+        if !idle && self.scheme.asks_terminal() {
+            // Not now: wait a full turn, or `due` would stay at zero.
+            if self.scheme.due() == Some(Duration::ZERO) {
+                self.scheme.defer();
+            }
+        } else if let Some(colors) = self.scheme.refresh() {
             changed |= colors != self.colors;
             self.colors = colors;
         }
