@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `leaf browser` no longer flickers when focus moves between Rex panes, including between two browser panes: the page stays above Rex while Rex or another leaf pane is in front, and drops back to normal stacking when another app comes forward. A browser pane that another app's window overlaps, even a floating one, stays behind that window when another leaf pane is activated.
+- After Rex's palette or a dialog closes over the browser, or Rex comes back to the front, the browser waits for the pane layout to settle before taking the keyboard, so it no longer takes focus from the pane you clicked.
+
 ## 0.18.2
 
 - In `leaf browser`, unmodified keys (and characters typed with ⌥) typed into the address bar or a text field on the page stay there, even when Rex binds them; shortcuts with ⌘ or ⌃ still reach Rex. Bindings inside a Rex key mode are no longer forwarded. Typing `n` no longer switches tabs, and `enter` navigates again.
