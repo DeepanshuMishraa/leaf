@@ -615,6 +615,26 @@ impl Split {
         }))
     }
 
+    /// The diff rows a comment on display lines `first..=last` covers. When
+    /// the rows between the lines' first and last reach a line outside them,
+    /// as a paired line's two rows do once a block's pairing shifts, it is
+    /// the new side's rows alone, or the old side's when no line shows a new one.
+    fn comment_rows(&self, first: usize, last: usize) -> Option<(usize, usize)> {
+        let (first, last) = (first.min(last), first.max(last));
+        let all = self.rows_between(first, last)?;
+        let inside = (all.0..=all.1).all(|row| {
+            self.line_for_row(row)
+                .is_some_and(|line| (first..=last).contains(&line))
+        });
+        if inside {
+            return Some(all);
+        }
+        let lines = self.lines.get(first..=last)?;
+        let span = |rows: Vec<usize>| Some((*rows.iter().min()?, *rows.iter().max()?));
+        span(lines.iter().filter_map(|line| line.right).collect())
+            .or_else(|| span(lines.iter().filter_map(|line| line.left).collect()))
+    }
+
     fn first_content(&self) -> Option<usize> {
         self.lines.iter().position(|line| line.is_content())
     }
@@ -2164,7 +2184,7 @@ impl App {
 
     fn compose(&mut self, purpose: Purpose) {
         let (start, end) = self.range();
-        let rows = self.split.rows_between(start, end);
+        let rows = self.split.comment_rows(start, end);
         let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
         match range {
             Some((first, last, anchor)) => {
@@ -2446,7 +2466,7 @@ impl App {
             return;
         }
         let (start, end) = self.range();
-        let rows = self.split.rows_between(start, end);
+        let rows = self.split.comment_rows(start, end);
         let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
         if let Some((first, last, anchor)) = range {
             self.copy = Some(payload(&self.loaded.diff, &anchor, first, last, ""));
@@ -4221,6 +4241,28 @@ diff --git a/a.rs b/a.rs
                 ),
                 (Some("}"), Some("}")),
             ]
+        );
+    }
+
+    #[test]
+    fn a_comment_on_a_shifted_pair_hangs_off_its_own_lines_only() {
+        let mut app = App::new(loaded(SHIFTED), Options::default());
+        let diff = &app.loaded.diff;
+        let edit = app
+            .split
+            .lines()
+            .iter()
+            .position(|line| {
+                line.right
+                    .is_some_and(|row| diff.content(row).ends_with("+ tax;"))
+            })
+            .unwrap_or(usize::MAX);
+        app.cursor = edit;
+        app.compose(Purpose::Comment);
+        let anchor = app.composer.as_ref().map(|c| c.anchor.clone());
+        assert_eq!(
+            anchor.map(|a| (a.side, a.start_line, a.end_line)),
+            Some((Side::New, 3, 3))
         );
     }
 

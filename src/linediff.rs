@@ -131,7 +131,12 @@ fn tokens(text: &str) -> Vec<&str> {
 /// `new thing` is one change rather than two with a gap.
 fn side(parts: &[(Part, usize)], changed: Part) -> Vec<Range<usize>> {
     let mut runs: Vec<(bool, usize)> = Vec::new();
-    let last = parts.len().saturating_sub(1);
+    // The last part this side draws: a change only on the other side after it
+    // doesn't stop it ending the line.
+    let last = parts
+        .iter()
+        .rposition(|&(part, _)| part == Part::Same || part == changed)
+        .unwrap_or(0);
     for (index, &(part, len)) in parts.iter().enumerate() {
         if part != Part::Same && part != changed {
             continue;
@@ -147,10 +152,13 @@ fn side(parts: &[(Part, usize)], changed: Part) -> Vec<Range<usize>> {
         }
     }
     let mut at = 0;
-    let mut ranges = Vec::new();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
     for (is_change, len) in runs {
         if is_change && len > 0 {
-            ranges.push(at..at + len);
+            match ranges.last_mut() {
+                Some(range) if range.end == at => range.end = at + len,
+                _ => ranges.push(at..at + len),
+            }
         }
         at += len;
     }
@@ -200,7 +208,8 @@ pub fn alignment(old: &[&str], new: &[&str]) -> usize {
 }
 
 /// The shared start and end of two lines over the longer length: 1 for equal
-/// lines, 0 when either is blank.
+/// lines, two blank ones included, and 0 for a blank line against one with
+/// content.
 fn similarity(a: &[char], b: &[char]) -> f64 {
     if a == b {
         return 1.0;
@@ -269,6 +278,8 @@ mod tests {
         assert_eq!(both("a, b", "x, y"), ("[a], [b]".into(), "[x], [y]".into()));
         // An unchanged character that ends the line is never joined.
         assert_eq!(both("f(a)", "f(b)"), ("f([a])".into(), "f([b])".into()));
+        // Even when the other line goes on past it.
+        assert_eq!(both("a)", "b)c"), ("[a])".into(), "[b)c]".into()));
     }
 
     #[test]
@@ -323,5 +334,7 @@ mod tests {
         assert_eq!(alignment(&old, &new), 0);
         assert_eq!(alignment(&["a", "b"], &["c", "d"]), 0);
         assert_eq!(alignment(&[], &["c", "d"]), 0);
+        // A blank line pairs with the blank line it matches.
+        assert_eq!(alignment(&["", "x();"], &["", "y();", "x();"]), 0);
     }
 }
