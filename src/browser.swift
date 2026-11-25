@@ -55,21 +55,71 @@ enum Rex {
 struct Placement: Equatable {
     let rect: CGRect
     let focused: Bool
+    let floating: Bool
+    /// The correction for the gaps introduced by each split above the block.
+    let gapOffset: CGRect
+    /// The outer floating layer, in the same normalized coordinates as `rect`.
+    let layerBounds: CGRect?
+    var layerID: String? = nil
+    var upperLayers: [CGRect] = []
+
+    /// The floating layer moved or changed size, but the block kept its slot within it.
+    /// All helpers see this in session.view, even after the last resize command has completed.
+    func followsLayer(from old: Placement?) -> Bool {
+        guard let old, floating, old.floating, let layerID, old.layerID == layerID,
+              let a = old.layerBounds, let b = layerBounds,
+              a.width > 0, a.height > 0, b.width > 0, b.height > 0 else { return false }
+        func same(_ x: CGFloat, _ y: CGFloat) -> Bool { abs(x - y) < 0.000001 }
+        return same((old.rect.minX - a.minX) / a.width, (rect.minX - b.minX) / b.width) &&
+               same((old.rect.minY - a.minY) / a.height, (rect.minY - b.minY) / b.height) &&
+               same(old.rect.width / a.width, rect.width / b.width) &&
+               same(old.rect.height / a.height, rect.height / b.height) &&
+               same(old.gapOffset.origin.x, gapOffset.origin.x) && same(old.gapOffset.origin.y, gapOffset.origin.y) &&
+               same(old.gapOffset.size.width, gapOffset.size.width) && same(old.gapOffset.size.height, gapOffset.size.height)
+    }
 }
 
 enum SessionView {
+    struct BlockPlacement {
+        let rect: CGRect
+        let gapOffset: CGRect
+    }
+
     static func rect(_ value: Any?) -> CGRect? {
         guard let numbers = value as? [NSNumber], numbers.count == 4 else { return nil }
         return CGRect(x: numbers[0].doubleValue, y: numbers[1].doubleValue,
                       width: numbers[2].doubleValue, height: numbers[3].doubleValue)
     }
 
-    static func find(_ block: String, in node: Any?) -> CGRect? {
+    /// Finds a block in a layout tree and carries the split-gap correction back
+    /// up to the layer's coordinate system. Rex's rects already include the
+    /// layer's position, so a floating layer's bounds must not be applied again.
+    static func find(_ block: String, in node: Any?) -> BlockPlacement? {
         if let object = node as? [String: Any] {
-            if object["block_id"] as? String == block { return rect(object["rect"]) }
-            for child in object.values { if let found = find(block, in: child) { return found } }
+            if object["block_id"] as? String == block, let rect = rect(object["rect"]) {
+                return BlockPlacement(rect: rect, gapOffset: .zero)
+            }
+            guard let split = object["split"] as? [String: Any] else { return nil }
+            let parent = rect(object["rect"])
+            for (branch, child) in [("before", split["before"]), ("after", split["after"])] {
+                guard let found = find(block, in: child) else { continue }
+                var gapOffset = found.gapOffset
+                let after = branch == "after" ? 1.0 : 0.0
+                if let parent, parent.width > 0, parent.height > 0 {
+                    if split["direction"] as? String == "vertical" {
+                        gapOffset.origin.y += after - (found.rect.minY - parent.minY) / parent.height
+                        gapOffset.size.height -= found.rect.height / parent.height
+                    } else {
+                        gapOffset.origin.x += after - (found.rect.minX - parent.minX) / parent.width
+                        gapOffset.size.width -= found.rect.width / parent.width
+                    }
+                }
+                return BlockPlacement(rect: found.rect, gapOffset: gapOffset)
+            }
         } else if let array = node as? [Any] {
-            for child in array { if let found = find(block, in: child) { return found } }
+            for child in array {
+                if let found = find(block, in: child) { return found }
+            }
         }
         return nil
     }
@@ -88,19 +138,33 @@ enum SessionView {
         return false
     }
 
-    /// The block's place when it's drawn in a tiled layout of the active
-    /// window; nil when another tab is showing, another block is zoomed, or
-    /// the block floats (Leaf opens browsers as splits).
+    /// The block's place in the active window. Tiled and floating layers share
+    /// the same normalized coordinate system in `session.view`.
     static func placement(_ view: [String: Any], block: String) -> Placement? {
         guard let active = view["active_window_id"] as? String,
               let window = (view["windows"] as? [[String: Any]])?.first(where: { $0["window_id"] as? String == active })
         else { return nil }
         let focused = window["focused_block_id"] as? String == block
         if let zoomed = window["zoomed_block_id"] as? String, !zoomed.isEmpty {
-            return zoomed == block ? Placement(rect: CGRect(x: 0, y: 0, width: 1, height: 1), focused: focused) : nil
+            let full = CGRect(x: 0, y: 0, width: 1, height: 1)
+            return zoomed == block ? Placement(rect: full, focused: focused, floating: false, gapOffset: .zero, layerBounds: nil) : nil
         }
-        for layer in window["layers"] as? [[String: Any]] ?? [] where layer["kind"] as? String == "tiled" {
-            if let rect = find(block, in: layer["layout"]) { return Placement(rect: rect, focused: focused) }
+        let layers = window["layers"] as? [[String: Any]] ?? []
+        for (index, layer) in layers.enumerated() {
+            guard let kind = layer["kind"] as? String, kind == "tiled" || kind == "floating",
+                  layer["state"] as? String != "minimized",
+                  let found = find(block, in: layer["layout"]) else { continue }
+            // Higher floating layers may cover the browser. Resolve their bounds in
+            // screen points because the tiled and floating canvases can start at different heights.
+            var upperLayers = [CGRect]()
+            for upper in layers.dropFirst(index + 1) {
+                guard upper["state"] as? String != "minimized", let layout = upper["layout"], !(layout is NSNull) else { continue }
+                guard let bounds = rect(upper["bounds"]) else { return nil }
+                upperLayers.append(bounds)
+            }
+            return Placement(rect: found.rect, focused: focused, floating: kind == "floating",
+                             gapOffset: found.gapOffset, layerBounds: rect(layer["bounds"]),
+                             layerID: layer["layer_id"] as? String, upperLayers: upperLayers)
         }
         return nil
     }
@@ -111,11 +175,28 @@ enum SessionView {
 struct Chrome: Equatable {
     var top: CGFloat, left: CGFloat, right: CGFloat, bottom: CGFloat
     var gap: CGFloat, header: CGFloat, radius: CGFloat
+    /// The top of Rex's floating canvas. It can include a title area that the
+    /// tiled pane area does not have when tabs are vertical.
+    var floatTop: CGFloat
 
+    static let cardRadius: CGFloat = 10
+    static let minimumBody = CGSize(width: 81, height: 61)
     static let domain = "com.superlogical.rex" as CFString
 
     static func setting(_ key: String) -> Any? {
         CFPreferencesCopyAppValue("Workspace.\(key)" as CFString, domain)
+    }
+
+    static func sessionID(from value: Any?) -> String? {
+        guard let data = value as? Data ?? (value as? String)?.data(using: .utf8),
+              let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let id = info["sessionID"] as? String, !id.isEmpty else { return nil }
+        return id
+    }
+
+    static func shownSession() -> String? {
+        CFPreferencesAppSynchronize(domain)
+        return sessionID(from: setting("lastFocusedSession"))
     }
 
     static func current() -> Chrome {
@@ -125,13 +206,20 @@ struct Chrome: Equatable {
         // Measured from Rex 0.1.0-preview.23. Compact panes are split by a
         // 1pt rule under a 34pt header.
         var chrome = Chrome(top: compact ? 41 : 46, left: edge, right: edge, bottom: edge,
-                            gap: compact ? 1 : 8, header: compact ? 34 : 36, radius: compact ? 0 : 10)
+                            gap: compact ? 1 : 8, header: compact ? 34 : 36, radius: compact ? 0 : cardRadius,
+                            floatTop: compact ? 41 : 46)
         let headers = setting("paneHeaderVisibility") as? String
             ?? (((setting("showsPaneHeaders") as? NSNumber)?.boolValue ?? true) ? "always" : "never")
         if headers != "always" { chrome.header = 0 }
         let vertical = setting("tabStyle") as? String == "vertical"
         let toolbar = setting("toolbarBehavior") as? String ?? "alwaysShow"
         if vertical || toolbar != "alwaysShow" { chrome.top = edge }
+        chrome.floatTop = chrome.top
+        if vertical && toolbar == "alwaysShow" {
+            // The vertical-tab layout leaves a title area above the floating
+            // canvas in Rex. This is measured in points, including on Retina.
+            chrome.floatTop += 34
+        }
         if vertical, !((setting("sidebarCollapsed") as? NSNumber)?.boolValue ?? false) {
             let width = CGFloat((setting("sidebarWidth") as? NSNumber)?.doubleValue ?? 240)
             if setting("sidebarPosition") as? String == "right" { chrome.right = width } else { chrome.left = width }
@@ -149,20 +237,98 @@ struct Chrome: Equatable {
         }
     }
 
+    /// The outer frame of a Rex floating layer in screen points, with a top-left origin.
+    func floatingFrame(_ layer: CGRect, in window: CGRect) -> CGRect {
+        let width = window.width - left - right
+        let height = window.height - floatTop - bottom
+        return CGRect(x: window.minX + left + layer.minX * width,
+                      y: window.minY + floatTop + layer.minY * height,
+                      width: layer.width * width, height: layer.height * height)
+    }
+
+    /// Capture the sides grabbed at mouse-down, not the ones under the pointer later in the drag.
+    func resizeGrip(at point: CGPoint, placement: Placement, in window: CGRect) -> ResizeGrip? {
+        guard placement.floating, let layer = placement.layerBounds, let id = placement.layerID else { return nil }
+        let frame = floatingFrame(layer, in: window)
+        guard frame.contains(point), !frame.insetBy(dx: 8, dy: 8).contains(point) else { return nil }
+        let horizontal = point.x < frame.minX + 8 ? -1 : (point.x >= frame.maxX - 8 ? 1 : 0)
+        let vertical = point.y < frame.minY + 8 ? -1 : (point.y >= frame.maxY - 8 ? 1 : 0)
+        // The leaf gets its share of the layer, less its split gaps, border and header.
+        let g = placement.gapOffset.size, r = placement.rect
+        guard r.width > 0, r.height > 0 else { return nil }
+        // body() rounds each edge separately; allow one point in the leaf before scaling to its layer.
+        let rounding: CGFloat = 1
+        let minimum = CGSize(width: max(96, (Self.minimumBody.width + rounding + 2 - g.width * gap) * layer.width / r.width),
+                             height: max(104, (Self.minimumBody.height + rounding + max(header, 1) + 1 - g.height * gap) * layer.height / r.height))
+        return ResizeGrip(id: id, bounds: layer, canvas: CGSize(width: window.width - left - right,
+                          height: window.height - floatTop - bottom), minimum: minimum, horizontal: horizontal, vertical: vertical)
+    }
+
     /// The block's body in screen points (top-left origin), inside `window`.
-    func body(_ fraction: CGRect, in window: CGRect) -> CGRect {
-        let area = CGRect(x: window.minX + left, y: window.minY + top,
-                          width: window.width - left - right, height: window.height - top - bottom)
-        var card = CGRect(x: area.minX + fraction.minX * area.width, y: area.minY + fraction.minY * area.height,
-                          width: fraction.width * area.width, height: fraction.height * area.height)
-        let half = gap / 2, edge = 0.001
-        if fraction.minX > edge { card.origin.x += half; card.size.width -= half }
-        if fraction.maxX < 1 - edge { card.size.width -= half }
-        if fraction.minY > edge { card.origin.y += half; card.size.height -= half }
-        if fraction.maxY < 1 - edge { card.size.height -= half }
-        card.origin.y += header
-        card.size.height -= header
-        return card
+    func body(_ placement: Placement, in window: CGRect) -> CGRect? {
+        let top = placement.floating ? floatTop : self.top
+        let width = window.width - left - right
+        let height = window.height - top - bottom
+        let fraction = placement.rect
+        let gapOffset = placement.gapOffset
+        // Gap corrections are signed. CGRect's minX/width accessors standardize negative sizes.
+        let x = window.minX + left + fraction.minX * width + gapOffset.origin.x * gap
+        let y = window.minY + top + fraction.minY * height + gapOffset.origin.y * gap
+        let right = x + fraction.width * width + gapOffset.size.width * gap
+        let bottom = y + fraction.height * height + gapOffset.size.height * gap
+        let border: CGFloat = radius > 0 || placement.floating ? 1 : 0
+        let bodyX = x.rounded() + border
+        let bodyY = y.rounded() + max(header, border)
+        let body = CGRect(x: bodyX, y: bodyY, width: right.rounded() - border - bodyX,
+                          height: bottom.rounded() - border - bodyY)
+        guard body.size.width >= Self.minimumBody.width, body.size.height >= Self.minimumBody.height else { return nil }
+        for layer in placement.upperLayers {
+            if !floatingFrame(layer, in: window).intersection(body).isEmpty { return nil }
+        }
+        return body
+    }
+}
+
+/// A drag of a floating pane by its header. Rex reports the layer's new place
+/// only once the drag ends, so the browser follows the pointer until then.
+struct FloatDrag {
+    /// `Placement.rect` when the drag began; a different rect means Rex has landed it.
+    let rect: CGRect
+    /// The browser's window frame and the pointer when the drag began, in AppKit screen points.
+    let frame: NSRect
+    let mouse: NSPoint
+    var released: Date?
+
+    /// Starts a drag when `mouse` is on the header above `frame`, clear of the
+    /// outer edge where Rex resizes the float.
+    static func start(at mouse: NSPoint, frame: NSRect, header: CGFloat, rect: CGRect) -> FloatDrag? {
+        let edge: CGFloat = 7
+        guard header > edge else { return nil }
+        let grip = NSRect(x: frame.minX + edge, y: frame.maxY, width: frame.width - 2 * edge, height: header - edge)
+        guard grip.contains(mouse) else { return nil }
+        return FloatDrag(rect: rect, frame: frame, mouse: mouse)
+    }
+
+    func frame(at mouse: NSPoint) -> NSRect {
+        frame.offsetBy(dx: (mouse.x - self.mouse.x).rounded(), dy: (mouse.y - self.mouse.y).rounded())
+    }
+}
+
+struct ResizeGrip {
+    let id: String, bounds: CGRect, canvas: CGSize, minimum: CGSize
+    let horizontal: Int, vertical: Int
+
+    func resized(dx: CGFloat, dy: CGFloat) -> CGRect {
+        func span(_ start: CGFloat, _ size: CGFloat, _ side: Int, _ delta: CGFloat, _ minimum: CGFloat) -> (CGFloat, CGFloat) {
+            let end = start + size
+            let limit = min(size, minimum)
+            if side < 0 { return (max(0, min(start + delta, end - limit)), end) }
+            if side > 0 { return (start, min(1, max(end + delta, start + limit))) }
+            return (start, end)
+        }
+        let (left, right) = span(bounds.minX, bounds.width, horizontal, dx / canvas.width, minimum.width / canvas.width)
+        let (top, bottom) = span(bounds.minY, bounds.height, vertical, dy / canvas.height, minimum.height / canvas.height)
+        return CGRect(x: left, y: top, width: right - left, height: bottom - top)
     }
 }
 
@@ -336,6 +502,17 @@ final class Bar: NSView {
 final class PaneWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    var handleEdgeEvent: ((NSEvent) -> Bool)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if handleEdgeEvent?(event) != true { super.sendEvent(event) }
+    }
+
+    func forwardPress(_ down: NSEvent, followedBy event: NSEvent) {
+        // A control may enter a tracking loop in mouseDown; queue its drag/up first.
+        NSApp.postEvent(event, atStart: true)
+        super.sendEvent(down)
+    }
 }
 
 // MARK: - Asking the agent
@@ -455,7 +632,15 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var placement: Placement?
     var rex: RexWindow?
     var shown = false
+    var shownSession: String?
+    var sessionPoll: Timer?
+    var sessionIsShown: Bool { shownSession == nil || shownSession == session }
     var lastFrame = NSRect.zero
+    var resizeStart: (grip: ResizeGrip, mouse: CGPoint, down: NSEvent)?
+    var resizingLayer: String?
+    // At most one completed size per layer, followed by the current drag's latest preview.
+    var pendingResizes: [(id: String, bounds: CGRect, isFinal: Bool)] = []
+    var resizeInFlight: String?
     var settleUntil = Date.distantPast
     var missing = 0
     var refreshing = false
@@ -471,6 +656,11 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Whether a text field on the page has focus, as `Browser.focusScript` reports it.
     var pageEditing = false
     var forwardedAt = Date.distantPast
+    var clickMonitor: Any?
+    var dragMonitor: Any?
+    var floatDrag: FloatDrag?
+    var lastExternalClick: (point: NSPoint, time: TimeInterval)?
+    var focusRequestedByActivation = false
     /// Focus asked for before the window was first placed.
     var focusWhenShown = false
     var ticks = 0
@@ -592,6 +782,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         root.layer?.masksToBounds = true
         root.layer?.cornerCurve = .continuous
         window.contentView = root
+        window.handleEdgeEvent = { [weak self] event in self?.handleEdgeEvent(event) ?? false }
 
         root.addSubview(bar)
         for button in [back, forward, reload] { bar.addSubview(button) }
@@ -1665,7 +1856,90 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     // MARK: Following the pane
 
+    func handleEdgeEvent(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .leftMouseDown:
+            resizeStart = nil
+            resizingLayer = nil
+            guard shown, let placement, placement.floating, let rex, let bounds = WindowServer.bounds(of: rex.number),
+                  let primary = NSScreen.screens.first else { return false }
+            let mouse = window.convertPoint(toScreen: event.locationInWindow)
+            let point = CGPoint(x: mouse.x, y: primary.frame.height - mouse.y)
+            guard let grip = chrome.resizeGrip(at: point, placement: placement, in: bounds) else { return false }
+            resizeStart = (grip, mouse, event)
+            return true
+        case .leftMouseDragged, .leftMouseUp:
+            guard let start = resizeStart else { return false }
+            let mouse = window.convertPoint(toScreen: event.locationInWindow)
+            let dx = mouse.x - start.mouse.x, dy = start.mouse.y - mouse.y
+            if resizingLayer == nil {
+                let tiny = max(abs(dx), abs(dy)) < 3
+                let parallel = (start.grip.horizontal == 0 && abs(dx) > abs(dy)) ||
+                               (start.grip.vertical == 0 && abs(dy) > abs(dx))
+                if tiny && event.type != .leftMouseUp { return true }
+                if tiny || parallel {
+                    // Ordinary clicks and scrolling along the edge still belong to WebKit.
+                    resizeStart = nil
+                    window.forwardPress(start.down, followedBy: event)
+                    return true
+                }
+                resizingLayer = start.grip.id
+            }
+            let released = event.type == .leftMouseUp
+            pendingResizes.removeAll { !$0.isFinal || (released && $0.id == start.grip.id) }
+            pendingResizes.append((start.grip.id, start.grip.resized(dx: dx, dy: dy), released))
+            if released { resizeStart = nil; resizingLayer = nil }
+            sendPendingResize()
+            return true
+        default: return false
+        }
+    }
+
+    /// Send queued resizes one at a time, oldest first. Keep mouse-up bounds until
+    /// delivery or a later mouse-up on the same layer.
+    func sendPendingResize() {
+        guard resizeInFlight == nil, !pendingResizes.isEmpty else { return }
+        let next = pendingResizes.removeFirst()
+        resizeInFlight = next.id
+        let r = next.bounds
+        Rex.background {
+            _ = Rex.call("session.resize_layer", ["session_id": self.session, "layer_id": next.id,
+                         "bounds": [r.minX, r.minY, r.width, r.height]])
+            DispatchQueue.main.async {
+                self.resizeInFlight = nil
+                if self.pendingResizes.isEmpty { self.refresh() } else { self.sendPendingResize() }
+            }
+        }
+    }
+
     func start() {
+        // Switching sessions in the Rex sidebar need not change this session's server-side layout.
+        shownSession = Chrome.shownSession()
+        let poll = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.shownSession = Chrome.shownSession()
+            if !self.sessionIsShown {
+                self.focusWhenShown = false
+                self.focusRequestedByActivation = false
+                self.hide()
+            }
+        }
+        sessionPoll = poll
+        RunLoop.main.add(poll, forMode: .common)
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) {
+            [weak self] event in
+            guard let self, let point = event.cgEvent?.location, let primary = NSScreen.screens.first else { return }
+            self.lastExternalClick = (CGPoint(x: point.x, y: primary.frame.height - point.y), event.timestamp)
+            self.floatDrag = nil
+            if event.type == .leftMouseDown, self.shown, let placement = self.placement, placement.floating {
+                self.floatDrag = FloatDrag.start(at: NSEvent.mouseLocation, frame: self.lastFrame,
+                                                 header: self.chrome.header, rect: placement.rect)
+            }
+        }
+        dragMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) {
+            [weak self] event in
+            self?.followFloatDrag(to: NSEvent.mouseLocation, released: event.type == .leftMouseUp)
+        }
         Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.follow() }
             .tolerance = 0.002
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -1757,7 +2031,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             let next = SessionView.placement(view, block: block)
             // Rex animates panes into place. Following that animation would
             // lag it, so step out of the way and come back once it settles.
-            if next?.rect != placement?.rect {
+            let followsLayer = next?.followsLayer(from: placement) == true
+            if !followsLayer && (next?.rect != placement?.rect || next?.floating != placement?.floating || next?.gapOffset != placement?.gapOffset) {
                 settleUntil = Date().addingTimeInterval(0.28)
                 hide()
             }
@@ -1773,7 +2048,36 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         return windows.first
     }
 
+    /// Moves the page with a header drag Rex is handling, and keeps it above
+    /// Rex's window, which the click raised.
+    /// `mouse` is in AppKit screen points; `released` is true for the mouse-up.
+    func followFloatDrag(to mouse: NSPoint, released: Bool) {
+        guard var drag = floatDrag, drag.released == nil, shown, let rex else { return }
+        // The release can land between drag events: place the page there first.
+        let frame = drag.frame(at: mouse)
+        if frame != lastFrame {
+            // Only the origin changes: moving without a redraw keeps up with the pointer.
+            window.setFrameOrigin(frame.origin)
+            lastFrame = frame
+        }
+        if !directlyAbove(rex.number) { window.order(.above, relativeTo: Int(rex.number)) }
+        if released {
+            drag.released = Date()
+            floatDrag = drag
+            refresh()
+        }
+    }
+
     func follow() {
+        guard sessionIsShown else { focusWhenShown = false; hide(); return }
+        if let drag = floatDrag {
+            // Hold the dragged frame until Rex reports where the float landed,
+            // or briefly after a click that didn't move it.
+            let landed = placement?.rect != drag.rect
+            let settled = drag.released.map { Date().timeIntervalSince($0) > 0.5 } ?? false
+            if !landed && !settled { return }
+            floatDrag = nil
+        }
         ticks &+= 1
         if ticks % 8 == 0 { pollBarMode(animated: true) }
         // Rex's window only moves while Rex (or this pane) is in front;
@@ -1788,8 +2092,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         }
         guard let target = rex, let bounds,
               let primary = NSScreen.screens.first?.frame.height else { hide(); return }
-        let body = chrome.body(placement.rect, in: bounds)
-        guard body.width > 80, body.height > 60 else { hide(); return }
+        guard let body = chrome.body(placement, in: bounds) else { hide(); return }
         // Rex's palette and dialogs are windows of their own over the pane;
         // they must stay on top and keep the keyboard, so give way to them.
         if !watching || ticks % 3 == 0 {
@@ -1804,7 +2107,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             window.setFrame(frame, display: true)
             lastFrame = frame
         }
-        if root.layer?.cornerRadius != chrome.radius { root.layer?.cornerRadius = chrome.radius }
+        let radius = placement.floating ? Chrome.cardRadius : chrome.radius
+        if root.layer?.cornerRadius != radius { root.layer?.cornerRadius = radius }
         if !shown {
             window.alphaValue = 0
             window.order(.above, relativeTo: Int(target.number))
@@ -1818,7 +2122,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         shown = true
         if focusWhenShown {
             focusWhenShown = false
+            focusRequestedByActivation = false
             takeFocus()
+        } else if focusRequestedByActivation {
+            reclaimFocusAfterActivation()
         }
         if shown { updateAddressBarHover() }
     }
@@ -1856,8 +2163,18 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         return false
     }
 
+    func stopSidebarTracking() {
+        sessionPoll?.invalidate()
+        sessionPoll = nil
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+        clickMonitor = nil
+        if let dragMonitor { NSEvent.removeMonitor(dragMonitor) }
+        dragMonitor = nil
+    }
+
     /// Stops the `rex events` watcher, then exits: every way out goes here.
     func shutDown() -> Never {
+        stopSidebarTracking()
         events?.terminationHandler = nil
         events?.terminate()
         exit(0)
@@ -1865,6 +2182,11 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     func hide() {
         guard shown else { return }
+        floatDrag = nil
+        resizeStart = nil
+        resizingLayer = nil
+        // An accepted mouse-up belongs to its original layer even when the browser is hidden.
+        pendingResizes.removeAll { !$0.isFinal }
         window.orderOut(nil)
         shown = false
     }
@@ -1890,13 +2212,36 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func applicationActivated(_ note: Notification) {
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.processIdentifier == rex?.pid else { return }
-        // Rex raised its windows over this one; go back on top at once.
-        if shown, let number = rex?.number { window.order(.above, relativeTo: Int(number)) }
-        if placement?.focused == true && Date().timeIntervalSince(forwardedAt) > 1 { takeFocus() }
+        // Rex raised its windows over this one. Restore stacking now, but delay focus until the tab click settles.
+        if shown, sessionIsShown, let number = rex?.number { window.order(.above, relativeTo: Int(number)) }
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.reclaimFocusAfterActivation() }
+    }
+
+    func reclaimFocusAfterActivation() {
+        focusRequestedByActivation = false
+        guard sessionIsShown, placement?.focused == true, !coveredByRex, rexIsActive,
+              Date().timeIntervalSince(forwardedAt) > 1 else { return }
+        guard shown else {
+            // During layout animation lastFrame still belongs to the previous placement.
+            focusRequestedByActivation = Date() < settleUntil
+            return
+        }
+        if !clickedOutsidePane(at: ProcessInfo.processInfo.systemUptime) { takeFocus() }
+    }
+
+    func clickedOutsidePane(at time: TimeInterval) -> Bool {
+        guard let click = lastExternalClick, time - click.time <= 0.75 else { return false }
+        // Both are AppKit screen points: extend upwards from the body to include its header.
+        var pane = lastFrame
+        pane.size.height += chrome.header
+        return !pane.contains(click.point)
     }
 
     func takeFocus() {
+        guard sessionIsShown else { return }
         guard shown else { focusWhenShown = true; return }
+        guard placement?.focused == true, rexIsActive || NSApp.isActive else { return }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKey()
         if window.firstResponder == nil || window.firstResponder === window { window.makeFirstResponder(web) }
@@ -2031,6 +2376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) { browser.stopSidebarTracking() }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func windowDidBecomeKey(_ notification: Notification) { browser.windowBecameKey() }
@@ -2090,17 +2437,3 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return main
     }
 }
-
-let environment = ProcessInfo.processInfo.environment
-guard let session = environment["REX_SESSION"], !session.isEmpty,
-      let block = environment["REX_BLOCK"], !block.isEmpty else {
-    FileHandle.standardError.write(Data("leaf: the browser needs REX_SESSION and REX_BLOCK; open it from a Rex pane.\n".utf8))
-    exit(1)
-}
-signal(SIGPIPE, SIG_IGN)
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-let browser = Browser(session: session, block: block)
-let delegate = AppDelegate(browser: browser)
-app.delegate = delegate
-app.run()
