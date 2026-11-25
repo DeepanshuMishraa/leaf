@@ -2029,6 +2029,7 @@ dependencies = [
  "toml",
  "tungstenite",
  "unicode-ident",
+ "unicode-segmentation",
  "unicode-width",
  "ureq",
  "url",

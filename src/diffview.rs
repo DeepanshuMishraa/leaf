@@ -18,10 +18,12 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::agent;
@@ -3321,16 +3323,19 @@ fn hunk_note(text: &str) -> Option<&str> {
     (!note.is_empty()).then_some(note)
 }
 
-fn cell_width(ch: char, column: usize) -> usize {
-    if ch == '\t' {
+fn cell_width(symbol: &str, column: usize) -> usize {
+    if symbol == "\t" {
         4 - column % 4
+    } else if symbol.contains(char::is_control) {
+        0
     } else {
-        ch.width().unwrap_or(0)
+        symbol.cell_width() as usize
     }
 }
 
 fn cells(text: &str) -> usize {
-    text.chars().fold(0, |col, ch| col + cell_width(ch, col))
+    text.graphemes(true)
+        .fold(0, |col, symbol| col + cell_width(symbol, col))
 }
 
 /// Appends `text` to `spans` one style run at a time, skipping `start` columns
@@ -3347,13 +3352,29 @@ fn text_spans(
     word: Color,
     selection: Option<Color>,
 ) -> usize {
-    let chars: Vec<char> = text.chars().collect();
-    let (prefix, suffix) = emphasis.unwrap_or((0, 0));
-    let changed_from = prefix;
-    let changed_to = chars.len().saturating_sub(suffix);
+    let (changed_from, suffix) = emphasis.unwrap_or((0, 0));
+    let changed_to = if suffix == 0 {
+        usize::MAX
+    } else {
+        text.chars().count().saturating_sub(suffix)
+    };
+    let end = start.saturating_add(avail);
     let mut column = 0;
     let mut used = 0;
-    for (at, ch) in chars.iter().enumerate() {
+    let mut char_index = 0;
+    for symbol in text.graphemes(true) {
+        if column >= end {
+            break;
+        }
+        let at = char_index;
+        char_index += symbol.chars().count();
+        let width = cell_width(symbol, column);
+        let from = column;
+        column += width;
+        let visible = column.min(end).saturating_sub(from.max(start));
+        if visible == 0 {
+            continue;
+        }
         let mut style = base;
         if let Some(kinds) = kinds
             && let Some(kind) = kinds.get(at)
@@ -3366,31 +3387,13 @@ fn text_spans(
         if let Some(selection) = selection {
             style = style.bg(selection);
         }
-        let width = cell_width(*ch, column);
-        if *ch == '\t' {
-            if column >= start {
-                if used + width > avail {
-                    break;
-                }
-                push_text(spans, style, &" ".repeat(width));
-                used += width;
-            }
-            column += width;
-            continue;
+        if symbol == "\t" || visible < width {
+            // A clipped wide glyph can't be drawn in half. Keep its visible cells in place.
+            push_text(spans, style, &" ".repeat(visible));
+        } else {
+            push_text(spans, style, symbol);
         }
-        if column + width <= start {
-            column += width;
-            continue;
-        }
-        if used + width > avail {
-            break;
-        }
-        if column >= start {
-            let mut buffer = [0u8; 4];
-            push_text(spans, style, ch.encode_utf8(&mut buffer));
-            used += width;
-        }
-        column += width;
+        used += visible;
     }
     used
 }
@@ -4929,6 +4932,29 @@ diff --git a/b.rs b/b.rs
     }
 
     #[test]
+    fn horizontal_scroll_clips_in_terminal_cells() {
+        for (text, room, offset, expected) in
+            [("\tabc", 4, 3, " abc"), ("a#\u{fe0f}X", 3, 1, "#\u{fe0f}X")]
+        {
+            let start = cells(text).saturating_sub(room);
+            let mut spans = Vec::new();
+            text_spans(
+                &mut spans,
+                text,
+                start,
+                room,
+                Style::default(),
+                None,
+                None,
+                Color::Reset,
+                None,
+            );
+            assert_eq!(start, offset);
+            assert_eq!(Line::from(spans).to_string(), expected);
+        }
+    }
+
+    #[test]
     fn horizontal_scroll_reclamps_after_a_layout_switch_or_diff_refresh() {
         let patch = PATCH.replace("let b = 2;", "123456789abcde");
         let mut app = App::new(loaded(&patch), Options::default());
@@ -4964,6 +4990,10 @@ diff --git a/b.rs b/b.rs
             remote::WAKE,
         ] {
             let mut app = app();
+            draw(&mut app, 19, 12);
+            wheel(&mut app, MouseEventKind::ScrollRight);
+            assert!(app.left > 0);
+            press(&mut app, KeyCode::Char('0'));
             press(&mut app, key);
             wheel(&mut app, MouseEventKind::ScrollRight);
             assert_eq!(app.left, 0, "after {key:?}");
