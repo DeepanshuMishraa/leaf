@@ -112,12 +112,21 @@ local amber = dofile(os.getenv("HOME") .. "/.local/share/rex/amber/amber.lua")
 
 amber.setup({
   plugins = {
-    { "DeepanshuMishraa/leaf", main = "leaf" },
+    {
+      "DeepanshuMishraa/leaf",
+      main = "leaf",
+      -- Installs the leaf release matching this checkout, like the install script above.
+      build = [[LEAF_VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml) sh site/public/install.sh]],
+    },
   },
 })
 ```
 
-Run `amber install` to install it and reload Rex; loading the config alone does not install.
+Run `amber install`: it clones the plugin, installs the matching `leaf` command and reloads Rex. `amber update` keeps both in step. Loading the config alone does not install.
+
+- Already ran `leaf rex install`? Run `leaf rex uninstall` first, or the palette lists Leaf twice.
+- Installed leaf with Homebrew? Leave out `build` and update it with `brew upgrade`.
+- leaf not on the default path (`~/.local/bin`, `~/.cargo/bin`, Homebrew)? Pass its location: `opts = { bin = { "/path/to/leaf" } }`.
 
 ## Development
 
