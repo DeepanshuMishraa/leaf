@@ -172,7 +172,7 @@ fn stand_ins(family: &str) -> &'static [&'static str] {
 fn generic(family: &str) -> Family<'static> {
     let lower = family.to_ascii_lowercase();
     let any = |words: &[&str]| words.iter().any(|w| lower.contains(w));
-    if any(&["mono", "courier", "consolas", "code"]) {
+    if any(&["mono", "courier", "consolas", "code", "menlo"]) {
         Family::Monospace
     } else if any(&[
         "times",
@@ -631,6 +631,11 @@ mod tests {
             text: text.into(),
             style: Rc::new(Style::default()),
         }
+    }
+
+    #[test]
+    fn menlo_falls_back_to_monospace_like_the_board_draws_it() {
+        assert_eq!(generic("Menlo"), Family::Monospace);
     }
 
     #[test]
