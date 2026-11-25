@@ -103,6 +103,22 @@ Adds Leaf to Rex's command palette (`cmd+shift+p`): open documents, review diffs
 
 **Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a pane, macOS 13+. Its start page lists local dev servers. Press the pointer button (`shift+cmd+c`) to pick an element with [React Grab](https://github.com/aidenybai/react-grab) and ask your agent about it.
 
+### With Amber
+
+With [Amber](https://github.com/rawnly/amber) installed, add Leaf to your Rex config instead:
+
+```lua
+local amber = dofile(os.getenv("HOME") .. "/.local/share/rex/amber/amber.lua")
+
+amber.setup({
+  plugins = {
+    { "DeepanshuMishraa/leaf", main = "leaf" },
+  },
+})
+```
+
+Run `amber install` to install it and reload Rex; loading the config alone does not install.
+
 ## Development
 
 ```sh
