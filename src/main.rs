@@ -29,6 +29,7 @@ mod host;
 mod html;
 mod hue;
 mod kitty;
+mod linediff;
 mod look;
 mod margin;
 mod markdown;
