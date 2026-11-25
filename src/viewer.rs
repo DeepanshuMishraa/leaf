@@ -243,6 +243,27 @@ struct Search {
     seek: Seek,
 }
 
+/// Finds visible text and reports matches in the original page offsets.
+fn page_matches(query: &Query, laid: &Laid) -> Vec<(usize, usize)> {
+    if laid.hidden_link_urls.is_empty() {
+        return query.matches(&laid.text);
+    }
+
+    let mut offsets = Vec::with_capacity(laid.text.len());
+    let mut start = 0;
+    for hidden in &laid.hidden_link_urls {
+        offsets.extend(start..hidden.start);
+        start = hidden.end;
+    }
+    offsets.extend(start..laid.text.len());
+    let text: Vec<_> = offsets.iter().map(|&offset| laid.text[offset]).collect();
+    query
+        .matches(&text)
+        .into_iter()
+        .map(|(start, end)| (offsets[start], offsets[end - 1] + 1))
+        .collect()
+}
+
 /// A place in a page's text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TextPos {
@@ -1363,7 +1384,7 @@ impl App {
         for page in screen.iter().flatten().map(|s| s.page) {
             found
                 .entry(page)
-                .or_insert_with(|| query.matches(&self.laid(page).text));
+                .or_insert_with(|| page_matches(&query, &self.laid(page)));
         }
         found
     }
@@ -2530,9 +2551,7 @@ impl App {
                 Direction::Backward if step == pages => start >= from.offset,
                 _ => true,
             };
-            let mut ranges = search
-                .query
-                .matches(&self.laid(page).text)
+            let mut ranges = page_matches(&search.query, &self.laid(page))
                 .into_iter()
                 .filter(|&(start, _)| keep(start));
             let hit = match direction {
@@ -5576,6 +5595,33 @@ mod tests {
         let buffer = s.terminal.backend().buffer();
         assert_eq!(buffer[(x, y)].bg, FOUND_HERE);
         assert_eq!(buffer[(x + 7, y)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn find_searches_the_label_and_visible_text_when_the_link_url_is_hidden() {
+        let url = "https://x.dev/guide";
+        let first = format!("Read [the guide]({url}) now.");
+        let second = format!("The address is <{url}>.");
+        let options = ViewerOptions {
+            hide_link_urls: true,
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&[&first, &second]), 120, 30, options);
+
+        assert!(search(&mut s, "guide now").contains("\"guide now\" n/N"));
+        let (x, y) = s.find("guide now");
+        let buffer = s.terminal.backend().buffer();
+        assert_eq!(buffer[(x, y)].bg, FOUND_HERE);
+        assert_eq!(buffer[(x + 8, y)].bg, FOUND_HERE);
+
+        search(&mut s, url);
+        assert_eq!(s.app.found_here().map(|m| m.page), Some(1));
+        s.press(KeyCode::Char('N'));
+        assert_eq!(s.app.found_here().map(|m| m.page), Some(1));
+
+        let mut s = Screen::new(book(&[&first]), 120, 30, ViewerOptions::default());
+        search(&mut s, url);
+        assert_eq!(s.app.found_here().map(|m| m.page), Some(0));
     }
 
     #[test]

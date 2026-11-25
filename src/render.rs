@@ -120,6 +120,8 @@ pub struct Laid {
     pub text: Vec<char>,
     /// Each link's span of the page text, in order.
     pub links: Vec<(std::ops::Range<usize>, Link)>,
+    /// Hidden URL suffixes, in page text order.
+    pub hidden_link_urls: Vec<std::ops::Range<usize>>,
 }
 
 impl Laid {
@@ -784,6 +786,7 @@ impl Ctx<'_> {
             }
             // Keep saved reading positions, highlights and ink at the same offsets.
             self.laid.text.extend(run.text.chars());
+            let end = self.laid.text.len();
             if self.link_urls == LinkUrls::Show || !run.link_url_suffix {
                 cells.extend(
                     run.text
@@ -791,8 +794,9 @@ impl Ctx<'_> {
                         .enumerate()
                         .map(|(i, c)| (c, style, Some(start + i))),
                 );
+            } else {
+                self.laid.hidden_link_urls.push(start..end);
             }
-            let end = self.laid.text.len();
             if let Some(link) = &run.link
                 && start < end
             {
