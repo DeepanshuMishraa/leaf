@@ -2272,8 +2272,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     }
 
     static func coveredByOtherApp(_ body: CGRect, above windows: [[String: Any]], host: pid_t, sibling: pid_t) -> Bool {
-        windows.contains { item in
-            guard item[kCGWindowLayer as String] as? Int == NSWindow.Level.normal.rawValue,
+        let levelsLeafCanCover = NSWindow.Level.normal.rawValue...NSWindow.Level.floating.rawValue
+        return windows.contains { item in
+            guard let layer = item[kCGWindowLayer as String] as? Int, levelsLeafCanCover.contains(layer),
                   let pid = item[kCGWindowOwnerPID as String] as? pid_t, pid != host, pid != sibling, pid != getpid(),
                   let dictionary = item[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: dictionary), bounds.intersects(body) else { return false }

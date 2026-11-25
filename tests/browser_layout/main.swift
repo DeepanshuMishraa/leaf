@@ -338,8 +338,13 @@ func window(_ number: CGWindowID, _ owner: pid_t, _ bounds: CGRect, level: NSWin
 let body = chrome.body(pane.placement!, in: host)!
 let rexEntry = window(rexWindow.number, rexWindow.pid, host)
 let thirdWindow = window(45, -12, body)
-activated(-11, executable, .floating, body: body.offsetBy(dx: body.width + 1, dy: 0), above: [thirdWindow])
-activated(-11, executable, .normal, body: body, above: [thirdWindow])
+for level in [NSWindow.Level.normal, .floating] {
+    let occluder = window(45, -12, body, level: level)
+    activated(-11, executable, .floating, body: body.offsetBy(dx: body.width + 1, dy: 0), above: [occluder])
+    activated(-11, executable, .normal, body: body, above: [occluder])
+}
+// Pop-up menus already sit above the level Leaf can reach.
+activated(-11, executable, .floating, body: body, above: [window(45, -12, body, level: .popUpMenu)])
 activated(rexWindow.pid, nil, .floating)
 precondition(pane.rexOverlay(covering: body, of: rexWindow, windows: [window(43, rexWindow.pid, body), rexEntry]))
 let panel = window(44, rexWindow.pid, body, level: .floating)
