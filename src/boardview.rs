@@ -1006,7 +1006,7 @@ impl App {
     fn typing_at(&self, typing: &Typing) -> Pt {
         match typing.container.as_deref().and_then(|c| self.board.get(c)) {
             Some(holder) => {
-                let (w, h) = text_size(&typing.text, typing.size);
+                let (w, h) = text_size(&typing.text, typing.size, 1);
                 let c = holder.center();
                 Pt::new(c.x - w / 2.0, c.y - h / 2.0)
             }
@@ -2228,8 +2228,20 @@ impl App {
             }
         }
         if let Mode::Typing(typing) = &self.mode {
-            let start = self.typing_at(typing);
             let lines: Vec<&str> = typing.text.split('\n').collect();
+            // Terminal text is one cell per character, so text in a shape is
+            // centered by cells, as `labels` does, not by the font's measure.
+            let start = match typing.container.as_deref().and_then(|c| self.board.get(c)) {
+                Some(holder) => {
+                    let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                    let c = holder.center();
+                    Pt::new(
+                        c.x - widest as f64 * view.scale / 2.0,
+                        c.y - lines.len() as f64 * view.row() / 2.0,
+                    )
+                }
+                None => self.typing_at(typing),
+            };
             let last = lines.len() - 1;
             let color = self.screen_color(&typing.color);
             for (i, line) in lines.iter().enumerate() {
@@ -3168,6 +3180,28 @@ mod tests {
         drag(&mut app, (12, 6), (17, 6));
         let board = on_disk(&path);
         assert_eq!(board.elements[1].x, label.x + 50.0);
+    }
+
+    #[test]
+    fn text_typed_in_a_shape_stays_put_when_it_is_saved() {
+        let path = temp("inside-cells");
+        let (mut app, _) = app(&path);
+        boxed(&mut app);
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "iiiiiiiiiiiiiiii");
+        let at = |screen: &str| {
+            screen
+                .lines()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let byte = line.find("iiiiiiiiiiiiiiii")?;
+                    Some((row, line[..byte].chars().count()))
+                })
+                .expect("text on screen")
+        };
+        let typing = at(&draw(&mut app));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(at(&draw(&mut app)), typing);
     }
 
     /// A box from column 10 to 30 and an ellipse from 50 to 70, rows 5–10.
