@@ -413,12 +413,21 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         };
     }
-    if std::env::var_os("REX_SESSION").is_none() || std::env::var_os("REX_BLOCK").is_none() {
+    // The helper calls Rex's API, which needs the session's own ID, not the
+    // block ID the rex CLI also takes.
+    let Some(block) = crate::agent::rex_block() else {
         eprintln!(
             "leaf: open the browser from a Rex pane, or with Leaf: Open Browser in Rex's command palette."
         );
         return ExitCode::FAILURE;
-    }
+    };
+    let session = match crate::agent::rex_session_api_id() {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("leaf: couldn't find this pane's Rex session: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if args.len() > 1 {
         eprintln!("Usage: leaf browser [URL]");
         return ExitCode::from(2);
@@ -441,6 +450,8 @@ pub fn run(args: &[String]) -> ExitCode {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .env("REX_SESSION", session)
+        .env("REX_BLOCK", block)
         .env("LEAF_REX", rex)
         .env(
             "LEAF_AGENT",

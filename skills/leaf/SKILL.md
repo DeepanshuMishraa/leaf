@@ -13,7 +13,7 @@ leaf is a full-screen terminal app and your shell tool has no terminal, so a bar
 
 1. **Review commands.** `leaf plan` and `leaf review` (see the `leaf-plan` and `leaf-review` skills) open a pane beside you in Rex, tmux or Herdr and return at once. The review comes back as your next message.
 2. **Any other screen: open a pane beside you.**
-   - Rex (`$REX_SESSION` and `$REX_BLOCK` are set): `rex split -s "$REX_SESSION" -b "$REX_BLOCK" --split=right --focus=false -- leaf open notes.md`
+   - Rex (`$REX_BLOCK` is set): `rex split -s "${REX_SESSION:-$REX_BLOCK}" -b "$REX_BLOCK" --split=right --focus=false -- leaf open notes.md`
    - tmux: `tmux split-window -h 'leaf open notes.md'`
    - Herdr (`HERDR_ENV=1`): use the `herdr` skill to open a pane running the command.
 3. **Anywhere else.** Tell the person the exact command to run, such as `leaf diff --branch`.
@@ -58,7 +58,7 @@ Article or browser? Use `leaf open <url>` to *read* text and keep the place. Use
 `leaf browser [url]` runs a WebKit page in the current Rex pane until it closes. You have no pane, so open it beside you:
 
 ```bash
-rex split -s "$REX_SESSION" -b "$REX_BLOCK" --split=right --focus=false -- leaf browser http://localhost:3000
+rex split -s "${REX_SESSION:-$REX_BLOCK}" -b "$REX_BLOCK" --split=right --focus=false -- leaf browser http://localhost:3000
 ```
 
 The person can also use **Leaf: Open Browser** in Rex's command palette (`cmd+shift+p`). With no URL it opens a start page listing web servers running on this Mac. It fails outside Rex, on Linux and on remote hosts; there, use `leaf open <url>` for reading or tell the person to open a normal browser.

@@ -237,7 +237,7 @@ pub fn state() -> String {
 }
 
 fn inside_rex() -> bool {
-    std::env::var("REX_SESSION").is_ok_and(|s| !s.trim().is_empty())
+    crate::agent::inside_rex()
 }
 
 fn emit(sequence: &str) -> bool {

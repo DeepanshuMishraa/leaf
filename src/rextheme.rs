@@ -19,7 +19,7 @@ const APPS: [&str; 2] = ["Rex Beta.app", "Rex.app"];
 
 /// Whether leaf runs in a Rex pane.
 pub fn inside_rex() -> bool {
-    std::env::var("REX_SESSION").is_ok_and(|s| !s.trim().is_empty())
+    crate::agent::inside_rex()
 }
 
 fn home() -> Option<std::path::PathBuf> {

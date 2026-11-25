@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- leaf finds Rex again in panes from Rex server preview.23 on, which set only `REX_BLOCK`, not `REX_SESSION`. Asking the agent, opening beside you, the browser, and Rex's theme and status all work there again.
+
 ## 0.18.1
 
 - **Leaf: Minimal Address Bar** in Rex's command palette hides the browser's address bar until the pointer is at the top of the page. `cmd+l` brings it back. The page fills the pane the rest of the time.

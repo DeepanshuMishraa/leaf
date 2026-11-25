@@ -26,7 +26,7 @@ impl Host {
     }
 
     fn from_env(var: impl Fn(&str) -> Option<String>) -> Option<Host> {
-        if var("REX_SESSION").is_some() {
+        if var("REX_SESSION").is_some() || var("REX_BLOCK").is_some() {
             Some(Host::Rex)
         } else if var("HERDR_ENV").as_deref() == Some("1") && var("HERDR_PANE_ID").is_some() {
             Some(Host::Herdr)
@@ -373,6 +373,15 @@ mod tests {
         );
         assert_eq!(
             Host::from_env(env(&[("HERDR_ENV", "1"), ("REX_SESSION", "s")])),
+            Some(Host::Rex)
+        );
+        // Rex servers from preview.23 on set only REX_BLOCK in new panes.
+        assert_eq!(
+            Host::from_env(env(&[
+                ("TMUX", "/tmp/s,1,0"),
+                ("TMUX_PANE", "%3"),
+                ("REX_BLOCK", "b")
+            ])),
             Some(Host::Rex)
         );
         assert_eq!(Host::from_env(env(&[("TMUX", "/tmp/s,1,0")])), None);

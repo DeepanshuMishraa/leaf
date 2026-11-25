@@ -8,7 +8,8 @@
 // headers) comes from Rex's preferences. The window sits directly above the
 // Rex window at the normal level, so other apps still cover both.
 //
-// Environment: REX_SESSION, REX_BLOCK (set by Rex in the pane), LEAF_REX (the
+// Environment: REX_SESSION (the session ID, which leaf browser resolves when
+// Rex sets only REX_BLOCK), REX_BLOCK (set by Rex in the pane), LEAF_REX (the
 // rex program), LEAF_BROWSER_URL (optional first page).
 
 import AppKit
