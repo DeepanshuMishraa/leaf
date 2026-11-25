@@ -5,8 +5,8 @@
 // the window) comes from `rex api call session.view`, refreshed whenever the
 // session emits an event; the Rex window's frame comes from the window server
 // every frame; the space Rex's own chrome takes (sidebar, toolbar, gaps,
-// headers) comes from Rex's preferences. The window sits directly above the
-// Rex window at the normal level, so other apps still cover both.
+// headers) comes from Rex's preferences. The page floats while Rex or a Leaf
+// helper is frontmost; otherwise it sits just above Rex at the normal level.
 //
 // Environment: REX_SESSION (the session ID, which leaf browser resolves when
 // Rex sets only REX_BLOCK), REX_BLOCK (set by Rex in the pane), LEAF_REX (the
@@ -344,6 +344,10 @@ enum WindowServer {
         CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
     }
 
+    static func above(_ number: CGWindowID) -> [[String: Any]] {
+        CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow], number) as? [[String: Any]] ?? []
+    }
+
     static func rexWindows(_ list: [[String: Any]]) -> [RexWindow] {
         list.compactMap { item in
             guard let owner = item[kCGWindowOwnerName as String] as? String,
@@ -661,7 +665,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var dragMonitor: Any?
     var floatDrag: FloatDrag?
     var lastExternalClick: (point: NSPoint, time: TimeInterval)?
-    var focusRequestedByActivation = false
+    var focusRequestedByActivation: TimeInterval?
+    var reclaimAfterRefresh: TimeInterval?
     /// Focus asked for before the window was first placed.
     var focusWhenShown = false
     var ticks = 0
@@ -1921,7 +1926,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             self.shownSession = Chrome.shownSession()
             if !self.sessionIsShown {
                 self.focusWhenShown = false
-                self.focusRequestedByActivation = false
+                self.focusRequestedByActivation = nil
+                self.reclaimAfterRefresh = nil
                 self.hide()
             }
         }
@@ -2040,7 +2046,18 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             placement = next
             syncFocus()
         }
-        if refreshAgain { refreshAgain = false; refresh() }
+        if refreshAgain {
+            refreshAgain = false
+            refresh()
+        } else if let requestedAt = reclaimAfterRefresh {
+            reclaimAfterRefresh = nil
+            if view != nil { reclaimFocusAfterActivation(at: requestedAt) }
+        }
+    }
+
+    func requestFocusAfterRefresh(at time: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        reclaimAfterRefresh = time
+        refresh()
     }
 
     func pickRexWindow() -> RexWindow? {
@@ -2057,11 +2074,17 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         // The release can land between drag events: place the page there first.
         let frame = drag.frame(at: mouse)
         if frame != lastFrame {
+            if let primary = NSScreen.screens.first?.frame.height {
+                let body = CGRect(x: frame.minX, y: primary - frame.maxY, width: frame.width, height: frame.height)
+                updateSiblingLevel(covering: body)
+            }
             // Only the origin changes: moving without a redraw keeps up with the pointer.
             window.setFrameOrigin(frame.origin)
             lastFrame = frame
         }
-        if !directlyAbove(rex.number) { window.order(.above, relativeTo: Int(rex.number)) }
+        if window.level == .normal && !directlyAbove(rex.number) {
+            window.order(.above, relativeTo: Int(rex.number))
+        }
         if released {
             drag.released = Date()
             floatDrag = drag
@@ -2096,15 +2119,21 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         guard let body = chrome.body(placement, in: bounds) else { hide(); return }
         // Rex's palette and dialogs are windows of their own over the pane;
         // they must stay on top and keep the keyboard, so give way to them.
-        if !watching || ticks % 3 == 0 {
+        if !shown || !watching || ticks % 3 == 0 {
             let covered = rexOverlay(covering: body, of: target)
-            if !covered && coveredByRex && placement.focused && rexIsActive { focusWhenShown = true }
+            if !covered && coveredByRex && rexIsActive {
+                // Dismissing a panel may itself select a different block.
+                focusWhenShown = false
+                focusRequestedByActivation = nil
+                requestFocusAfterRefresh()
+            }
             coveredByRex = covered
         }
         if coveredByRex { hide(); return }
         let frame = NSRect(x: body.minX.rounded(), y: (primary - body.maxY).rounded(),
                            width: body.width.rounded(), height: body.height.rounded())
         if frame != lastFrame {
+            if shown { updateSiblingLevel(covering: body) }
             window.setFrame(frame, display: true)
             lastFrame = frame
         }
@@ -2112,21 +2141,25 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         if root.layer?.cornerRadius != radius { root.layer?.cornerRadius = radius }
         if !shown {
             window.alphaValue = 0
-            window.order(.above, relativeTo: Int(target.number))
+            if let app = NSWorkspace.shared.frontmostApplication {
+                updateLevel(for: app.processIdentifier, executable: app.executableURL, body: body)
+            }
+            if window.level == .floating { window.orderFront(nil) }
+            else { window.order(.above, relativeTo: Int(target.number)) }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.12
                 window.animator().alphaValue = 1
             }
-        } else if ticks % 10 == 0 && !directlyAbove(target.number) {
+        } else if window.level == .normal && ticks % 10 == 0 && !directlyAbove(target.number) {
             window.order(.above, relativeTo: Int(target.number))
         }
         shown = true
         if focusWhenShown {
             focusWhenShown = false
-            focusRequestedByActivation = false
+            focusRequestedByActivation = nil
             takeFocus()
-        } else if focusRequestedByActivation {
-            reclaimFocusAfterActivation()
+        } else if let requestedAt = focusRequestedByActivation {
+            reclaimFocusAfterActivation(at: requestedAt)
         }
         if shown { updateAddressBarHover() }
     }
@@ -2134,13 +2167,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Whether another window of Rex's, in front of its main window, overlaps
     /// `body` (screen points, top-left origin): the palette, a dialog, or a
     /// second Rex window.
-    func rexOverlay(covering body: CGRect, of rex: RexWindow) -> Bool {
-        for item in WindowServer.list() {
+    func rexOverlay(covering body: CGRect, of rex: RexWindow, windows: [[String: Any]] = WindowServer.list()) -> Bool {
+        for item in windows {
             guard let number = item[kCGWindowNumber as String] as? CGWindowID else { continue }
             // The list runs front to back: past Rex's window, nothing covers it.
             if number == rex.number { return false }
             guard item[kCGWindowOwnerPID as String] as? pid_t == rex.pid,
-                  item[kCGWindowLayer as String] as? Int == 0,
+                  let layer = item[kCGWindowLayer as String] as? Int,
+                  layer == NSWindow.Level.normal.rawValue || layer == NSWindow.Level.floating.rawValue,
                   let dictionary = item[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: dictionary) else { continue }
             if bounds.intersects(body) { return true }
@@ -2151,7 +2185,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Whether only Leaf browser windows lie between this window and Rex's.
     func directlyAbove(_ rexNumber: CGWindowID) -> Bool {
         let mine = CGWindowID(window.windowNumber)
-        let above = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow], rexNumber) as? [[String: Any]] ?? []
+        let above = WindowServer.above(rexNumber)
         let ownName = ProcessInfo.processInfo.processName
         // `above` runs front to back; walk back from the window right above Rex.
         for item in above.reversed() {
@@ -2202,7 +2236,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func syncFocus() {
         let focused = placement?.focused ?? false
         defer { wasFocusedInRex = focused }
-        if focused && !wasFocusedInRex && rexIsActive {
+        guard sessionIsShown else { return }
+        if focused && !wasFocusedInRex && rexIsActive && reclaimAfterRefresh == nil {
             takeFocus()
         } else if !focused && wasFocusedInRex && NSApp.isActive {
             // Rex moved focus to another pane, by a forwarded key or its API.
@@ -2210,25 +2245,63 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         }
     }
 
-    func applicationActivated(_ note: Notification) {
-        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-              app.processIdentifier == rex?.pid else { return }
-        // Rex raised its windows over this one. Restore stacking now, but delay focus until the tab click settles.
-        if shown, sessionIsShown, let number = rex?.number { window.order(.above, relativeTo: Int(number)) }
-        refresh()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.reclaimFocusAfterActivation() }
+    func updateSiblingLevel(covering body: CGRect) {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid(),
+              let executable = app.executableURL, executable == Bundle.main.executableURL else { return }
+        updateLevel(for: app.processIdentifier, executable: executable, body: body)
     }
 
-    func reclaimFocusAfterActivation() {
-        focusRequestedByActivation = false
+    // Rex raises its normal window before the activation notification arrives.
+    func updateLevel(for pid: pid_t, executable: URL?, body: CGRect? = nil,
+                     windowsAbove: (CGWindowID) -> [[String: Any]] = WindowServer.above) {
+        let sibling = executable != nil && executable == Bundle.main.executableURL
+        var raise = pid == rex?.pid || pid == getpid()
+        if !raise && sibling, let host = rex {
+            let paneBody = body ?? placement.flatMap { chrome.body($0, in: WindowServer.bounds(of: host.number) ?? host.bounds) }
+            // Activating an exposed sibling does not raise Rex through other apps.
+            if let paneBody {
+                raise = !Self.coveredByOtherApp(paneBody, above: windowsAbove(host.number), host: host.pid, sibling: pid)
+            }
+        }
+        let level: NSWindow.Level = raise ? .floating : .normal
+        guard window.level != level else { return }
+        window.level = level
+        if level == .normal, shown, let number = rex?.number {
+            window.order(.above, relativeTo: Int(number))
+        }
+    }
+
+    static func coveredByOtherApp(_ body: CGRect, above windows: [[String: Any]], host: pid_t, sibling: pid_t) -> Bool {
+        windows.contains { item in
+            guard item[kCGWindowLayer as String] as? Int == NSWindow.Level.normal.rawValue,
+                  let pid = item[kCGWindowOwnerPID as String] as? pid_t, pid != host, pid != sibling, pid != getpid(),
+                  let dictionary = item[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary), bounds.intersects(body) else { return false }
+            return NSRunningApplication(processIdentifier: pid)?.executableURL != Bundle.main.executableURL
+        }
+    }
+
+    func applicationActivated(_ note: Notification) {
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        updateLevel(for: app.processIdentifier, executable: app.executableURL)
+        guard app.processIdentifier == rex?.pid, sessionIsShown else { return }
+        // The mouse-down and Rex's new focused block can arrive after activation.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.sessionIsShown, self.rexIsActive else { return }
+            self.requestFocusAfterRefresh()
+        }
+    }
+
+    func reclaimFocusAfterActivation(at requestedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        focusRequestedByActivation = nil
         guard sessionIsShown, placement?.focused == true, !coveredByRex, rexIsActive,
               Date().timeIntervalSince(forwardedAt) > 1 else { return }
         guard shown else {
             // During layout animation lastFrame still belongs to the previous placement.
-            focusRequestedByActivation = Date() < settleUntil
+            if Date() < settleUntil { focusRequestedByActivation = requestedAt }
             return
         }
-        if !clickedOutsidePane(at: ProcessInfo.processInfo.systemUptime) { takeFocus() }
+        if !clickedOutsidePane(at: requestedAt) { takeFocus() }
     }
 
     func clickedOutsidePane(at time: TimeInterval) -> Bool {
@@ -2242,7 +2315,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func takeFocus() {
         guard sessionIsShown else { return }
         guard shown else { focusWhenShown = true; return }
-        guard placement?.focused == true, rexIsActive || NSApp.isActive else { return }
+        guard placement?.focused == true, !coveredByRex, rexIsActive || NSApp.isActive else { return }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKey()
         if window.firstResponder == nil || window.firstResponder === window { window.makeFirstResponder(web) }

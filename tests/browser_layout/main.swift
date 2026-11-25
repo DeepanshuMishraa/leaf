@@ -295,11 +295,65 @@ if let front = NSWorkspace.shared.frontmostApplication {
     sidebar.lastExternalClick = (CGPoint(x: 50, y: 200), ProcessInfo.processInfo.systemUptime)
     sidebar.shown = true
     sidebar.reclaimFocusAfterActivation()
-    precondition(!sidebar.window.isKeyWindow && !sidebar.focusRequestedByActivation && !sidebar.focusWhenShown)
+    precondition(!sidebar.window.isKeyWindow && sidebar.focusRequestedByActivation == nil && !sidebar.focusWhenShown)
     sidebar.shown = false // lastFrame may not yet include the new header: decide only once shown.
-    sidebar.reclaimFocusAfterActivation()
-    precondition(sidebar.focusRequestedByActivation && !sidebar.focusWhenShown)
+    sidebar.lastExternalClick = (CGPoint(x: 50, y: 200), 10)
+    sidebar.reclaimFocusAfterActivation(at: 10.25)
+    precondition(sidebar.focusRequestedByActivation == 10.25 && !sidebar.focusWhenShown)
+    precondition(sidebar.clickedOutsidePane(at: sidebar.focusRequestedByActivation!))
     sidebar.shownSession = "other"
     sidebar.reclaimFocusAfterActivation()
-    precondition(!sidebar.focusRequestedByActivation && !sidebar.focusWhenShown)
+    precondition(sidebar.focusRequestedByActivation == nil && !sidebar.focusWhenShown)
 }
+
+// Rex raises its normal window before delivering the next activation notification.
+let pane = Browser(session: "fixture", block: "web")
+pane.applicationActivated(Notification(name: NSWorkspace.didActivateApplicationNotification,
+    userInfo: [NSWorkspace.applicationUserInfoKey: NSRunningApplication.current]))
+precondition(pane.window.level == .floating, "Leaf is still at normal level before Rex activation")
+
+let executable = Bundle.main.executableURL!
+let lookalike = URL(fileURLWithPath: "/another-app/" + executable.lastPathComponent)
+let rexWindow = RexWindow(number: CGWindowID.max, pid: -10, bounds: host)
+pane.rex = rexWindow
+pane.chrome = chrome
+let webLayout = view([layer("tiled", full, "web")])
+let terminalLayout = webLayout.merging(["windows": [["window_id": "w", "focused_block_id": "terminal",
+    "layers": [layer("tiled", full, "web")]]]]) { _, new in new }
+pane.placement = SessionView.placement(webLayout, block: "web")
+func activated(_ pid: pid_t, _ exe: URL?, _ level: NSWindow.Level, body: CGRect? = nil, above: [Object] = []) {
+    pane.updateLevel(for: pid, executable: exe, body: body, windowsAbove: { _ in above })
+    precondition(pane.window.level == level && !pane.window.isKeyWindow)
+}
+activated(-11, executable, .floating)    // Same executable, different PID.
+activated(rexWindow.pid, nil, .floating)
+activated(-12, lookalike, .normal)       // Matching basename alone isn't another Leaf pane.
+activated(-11, executable, .floating)
+activated(-12, nil, .normal)
+
+func window(_ number: CGWindowID, _ owner: pid_t, _ bounds: CGRect, level: NSWindow.Level = .normal) -> Object {
+    [kCGWindowNumber as String: number, kCGWindowOwnerPID as String: owner, kCGWindowLayer as String: level.rawValue,
+     kCGWindowBounds as String: bounds.dictionaryRepresentation]
+}
+let body = chrome.body(pane.placement!, in: host)!
+let rexEntry = window(rexWindow.number, rexWindow.pid, host)
+let thirdWindow = window(45, -12, body)
+activated(-11, executable, .floating, body: body.offsetBy(dx: body.width + 1, dy: 0), above: [thirdWindow])
+activated(-11, executable, .normal, body: body, above: [thirdWindow])
+activated(rexWindow.pid, nil, .floating)
+precondition(pane.rexOverlay(covering: body, of: rexWindow, windows: [window(43, rexWindow.pid, body), rexEntry]))
+let panel = window(44, rexWindow.pid, body, level: .floating)
+precondition(pane.rexOverlay(covering: body, of: rexWindow, windows: [panel, rexEntry]))
+precondition(!pane.rexOverlay(covering: body, of: rexWindow, windows: [rexEntry, panel]))
+precondition(!pane.rexOverlay(covering: body, of: rexWindow, windows: [thirdWindow, rexEntry]))
+
+// A click dismisses the panel while an older session.view request is in flight.
+// Wait for the next snapshot, which selects the terminal.
+pane.shown = true
+pane.wasFocusedInRex = true
+pane.refreshing = true
+pane.requestFocusAfterRefresh(at: 10.25)
+pane.apply(webLayout)
+precondition(pane.shown && pane.reclaimAfterRefresh == 10.25 && pane.refreshing && !pane.focusWhenShown)
+pane.apply(terminalLayout)
+precondition(pane.reclaimAfterRefresh == nil && pane.placement?.focused == false && !pane.focusWhenShown)
