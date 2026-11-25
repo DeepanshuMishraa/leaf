@@ -613,7 +613,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var lastFrame = NSRect.zero
     var resizeStart: (grip: ResizeGrip, mouse: CGPoint, down: NSEvent)?
     var resizingLayer: String?
-    var pendingResize: (id: String, bounds: CGRect, isFinal: Bool)?
+    // At most one completed size per layer, followed by the current drag's latest preview.
+    var pendingResizes: [(id: String, bounds: CGRect, isFinal: Bool)] = []
     var resizeInFlight: String?
     var settleUntil = Date.distantPast
     var missing = 0
@@ -1857,8 +1858,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                 }
                 resizingLayer = start.grip.id
             }
-            pendingResize = (start.grip.id, start.grip.resized(dx: dx, dy: dy), event.type == .leftMouseUp)
-            if event.type == .leftMouseUp { resizeStart = nil; resizingLayer = nil }
+            let released = event.type == .leftMouseUp
+            pendingResizes.removeAll { !$0.isFinal || (released && $0.id == start.grip.id) }
+            pendingResizes.append((start.grip.id, start.grip.resized(dx: dx, dy: dy), released))
+            if released { resizeStart = nil; resizingLayer = nil }
             sendPendingResize()
             return true
         default: return false
@@ -1867,8 +1870,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     /// Send the latest pointer position once the previous resize finishes, including the final mouse-up.
     func sendPendingResize() {
-        guard resizeInFlight == nil, let next = pendingResize else { return }
-        pendingResize = nil
+        guard resizeInFlight == nil, !pendingResizes.isEmpty else { return }
+        let next = pendingResizes.removeFirst()
         resizeInFlight = next.id
         let r = next.bounds
         Rex.background {
@@ -1876,7 +1879,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                          "bounds": [r.minX, r.minY, r.width, r.height]])
             DispatchQueue.main.async {
                 self.resizeInFlight = nil
-                if self.pendingResize != nil { self.sendPendingResize() } else { self.refresh() }
+                if self.pendingResizes.isEmpty { self.refresh() } else { self.sendPendingResize() }
             }
         }
     }
@@ -2115,7 +2118,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         resizeStart = nil
         resizingLayer = nil
         // An accepted mouse-up belongs to its original layer even when the browser is hidden.
-        if pendingResize?.isFinal == false { pendingResize = nil }
+        pendingResizes.removeAll { !$0.isFinal }
         window.orderOut(nil)
         shown = false
     }

@@ -129,8 +129,9 @@ let roundedChild = SessionView.placement(splitCorner(offsetClamped, first: false
 precondition(offsetClamped.width < offsetLayer.width && chrome.body(roundedChild, in: offsetHost) != nil,
              "rounding the clamped edges hid the split child")
 
-// Hold the main queue until mouse-up and a session switch have both happened, then drain the real sender.
-func checkResizeDelivery() throws {
+// Keep the first request in flight on the main queue until the desired sequence of input events is complete.
+enum DragSequence: CaseIterable { case switchAfterRelease, cancelSecond, finishSecond, continueSecond, differentLayer }
+func checkResizeDelivery(_ sequence: DragSequence) throws {
     let log = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try Data().write(to: log)
     defer { try? FileManager.default.removeItem(at: log) }
@@ -150,25 +151,44 @@ func checkResizeDelivery() throws {
     precondition(browser.handleEdgeEvent(mouse(.leftMouseDragged, 40)))
     precondition(browser.handleEdgeEvent(mouse(.leftMouseUp, 90)))
     let final = corner.resized(dx: 70, dy: 0)
-    precondition(browser.pendingResize?.bounds == final)
     browser.apply(view([tile, layer("floating", [0.125, 0.25, 0.5125, 0.5], "web")]))
-    precondition(browser.shown && browser.pendingResize?.bounds == final, "an older layout cancelled mouse-up")
+    precondition(browser.shown, "an older layout hid the pane before mouse-up was delivered")
+    func drain() {
+        let deadline = Date().addingTimeInterval(5)
+        while browser.resizeInFlight != nil && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        precondition(browser.resizeInFlight == nil)
+    }
+    var expected = [(corner.id, corner.resized(dx: 20, dy: 0)), (corner.id, final)]
+    if sequence != .switchAfterRelease {
+        let grip = sequence == .differentLayer ? ResizeGrip(id: "new-layer", bounds: final, canvas: corner.canvas,
+                       minimum: corner.minimum, horizontal: corner.horizontal, vertical: corner.vertical) : corner
+        browser.resizeStart = (grip, browser.window.convertPoint(toScreen: down.locationInWindow), down)
+        precondition(browser.handleEdgeEvent(mouse(.leftMouseDragged, 60)))
+        if sequence == .continueSecond {
+            drain()
+            expected.append((grip.id, grip.resized(dx: 40, dy: 0)))
+        }
+        if sequence != .cancelSecond {
+            precondition(browser.handleEdgeEvent(mouse(.leftMouseUp, 120)))
+            if sequence == .finishSecond { expected.removeLast() } // newest completed size for this layer wins
+            expected.append((grip.id, grip.resized(dx: 100, dy: 0)))
+        }
+    }
     browser.shownSession = "another-session"
     browser.follow()
     precondition(!browser.shown)
-    let deadline = Date().addingTimeInterval(5)
-    while browser.resizeInFlight != nil && Date() < deadline {
-        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
-    }
+    drain()
     let requests = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map {
         try JSONSerialization.jsonObject(with: Data($0.utf8)) as! Object
     }
-    let last = requests.last ?? [:]
-    checkResize(requests.count == 2 && last["session_id"] as? String == "fixture" &&
-                last["layer_id"] as? String == corner.id && SessionView.rect(last["bounds"]) == final,
-                "switching sessions dropped the final resize request")
+    checkResize(requests.count == expected.count && zip(requests, expected).allSatisfy { request, target in
+        request["session_id"] as? String == "fixture" && request["layer_id"] as? String == target.0 &&
+            SessionView.rect(request["bounds"]) == target.1
+    }, "incorrect resize delivery for \(sequence)")
 }
-try checkResizeDelivery()
+for sequence in DragSequence.allCases { try checkResizeDelivery(sequence) }
 
 // The same snapshots reach both helpers, including after the sender's async resize has completed.
 let initialLayout = splitCorner(placed.rect, first: true)
