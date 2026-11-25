@@ -20,7 +20,10 @@ const SEARCH_LIMIT: usize = 20_000;
 /// Where `link` leads from the document at `doc` (`None` for one read from a URL).
 /// The error says why it leads nowhere, for the footer.
 pub fn resolve(link: &Link, doc: Option<&Path>) -> Result<Follow, String> {
-    let dir = doc.and_then(Path::parent);
+    // `leaf notes.md` passes a path relative to the working directory, whose
+    // folder is empty: links are followed from where the file really is.
+    let doc = doc.and_then(|doc| std::path::absolute(doc).ok());
+    let dir = doc.as_deref().and_then(Path::parent);
     match link {
         Link::Url(url) => url_target(url, dir),
         Link::Note(target) => {
@@ -208,6 +211,24 @@ mod tests {
         ] {
             assert!(resolve(&url(link), Some(doc)).is_err(), "{link}");
         }
+    }
+
+    #[test]
+    fn links_resolve_when_the_file_was_opened_by_a_relative_path() {
+        // As `leaf notes.md` would pass it: relative to the working directory.
+        let folder = format!(".leaf-follow-{}-cwd", std::process::id());
+        let cwd = std::env::current_dir().expect("working directory");
+        let _ = std::fs::remove_dir_all(cwd.join(&folder));
+        touch(&cwd.join(&folder).join("today.md"));
+        touch(&cwd.join(&folder).join("plan.md"));
+        let doc = PathBuf::from(&folder).join("today.md");
+        let plan = cwd.join(&folder).join("plan.md");
+        assert_eq!(
+            resolve(&url("plan.md"), Some(&doc)),
+            Ok(Follow::Open(plan.clone()))
+        );
+        assert_eq!(resolve(&wiki("plan"), Some(&doc)), Ok(Follow::Open(plan)));
+        std::fs::remove_dir_all(cwd.join(&folder)).expect("clean up");
     }
 
     #[test]
