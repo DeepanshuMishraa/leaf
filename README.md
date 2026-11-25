@@ -50,6 +50,7 @@ Optional, at `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config
 ```toml
 [reader]
 max_width = 100   # reading column width, default 76
+colorful_markdown = true   # terminal palette colors for heading levels and links, default false
 ```
 
 ## Diffs

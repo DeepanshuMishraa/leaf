@@ -15,12 +15,14 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ReaderConfig {
     pub max_width: u16,
+    pub colorful_markdown: bool,
 }
 
 impl Default for ReaderConfig {
     fn default() -> Self {
         Self {
             max_width: DEFAULT_MAX_WIDTH,
+            colorful_markdown: false,
         }
     }
 }
@@ -64,4 +66,22 @@ pub fn load() -> Result<Config, ConfigFailed> {
         ));
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn colorful_markdown_is_opt_in() {
+        for (text, expected) in [
+            ("", false),
+            ("[reader]\nmax_width = 92", false),
+            ("[reader]\ncolorful_markdown = false", false),
+            ("[reader]\ncolorful_markdown = true", true),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.reader.colorful_markdown, expected, "{text:?}");
+        }
+    }
 }
