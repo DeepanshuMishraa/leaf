@@ -227,6 +227,32 @@ precondition(FloatDrag.start(at: NSPoint(x: 302, y: 680), frame: dragBody, heade
 precondition(FloatDrag.start(at: NSPoint(x: 600, y: 400), frame: dragBody, header: 36, rect: dragRect) == nil)
 precondition(FloatDrag.start(at: NSPoint(x: 600, y: 202), frame: dragBody, header: 0, rect: dragRect) == nil)
 
+// The drag handler moves the page, keeps it above Rex's window, and places it at the release point.
+// A window of this process stands in for Rex's.
+let rexStandIn = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [], backing: .buffered, defer: false)
+rexStandIn.orderFront(nil)
+let dragged = Browser(session: "fixture", block: "web")
+dragged.placement = placed
+dragged.shown = true
+dragged.rex = RexWindow(number: CGWindowID(rexStandIn.windowNumber), pid: getpid(), bounds: .zero)
+dragged.window.setFrame(dragBody, display: false)
+dragged.lastFrame = dragBody
+dragged.floatDrag = drag
+dragged.followFloatDrag(to: NSPoint(x: 650, y: 600), released: false)
+precondition(dragged.window.frame == NSRect(x: 350, y: 120, width: 800, height: 460))
+let orderDeadline = Date().addingTimeInterval(2) // the window server applies ordering asynchronously
+while !dragged.directlyAbove(CGWindowID(rexStandIn.windowNumber)) && Date() < orderDeadline {
+    RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+}
+precondition(dragged.directlyAbove(CGWindowID(rexStandIn.windowNumber)), "the dragged page fell behind Rex")
+dragged.followFloatDrag(to: NSPoint(x: 700, y: 650), released: true)
+precondition(dragged.window.frame == NSRect(x: 400, y: 170, width: 800, height: 460) && dragged.floatDrag?.released != nil,
+             "the release point wasn't applied before the drag ended")
+dragged.followFloatDrag(to: NSPoint(x: 900, y: 900), released: false)
+precondition(dragged.lastFrame.origin == NSPoint(x: 400, y: 170)) // ignores events after the release
+dragged.window.orderOut(nil)
+rexStandIn.orderOut(nil)
+
 if !failures.isEmpty {
     FileHandle.standardError.write(Data((failures.joined(separator: "\n") + "\n").utf8))
     exit(1)

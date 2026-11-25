@@ -1937,7 +1937,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
             }
         }
         dragMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) {
-            [weak self] event in self?.followFloatDrag(event)
+            [weak self] event in
+            self?.followFloatDrag(to: NSEvent.mouseLocation, released: event.type == .leftMouseUp)
         }
         Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.follow() }
             .tolerance = 0.002
@@ -2049,21 +2050,22 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     /// Moves the page with a header drag Rex is handling, and keeps it above
     /// Rex's window, which the click raised.
-    func followFloatDrag(_ event: NSEvent) {
+    /// `mouse` is in AppKit screen points; `released` is true for the mouse-up.
+    func followFloatDrag(to mouse: NSPoint, released: Bool) {
         guard var drag = floatDrag, drag.released == nil, shown, let rex else { return }
-        if event.type == .leftMouseUp {
-            drag.released = Date()
-            floatDrag = drag
-            refresh()
-            return
-        }
-        let frame = drag.frame(at: NSEvent.mouseLocation)
+        // The release can land between drag events: place the page there first.
+        let frame = drag.frame(at: mouse)
         if frame != lastFrame {
             // Only the origin changes: moving without a redraw keeps up with the pointer.
             window.setFrameOrigin(frame.origin)
             lastFrame = frame
         }
         if !directlyAbove(rex.number) { window.order(.above, relativeTo: Int(rex.number)) }
+        if released {
+            drag.released = Date()
+            floatDrag = drag
+            refresh()
+        }
     }
 
     func follow() {
