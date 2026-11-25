@@ -215,7 +215,8 @@ fn refresh_palettes() {
 }
 
 /// What leaf shows on this machine and the look it's in, as the plugin reads
-/// it: `document diff dither`, or `idle classic`.
+/// it: `document diff dither`, or `idle classic`. `minimal` is added while
+/// the browser's address bar hides until the pointer is at the top.
 pub fn state() -> String {
     let open: Vec<&str> = Readers::here().open().into_iter().map(Kind::name).collect();
     let open = if open.is_empty() {
@@ -227,11 +228,16 @@ pub fn state() -> String {
         .ok()
         .and_then(|store| store.load_ui().ok())
         .unwrap_or_default();
-    format!("{open} {}", ui.as_str())
+    let bar = if crate::browser::minimal_bar() {
+        " minimal"
+    } else {
+        ""
+    };
+    format!("{open} {}{bar}", ui.as_str())
 }
 
 fn inside_rex() -> bool {
-    std::env::var("REX_SESSION").is_ok_and(|s| !s.trim().is_empty())
+    crate::agent::inside_rex()
 }
 
 fn emit(sequence: &str) -> bool {

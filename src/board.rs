@@ -380,19 +380,36 @@ impl Shape {
     }
 }
 
-/// How wide one character of text is, as a share of its size.
-pub const ADVANCE: f64 = 0.6;
 /// How far apart lines of text are, as a share of its size.
 pub const LEADING: f64 = 1.25;
 
-/// Width and height of text at `size`, roughly as Excalidraw measures it.
-pub fn text_size(text: &str, size: f64) -> (f64, f64) {
+/// The font leaf draws an Excalidraw font number in (see `boardsvg::family`).
+pub fn font_name(font: i64) -> &'static str {
+    match font {
+        2 | 6 => "Helvetica",
+        3 | 8 => "Menlo",
+        _ => "Chalkboard SE",
+    }
+}
+
+/// How wide one line of text is at `size`, in the font it's drawn in.
+pub fn line_width(line: &str, size: f64, font: i64) -> f64 {
+    let style = crate::typeset::Style {
+        family: font_name(font).into(),
+        size: size as f32,
+        ..Default::default()
+    };
+    f64::from(crate::typeset::measure(line, &style))
+}
+
+/// Width and height of text at `size`, measured in the font it's drawn in.
+pub fn text_size(text: &str, size: f64, font: i64) -> (f64, f64) {
     let lines = text.split('\n');
-    let widest = lines.clone().map(|l| l.chars().count()).max().unwrap_or(0);
-    (
-        widest as f64 * size * ADVANCE,
-        lines.count().max(1) as f64 * size * LEADING,
-    )
+    let widest = lines
+        .clone()
+        .map(|l| line_width(l, size, font))
+        .fold(0.0, f64::max);
+    (widest, lines.count().max(1) as f64 * size * LEADING)
 }
 
 fn extent(points: &[Pt]) -> Frame {
@@ -827,7 +844,7 @@ impl Element {
             | Shape::Frame { w, h, .. }
             | Shape::Other { w, h, .. } => sized(*w, *h),
             Shape::Text { text, size } => {
-                let (w, h) = text_size(text, *size);
+                let (w, h) = text_size(text, *size, self.font());
                 sized(w, h)
             }
             Shape::Line { points } | Shape::Arrow { points } | Shape::Draw { points } => {
@@ -1778,7 +1795,22 @@ mod tests {
     fn text_is_measured_from_its_longest_line() {
         let board = board();
         let f = board.elements[2].frame();
-        assert_eq!((f.x0, f.y0, f.x1, f.y1), (0.0, 200.0, 60.0, 250.0));
+        assert_eq!(
+            (f.x0, f.y0, f.x1, f.y1),
+            (0.0, 200.0, line_width("there", 20.0, 1), 250.0)
+        );
+    }
+
+    #[test]
+    fn text_width_follows_the_letters_and_the_font() {
+        // A fixed width per character can't tell these apart.
+        assert!(line_width("iiiiiiiiii", 20.0, 1) < line_width("WWWWWWWWWW", 20.0, 1));
+        // Monospace is the same width whatever the letters.
+        let (i, w) = (
+            line_width("iiiiiiiiii", 20.0, 3),
+            line_width("WWWWWWWWWW", 20.0, 3),
+        );
+        assert!((i - w).abs() < 0.01, "monospace {i} vs {w}");
     }
 
     #[test]

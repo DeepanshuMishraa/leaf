@@ -1,22 +1,21 @@
 //! `leaf browser`: a WebKit page in a Rex pane, on macOS.
 //!
 //! Rex draws its blocks itself, so the page lives in a small native helper
-//! (src/browser.swift and src/pane.swift, compiled by build.rs and embedded
-//! here) whose window follows the pane; see src/helper.rs for how it's
-//! unpacked.
+//! (src/browser.swift, compiled by build.rs and embedded here) whose window
+//! follows the pane. The helper is unpacked once per Leaf version into the
+//! user's cache folder; nothing is installed in Applications.
 //!
 //! Pointing at a page: React Grab (vendor/react-grab) picks elements in the
 //! page, the helper's own composer takes the question, and the helper writes
 //! one JSON line per question to its stdout. This process sends each to the
 //! person's agent and answers on the helper's stdin.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 use serde::{Deserialize, Serialize};
-
-use crate::helper::{Part, macos_version};
 
 const WEBKIT_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-webkit-host"));
 const REACT_GRAB: &[u8] = include_bytes!("../vendor/react-grab/react-grab.js");
@@ -189,33 +188,204 @@ fn answer(line: &str) -> Reply {
     }
 }
 
+/// This Mac's macOS version as (major, minor), when it can be read.
+fn macos_version() -> Option<(u32, u32)> {
+    let output = Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    parse_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_version(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |minor| minor.parse().ok())?;
+    Some((major, minor))
+}
+
+/// FNV-1a, to name the unpacked helper after its contents.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 /// The helper on disk, unpacking it the first time this build runs it.
 fn helper() -> Result<PathBuf, String> {
     if WEBKIT_HOST.is_empty() {
         return Err("this leaf was built without the WebKit browser (Apple's Swift toolchain wasn't available). Install the Xcode Command Line Tools with `xcode-select --install`, then reinstall leaf.".into());
     }
-    // A fixed executable name: WebKit keys cookies and site data by it, so
-    // they last across Leaf updates.
-    let dir = crate::helper::unpack(
-        "webkit",
-        "browser",
-        &[
-            Part {
-                name: "leaf-webkit-host",
-                bytes: WEBKIT_HOST,
-                mode: 0o755,
-            },
-            Part {
-                name: "react-grab.js",
-                bytes: REACT_GRAB,
-                mode: 0o644,
-            },
-        ],
-    )?;
-    Ok(dir.join("leaf-webkit-host"))
+    let home = std::env::var_os("HOME")
+        .ok_or("HOME is unset, so there's nowhere to keep the browser helper")?;
+    let dir = PathBuf::from(home)
+        .join("Library/Caches/leaf")
+        .join(format!(
+            "webkit-{:016x}",
+            fingerprint(WEBKIT_HOST) ^ fingerprint(REACT_GRAB).rotate_left(1)
+        ));
+    // A fixed name: WebKit keys cookies and site data by it, so they last
+    // across Leaf updates.
+    let executable = dir.join("leaf-webkit-host");
+    let script = dir.join("react-grab.js");
+    let unpacked = |path: &PathBuf, bytes: &[u8]| {
+        fs::metadata(path).is_ok_and(|meta| meta.len() == bytes.len() as u64)
+    };
+    if unpacked(&executable, WEBKIT_HOST) && unpacked(&script, REACT_GRAB) {
+        return Ok(executable);
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    // Written beside, then renamed into place, so a second pane opening at
+    // the same moment never runs a half-written file.
+    let place = |target: &PathBuf, bytes: &[u8], mode: u32| -> Result<(), String> {
+        let partial = target.with_extension(format!("{}.part", std::process::id()));
+        fs::write(&partial, bytes)
+            .map_err(|e| format!("couldn't write {}: {e}", partial.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&partial, fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("couldn't set permissions on {}: {e}", partial.display()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        fs::rename(&partial, target)
+            .map_err(|e| format!("couldn't place {}: {e}", target.display()))
+    };
+    place(&script, REACT_GRAB, 0o644)?;
+    place(&executable, WEBKIT_HOST, 0o755)?;
+    // Helpers from earlier Leaf versions are no longer used. Removing them is
+    // best effort: one left behind only takes a little disk space, and a
+    // browser still running from it keeps working.
+    if let Some(cache) = dir.parent()
+        && let Ok(entries) = fs::read_dir(cache)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stale = path != dir
+                && entry.file_name().to_string_lossy().starts_with("webkit-")
+                && path.is_dir();
+            if stale {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+    Ok(executable)
+}
+
+/// Whether the browser's address bar is always on screen.
+///
+/// `minimal` draws the page edge to edge and brings the bar back only while
+/// the pointer is at the top, or while the address is being edited. The
+/// palette's "Minimal Address Bar" action writes this, and every open
+/// browser pane reads the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarMode {
+    #[default]
+    Full,
+    Minimal,
+}
+
+impl BarMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BarMode::Full => "full",
+            BarMode::Minimal => "minimal",
+        }
+    }
+
+    /// Anything other than `minimal` is the full bar, including a missing file.
+    pub fn parse(text: &str) -> Self {
+        match text.trim() {
+            "minimal" | "on" => BarMode::Minimal,
+            _ => BarMode::Full,
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            BarMode::Full => BarMode::Minimal,
+            BarMode::Minimal => BarMode::Full,
+        }
+    }
+}
+
+/// `$XDG_DATA_HOME/leaf/browser-bar`, beside the reading database.
+pub fn bar_path() -> PathBuf {
+    crate::progress::default_path().with_file_name("browser-bar")
+}
+
+pub fn load_bar_mode(path: &std::path::Path) -> BarMode {
+    fs::read_to_string(path)
+        .map(|text| BarMode::parse(&text))
+        .unwrap_or_default()
+}
+
+/// `true` when the address bar should stay hidden until the pointer is at the top.
+pub fn minimal_bar() -> bool {
+    load_bar_mode(&bar_path()) == BarMode::Minimal
+}
+
+fn save_bar_mode(path: &std::path::Path, mode: BarMode) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("couldn't create {}: {e}", parent.display()))?;
+    }
+    let partial = path.with_extension(format!("part-{}", std::process::id()));
+    fs::write(&partial, mode.as_str())
+        .map_err(|e| format!("couldn't write {}: {e}", partial.display()))?;
+    fs::rename(&partial, path).map_err(|e| {
+        let _ = fs::remove_file(&partial);
+        format!("couldn't save the address bar setting ({e})")
+    })
+}
+
+/// `leaf browser bar [minimal | full | toggle]`.
+fn bar_command(args: &[String]) -> ExitCode {
+    let path = bar_path();
+    let current = load_bar_mode(&path);
+    let next = match args {
+        [] => {
+            println!("{}", current.as_str());
+            return ExitCode::SUCCESS;
+        }
+        [word] if word == "toggle" => current.toggled(),
+        [word] => match word.as_str() {
+            "minimal" | "on" => BarMode::Minimal,
+            "full" | "off" => BarMode::Full,
+            _ => {
+                eprintln!("Usage: leaf browser bar [minimal | full | toggle]");
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("Usage: leaf browser bar [minimal | full | toggle]");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = save_bar_mode(&path, next) {
+        eprintln!("leaf: {error} The address bar is unchanged.");
+        return ExitCode::FAILURE;
+    }
+    // Rex refetches palette actions when this rewrites the plugin's open line,
+    // so the check mark follows the setting.
+    let _ = crate::plugin::note_open(&crate::remote::state());
+    println!(
+        "{}",
+        match next {
+            BarMode::Minimal => {
+                "Minimal address bar on. It shows when the pointer is at the top of the page."
+            }
+            BarMode::Full => "Address bar always shown.",
+        }
+    );
+    ExitCode::SUCCESS
 }
 
 pub fn run(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|arg| arg == "bar") {
+        return bar_command(&args[1..]);
+    }
     if !cfg!(target_os = "macos") {
         eprintln!("leaf: the WebKit browser runs on macOS only.");
         return ExitCode::FAILURE;
@@ -243,12 +413,21 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         };
     }
-    if std::env::var_os("REX_SESSION").is_none() || std::env::var_os("REX_BLOCK").is_none() {
+    // The helper calls Rex's API, which needs the session's own ID, not the
+    // block ID the rex CLI also takes.
+    let Some(block) = crate::agent::rex_block() else {
         eprintln!(
             "leaf: open the browser from a Rex pane, or with Leaf: Open Browser in Rex's command palette."
         );
         return ExitCode::FAILURE;
-    }
+    };
+    let session = match crate::agent::rex_session_api_id() {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("leaf: couldn't find this pane's Rex session: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if args.len() > 1 {
         eprintln!("Usage: leaf browser [URL]");
         return ExitCode::from(2);
@@ -271,11 +450,14 @@ pub fn run(args: &[String]) -> ExitCode {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .env("REX_SESSION", session)
+        .env("REX_BLOCK", block)
         .env("LEAF_REX", rex)
         .env(
             "LEAF_AGENT",
             crate::agent::default_agent().unwrap_or_default(),
-        );
+        )
+        .env("LEAF_BROWSER_BAR", bar_path());
     if let Some(url) = args.first() {
         command.env("LEAF_BROWSER_URL", url);
     }
@@ -321,7 +503,10 @@ pub fn run(args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ask, DATA_END, DATA_START, ELEMENT_LIMIT, ELEMENTS_LIMIT, Reply, Request, answer};
+    use super::{
+        Ask, BarMode, DATA_END, DATA_START, ELEMENT_LIMIT, ELEMENTS_LIMIT, Reply, Request, answer,
+        fingerprint, load_bar_mode, save_bar_mode,
+    };
 
     fn ask(question: &str, elements: &[&str]) -> Ask {
         Ask {
@@ -330,6 +515,39 @@ mod tests {
             title: "Sign in".into(),
             elements: elements.iter().map(|e| (*e).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn the_address_bar_is_full_until_minimal_is_saved() {
+        assert_eq!(BarMode::parse(""), BarMode::Full);
+        assert_eq!(BarMode::parse("full"), BarMode::Full);
+        assert_eq!(BarMode::parse("minimal\n"), BarMode::Minimal);
+        assert_eq!(BarMode::Full.toggled(), BarMode::Minimal);
+        assert_eq!(BarMode::Minimal.toggled(), BarMode::Full);
+        let dir = std::env::temp_dir().join(format!("leaf-bar-{}", std::process::id()));
+        let path = dir.join("browser-bar");
+        assert_eq!(load_bar_mode(&path), BarMode::Full);
+        save_bar_mode(&path, BarMode::Minimal).expect("saves");
+        assert_eq!(load_bar_mode(&path), BarMode::Minimal);
+        save_bar_mode(&path, BarMode::Full).expect("saves");
+        assert_eq!(load_bar_mode(&path), BarMode::Full);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn macos_versions_parse() {
+        use super::parse_version;
+        assert_eq!(parse_version("27.0\n"), Some((27, 0)));
+        assert_eq!(parse_version("12.7.6"), Some((12, 7)));
+        assert_eq!(parse_version("14"), Some((14, 0)));
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("x.y"), None);
+    }
+
+    #[test]
+    fn fingerprint_tells_builds_apart() {
+        assert_eq!(fingerprint(b""), 0xcbf2_9ce4_8422_2325);
+        assert_ne!(fingerprint(b"a"), fingerprint(b"b"));
     }
 
     /// The part of `prompt` between the data markers.

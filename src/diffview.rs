@@ -18,10 +18,12 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::agent;
@@ -30,6 +32,7 @@ use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
 use crate::diffreview::{self, FileNotes, Margin, Reopen, SaveNotes, Sends};
 use crate::github;
+use crate::linediff;
 use crate::look::Look;
 use crate::news::News;
 use crate::progress::{SavedComment, Store, StoreFailed};
@@ -65,12 +68,19 @@ struct Palette {
     added_word: Color,
     removed_word: Color,
     focus: Color,
+    /// The cursor line: a faint wash on unchanged code, and stronger
+    /// added and removed tints so a changed line keeps its color.
+    cursor: Color,
+    added_cursor: Color,
+    removed_cursor: Color,
 }
 
 /// How strongly each tint shows over the theme's background.
 const LINE_TINT: f32 = 0.2;
 const WORD_TINT: f32 = 0.4;
 const FOCUS_TINT: f32 = 0.3;
+const CURSOR_TINT: f32 = 0.12;
+const CHANGED_CURSOR_TINT: f32 = 0.3;
 
 impl Palette {
     fn new(light: bool) -> Self {
@@ -88,6 +98,9 @@ impl Palette {
             added_word: Color::Rgb(0x00, 0x87, 0x00),
             removed_word: Color::Rgb(0x87, 0x00, 0x00),
             focus: Color::Rgb(0x00, 0x5f, 0x87),
+            cursor: Color::Rgb(0x1c, 0x26, 0x30),
+            added_cursor: Color::Rgb(0x00, 0x73, 0x00),
+            removed_cursor: Color::Rgb(0x73, 0x00, 0x00),
         }
     }
 
@@ -98,6 +111,9 @@ impl Palette {
             added_word: Color::Rgb(0xaf, 0xff, 0xaf),
             removed_word: Color::Rgb(0xff, 0xaf, 0xaf),
             focus: Color::Rgb(0xaf, 0xd7, 0xff),
+            cursor: Color::Rgb(0xea, 0xf2, 0xfb),
+            added_cursor: Color::Rgb(0xc3, 0xff, 0xc3),
+            removed_cursor: Color::Rgb(0xff, 0xc3, 0xc3),
         }
     }
 
@@ -112,6 +128,9 @@ impl Palette {
             added_word: tint(theme.green, WORD_TINT),
             removed_word: tint(theme.red, WORD_TINT),
             focus: tint(theme.blue, FOCUS_TINT),
+            cursor: tint(theme.blue, CURSOR_TINT),
+            added_cursor: tint(theme.green, CHANGED_CURSOR_TINT),
+            removed_cursor: tint(theme.red, CHANGED_CURSOR_TINT),
         }
     }
 
@@ -162,6 +181,23 @@ impl Layout {
             "split" => Some(Layout::Split),
             "inline" => Some(Layout::Inline),
             _ => None,
+        }
+    }
+
+    fn pane_widths(self, width: u16) -> (u16, u16) {
+        match self {
+            Layout::Inline => (width, width),
+            Layout::Split => {
+                let space = width.saturating_sub(1); // split divider
+                (space / 2, space - space / 2)
+            }
+        }
+    }
+
+    fn gutter(self, number: usize) -> usize {
+        match self {
+            Layout::Split => number + 2,
+            Layout::Inline => 2 * number + 3,
         }
     }
 
@@ -369,11 +405,102 @@ impl SplitRow {
 struct Split {
     lines: Vec<SplitRow>,
     line_of_row: Vec<usize>,
+    /// For a change block whose lines don't pair in Git's order, its first
+    /// removed row and how far its shorter side shifts (see `linediff::alignment`).
+    shifts: HashMap<usize, usize>,
+}
+
+/// The removed rows and the added rows of the change block holding `row`,
+/// which must be a removed or added row inside `hunk`.
+fn change_block(
+    rows: &[diff::Row],
+    hunk: &diff::Hunk,
+    row: usize,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let is = |at: usize, kind: RowKind| rows.get(at).is_some_and(|r| r.kind == kind);
+    let mut first = row;
+    if is(row, RowKind::Added) {
+        while first > hunk.first && is(first - 1, RowKind::Added) {
+            first -= 1;
+        }
+    } else if !is(row, RowKind::Removed) {
+        return None;
+    }
+    while first > hunk.first && is(first - 1, RowKind::Removed) {
+        first -= 1;
+    }
+    let mut middle = first;
+    while middle < hunk.end && is(middle, RowKind::Removed) {
+        middle += 1;
+    }
+    let mut end = middle;
+    while end < hunk.end && is(end, RowKind::Added) {
+        end += 1;
+    }
+    Some((first..middle, middle..end))
+}
+
+/// Each change block with removed and added rows that pair better shifted,
+/// by its first removed row.
+fn block_shifts(diff: &Diff) -> HashMap<usize, usize> {
+    let rows = diff.rows();
+    let mut shifts = HashMap::new();
+    let mut at = 0;
+    while at < rows.len() {
+        if rows[at].kind != RowKind::Removed {
+            at += 1;
+            continue;
+        }
+        let first = at;
+        while at < rows.len() && rows[at].kind == RowKind::Removed {
+            at += 1;
+        }
+        let middle = at;
+        while at < rows.len() && rows[at].kind == RowKind::Added {
+            at += 1;
+        }
+        let old: Vec<&str> = (first..middle).map(|row| diff.content(row)).collect();
+        let new: Vec<&str> = (middle..at).map(|row| diff.content(row)).collect();
+        let shift = linediff::alignment(&old, &new);
+        if shift > 0 {
+            shifts.insert(first, shift);
+        }
+    }
+    shifts
 }
 
 impl Split {
+    /// The row `row` is drawn beside and compared with: the added row paired
+    /// with a removed one, or the other way round.
+    fn partner(&self, diff: &Diff, row: usize) -> Option<usize> {
+        let rows = diff.rows();
+        let r = rows.get(row)?;
+        let hunk = diff.file(r.file as usize)?.hunks.get(r.hunk as usize)?;
+        let (old, new) = change_block(rows, hunk, row)?;
+        let shift = self.shifts.get(&old.start).copied().unwrap_or(0);
+        let new_longer = new.len() > old.len();
+        if r.kind == RowKind::Removed {
+            let k = row - old.start;
+            let index = if new_longer {
+                Some(k + shift)
+            } else {
+                k.checked_sub(shift)
+            };
+            index.filter(|&i| i < new.len()).map(|i| new.start + i)
+        } else {
+            let k = row - new.start;
+            let index = if new_longer {
+                k.checked_sub(shift)
+            } else {
+                Some(k + shift)
+            };
+            index.filter(|&i| i < old.len()).map(|i| old.start + i)
+        }
+    }
+
     fn new(diff: &Diff, layout: Layout) -> Self {
         let rows = diff.rows();
+        let shifts = block_shifts(diff);
         let mut lines = Vec::new();
         let mut line_of_row = vec![0; rows.len()];
         let mut push = |line: SplitRow, line_of_row: &mut Vec<usize>| {
@@ -421,11 +548,18 @@ impl Split {
                     }
                     let old = new_start - old_start;
                     let new = at - new_start;
+                    let shift = shifts.get(&old_start).copied().unwrap_or(0);
+                    let (left_shift, right_shift) = if new > old { (shift, 0) } else { (0, shift) };
                     for pair in 0..old.max(new) {
+                        let side = |shift: usize, len: usize, start: usize| {
+                            pair.checked_sub(shift)
+                                .filter(|&i| i < len)
+                                .map(|i| start + i)
+                        };
                         push(
                             SplitRow {
-                                left: (pair < old).then_some(old_start + pair),
-                                right: (pair < new).then_some(new_start + pair),
+                                left: side(left_shift, old, old_start),
+                                right: side(right_shift, new, new_start),
                                 band: None,
                             },
                             &mut line_of_row,
@@ -461,7 +595,11 @@ impl Split {
                 }
             }
         }
-        Split { lines, line_of_row }
+        Split {
+            lines,
+            line_of_row,
+            shifts,
+        }
     }
 
     fn lines(&self) -> &[SplitRow] {
@@ -491,6 +629,26 @@ impl Split {
         Some(rows.fold((first, first), |(low, high), row| {
             (low.min(row), high.max(row))
         }))
+    }
+
+    /// The diff rows a comment on display lines `first..=last` covers. When
+    /// the rows between the lines' first and last reach a line outside them,
+    /// as a paired line's two rows do once a block's pairing shifts, it is
+    /// the new side's rows alone, or the old side's when no line shows a new one.
+    fn comment_rows(&self, first: usize, last: usize) -> Option<(usize, usize)> {
+        let (first, last) = (first.min(last), first.max(last));
+        let all = self.rows_between(first, last)?;
+        let inside = (all.0..=all.1).all(|row| {
+            self.line_for_row(row)
+                .is_some_and(|line| (first..=last).contains(&line))
+        });
+        if inside {
+            return Some(all);
+        }
+        let lines = self.lines.get(first..=last)?;
+        let span = |rows: Vec<usize>| Some((*rows.iter().min()?, *rows.iter().max()?));
+        span(lines.iter().filter_map(|line| line.right).collect())
+            .or_else(|| span(lines.iter().filter_map(|line| line.left).collect()))
     }
 
     fn first_content(&self) -> Option<usize> {
@@ -538,7 +696,9 @@ struct App {
     cursor: usize,
     /// First split line on screen.
     scroll: usize,
-    left: u16,
+    left: usize,
+    /// Maximum old/new content widths, measured only on the first pan in a diff.
+    content_widths: Option<(usize, usize)>,
     /// The split line where a visual selection started.
     selection: Option<usize>,
     /// Vim-style visual mode: movement extends the selection, and Escape leaves
@@ -621,6 +781,7 @@ impl App {
             cursor,
             scroll: 0,
             left: 0,
+            content_widths: None,
             selection: None,
             visual: false,
             focus: None,
@@ -877,6 +1038,7 @@ impl App {
                         .and_then(|at| self.loaded.diff.file(at - 1))
                         .map(|file| file.path().to_owned());
                     self.loaded = loaded;
+                    self.content_widths = None;
                     self.key = self.loaded.key.clone();
                     self.split = Split::new(&self.loaded.diff, self.layout);
                     if !same_key {
@@ -1425,12 +1587,8 @@ impl App {
                 self.leave = Leave::Checks;
                 self.quit = true;
             }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.left = self.left.saturating_sub(4);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.left = self.left.saturating_add(4);
-            }
+            KeyCode::Char('h') | KeyCode::Left => self.scroll_sideways(false),
+            KeyCode::Char('l') | KeyCode::Right => self.scroll_sideways(true),
             KeyCode::Char('0') => self.left = 0,
             KeyCode::Char('?') => self.dialog = Dialog::Help,
             _ => {}
@@ -1555,6 +1713,15 @@ impl App {
         {
             return;
         }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) {
+            if self.overview.is_none() && self.note_editor.is_none() && self.rex_command.is_none() {
+                self.scroll_sideways(mouse.kind == MouseEventKind::ScrollRight);
+            }
+            return;
+        }
         let (top, height, scroll) = (self.view.y, self.view.height, self.scroll);
         let pinned = self.pinned_header();
         let offset = u16::from(pinned.is_some());
@@ -1608,6 +1775,43 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => self.drag_origin = None,
             _ => {}
         }
+    }
+
+    fn max_left(&mut self) -> usize {
+        let diff = &self.loaded.diff;
+        let (old, new) = *self.content_widths.get_or_insert_with(|| {
+            let (mut old, mut new) = (0, 0);
+            for (i, row) in diff
+                .rows()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.kind.is_content())
+            {
+                let width = cells(diff.content(i));
+                if row.kind != RowKind::Added {
+                    old = old.max(width);
+                }
+                if row.kind != RowKind::Removed {
+                    new = new.max(width);
+                }
+            }
+            (old, new)
+        });
+        let (left, right) = self.layout.pane_widths(self.view.width);
+        let gutter = self.layout.gutter(self.number_width());
+        let overflow = |width: usize, pane: u16| match (pane as usize).saturating_sub(gutter) {
+            0 => 0,
+            room => width.saturating_sub(room),
+        };
+        overflow(old, left).max(overflow(new, right))
+    }
+
+    fn scroll_sideways(&mut self, right: bool) {
+        self.left = if right {
+            self.left.saturating_add(4).min(self.max_left())
+        } else {
+            self.left.saturating_sub(4)
+        };
     }
 
     /// Scrolls when a drag reaches past the top or bottom of the view.
@@ -1996,7 +2200,7 @@ impl App {
 
     fn compose(&mut self, purpose: Purpose) {
         let (start, end) = self.range();
-        let rows = self.split.rows_between(start, end);
+        let rows = self.split.comment_rows(start, end);
         let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
         match range {
             Some((first, last, anchor)) => {
@@ -2278,7 +2482,7 @@ impl App {
             return;
         }
         let (start, end) = self.range();
-        let rows = self.split.rows_between(start, end);
+        let rows = self.split.comment_rows(start, end);
         let range = rows.and_then(|(first, last)| self.loaded.diff.comment_range(first, last));
         if let Some((first, last, anchor)) = range {
             self.copy = Some(payload(&self.loaded.diff, &anchor, first, last, ""));
@@ -2366,6 +2570,9 @@ impl App {
         }
         let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         self.view = body;
+        if self.left > 0 {
+            self.left = self.left.min(self.max_left());
+        }
         self.follow_cursor();
         if let Some(selected) = self.overview {
             self.draw_overview(f, body, selected);
@@ -2675,13 +2882,12 @@ impl App {
             self.side_line(&mut spans, Some(row), drawn, width, side, true);
             return Line::from(spans);
         }
-        let left_width = width.saturating_sub(1) / 2;
-        let right_width = width.saturating_sub(1 + left_width);
+        let (left_width, right_width) = self.layout.pane_widths(width);
         self.side_line(&mut spans, line.left, Side::Old, left_width, side, false);
         let rule_style = if side.highlighted {
             Style::default().fg(ACCENT).bg(self.palette.focus)
         } else if current {
-            Style::default().fg(ACCENT)
+            Style::default().fg(ACCENT).bg(self.palette.cursor)
         } else {
             Style::default().fg(DIM)
         };
@@ -2722,6 +2928,12 @@ impl App {
         };
         let bg = if state.highlighted {
             Some(self.palette.focus)
+        } else if state.current {
+            Some(match (diff_row.kind, side) {
+                (RowKind::Added, Side::New) => self.palette.added_cursor,
+                (RowKind::Removed, Side::Old) => self.palette.removed_cursor,
+                _ => self.palette.cursor,
+            })
         } else {
             tint
         };
@@ -2736,6 +2948,7 @@ impl App {
                 };
                 ("●", base.fg(color))
             }
+            (None, _) if state.current => ("▌", base.fg(ACCENT)),
             (None, RowKind::Added) if side == Side::New => ("▌", base.fg(ADDED_FG)),
             (None, RowKind::Removed) if side == Side::Old => ("▌", base.fg(REMOVED_FG)),
             _ => (" ", base),
@@ -2777,19 +2990,11 @@ impl App {
             (RowKind::Removed, Side::Old) => self.palette.removed_word,
             _ => Color::Reset,
         };
-        let gutter = if both { 2 * number + 3 } else { number + 2 };
+        let gutter = self.layout.gutter(number);
         let available = (width as usize).saturating_sub(gutter);
         let overlay = state.highlighted.then_some(self.palette.focus);
         let used = text_spans(
-            spans,
-            &text,
-            self.left as usize,
-            available,
-            base,
-            kinds_line,
-            emphasis,
-            word,
-            overlay,
+            spans, &text, self.left, available, base, kinds_line, &emphasis, word, overlay,
         );
         let filled = (gutter + used).min(width as usize);
         if filled < width as usize {
@@ -2801,7 +3006,11 @@ impl App {
     }
 
     fn empty_bg(&self, state: SideState) -> Option<Color> {
-        state.highlighted.then_some(self.palette.focus)
+        if state.highlighted {
+            Some(self.palette.focus)
+        } else {
+            state.current.then_some(self.palette.cursor)
+        }
     }
 
     fn number_width(&self) -> usize {
@@ -2884,51 +3093,18 @@ impl App {
         self.highlight.insert(key, kinds);
     }
 
-    /// The unchanged prefix and suffix of a changed line, in characters,
-    /// against the line it replaced. The rest is the word-level change.
-    fn emphasis(&self, row_index: usize) -> Option<(usize, usize)> {
+    /// The changed text of a removed or added line, as character ranges,
+    /// against the line it is paired with. Empty when it has no partner.
+    fn emphasis(&self, row_index: usize) -> Vec<std::ops::Range<usize>> {
         let diff = &self.loaded.diff;
-        let row = *diff.rows().get(row_index)?;
-        let hunk = diff.file(row.file as usize)?.hunks.get(row.hunk as usize)?;
-        let rows = diff.rows();
-        let pair = match row.kind {
-            RowKind::Removed => {
-                let mut start = row_index;
-                while start > hunk.first && rows[start - 1].kind == RowKind::Removed {
-                    start -= 1;
-                }
-                let mut added = row_index;
-                while added < hunk.end && rows[added].kind == RowKind::Removed {
-                    added += 1;
-                }
-                let pair = added + (row_index - start);
-                (rows.get(pair)?.kind == RowKind::Added).then_some(pair)?
-            }
-            RowKind::Added => {
-                let mut start = row_index;
-                while start > hunk.first && rows[start - 1].kind == RowKind::Added {
-                    start -= 1;
-                }
-                let mut removed = start;
-                while removed > hunk.first && rows[removed - 1].kind == RowKind::Removed {
-                    removed -= 1;
-                }
-                let pair = removed + (row_index - start);
-                (rows.get(pair)?.kind == RowKind::Removed).then_some(pair)?
-            }
-            _ => return None,
+        let Some(partner) = self.split.partner(diff, row_index) else {
+            return Vec::new();
         };
-        let (a, b) = (diff.content(pair), diff.content(row_index));
-        let prefix = a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count();
-        let suffix = a
-            .chars()
-            .rev()
-            .zip(b.chars().rev())
-            .take_while(|(a, b)| a == b)
-            .count()
-            .min(a.chars().count().saturating_sub(prefix))
-            .min(b.chars().count().saturating_sub(prefix));
-        Some((prefix, suffix))
+        let (text, other) = (diff.content(row_index), diff.content(partner));
+        match diff.rows()[row_index].kind {
+            RowKind::Removed => linediff::Changes::between(text, other).old,
+            _ => linediff::Changes::between(other, text).new,
+        }
     }
 
     fn draw_composer(&mut self, f: &mut Frame, area: Rect) {
@@ -3264,16 +3440,19 @@ fn hunk_note(text: &str) -> Option<&str> {
     (!note.is_empty()).then_some(note)
 }
 
+fn cell_width(symbol: &str, column: usize) -> usize {
+    if symbol == "\t" {
+        4 - column % 4
+    } else if symbol.contains(char::is_control) {
+        0
+    } else {
+        symbol.cell_width() as usize
+    }
+}
+
 fn cells(text: &str) -> usize {
-    text.chars()
-        .map(|ch| {
-            if ch == '\t' {
-                4
-            } else {
-                ch.width().unwrap_or(0)
-            }
-        })
-        .sum()
+    text.graphemes(true)
+        .fold(0, |col, symbol| col + cell_width(symbol, col))
 }
 
 /// Appends `text` to `spans` one style run at a time, skipping `start` columns
@@ -3286,55 +3465,46 @@ fn text_spans(
     avail: usize,
     base: Style,
     kinds: Option<&[syntax::Kind]>,
-    emphasis: Option<(usize, usize)>,
+    emphasis: &[std::ops::Range<usize>],
     word: Color,
     selection: Option<Color>,
 ) -> usize {
-    let chars: Vec<char> = text.chars().collect();
-    let (prefix, suffix) = emphasis.unwrap_or((0, 0));
-    let changed_from = prefix;
-    let changed_to = chars.len().saturating_sub(suffix);
+    let end = start.saturating_add(avail);
     let mut column = 0;
     let mut used = 0;
-    for (at, ch) in chars.iter().enumerate() {
+    let mut char_index = 0;
+    for symbol in text.graphemes(true) {
+        if column >= end {
+            break;
+        }
+        let at = char_index;
+        char_index += symbol.chars().count();
+        let width = cell_width(symbol, column);
+        let from = column;
+        column += width;
+        let visible = column.min(end).saturating_sub(from.max(start));
+        if visible == 0 {
+            continue;
+        }
         let mut style = base;
         if let Some(kinds) = kinds
             && let Some(kind) = kinds.get(at)
         {
             style = style.patch(crate::render::code_style(*kind));
         }
-        if at >= changed_from && at < changed_to {
+        if emphasis.iter().any(|range| range.contains(&at)) {
             style = style.bg(word);
         }
         if let Some(selection) = selection {
             style = style.bg(selection);
         }
-        if *ch == '\t' {
-            let width = 4 - column % 4;
-            if column >= start {
-                if used + width > avail {
-                    break;
-                }
-                push_text(spans, style, &" ".repeat(width));
-                used += width;
-            }
-            column += width;
-            continue;
+        if symbol == "\t" || visible < width {
+            // A clipped wide glyph can't be drawn in half. Keep its visible cells in place.
+            push_text(spans, style, &" ".repeat(visible));
+        } else {
+            push_text(spans, style, symbol);
         }
-        let width = ch.width().unwrap_or(0);
-        if column + width <= start {
-            column += width;
-            continue;
-        }
-        if used + width > avail {
-            break;
-        }
-        if column >= start {
-            let mut buffer = [0u8; 4];
-            push_text(spans, style, ch.encode_utf8(&mut buffer));
-            used += width;
-        }
-        column += width;
+        used += visible;
     }
     used
 }
@@ -3411,7 +3581,10 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
         ("i", "split or inline layout"),
-        ("h l  ← →", "scroll sideways; 0 resets"),
+        (
+            "h l  ← →",
+            "scroll sideways with keys, wheel or trackpad; 0 resets",
+        ),
         ("? q", "this help, quit"),
     ];
     let mut lines: Vec<Line> = keys
@@ -4057,6 +4230,96 @@ diff --git a/b.rs b/b.rs
         }
     }
 
+    const SHIFTED: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+-    let total = sum(items);
++
++    let total = sum(items) + tax;
+ }
+";
+
+    #[test]
+    fn a_line_inserted_above_an_edit_pairs_the_edit_with_its_old_line() {
+        let diff = Diff::parse(SHIFTED.to_owned());
+        let split = Split::new(&diff, Layout::Split);
+        let rows: Vec<(Option<&str>, Option<&str>)> = split
+            .lines()
+            .iter()
+            .filter(|line| line.band.is_none())
+            .map(|line| {
+                (
+                    line.left.map(|row| diff.content(row)),
+                    line.right.map(|row| diff.content(row)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("fn main() {"), Some("fn main() {")),
+                (None, Some("")),
+                (
+                    Some("    let total = sum(items);"),
+                    Some("    let total = sum(items) + tax;")
+                ),
+                (Some("}"), Some("}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comment_on_a_shifted_pair_hangs_off_its_own_lines_only() {
+        let mut app = App::new(loaded(SHIFTED), Options::default());
+        let diff = &app.loaded.diff;
+        let edit = app
+            .split
+            .lines()
+            .iter()
+            .position(|line| {
+                line.right
+                    .is_some_and(|row| diff.content(row).ends_with("+ tax;"))
+            })
+            .unwrap_or(usize::MAX);
+        app.cursor = edit;
+        app.compose(Purpose::Comment);
+        let anchor = app.composer.as_ref().map(|c| c.anchor.clone());
+        assert_eq!(
+            anchor.map(|a| (a.side, a.start_line, a.end_line)),
+            Some((Side::New, 3, 3))
+        );
+    }
+
+    #[test]
+    fn emphasis_marks_the_changed_words_of_the_paired_line_in_both_layouts() {
+        for layout in [Layout::Split, Layout::Inline] {
+            let mut app = App::new(
+                loaded(SHIFTED),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            let rows = app.loaded.diff.rows().to_vec();
+            let row = |kind: RowKind, nth: usize| {
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.kind == kind)
+                    .nth(nth)
+                    .map(|(i, _)| i)
+                    .unwrap_or(usize::MAX)
+            };
+            assert!(app.emphasis(row(RowKind::Removed, 0)).is_empty());
+            assert!(app.emphasis(row(RowKind::Added, 0)).is_empty());
+            assert_eq!(app.emphasis(row(RowKind::Added, 1)), vec![26..32]);
+            app.toggle_layout();
+            assert_eq!(app.emphasis(row(RowKind::Added, 1)), vec![26..32]);
+        }
+    }
+
     fn app() -> App {
         let mut app = App::new(loaded(PATCH), Options::default());
         app.view = Rect::new(0, 1, 120, 20);
@@ -4346,6 +4609,54 @@ diff --git a/b.rs b/b.rs
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_cursor_line_is_washed_end_to_end_and_marked_at_its_edge() {
+        for layout in [Layout::Split, Layout::Inline] {
+            let mut app = App::new(
+                loaded(PATCH),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            let (cursor, added, removed) = (
+                app.palette.cursor,
+                app.palette.added_cursor,
+                app.palette.removed_cursor,
+            );
+            let line = app.split_content(app.cursor, 80);
+            let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(width, 80, "{layout:?}");
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(cursor)),
+                "{layout:?}: every cell of an unchanged cursor line is washed"
+            );
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.content == "▌" && s.style.fg == Some(ACCENT)),
+                "{layout:?}"
+            );
+
+            press(&mut app, KeyCode::Char('j'));
+            let line = app.split_content(app.cursor, 80);
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.style.bg == Some(added) || s.style.bg == Some(removed)),
+                "{layout:?}: a changed cursor line keeps its color, stronger"
+            );
+            let other = app.split_content(app.cursor + 1, 80);
+            assert!(
+                other
+                    .spans
+                    .iter()
+                    .all(|s| s.style.bg != Some(cursor) && s.style.fg != Some(ACCENT)),
+                "{layout:?}: other lines are left alone"
+            );
+        }
     }
 
     fn big_patch(lines: usize) -> String {
@@ -4806,6 +5117,136 @@ diff --git a/b.rs b/b.rs
         assert_eq!(app.scroll, 0, "the file heading scrolls back into view");
         let screen = draw(&mut app, 100, 22);
         assert!(screen.contains("big.rs"));
+    }
+
+    #[test]
+    fn the_horizontal_wheel_pans_code_but_not_gutters_or_selection() {
+        let patch = PATCH
+            .replace("let b = 2;", "000-old-TAIL")
+            .replace("let b = 3;", "000-new-TAIL");
+        for (layout, width, panned) in [
+            (Layout::Split, 27, "▌ 11 old-TAIL│▌ 11 new-TAIL"),
+            (Layout::Inline, 17, "▌ 11     old-TAIL\n▌     11 new-TAIL"),
+        ] {
+            let mut app = App::new(
+                loaded(&patch),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            app.scroll = 2;
+            app.cursor = 3;
+            app.selection = Some(2);
+            let before = draw(&mut app, width, 5);
+            assert!(!before.contains("TAIL"));
+
+            wheel(&mut app, MouseEventKind::ScrollRight);
+            let after = draw(&mut app, width, 5);
+            assert!(after.contains(panned), "{layout:?}:\n{after}");
+            assert_eq!((app.scroll, app.cursor, app.selection), (2, 3, Some(2)));
+
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(draw(&mut app, width, 5), before);
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(app.left, 0);
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_stops_at_the_last_content_column() {
+        // 14 display columns: the tab after "ab" occupies two, as does 界.
+        let patch = PATCH.replace("let b = 3;", "ab\t界12345END");
+        for (layout, width, limit) in [(Layout::Split, 26, 6), (Layout::Inline, 18, 5)] {
+            let mut app = App::new(
+                loaded(&patch),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            draw(&mut app, width, 12);
+            for _ in 0..20 {
+                wheel(&mut app, MouseEventKind::ScrollRight);
+            }
+            assert_eq!(app.left, limit, "{layout:?}");
+            assert!(draw(&mut app, width, 12).contains("END"));
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(app.left, limit - 4);
+            draw(&mut app, 80, 12);
+            assert_eq!(app.left, 0, "all lines fit after resize");
+            press(&mut app, KeyCode::Char('l'));
+            assert_eq!(app.left, 0, "keys share the wheel limit");
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_clips_in_terminal_cells() {
+        for (text, room, offset, expected) in
+            [("\tabc", 4, 3, " abc"), ("a#\u{fe0f}X", 3, 1, "#\u{fe0f}X")]
+        {
+            let start = cells(text).saturating_sub(room);
+            let mut spans = Vec::new();
+            text_spans(
+                &mut spans,
+                text,
+                start,
+                room,
+                Style::default(),
+                None,
+                &[],
+                Color::Reset,
+                None,
+            );
+            assert_eq!(start, offset);
+            assert_eq!(Line::from(spans).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_reclamps_after_a_layout_switch_or_diff_refresh() {
+        let patch = PATCH.replace("let b = 2;", "123456789abcde");
+        let mut app = App::new(loaded(&patch), Options::default());
+        draw(&mut app, 26, 12);
+        for _ in 0..4 {
+            wheel(&mut app, MouseEventKind::ScrollRight);
+        }
+        assert_eq!(app.left, 7, "the old side has seven columns for code");
+        press(&mut app, KeyCode::Char('i'));
+        draw(&mut app, 26, 12);
+        assert_eq!(app.left, 0, "the whole line fits inline");
+        press(&mut app, KeyCode::Char('i'));
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(TWO_FILES))),
+            remember: None,
+            background: true,
+        });
+        draw(&mut app, 26, 12);
+        assert_eq!(
+            app.left, 0,
+            "the replacement diff contains only short lines"
+        );
+    }
+
+    #[test]
+    fn the_horizontal_wheel_does_not_pan_behind_overlays_or_inputs() {
+        for key in [
+            KeyCode::Char('?'),
+            KeyCode::Char('c'),
+            KeyCode::Char('O'),
+            KeyCode::Char('M'),
+            remote::WAKE,
+        ] {
+            let mut app = app();
+            draw(&mut app, 19, 12);
+            wheel(&mut app, MouseEventKind::ScrollRight);
+            assert!(app.left > 0);
+            press(&mut app, KeyCode::Char('0'));
+            press(&mut app, key);
+            wheel(&mut app, MouseEventKind::ScrollRight);
+            assert_eq!(app.left, 0, "after {key:?}");
+        }
     }
 
     #[test]

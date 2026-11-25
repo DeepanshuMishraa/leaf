@@ -521,9 +521,9 @@ fn point_in(area: Rect, scroll: usize, column: u16, row: u16) -> Point {
     )
 }
 
-/// What a body was laid out for: width, tab, expanded, media generation, and
-/// on the Checks tab, a stamp of what it shows.
-type BodyKey = (u16, Tab, bool, u64, u64);
+/// What a body was laid out for: width, tab, expanded, media generation, a
+/// stamp for the Checks tab, and the Markdown heading color.
+type BodyKey = (u16, Tab, bool, u64, u64, Color);
 
 /// A tab's lines, and the figures drawn over them.
 struct Body {
@@ -2119,15 +2119,22 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let now = self.now;
-        let ink = self.look.ink();
         if let Some(page) = &mut self.page {
             let refreshing = self.inflight.contains(&page.pr);
-            draw_page(f, page, &mut self.gallery, &self.logs, now, refreshing, ink);
+            draw_page(
+                f,
+                page,
+                &mut self.gallery,
+                &self.logs,
+                now,
+                refreshing,
+                &self.look,
+            );
         } else if let Some(list) = &mut self.list {
-            draw_list(f, list, now, ink);
+            draw_list(f, list, now, self.look.ink());
         }
         if let Some(news) = &mut self.news {
-            let panel = news.draw(f, ink);
+            let panel = news.draw(f, self.look.ink());
             // Kitty images sit above the text, so any under the dialog would hide it.
             self.gallery.uncover(panel);
         }
@@ -2865,8 +2872,9 @@ fn draw_page(
     logs: &Logs,
     now: i64,
     refreshing: bool,
-    ink: Option<art::Ink>,
+    look: &Look,
 ) {
+    let ink = look.ink();
     let area = f.area();
     let (x, width) = column(area);
     let w = width as usize;
@@ -3078,13 +3086,29 @@ fn draw_page(
         }
         _ => 0,
     };
-    let key = (width, page.tab, page.expanded, gallery.generation, stamp);
+    let heading_color = look.colors().heading_color();
+    let key = (
+        width,
+        page.tab,
+        page.expanded,
+        gallery.generation,
+        stamp,
+        heading_color,
+    );
     if page.cache.as_ref().is_none_or(|(k, _)| *k != key) {
         page.check = page.check.min(detail.checks.len().saturating_sub(1));
         let body = match page.tab {
-            Tab::Summary => summary(detail, w, gallery),
+            Tab::Summary => summary(detail, w, gallery, heading_color),
             Tab::Timeline => {
-                let listed = timeline(detail, w, now, page.expanded, page.focus, gallery);
+                let listed = timeline(
+                    detail,
+                    w,
+                    now,
+                    page.expanded,
+                    page.focus,
+                    gallery,
+                    heading_color,
+                );
                 page.starts = listed.starts;
                 Body {
                     lines: listed.lines,
@@ -3092,7 +3116,15 @@ fn draw_page(
                 }
             }
             Tab::Comments => {
-                let listed = comments(detail, w, now, page.focus, page.expanded, gallery);
+                let listed = comments(
+                    detail,
+                    w,
+                    now,
+                    page.focus,
+                    page.expanded,
+                    gallery,
+                    heading_color,
+                );
                 page.starts = listed.starts;
                 Body {
                     lines: listed.lines,
@@ -3510,7 +3542,7 @@ fn field(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
 
 /// Status, then only what has something to say: reviewers, labels, checks
 /// that need you, then the description with its pictures.
-fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
+fn summary(detail: &Detail, width: usize, gallery: &mut Gallery, heading_color: Color) -> Body {
     let dim = Style::default().fg(DIM);
     let mut lines = Vec::new();
 
@@ -3538,7 +3570,7 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
                 vec![Span::styled(detail.labels.join("  "), dim)],
             ));
         }
-        return with_description(lines, detail, width, gallery);
+        return with_description(lines, detail, width, gallery, heading_color);
     }
 
     let (status, color) = match (detail.state, detail.mergeability) {
@@ -3607,7 +3639,7 @@ fn summary(detail: &Detail, width: usize, gallery: &mut Gallery) -> Body {
         }
     }
 
-    with_description(lines, detail, width, gallery)
+    with_description(lines, detail, width, gallery, heading_color)
 }
 
 /// The summary's fields, then two blank lines and the description.
@@ -3616,12 +3648,13 @@ fn with_description(
     detail: &Detail,
     width: usize,
     gallery: &mut Gallery,
+    heading_color: Color,
 ) -> Body {
     lines.push(Line::default());
     lines.push(Line::default());
     let offset = lines.len();
     gallery.sign(&detail.media);
-    let description = description(&detail.body, width as u16, gallery);
+    let description = description(&detail.body, width as u16, gallery, heading_color);
     lines.extend(description.lines);
     Body {
         lines,
@@ -4158,7 +4191,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, first: usize, rest: usize) -> Vec<Vec<S
 
 /// The description laid out by the reader's markdown, with room held for its
 /// pictures when the terminal can draw them, and placeholders when it can't.
-fn description(body: &str, width: u16, gallery: &mut Gallery) -> Body {
+fn description(body: &str, width: u16, gallery: &mut Gallery, heading_color: Color) -> Body {
     let body = pr::visible(body);
     if body.is_empty() {
         return Body {
@@ -4171,24 +4204,34 @@ fn description(body: &str, width: u16, gallery: &mut Gallery) -> Body {
     }
     if !gallery.shows_media() {
         return Body {
-            lines: markdown(&body, width, 0),
+            lines: markdown(&body, width, 0, heading_color),
             figures: Vec::new(),
         };
     }
-    with_media(&body, width, 0, gallery)
+    with_media(&body, width, 0, gallery, heading_color)
 }
 
 /// Markdown laid out by the reader, as lines `indent` columns in, with room
 /// held for its pictures and videos and a label under each video. Only for a
 /// terminal that can draw them.
-fn with_media(body: &str, width: u16, indent: u16, gallery: &mut Gallery) -> Body {
+fn with_media(
+    body: &str,
+    width: u16,
+    indent: u16,
+    gallery: &mut Gallery,
+    heading_color: Color,
+) -> Body {
     let prepared = prmedia::prepare(body);
     gallery.learn(&prepared);
     let mut laid = {
         let gallery = &*gallery;
-        render::layout(&prepared.markdown, width.max(10), gallery.cell(), &|href| {
-            gallery.size(href).map(render::ImageSize::from)
-        })
+        render::layout_with_heading_color(
+            &prepared.markdown,
+            width.max(10),
+            gallery.cell(),
+            &|href| gallery.size(href).map(render::ImageSize::from),
+            heading_color,
+        )
     };
     for figure in &mut laid.figures {
         gallery.want(&figure.href);
@@ -4359,9 +4402,13 @@ struct Listed {
 /// Which events a list of them holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Events {
-    All,
+    All {
+        expanded: bool,
+    },
     /// Only those with a comment to quote, each in full.
-    Comments,
+    Comments {
+        quotes: bool,
+    },
 }
 
 /// The timeline's lines, and the first line of each event. The `focus`
@@ -4373,8 +4420,17 @@ fn timeline(
     expanded: bool,
     focus: Option<usize>,
     gallery: &mut Gallery,
+    heading_color: Color,
 ) -> Listed {
-    events(detail, width, now, expanded, focus, Events::All, gallery)
+    events(
+        detail,
+        width,
+        now,
+        focus,
+        Events::All { expanded },
+        gallery,
+        heading_color,
+    )
 }
 
 /// The Comments tab: every comment and review with something to say, in
@@ -4386,8 +4442,17 @@ fn comments(
     focus: Option<usize>,
     quotes: bool,
     gallery: &mut Gallery,
+    heading_color: Color,
 ) -> Listed {
-    let listed = events(detail, width, now, quotes, focus, Events::Comments, gallery);
+    let listed = events(
+        detail,
+        width,
+        now,
+        focus,
+        Events::Comments { quotes },
+        gallery,
+        heading_color,
+    );
     if !listed.lines.is_empty() {
         return listed;
     }
@@ -4410,13 +4475,16 @@ fn events(
     detail: &Detail,
     width: usize,
     now: i64,
-    expanded: bool,
     focus: Option<usize>,
     which: Events,
     gallery: &mut Gallery,
+    heading_color: Color,
 ) -> Listed {
     // The Comments tab shows each comment whole; `e` shows quotes too.
-    let (quotes, expanded) = (expanded, expanded || which == Events::Comments);
+    let (quotes, expanded) = match which {
+        Events::All { expanded } => (expanded, expanded),
+        Events::Comments { quotes } => (quotes, true),
+    };
     let dim = Style::default().fg(DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut lines = Vec::new();
@@ -4435,7 +4503,7 @@ fn events(
     let closed_color = state_color(detail.state);
     for (index, event) in detail.timeline.iter().enumerate() {
         starts.push(lines.len());
-        if which == Events::Comments && quoted(event).is_none() {
+        if matches!(which, Events::Comments { .. }) && quoted(event).is_none() {
             continue;
         }
         let picked = focus == Some(index);
@@ -4541,7 +4609,7 @@ fn events(
             // A cut-short excerpt would cut a picture in two, so pictures
             // show only where comments are shown whole.
             let rendered = if expanded && gallery.shows_media() {
-                let laid = with_media(&body, room, indent, gallery);
+                let laid = with_media(&body, room, indent, gallery, heading_color);
                 let top = lines.len();
                 figures.extend(laid.figures.into_iter().map(|mut figure| {
                     figure.top += top;
@@ -4549,7 +4617,7 @@ fn events(
                 }));
                 laid.lines
             } else {
-                markdown(&body, room, indent)
+                markdown(&body, room, indent, heading_color)
             };
             let total = rendered.len();
             let shown = if expanded { total } else { total.min(EXCERPT) };
@@ -4614,9 +4682,10 @@ fn without_images(text: &str) -> String {
 
 /// Markdown laid out by the reader, as lines `indent` columns in. Images
 /// become a short placeholder: used where pictures can't be drawn.
-fn markdown(text: &str, width: u16, indent: u16) -> Vec<Line<'static>> {
+fn markdown(text: &str, width: u16, indent: u16, heading_color: Color) -> Vec<Line<'static>> {
     let text = without_images(text);
-    let laid = render::layout(&text, width.max(10), (8, 16), &|_| None);
+    let laid =
+        render::layout_with_heading_color(&text, width.max(10), (8, 16), &|_| None, heading_color);
     let mut lines = rows(&laid.rows, indent);
     while lines
         .last()
@@ -4780,6 +4849,8 @@ mod tests {
     use super::*;
     use crate::pr::{Check, MergeMethod, Reviewer};
 
+    const TEST_HEADING_COLOR: Color = Color::LightBlue;
+
     fn detail(state: State) -> Detail {
         Detail {
             pr: PrRef {
@@ -4870,6 +4941,59 @@ mod tests {
             logs: Logs::default(),
             gallery: Gallery::plain(),
             now: 0,
+        }
+    }
+
+    #[test]
+    fn headings_follow_the_theme_in_all_pr_markdown_tabs() {
+        let mut detail = detail(State::Open);
+        detail.body = "## Heading".into();
+        detail.timeline[1].kind = EventKind::Comment {
+            body: "## Heading".into(),
+        };
+        let mut app = app_with_page(detail);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30))
+            .expect("test terminal");
+
+        for tab in [Tab::Summary, Tab::Timeline, Tab::Comments] {
+            app.page.as_mut().expect("open PR").show(tab);
+            for (colors, expected) in crate::scheme::HEADING_COLOR_CASES {
+                app.look.set_test_colors(colors);
+                terminal.draw(|f| app.draw(f)).expect("draws");
+                let (_, body) = app
+                    .page
+                    .as_ref()
+                    .and_then(|page| page.cache.as_ref())
+                    .expect("drawn PR body");
+                let heading = body
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .find(|span| span.content == "Heading")
+                    .expect("Markdown heading");
+                assert_eq!(heading.style.fg, Some(expected), "{tab:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn headings_follow_the_theme_when_pr_markdown_has_media() {
+        for (colors, expected) in crate::scheme::HEADING_COLOR_CASES {
+            let body = with_media(
+                "## Heading\n\n![Figure](https://example.com/figure.png)",
+                80,
+                0,
+                &mut Gallery::plain(),
+                colors.heading_color(),
+            );
+            assert_eq!(body.figures.len(), 1);
+            let heading = body
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "Heading")
+                .expect("Markdown heading");
+            assert_eq!(heading.style.fg, Some(expected));
         }
     }
 
@@ -5207,17 +5331,43 @@ mod tests {
                 headline: "fix it".into(),
             },
         });
-        let Listed { lines, starts, .. } = comments(&d, 60, now, None, true, &mut Gallery::plain());
+        let Listed { lines, starts, .. } = comments(
+            &d,
+            60,
+            now,
+            None,
+            true,
+            &mut Gallery::plain(),
+            TEST_HEADING_COLOR,
+        );
         let shown = texts(&lines);
         assert!(shown[0].starts_with("◆  bot commented"), "{shown:?}");
         // Picked, it's pointed at, its rail is thick, and enter is named.
-        let picked = comments(&d, 60, now, Some(1), true, &mut Gallery::plain()).lines;
+        let picked = comments(
+            &d,
+            60,
+            now,
+            Some(1),
+            true,
+            &mut Gallery::plain(),
+            TEST_HEADING_COLOR,
+        )
+        .lines;
         let picked = texts(&picked);
         assert!(picked[0].starts_with("▶  bot commented"), "{picked:?}");
         assert!(picked[0].contains("enter replies"), "{picked:?}");
         assert!(picked[1].starts_with('┃'), "{picked:?}");
         // Too narrow for the hint, the header keeps its own words whole.
-        let narrow = comments(&d, 24, now, Some(1), true, &mut Gallery::plain()).lines;
+        let narrow = comments(
+            &d,
+            24,
+            now,
+            Some(1),
+            true,
+            &mut Gallery::plain(),
+            TEST_HEADING_COLOR,
+        )
+        .lines;
         let narrow = texts(&narrow);
         assert!(narrow[0].starts_with("▶  bot commented"), "{narrow:?}");
         assert!(!narrow[0].contains("enter"), "{narrow:?}");
@@ -5231,7 +5381,16 @@ mod tests {
         assert_eq!(starts[1], 0);
 
         d.timeline.truncate(1);
-        let lines = comments(&d, 60, now, None, true, &mut Gallery::plain()).lines;
+        let lines = comments(
+            &d,
+            60,
+            now,
+            None,
+            true,
+            &mut Gallery::plain(),
+            TEST_HEADING_COLOR,
+        )
+        .lines;
         assert!(texts(&lines)[0].starts_with("No comments on this pull request yet"));
     }
 
@@ -5290,7 +5449,12 @@ mod tests {
 
     #[test]
     fn the_summary_shows_only_what_has_something_to_say() {
-        let body = summary(&detail(State::Open), 80, &mut Gallery::plain());
+        let body = summary(
+            &detail(State::Open),
+            80,
+            &mut Gallery::plain(),
+            TEST_HEADING_COLOR,
+        );
         let text = texts(&body.lines).join("\n");
         assert!(text.contains("Status     Ready to merge"), "{text}");
         assert!(text.contains("Branch     fix/find → main"), "{text}");
@@ -5311,7 +5475,8 @@ mod tests {
         let mut bare = detail(State::Open);
         bare.reviewers.clear();
         bare.labels.clear();
-        let text = texts(&summary(&bare, 80, &mut Gallery::plain()).lines).join("\n");
+        let text =
+            texts(&summary(&bare, 80, &mut Gallery::plain(), TEST_HEADING_COLOR).lines).join("\n");
         assert!(
             !text.contains("Reviewers") && !text.contains("Labels"),
             "{text}"
@@ -5329,6 +5494,7 @@ mod tests {
                 false,
                 None,
                 &mut Gallery::plain(),
+                TEST_HEADING_COLOR,
             )
             .lines,
         );
@@ -5342,6 +5508,7 @@ mod tests {
                 true,
                 None,
                 &mut Gallery::plain(),
+                TEST_HEADING_COLOR,
             )
             .lines,
         );
@@ -5811,7 +5978,7 @@ mod tests {
             Load::Loading,
         );
         page.cache = Some((
-            (80, Tab::Summary, false, 0, 0),
+            (80, Tab::Summary, false, 0, 0, TEST_HEADING_COLOR),
             Body {
                 lines: vec![
                     Line::from(vec![Span::raw("hello "), Span::raw("world")]),
@@ -5854,7 +6021,7 @@ mod tests {
         page.header_area = Rect::new(4, 0, 60, 3);
         page.body_area = Rect::new(4, 4, 60, 10);
         page.cache = Some((
-            (60, Tab::Summary, false, 0, 0),
+            (60, Tab::Summary, false, 0, 0, TEST_HEADING_COLOR),
             Body {
                 lines: vec![
                     Line::from("Status  Ready to merge"),

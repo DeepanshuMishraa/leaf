@@ -40,6 +40,11 @@ impl Look {
         self.colors
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_colors(&mut self, colors: Colors) {
+        self.colors = colors;
+    }
+
     /// The dither's tints, or `None` when the classic UI is on.
     pub fn ink(&self) -> Option<Ink> {
         match self.ui {

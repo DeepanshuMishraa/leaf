@@ -75,7 +75,7 @@ fn rex_json(args: &[&str]) -> Result<Value, String> {
 /// Runs this leaf with `args` over `block`, or beside it when it's busy.
 pub fn run_in(block: &str, args: &[String], label: &str) -> Result<Placed, String> {
     let session = agent::rex_session_id()
-        .ok_or_else(|| "REX_SESSION is unset; this needs a Rex session".to_owned())?;
+        .ok_or_else(|| "REX_SESSION and REX_BLOCK are unset; this needs a Rex pane".to_owned())?;
     let exe = std::env::current_exe().map_err(|e| format!("couldn't find this leaf: {e}"))?;
     let mut command = vec![exe.display().to_string()];
     command.extend(args.iter().cloned());

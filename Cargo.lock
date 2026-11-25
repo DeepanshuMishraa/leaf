@@ -251,6 +251,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a680398c10c7bc0488067c4612226ea905a85f607134b69f3068d505d58c4214"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1999,7 +2009,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "leaf-reader"
-version = "0.18.1"
+version = "0.18.2"
 dependencies = [
  "base64 0.22.1",
  "calamine",
@@ -2023,12 +2033,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "similar",
  "skrifa",
  "symphonia",
  "thiserror 2.0.21",
  "toml",
  "tungstenite",
  "unicode-ident",
+ "unicode-segmentation",
  "unicode-width",
  "ureq",
  "url",
@@ -3810,6 +3822,15 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
+dependencies = [
+ "bstr",
+]
 
 [[package]]
 name = "simplecss"

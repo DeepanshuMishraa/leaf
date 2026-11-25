@@ -1,6 +1,7 @@
 //! The reader: pages on screen, keys, mouse selection, highlights and figures.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -33,6 +34,7 @@ use crate::article;
 use crate::doc::{Doc, ImageRef, WATCH_TICK, Watch};
 use crate::edge;
 use crate::find::Query;
+use crate::follow::{self, Follow};
 use crate::highlight::{self, Highlight};
 use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
@@ -85,6 +87,8 @@ const FALLBACK_PAPER: Rgb = [30, 30, 30];
 const KEPT_PAGES: usize = 4;
 /// How much of a page's first line names its bookmark.
 const BOOKMARK_LABEL_CHARS: usize = 48;
+/// How much text to look for when an edited page is reopened from history.
+const HISTORY_ANCHOR_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
 /// How often the word read aloud is checked: fast enough that the mark
@@ -115,6 +119,51 @@ const FOUND_HERE: Color = Color::Rgb(255, 128, 48);
 enum Mode {
     Paged,
     Scroll,
+}
+
+/// A place in a document, with a text anchor in case the page changes or reflows.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Viewport {
+    page: usize,
+    offset: usize,
+    anchor: Option<HistoryAnchor>,
+    width: u16,
+    mode: Mode,
+    look: Option<crate::doc::Look>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryAnchor {
+    offset: usize,
+    excerpt: Vec<char>,
+    page_hash: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadingLocation {
+    path: PathBuf,
+    viewport: Viewport,
+}
+
+/// Places reached through reader navigation in the current open session.
+#[derive(Debug, Default)]
+pub(crate) struct ReaderHistory {
+    back: VecDeque<ReadingLocation>,
+    forward: VecDeque<ReadingLocation>,
+}
+
+impl ReaderHistory {
+    const LIMIT: usize = 100;
+
+    fn push(stack: &mut VecDeque<ReadingLocation>, location: ReadingLocation) {
+        if stack.back() == Some(&location) {
+            return;
+        }
+        if stack.len() == Self::LIMIT {
+            stack.pop_front();
+        }
+        stack.push_back(location);
+    }
 }
 
 /// What floats over the text: nothing, the key list, the go-to-page box,
@@ -149,7 +198,7 @@ enum Dialog {
     },
 }
 
-/// Which way a search moves through the pages.
+/// Which way to move through pages or history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Forward,
@@ -310,6 +359,9 @@ struct ScreenRow {
 
 /// Hears the full set of highlights after each change.
 pub type HighlightsListener = Box<dyn FnMut(&[Highlight])>;
+
+/// Opens a web link outside leaf.
+type UrlOpener = Box<dyn Fn(&str) -> io::Result<()>>;
 pub type BookmarksListener = Box<dyn FnMut(&[Bookmark])>;
 pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 
@@ -323,6 +375,9 @@ pub struct ViewerOptions {
     pub on_page: Box<dyn FnMut(Progress)>,
     /// For documents without pages, where reading resumes: a place in the page text.
     pub start_anchor: Option<usize>,
+    /// A session history position takes precedence over saved reading progress.
+    pub(crate) start_viewport: Option<Viewport>,
+    pub(crate) start_notice: Option<String>,
     /// Hears the place in a document without pages as each percent goes by, and on quitting.
     pub on_scroll: Box<dyn FnMut(Scroll)>,
     pub on_image_mode: Box<dyn FnMut(ImageMode)>,
@@ -346,7 +401,7 @@ pub struct ViewerOptions {
     pub speech: Backend,
     /// Path or URL this document was opened from, when leaf knows it.
     pub source: Option<String>,
-    /// Original filesystem path for picture navigation, which may differ from the progress key.
+    /// Original filesystem path, which may differ from the progress key.
     pub picture_path: Option<PathBuf>,
     pub watch: Option<Watch>,
 }
@@ -360,6 +415,8 @@ impl Default for ViewerOptions {
             highlights: Vec::new(),
             on_page: Box::new(|_| {}),
             start_anchor: None,
+            start_viewport: None,
+            start_notice: None,
             on_scroll: Box::new(|_| {}),
             on_image_mode: Box::new(|_| {}),
             on_highlights: Box::new(|_| {}),
@@ -416,6 +473,8 @@ pub struct App {
     /// Where a question about a selection is sent. Tests stand in for the
     /// agent pane; otherwise leaf finds one in this Rex session.
     ask: Option<Box<dyn FnMut(&str) -> Result<Agent, AgentFailed>>>,
+    /// Opens a web link from the page. Tests stand in for the browser.
+    open_url: UrlOpener,
     /// A command from Rex's command palette, being typed in after F12.
     rex_command: Option<String>,
     bookmarks: Vec<Bookmark>,
@@ -456,7 +515,7 @@ pub struct App {
     watch: Option<Watch>,
     /// For a picture file with others beside it: its place among them and how many there are.
     folder: Option<(usize, usize)>,
-    /// A request to move to a neighbouring picture, once the reader has closed.
+    /// A request to open another document, once the reader has closed.
     go: Option<Go>,
     quit: bool,
 }
@@ -524,6 +583,14 @@ impl App {
             })
             .collect();
         let watch = options.watch.take();
+        let notice = options.start_notice.take();
+        if let Some(look) = options
+            .start_viewport
+            .as_ref()
+            .and_then(|viewport| viewport.look)
+        {
+            doc.source.set_look(look);
+        }
         let folder = Self::folder_place(&doc, options.picture_path.as_deref());
         let narrator = Narrator::new(
             options.voice.clone(),
@@ -543,8 +610,9 @@ impl App {
             shown_as: doc.source.look(),
             highlights: options.highlights.clone(),
             hue: Hue::default(),
-            notice: None,
+            notice,
             ask: None,
+            open_url: Box::new(crate::prmedia::open),
             rex_command: None,
             bookmarks: options.bookmarks.clone(),
             reading_width: ReadingWidth::Columns(options.max_text_width),
@@ -604,7 +672,7 @@ impl App {
         if self.folder.is_some() {
             let step = if forward { 1 } else { -1 };
             if let Some(path) = self.options.picture_path.clone() {
-                self.go = Some(Go { path, step });
+                self.go = Some(Go::Neighbour { path, step });
                 self.quit = true;
             }
         } else if forward {
@@ -682,11 +750,12 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
-        let laid = Rc::new(render::layout(
+        let laid = Rc::new(render::layout_with_heading_color(
             &markdown,
             self.width,
             (font.width, font.height),
             &sizes,
+            self.look.colors().heading_color(),
         ));
         self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
@@ -908,7 +977,7 @@ impl App {
         (self.offset * 100).checked_div(max).unwrap_or(100)
     }
 
-    fn top_anchor(&mut self) -> usize {
+    fn first_anchor(&mut self) -> Option<usize> {
         let laid = self.laid(self.current);
         let top = self
             .offset
@@ -918,7 +987,69 @@ impl App {
             .iter()
             .flat_map(|row| &row.segs)
             .find_map(|seg| seg.offset)
-            .unwrap_or(laid.text.len())
+    }
+
+    fn top_anchor(&mut self) -> usize {
+        self.first_anchor()
+            .unwrap_or_else(|| self.laid(self.current).text.len())
+    }
+
+    fn reading_location(&mut self) -> Option<ReadingLocation> {
+        let path = std::path::absolute(self.options.picture_path.as_deref()?).ok()?;
+        let anchor = self.first_anchor().map(|offset| {
+            let laid = self.laid(self.current);
+            let end = (offset + HISTORY_ANCHOR_CHARS).min(laid.text.len());
+            HistoryAnchor {
+                offset,
+                excerpt: laid.text[offset..end].to_vec(),
+                page_hash: self.current_page_hash(),
+            }
+        });
+        Some(ReadingLocation {
+            path,
+            viewport: Viewport {
+                page: self.current,
+                offset: self.offset,
+                anchor,
+                width: self.width,
+                mode: self.mode,
+                look: self.shown_as,
+            },
+        })
+    }
+
+    fn current_page_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.doc.source.page(self.current).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn restore_viewport(&mut self, viewport: Viewport) {
+        self.current = viewport.page.min(self.last());
+        self.offset = viewport.offset;
+        if self.current != viewport.page {
+            return;
+        }
+        let Some(anchor) = viewport.anchor else {
+            return;
+        };
+        if anchor.page_hash != self.current_page_hash() {
+            let laid = self.laid(self.current);
+            let offset = laid
+                .text
+                .windows(anchor.excerpt.len())
+                .enumerate()
+                .filter(|(_, text)| *text == anchor.excerpt)
+                .map(|(offset, _)| offset)
+                .min_by_key(|offset| offset.abs_diff(anchor.offset));
+            if let Some(offset) = offset {
+                self.scroll_to_anchor(offset);
+                return;
+            }
+        }
+        if self.width != viewport.width || self.mode != viewport.mode {
+            self.scroll_to_anchor(anchor.offset);
+        }
     }
 
     fn scroll_to_anchor(&mut self, anchor: usize) {
@@ -1090,7 +1221,10 @@ impl App {
             }
         }
         self.view_height = area.height.saturating_sub(FOOTER_ROWS).max(1);
-        if let Some(anchor) = self.anchor.take() {
+        let anchor = self.anchor.take();
+        if let Some(viewport) = self.options.start_viewport.take() {
+            self.restore_viewport(viewport);
+        } else if let Some(anchor) = anchor {
             self.scroll_to_anchor(anchor);
         }
         self.offset = match self.mode {
@@ -1534,6 +1668,7 @@ impl App {
             rows.push(("←/→  h/l  p/n", "previous / next picture in the folder"));
         }
         rows.extend([
+            ("H/L", "back / forward through followed links"),
             ("j/k  ↓/↑", "scroll"),
             ("^d  u", "half screen down / up"),
             ("space/b", "next / previous screen"),
@@ -1580,15 +1715,14 @@ impl App {
             },
         ));
         rows.extend([
-            ("drag", "select and copy text"),
+            ("drag  click", "select and copy text; click follows a link"),
             ("@  ^enter", "ask an agent about the selection (⇧⌘A in Rex)"),
             ("y", "highlight selection, or clear one"),
             ("1-6", "pick a color; paints the selection"),
             ("d  e", "pen / eraser: drag to draw or erase"),
             ("v", "move tool: pick, move, resize ink"),
             ("!", "how to highlight and draw"),
-            ("?", "this help"),
-            ("q", "quit"),
+            ("?  q", "help / quit"),
         ]);
         rows
     }
@@ -2620,16 +2754,16 @@ impl App {
         }
     }
 
-    pub fn key(&mut self, key: KeyEvent) {
+    fn key(&mut self, key: KeyEvent, history: &mut ReaderHistory) {
         let place = (self.current, self.offset);
-        self.act(key);
+        self.act(key, history);
         // Scrolling away from the word being read stops the screen following it.
         if place != (self.current, self.offset) {
             self.follow = false;
         }
     }
 
-    fn act(&mut self, key: KeyEvent) {
+    fn act(&mut self, key: KeyEvent, history: &mut ReaderHistory) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -2711,6 +2845,8 @@ impl App {
             Some('b') => self.previous_screen(paged),
             Some('l') | Some('n') => self.turn(true),
             Some('h') | Some('p') => self.turn(false),
+            Some('H') => self.revisit(history, Direction::Backward),
+            Some('L') => self.revisit(history, Direction::Forward),
             Some('g') => self.go_to_page(0, false),
             Some('G') => self.go_to_page(self.last(), !paged),
             Some('i') => self.toggle_images(),
@@ -2838,6 +2974,88 @@ impl App {
         (self.options.on_image_mode)(self.image_mode);
     }
 
+    /// The link drawn in the screen cell at `x`, `y`, if any. Unlike `hit`,
+    /// only a cell the link's own text covers counts.
+    fn link_under(&mut self, x: u16, y: u16) -> Option<render::Link> {
+        let row = y.checked_sub(self.column.y)?;
+        let slot = (*self.screen.get(row as usize)?)?;
+        let laid = self.laid(slot.page);
+        let row = laid
+            .rows
+            .get(slot.row.checked_sub(self.prefix(slot.page))?)?;
+        let col = x.checked_sub(self.column.x)?;
+        for seg in &row.segs {
+            let Some(offset) = seg.offset else { continue };
+            let mut sx = seg.x;
+            for (n, c) in seg.text.chars().enumerate() {
+                let w = char_width(c).max(1);
+                if (sx..sx + w).contains(&col) {
+                    return laid.link_at(offset + n).cloned();
+                }
+                sx += w;
+            }
+        }
+        None
+    }
+
+    /// Opens a web link in the browser or loads a local link in the reader.
+    fn follow_link(&mut self, link: &render::Link, history: &mut ReaderHistory) {
+        let doc = self
+            .options
+            .picture_path
+            .as_deref()
+            .filter(|path| path.is_file());
+        match follow::resolve(link, doc) {
+            Ok(Follow::Web(url)) => {
+                self.notice = Some(match (self.open_url)(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(e) => format!("couldn't open {url} ({e})"),
+                });
+            }
+            Ok(Follow::Open(path)) => match crate::load_file(&path) {
+                Ok(doc) => {
+                    if let Some(origin) = self.reading_location() {
+                        ReaderHistory::push(&mut history.back, origin);
+                    }
+                    history.forward.clear();
+                    self.go = Some(Go::Open {
+                        path,
+                        doc,
+                        viewport: None,
+                        notice: None,
+                    });
+                    self.quit = true;
+                }
+                Err(why) => self.notice = Some(why),
+            },
+            Err(why) => self.notice = Some(why),
+        }
+    }
+
+    fn revisit(&mut self, history: &mut ReaderHistory, direction: Direction) {
+        let (from, to) = match direction {
+            Direction::Backward => (&mut history.back, &mut history.forward),
+            Direction::Forward => (&mut history.forward, &mut history.back),
+        };
+        while let Some(ReadingLocation { path, viewport }) = from.pop_back() {
+            let Some(Ok(doc)) = path.is_file().then(|| crate::load_file(&path)) else {
+                self.notice = Some("skipped unavailable file in history".into());
+                continue;
+            };
+            if let Some(origin) = self.reading_location() {
+                ReaderHistory::push(to, origin);
+            }
+            self.go = Some(Go::Open {
+                path,
+                doc,
+                viewport: Some(viewport),
+                notice: self.notice.take(),
+            });
+            self.quit = true;
+            break;
+        }
+    }
+
     /// Where in the text a screen cell falls: the character under it, or
     /// the nearest edge of the text on its row.
     fn hit(&mut self, x: u16, y: u16) -> Option<TextPos> {
@@ -2887,7 +3105,7 @@ impl App {
         })
     }
 
-    pub fn mouse(&mut self, mouse: MouseEvent) {
+    fn mouse(&mut self, mouse: MouseEvent, history: &mut ReaderHistory) {
         if News::mouse(&mut self.news, mouse) || self.dialog != Dialog::None {
             return;
         }
@@ -2966,6 +3184,10 @@ impl App {
                         let text = self.selected_text();
                         if text.is_empty() {
                             self.selection = None;
+                            // A click, not a drag: follow the link under it.
+                            if let Some(link) = self.link_under(x, y) {
+                                self.follow_link(&link, history);
+                            }
                         } else {
                             // Taking over the mouse turns off the terminal's own selection, so copy here.
                             let context = self.selection_context(&text);
@@ -3400,7 +3622,11 @@ impl App {
         (self.options.on_highlights)(&self.highlights);
     }
 
-    fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+    fn event_loop(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        history: &mut ReaderHistory,
+    ) -> io::Result<()> {
         // Set when the loop woke only to follow the narration.
         let mut quiet = false;
         loop {
@@ -3416,7 +3642,11 @@ impl App {
             }
             // Following the terminal's theme reads its reply from stdin, so it's
             // asked only after a wait that no key broke.
+            let heading_color = self.look.colors().heading_color();
             if self.look.refresh(quiet && !event::poll(Duration::ZERO)?) {
+                if self.look.colors().heading_color() != heading_color {
+                    self.laid.clear();
+                }
                 quiet = false;
             }
             // Between words nothing on screen changes, so there's nothing to draw.
@@ -3470,8 +3700,8 @@ impl App {
             loop {
                 self.clock.touch();
                 match event::read()? {
-                    Event::Key(key) => self.key(key),
-                    Event::Mouse(mouse) => self.mouse(mouse),
+                    Event::Key(key) => self.key(key, history),
+                    Event::Mouse(mouse) => self.mouse(mouse, history),
                     Event::Resize(..) => self.resized(),
                     _ => {}
                 }
@@ -3585,18 +3815,27 @@ fn parse_color_reply(reply: &str) -> Option<Rgb> {
     Some([*channels.first()?, *channels.get(1)?, *channels.get(2)?])
 }
 
-/// A request to move along to another picture in the same folder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Go {
-    /// The picture that was open.
-    pub path: PathBuf,
-    /// 1 for the next picture, -1 for the previous one.
-    pub step: i32,
+/// What the reader asks `main` to open next.
+pub(crate) enum Go {
+    /// The next or previous picture in the same folder as `path`, the picture
+    /// that was open: `step` is 1 for the next, -1 for the previous.
+    Neighbour { path: PathBuf, step: i32 },
+    /// A loaded file reached through a link or the session's history.
+    Open {
+        path: PathBuf,
+        doc: Doc,
+        viewport: Option<Viewport>,
+        notice: Option<String>,
+    },
 }
 
 /// Runs the reader in the terminal until the reader quits, or asks for
-/// another picture in the folder.
-pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<Option<Go>> {
+/// another document.
+pub(crate) fn run(
+    doc: Doc,
+    options: ViewerOptions,
+    history: &mut ReaderHistory,
+) -> io::Result<Option<Go>> {
     static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
     PANIC_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
@@ -3612,7 +3851,7 @@ pub fn run(doc: Doc, options: ViewerOptions) -> io::Result<Option<Go>> {
     // Lets Rex's command palette find this reader; Rex drops it if leaf dies.
     remote::announce(remote::Kind::Document, &doc.title);
     let mut app = App::new(doc, options, picker);
-    let result = setup.and_then(|_| app.event_loop(&mut terminal));
+    let result = setup.and_then(|_| app.event_loop(&mut terminal, history));
     remote::withdraw(remote::Kind::Document);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -3652,6 +3891,7 @@ mod tests {
     struct Screen {
         app: App,
         terminal: Terminal<TestBackend>,
+        history: ReaderHistory,
     }
 
     impl Screen {
@@ -3660,6 +3900,7 @@ mod tests {
             let mut screen = Screen {
                 app,
                 terminal: Terminal::new(TestBackend::new(width, height)).expect("test terminal"),
+                history: ReaderHistory::default(),
             };
             screen.draw();
             screen
@@ -3683,7 +3924,7 @@ mod tests {
         }
 
         fn press(&mut self, code: KeyCode) -> String {
-            self.app.key(KeyEvent {
+            self.key(KeyEvent {
                 code,
                 modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press,
@@ -3692,13 +3933,45 @@ mod tests {
             self.draw()
         }
 
+        fn key(&mut self, key: KeyEvent) {
+            self.app.key(key, &mut self.history);
+        }
+
+        fn open_next(&mut self, options: ViewerOptions) -> String {
+            assert!(
+                self.app.quit,
+                "the reader should leave the current document"
+            );
+            let Some(Go::Open {
+                path,
+                doc,
+                viewport,
+                notice,
+            }) = self.app.go.take()
+            else {
+                panic!("the reader should have loaded a destination");
+            };
+            let options = ViewerOptions {
+                watch: Some(Watch::live(path.clone())),
+                picture_path: Some(path),
+                start_viewport: viewport,
+                start_notice: notice,
+                ..options
+            };
+            self.app = App::new(doc, options, Picker::halfblocks());
+            self.draw()
+        }
+
         fn mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) -> String {
-            self.app.mouse(MouseEvent {
-                kind,
-                column,
-                row,
-                modifiers: KeyModifiers::NONE,
-            });
+            self.app.mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut self.history,
+            );
             self.draw()
         }
 
@@ -3713,6 +3986,404 @@ mod tests {
                         .map(|x| (line[..x].chars().count() as u16, y as u16))
                 })
                 .expect("text is on screen")
+        }
+    }
+
+    /// A markdown file on disk, read in a screen whose browser records what it was asked to open.
+    fn linked_note(name: &str, text: &str) -> (Screen, PathBuf, Rc<RefCell<Vec<String>>>) {
+        let dir = std::env::temp_dir().join(format!("leaf-links-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("today.md");
+        std::fs::write(&path, text).unwrap();
+        std::fs::write(dir.join("plan.md"), "# Plan").unwrap();
+        let options = ViewerOptions {
+            picture_path: Some(path.clone()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(crate::markdown::open(&path).unwrap(), 80, 20, options);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let log = opened.clone();
+        s.app.open_url = Box::new(move |url| {
+            log.borrow_mut().push(url.to_owned());
+            Ok(())
+        });
+        (s, dir, opened)
+    }
+
+    fn click(s: &mut Screen, (x, y): (u16, u16)) {
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+    }
+
+    fn click_text(s: &mut Screen, label: &str) {
+        let position = s.find(label);
+        click(s, position);
+    }
+
+    #[test]
+    fn clicking_a_web_link_opens_it_in_the_browser() {
+        let (mut s, dir, opened) = linked_note("web", "Read [the docs](https://x.dev/a) now.");
+        let (x, y) = s.find("docs");
+        click(&mut s, (x + 1, y));
+        assert_eq!(*opened.borrow(), ["https://x.dev/a"]);
+        assert!(!s.app.quit);
+        // The URL shown after the label opens it too.
+        let (x, y) = s.find("x.dev");
+        click(&mut s, (x, y));
+        assert_eq!(opened.borrow().len(), 2);
+        // Plain text beside a link is just text.
+        let (x, y) = s.find("Read");
+        click(&mut s, (x, y));
+        let (x, y) = s.find("now");
+        click(&mut s, (x + 1, y));
+        assert_eq!(opened.borrow().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_wikilink_opens_its_note_in_leaf() {
+        let (mut s, dir, opened) = linked_note("wiki", "Next: [[plan|the plan]] and [[nowhere]].");
+        let (x, y) = s.find("nowhere");
+        click(&mut s, (x, y));
+        assert!(!s.app.quit);
+        assert!(s.draw().contains("no note named nowhere"));
+        let (x, y) = s.find("the plan");
+        click(&mut s, (x + 2, y));
+        assert!(matches!(&s.app.go, Some(Go::Open { path, .. }) if *path == dir.join("plan.md")));
+        assert!(s.app.quit);
+        assert!(opened.borrow().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_restores_the_exact_row_in_both_directions() {
+        let filler = "A short paragraph.\n\n".repeat(40);
+        let text = format!(
+            "{}[[plan|Open Plan]]\n\n{filler}",
+            "A short paragraph.\n\n".repeat(10)
+        );
+        let (mut s, dir, _) = linked_note("history-rows", &text);
+        std::fs::write(dir.join("plan.md"), &filler).unwrap();
+        // Row 12 is between paragraphs. Its next text anchor is on row 13.
+        s.app.scroll_by(12);
+        let origin = s.app.reading_location().unwrap();
+        assert_eq!(origin.viewport.offset, 12);
+        click_text(&mut s, "Open Plan");
+        let anchor = origin
+            .viewport
+            .anchor
+            .as_ref()
+            .expect("text follows the blank row")
+            .offset;
+        assert_eq!(s.app.screen_row(origin.viewport.page, anchor), Some(1));
+        assert_eq!(s.history.back.back(), Some(&origin));
+        s.open_next(ViewerOptions::default());
+        s.app.scroll_by(22);
+        let destination = s.app.reading_location().unwrap();
+        assert_eq!(destination.viewport.offset, 22);
+
+        s.press(KeyCode::Char('H'));
+        s.open_next(ViewerOptions {
+            start_anchor: Some(0),
+            ..ViewerOptions::default()
+        });
+        assert_eq!(s.app.reading_location(), Some(origin));
+
+        s.press(KeyCode::Char('L'));
+        s.open_next(ViewerOptions::default());
+        assert_eq!(s.app.reading_location(), Some(destination));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_finds_the_same_text_after_edits_above_it_while_away() {
+        let filler = "A short paragraph.\n\n".repeat(40);
+        let intro = "A paragraph before the saved position.\n\n".repeat(6);
+        let text = format!("{intro}The saved passage. [[plan|Open Plan]]\n\n{filler}");
+        let plan = format!("{intro}The saved line in the plan.\n\n{filler}");
+        let (mut s, dir, _) = linked_note("history-edits", &text);
+        let plan_path = dir.join("plan.md");
+        std::fs::write(&plan_path, plan).unwrap();
+        let (_, row) = s.find("The saved passage.");
+        s.app.scroll_by(row as isize);
+        assert_eq!(s.find("The saved passage.").1, 0);
+        click_text(&mut s, "Open Plan");
+        s.open_next(ViewerOptions::default());
+
+        let (_, row) = s.find("The saved line in the plan.");
+        s.app.scroll_by(row as isize);
+        assert_eq!(s.find("The saved line in the plan.").1, 0);
+        std::fs::write(
+            dir.join("today.md"),
+            format!("{}{}", "A new paragraph.\n\n".repeat(14), text),
+        )
+        .unwrap();
+
+        s.press(KeyCode::Char('H'));
+        let frame = s.open_next(ViewerOptions::default());
+        assert!(frame.starts_with("  The saved passage."), "{frame}");
+
+        std::fs::write(
+            &plan_path,
+            format!("The saved line in the plan.\n\n{filler}"),
+        )
+        .unwrap();
+        s.press(KeyCode::Char('L'));
+        let frame = s.open_next(ViewerOptions::default());
+        assert!(
+            frame.starts_with("  The saved line in the plan."),
+            "{frame}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_reflows_text_when_the_terminal_is_resized_while_away() {
+        let words = "one two three four five six seven eight nine ten ";
+        let text = format!(
+            "{} [[plan|Open Plan]] {}",
+            words.repeat(20),
+            words.repeat(60)
+        );
+        let (mut s, dir, _) = linked_note("history-reflow", &text);
+        s.app.scroll_by(10);
+        let before = s.app.reading_location().unwrap().viewport;
+        let anchor = before.anchor.expect("visible text has an anchor").offset;
+        click_text(&mut s, "Open Plan");
+        s.open_next(ViewerOptions::default());
+
+        s.terminal.backend_mut().resize(44, 20);
+        s.draw();
+        s.press(KeyCode::Char('H'));
+        s.open_next(ViewerOptions::default());
+        assert_ne!(s.app.width, before.width);
+        assert_ne!(s.app.offset, before.offset);
+        assert_eq!(s.app.screen_row(before.page, anchor), Some(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_restores_an_office_page_and_look_across_reader_modes() {
+        let (mut s, dir, _) = linked_note("history-office", "[Open sheet](sheet.csv)");
+        let rows = (1..=150)
+            .map(|row| format!("{row},Row {row}\n"))
+            .collect::<String>();
+        std::fs::write(dir.join("sheet.csv"), format!("Number,Name\n{rows}")).unwrap();
+        s.terminal.backend_mut().resize(120, 30);
+        click_text(&mut s, "Open sheet");
+        s.open_next(ViewerOptions::default());
+        s.press(KeyCode::Char('o'));
+        s.press(KeyCode::Char('l'));
+        s.app.scroll_by(8);
+        let before = s.app.reading_location().unwrap().viewport;
+        assert_eq!(before.mode, Mode::Paged);
+        assert_eq!(before.page, 1);
+        assert_eq!(before.look, Some(crate::doc::Look::Terminal));
+        let anchor = before
+            .anchor
+            .expect("visible cells have a text anchor")
+            .offset;
+
+        s.press(KeyCode::Char('H'));
+        s.open_next(ViewerOptions::default());
+        s.terminal.backend_mut().resize(120, 20);
+        s.draw();
+        s.press(KeyCode::Char('L'));
+        s.open_next(ViewerOptions {
+            start_page: Some(1),
+            ..ViewerOptions::default()
+        });
+        assert_eq!(s.app.mode, Mode::Scroll);
+        assert_eq!(s.app.width, before.width);
+        assert_eq!(s.app.current, before.page);
+        assert_eq!(s.app.shown_as, before.look);
+        assert_eq!(s.app.screen_row(before.page, anchor), Some(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_clamps_an_image_row_when_the_terminal_grows() {
+        let (mut s, dir, _) = linked_note("history-image", "[Open image](tall.bmp)");
+        RgbaImage::from_pixel(160, 640, image::Rgba([255, 0, 0, 255]))
+            .save(dir.join("tall.bmp"))
+            .unwrap();
+        s.terminal.backend_mut().resize(80, 8);
+        click_text(&mut s, "Open image");
+        s.open_next(ViewerOptions::default());
+        s.app.scroll_by(10);
+        let picture = s.app.reading_location().unwrap();
+        assert_eq!(picture.viewport.anchor, None);
+        assert_eq!(picture.viewport.offset, 10);
+
+        s.press(KeyCode::Char('H'));
+        s.open_next(ViewerOptions::default());
+        s.terminal.backend_mut().resize(44, 50);
+        s.draw();
+        s.press(KeyCode::Char('L'));
+        s.open_next(ViewerOptions::default());
+        assert_eq!(s.app.options.picture_path.as_ref(), Some(&picture.path));
+        assert_eq!(s.app.offset, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_skips_missing_files_and_shows_the_notice_where_it_lands() {
+        let (mut s, dir, _) = linked_note("history-missing", "[[plan|Open Plan]]");
+        std::fs::write(dir.join("plan.md"), "[[later|Read Later]]").unwrap();
+        std::fs::write(dir.join("later.md"), "# Later").unwrap();
+        click_text(&mut s, "Open Plan");
+        s.open_next(ViewerOptions::default());
+        click_text(&mut s, "Read Later");
+        s.open_next(ViewerOptions::default());
+
+        std::fs::remove_file(dir.join("plan.md")).unwrap();
+        s.press(KeyCode::Char('H'));
+        let frame = s.open_next(ViewerOptions::default());
+        assert!(
+            frame.contains("skipped unavailable file in history"),
+            "{frame}"
+        );
+        assert_eq!(s.app.doc.title, "today");
+        assert_eq!(s.history.forward.len(), 1);
+
+        std::fs::remove_file(dir.join("later.md")).unwrap();
+        let frame = s.press(KeyCode::Char('L'));
+        assert!(
+            frame.contains("skipped unavailable file in history"),
+            "{frame}"
+        );
+        assert!(!s.app.quit);
+        assert!(s.app.go.is_none());
+        assert!(s.history.forward.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_successful_new_link_clears_forward_history() {
+        let links = "[[plan|Open Plan]] [Open broken](broken.txt) [[other|Open Other]]";
+        let (mut s, dir, _) = linked_note("history-branch", links);
+        std::fs::write(dir.join("broken.txt"), "unsupported format").unwrap();
+        std::fs::write(dir.join("other.md"), "# Other").unwrap();
+        click_text(&mut s, "Open Plan");
+        s.open_next(ViewerOptions::default());
+        s.press(KeyCode::Char('H'));
+        s.open_next(ViewerOptions::default());
+
+        click_text(&mut s, "Open broken");
+        assert!(!s.app.quit);
+        assert!(s.app.go.is_none());
+        assert!(s.draw().contains("Can't open"));
+        assert!(s.history.back.is_empty());
+        assert_eq!(s.history.forward.len(), 1);
+
+        click_text(&mut s, "Open Other");
+        s.open_next(ViewerOptions::default());
+        assert_eq!(s.app.doc.title, "other");
+        assert_eq!(s.history.back.len(), 1);
+        assert!(s.history.forward.is_empty());
+        s.press(KeyCode::Char('L'));
+        assert!(!s.app.quit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_stacks_keep_the_latest_hundred_distinct_adjacent_positions() {
+        let mut history = ReaderHistory::default();
+        let at = |offset| ReadingLocation {
+            path: std::env::temp_dir().join("note.md"),
+            viewport: Viewport {
+                page: 0,
+                offset,
+                anchor: None,
+                width: 76,
+                mode: Mode::Scroll,
+                look: None,
+            },
+        };
+        for stack in [&mut history.back, &mut history.forward] {
+            for offset in 0..102 {
+                ReaderHistory::push(stack, at(offset));
+                ReaderHistory::push(stack, at(offset));
+            }
+            assert_eq!(stack.len(), 100);
+            assert_eq!(stack.front(), Some(&at(2)));
+            assert_eq!(stack.back(), Some(&at(101)));
+        }
+    }
+
+    #[test]
+    fn history_keys_leave_dialogs_and_prompts_in_control_after_reload() {
+        let (mut s, dir, _) = linked_note("history-prompts", "[[plan|Open Plan]]");
+        let plan = dir.join("plan.md");
+        std::fs::write(&plan, "[[later|Read Later]]").unwrap();
+        std::fs::write(dir.join("later.md"), "# Later").unwrap();
+        click_text(&mut s, "Open Plan");
+        s.open_next(ViewerOptions::default());
+        click_text(&mut s, "Read Later");
+        s.open_next(ViewerOptions::default());
+        s.press(KeyCode::Char('H'));
+        s.open_next(ViewerOptions::default());
+
+        std::fs::write(&plan, "Updated Plan").unwrap();
+        std::thread::sleep(crate::doc::LIVE_TICK);
+        assert!(s.app.reload());
+        assert!(s.draw().contains("Updated Plan"));
+        assert_eq!(s.history.back.len(), 1);
+        assert_eq!(s.history.forward.len(), 1);
+
+        let help = s.press(KeyCode::Char('?'));
+        assert!(help.contains("back / forward through followed links"));
+        for key in ['H', 'L'] {
+            s.press(KeyCode::Char(key));
+        }
+        assert_eq!(s.app.dialog, Dialog::Help);
+        s.press(KeyCode::Esc);
+
+        s.press(KeyCode::Char('f'));
+        for key in ['H', 'L'] {
+            s.press(KeyCode::Char(key));
+        }
+        assert_eq!(s.app.dialog, Dialog::Find { typed: "HL".into() });
+        s.press(KeyCode::Esc);
+
+        s.press(remote::WAKE);
+        for key in ['H', 'L'] {
+            s.press(KeyCode::Char(key));
+        }
+        assert_eq!(s.app.rex_command.as_deref(), Some("HL"));
+        assert!(!s.app.quit);
+        assert!(s.app.go.is_none());
+        assert_eq!(s.history.back.len(), 1);
+        assert_eq!(s.history.forward.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dragging_across_a_link_selects_instead_of_following_it() {
+        let (mut s, dir, opened) = linked_note("drag", "Read [the docs](https://x.dev/a) now.");
+        let (x, y) = s.find("the docs");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert!(opened.borrow().is_empty());
+        assert_eq!(s.app.copy.as_deref(), Some("the d"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn headings_follow_the_reader_theme() {
+        for (colors, expected) in crate::scheme::HEADING_COLOR_CASES {
+            let doc = book(&["## Heading"]);
+            let mut app = App::new(doc, ViewerOptions::default(), Picker::halfblocks());
+            app.look.set_test_colors(colors);
+            let mut screen = Screen {
+                app,
+                terminal: Terminal::new(TestBackend::new(80, 20)).expect("test terminal"),
+                history: ReaderHistory::default(),
+            };
+            let position = screen.find("Heading");
+            assert_eq!(screen.terminal.backend().buffer()[position].fg, expected);
         }
     }
 
@@ -3933,13 +4604,13 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         };
-        s.app.key(key(KeyCode::Char('<')));
-        s.app.key(key(KeyCode::Char('<')));
+        s.key(key(KeyCode::Char('<')));
+        s.key(key(KeyCode::Char('<')));
         s.draw();
         assert_eq!(s.app.column.width, 76 - 2 * WIDTH_STEP);
-        s.app.key(key(KeyCode::Char('>')));
-        s.app.key(key(KeyCode::Char('>')));
-        s.app.key(key(KeyCode::Char('>')));
+        s.key(key(KeyCode::Char('>')));
+        s.key(key(KeyCode::Char('>')));
+        s.key(key(KeyCode::Char('>')));
         s.draw();
         assert_eq!(s.app.column.width, 76 + WIDTH_STEP);
     }
@@ -4320,25 +4991,18 @@ mod tests {
         let go = |code: KeyCode| {
             let mut s = picture_screen(&middle);
             s.press(code);
-            (s.app.go.clone(), s.app.quit)
+            assert!(s.app.quit, "{code:?} should close the current picture");
+            let Some(Go::Neighbour { path, step }) = s.app.go else {
+                panic!("{code:?} should ask for a neighbouring picture");
+            };
+            assert_eq!(path, middle, "{code:?}");
+            step
         };
         for code in [KeyCode::Right, KeyCode::Char('l'), KeyCode::Char('n')] {
-            let (asked, quit) = go(code);
-            let want = Go {
-                path: middle.clone(),
-                step: 1,
-            };
-            assert_eq!(asked, Some(want), "{code:?}");
-            assert!(quit);
+            assert_eq!(go(code), 1, "{code:?}");
         }
         for code in [KeyCode::Left, KeyCode::Char('h'), KeyCode::Char('p')] {
-            let (asked, quit) = go(code);
-            let want = Go {
-                path: middle.clone(),
-                step: -1,
-            };
-            assert_eq!(asked, Some(want), "{code:?}");
-            assert!(quit);
+            assert_eq!(go(code), -1, "{code:?}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -4385,7 +5049,7 @@ mod tests {
         s.draw();
         s.press(KeyCode::Char('\''));
         s.press(KeyCode::Char('x'));
-        s.app.key(KeyEvent {
+        s.key(KeyEvent {
             code: KeyCode::Char('x'),
             modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Repeat,
@@ -4757,7 +5421,7 @@ mod tests {
         let text: String = (1..=80).map(|i| format!("Line {i}\n\n")).collect();
         let mut s = Screen::new(Doc::whole("Notes", text), 120, 30, ViewerOptions::default());
         s.app.kitty = Some(Kitty::default());
-        s.app.key(KeyEvent {
+        s.key(KeyEvent {
             code: KeyCode::Char('d'),
             modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,

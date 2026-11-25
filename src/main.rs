@@ -17,6 +17,7 @@ mod doc;
 mod drawing;
 mod edge;
 mod find;
+mod follow;
 mod font;
 mod gec;
 mod github;
@@ -29,6 +30,7 @@ mod host;
 mod html;
 mod hue;
 mod kitty;
+mod linediff;
 mod look;
 mod margin;
 mod markdown;
@@ -90,6 +92,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf browser [URL]   open a WebKit browser pane in Rex on macOS
+       leaf browser bar [minimal | full | toggle]   hide the address bar until the pointer is at the top
        leaf sim [list | open <udid> | tap | swipe | type | screenshot | …]   an iOS Simulator on a 3D iPhone in Rex (leaf sim help)
        leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
@@ -817,6 +820,8 @@ fn open(first: &str) -> ExitCode {
     std::thread::spawn(syntax::warm);
     let mut target = first.to_owned();
     let mut path_override: Option<PathBuf> = None;
+    let mut pending = None;
+    let mut history = viewer::ReaderHistory::default();
     let mut seen = std::collections::HashSet::new();
     // Moving along a folder of pictures opens the reader again on each one, so
     // every picture keeps its own place, ink and bookmarks. Set while moving:
@@ -827,12 +832,14 @@ fn open(first: &str) -> ExitCode {
             .clone()
             .unwrap_or_else(|| PathBuf::from(&target));
         let watch = (!is_url(&target)).then(|| doc::Watch::new(source_path.clone()));
-        let doc = match path_override
-            .as_deref()
-            .map(load_file)
-            .unwrap_or_else(|| load(&target))
-        {
-            Ok(doc) => doc,
+        let (doc, viewport, notice) = match pending.take().map(Ok).unwrap_or_else(|| {
+            path_override
+                .as_deref()
+                .map(load_file)
+                .unwrap_or_else(|| load(&target))
+                .map(|doc| (doc, None, None))
+        }) {
+            Ok(loaded) => loaded,
             Err(message) => {
                 if let Some((step, left)) = moving.filter(|(_, left)| *left > 0)
                     && let Some(next) = picture::neighbour(&source_path, step)
@@ -854,22 +861,37 @@ fn open(first: &str) -> ExitCode {
         seen.insert(source_path.clone());
         let mut options = resume(&target, doc.page_count, &failure);
         options.max_text_width = config.reader.max_width;
-        options.picture_path = Some(source_path.clone());
+        options.picture_path = watch.as_ref().map(|_| source_path);
         options.watch = watch;
-        let result = viewer::run(doc, options);
+        options.start_viewport = viewport;
+        options.start_notice = notice;
+        let result = viewer::run(doc, options, &mut history);
         if let Some(message) = failure.borrow().as_ref() {
             eprintln!("leaf: {message}");
         }
         match result {
             Ok(None) => return ExitCode::SUCCESS,
-            Ok(Some(go)) => match picture::neighbour(&go.path, go.step) {
-                Some(next) => {
-                    moving = Some((go.step, picture::in_folder(&go.path).len()));
-                    target = next.to_string_lossy().into_owned();
-                    path_override = Some(next);
+            Ok(Some(viewer::Go::Neighbour { path, step })) => {
+                match picture::neighbour(&path, step) {
+                    Some(next) => {
+                        moving = Some((step, picture::in_folder(&path).len()));
+                        target = next.to_string_lossy().into_owned();
+                        path_override = Some(next);
+                    }
+                    None => return ExitCode::SUCCESS,
                 }
-                None => return ExitCode::SUCCESS,
-            },
+            }
+            Ok(Some(viewer::Go::Open {
+                path,
+                doc,
+                viewport,
+                notice,
+            })) => {
+                moving = None;
+                target = path.to_string_lossy().into_owned();
+                path_override = Some(path);
+                pending = Some((doc, viewport, notice));
+            }
             Err(e) => {
                 eprintln!(
                     "leaf: the terminal failed ({e}). Your place and highlights up to now are saved."

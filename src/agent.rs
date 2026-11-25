@@ -456,7 +456,7 @@ pub fn recall(selection: &str) -> Option<String> {
 /// Tells Rex what leaf is doing, when this process is one of its panes.
 /// Other terminals ignore the sequence.
 pub fn report_status(state: &str, msg: &str) {
-    if rex_session().is_none() {
+    if !inside_rex() {
         return;
     }
     let msg: String = msg.chars().filter(|c| !c.is_control()).take(180).collect();
@@ -474,11 +474,51 @@ pub fn report_status(state: &str, msg: &str) {
     let _ = out.flush();
 }
 
+fn rex_var(name: &str) -> Option<String> {
+    nonblank(std::env::var(name).ok())
+}
+
+fn nonblank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The session to pass to `rex -s`: `REX_SESSION`, else this pane's
+/// `REX_BLOCK`. Rex servers from preview.23 on set only `REX_BLOCK` in new
+/// panes, and the rex CLI takes a block ID wherever it takes a session.
 fn rex_session() -> Option<String> {
-    std::env::var("REX_SESSION")
-        .ok()
-        .map(|session| session.trim().to_owned())
-        .filter(|session| !session.is_empty())
+    session_from(|name| std::env::var(name).ok())
+}
+
+fn session_from(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    nonblank(var("REX_SESSION")).or_else(|| nonblank(var("REX_BLOCK")))
+}
+
+/// This pane's Rex block ID, when Rex set one.
+pub(crate) fn rex_block() -> Option<String> {
+    rex_var("REX_BLOCK")
+}
+
+/// Whether this process runs in a Rex pane.
+pub(crate) fn inside_rex() -> bool {
+    rex_session().is_some()
+}
+
+/// This pane's session ID itself, for Rex's API, which (unlike the CLI)
+/// doesn't take a block ID: `REX_SESSION`, else what `rex whoami` says.
+pub(crate) fn rex_session_api_id() -> Result<String, String> {
+    if let Some(session) = rex_var("REX_SESSION") {
+        return Ok(session);
+    }
+    session_in_whoami(&rex_output(&["whoami".into(), "--json".into()])?)
+}
+
+fn session_in_whoami(said: &str) -> Result<String, String> {
+    let said: serde_json::Value =
+        serde_json::from_str(said).map_err(|e| format!("rex whoami printed no JSON: {e}"))?;
+    nonblank(said["session_id"].as_str().map(str::to_owned))
+        .ok_or_else(|| "rex whoami named no session for this pane".to_owned())
 }
 
 pub(crate) fn rex_program() -> Result<PathBuf, String> {
@@ -552,7 +592,8 @@ pub(crate) fn rex_output(args: &[String]) -> Result<String, String> {
 
 /// Types `data` into a Rex block in this session, as if from the keyboard.
 pub(crate) fn rex_write(block: &str, data: &str) -> Result<(), String> {
-    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let session =
+        rex_session().ok_or("this isn't a Rex pane (REX_SESSION and REX_BLOCK are unset)")?;
     let payload = serde_json::json!({ "data": data }).to_string();
     rex_run(
         &[
@@ -931,7 +972,8 @@ pub fn split_beside(
     label: &str,
     argv: &[String],
 ) -> Result<String, String> {
-    let session = rex_session().ok_or("this isn't a Rex pane (REX_SESSION is unset)")?;
+    let session =
+        rex_session().ok_or("this isn't a Rex pane (REX_SESSION and REX_BLOCK are unset)")?;
     let mut args: Vec<String> = vec!["split".into(), "-s".into(), session];
     let own = std::env::var("REX_BLOCK")
         .ok()
@@ -979,6 +1021,50 @@ pub fn block_open(block: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn the_session_falls_back_to_the_block() {
+        assert_eq!(
+            session_from(env(&[
+                ("REX_SESSION", "session:s"),
+                ("REX_BLOCK", "block:b")
+            ])),
+            Some("session:s".into())
+        );
+        assert_eq!(
+            session_from(env(&[("REX_SESSION", " "), ("REX_BLOCK", "block:b")])),
+            Some("block:b".into())
+        );
+        assert_eq!(
+            session_from(env(&[("REX_BLOCK", " block:b\n")])),
+            Some("block:b".into())
+        );
+        assert_eq!(session_from(env(&[("REX_BLOCK", "")])), None);
+        assert_eq!(session_from(env(&[])), None);
+    }
+
+    #[test]
+    fn whoami_names_the_session() {
+        assert_eq!(
+            session_in_whoami(r#"{"session_id":"session:s","block_id":"block:b"}"#),
+            Ok("session:s".into())
+        );
+        assert!(session_in_whoami(r#"{"block_id":"block:b"}"#).is_err());
+        assert!(session_in_whoami("not json").is_err());
+    }
 
     #[test]
     fn command_names_lose_their_wrappers() {
