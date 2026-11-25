@@ -71,6 +71,15 @@ pub struct Figure {
     pub rows: u16,
 }
 
+/// Where a link in the text points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// A markdown link's destination, as written: a URL, a path or an `#anchor`.
+    Url(String),
+    /// A wikilink's target, such as `note` in `[[note|label]]` or `![[note]]`.
+    Note(String),
+}
+
 /// A page laid out at one width.
 #[derive(Debug, Default)]
 pub struct Laid {
@@ -78,9 +87,19 @@ pub struct Laid {
     pub figures: Vec<Figure>,
     /// The page's readable text: each block's text followed by a newline.
     pub text: Vec<char>,
+    /// Each link's span of the page text, in order.
+    pub links: Vec<(std::ops::Range<usize>, Link)>,
 }
 
 impl Laid {
+    /// The link drawn at character `offset` of the page text.
+    pub fn link_at(&self, offset: usize) -> Option<&Link> {
+        self.links
+            .iter()
+            .find(|(span, _)| span.contains(&offset))
+            .map(|(_, link)| link)
+    }
+
     /// The row and column character `offset` of the page text is drawn at.
     /// An offset that isn't drawn (a block's closing newline) takes the next
     /// character drawn, or the end of the last; a page with no text puts it at the top left.
@@ -142,6 +161,8 @@ pub fn image_cells(max_cols: u16, size: ImageSize, cell: (u16, u16)) -> (u16, u1
 struct Run {
     text: String,
     style: Style,
+    /// The link this text belongs to.
+    link: Option<Link>,
 }
 
 type Inlines = Vec<Run>;
@@ -184,8 +205,8 @@ struct Builder {
     styles: Vec<Style>,
     inlines: Inlines,
     images: Vec<String>,
-    // Wikilinks have no URL suffix.
-    links: Vec<Option<String>>,
+    /// Open links and wikilink embeds, innermost last.
+    links: Vec<Link>,
     code: Option<(Option<String>, String)>,
     html: Option<String>,
     table: Option<TableParts>,
@@ -245,11 +266,13 @@ impl Builder {
 
     fn text(&mut self, text: &str) {
         let style = self.style();
+        let link = self.links.last().cloned();
         match self.inlines.last_mut() {
-            Some(run) if run.style == style => run.text.push_str(text),
+            Some(run) if run.style == style && run.link == link => run.text.push_str(text),
             _ => self.inlines.push(Run {
                 text: text.to_owned(),
                 style,
+                link,
             }),
         }
     }
@@ -279,6 +302,7 @@ impl Builder {
                     .map(|r| Run {
                         text: r.text.replace(IMAGE_MARK, ""),
                         style: r.style,
+                        link: r.link,
                     })
                     .collect()
             };
@@ -395,10 +419,10 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                     dest_url,
                     ..
                 } => {
-                    b.links.push(
-                        (!matches!(link_type, LinkType::WikiLink { .. }))
-                            .then(|| dest_url.to_string()),
-                    );
+                    b.links.push(match link_type {
+                        LinkType::WikiLink { .. } => Link::Note(dest_url.to_string()),
+                        _ => Link::Url(dest_url.to_string()),
+                    });
                     b.push_style(|s| s.add_modifier(Modifier::UNDERLINED));
                 }
                 Tag::Image {
@@ -408,6 +432,7 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 } => {
                     image_kinds.push(link_type);
                     if matches!(link_type, LinkType::WikiLink { .. }) {
+                        b.links.push(Link::Note(dest_url.to_string()));
                         b.push_style(|s| s.add_modifier(Modifier::UNDERLINED));
                     } else {
                         image_depth += 1;
@@ -546,7 +571,8 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 }
                 TagEnd::Link => {
                     b.styles.pop();
-                    if let Some(Some(url)) = b.links.pop() {
+                    // The URL shown after the label is part of the link, so it's clickable too.
+                    if let Some(Link::Url(url)) = b.links.last().cloned() {
                         let label: String =
                             b.inlines.last().map(|r| r.text.clone()).unwrap_or_default();
                         if !label.ends_with(&url) && !url.starts_with('#') {
@@ -555,10 +581,12 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                             b.styles.pop();
                         }
                     }
+                    b.links.pop();
                 }
                 TagEnd::Image => match image_kinds.pop() {
                     Some(LinkType::WikiLink { .. }) => {
                         b.styles.pop();
+                        b.links.pop();
                     }
                     _ => image_depth = image_depth.saturating_sub(1),
                 },
@@ -692,9 +720,20 @@ impl Ctx<'_> {
         let mut cells = Vec::with_capacity(bytes);
         self.laid.text.reserve(bytes + 1);
         for run in runs {
+            let start = self.laid.text.len();
             for c in run.text.chars() {
                 cells.push((c, run.style, Some(self.laid.text.len())));
                 self.laid.text.push(c);
+            }
+            let end = self.laid.text.len();
+            if let Some(link) = &run.link
+                && start < end
+            {
+                // A link split across styles (`[**a** b](x)`) is one span.
+                match self.laid.links.last_mut() {
+                    Some((span, last)) if span.end == start && last == link => span.end = end,
+                    _ => self.laid.links.push((start..end, link.clone())),
+                }
             }
         }
         self.laid.text.push('\n');
@@ -757,6 +796,7 @@ impl Ctx<'_> {
             .map(|r| Run {
                 text: r.text.clone(),
                 style: style.patch(r.style),
+                link: r.link.clone(),
             })
             .collect();
         let cells = self.cells(&runs);
@@ -795,6 +835,7 @@ impl Ctx<'_> {
                     &[Run {
                         text: m[2].to_owned(),
                         style: Style::default(),
+                        link: None,
                     }],
                     x,
                     width,
@@ -814,7 +855,11 @@ impl Ctx<'_> {
                 Some(rest) => format!("• {rest}"),
                 None => text,
             };
-            let cells = self.cells(&[Run { text, style }]);
+            let cells = self.cells(&[Run {
+                text,
+                style,
+                link: None,
+            }]);
             self.flow(&cells, x, width, Align::Center, Wrap::Word);
         }
     }
@@ -972,6 +1017,7 @@ impl Ctx<'_> {
                                 } else {
                                     run.style
                                 },
+                                link: run.link.clone(),
                             })
                             .collect()
                     })
@@ -1076,6 +1122,7 @@ impl Ctx<'_> {
                             &[Run {
                                 text: m[2].to_owned(),
                                 style: Style::default(),
+                                link: None,
                             }],
                             x,
                             width,
@@ -1530,6 +1577,45 @@ mod tests {
             .collect();
         assert_eq!(underlined, ["target", "embed", "caption", "alias"]);
         assert!(laid.figures.is_empty());
+    }
+
+    #[test]
+    fn links_know_where_they_point_and_what_text_they_cover() {
+        let laid = layout(
+            "See [the **docs**](https://x.dev) and [[notes/plan|the plan]], ![[sketch]] or [top](#top).",
+            80,
+            (8, 16),
+            &no_images,
+        );
+        let text: String = laid.text.iter().collect();
+        let spans: Vec<(&str, &Link)> = laid
+            .links
+            .iter()
+            .map(|(span, link)| {
+                let start = text.char_indices().nth(span.start).map_or(0, |(i, _)| i);
+                let end = text
+                    .char_indices()
+                    .nth(span.end)
+                    .map_or(text.len(), |(i, _)| i);
+                (&text[start..end], link)
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (
+                    "the docs (https://x.dev)",
+                    &Link::Url("https://x.dev".into())
+                ),
+                ("the plan", &Link::Note("notes/plan".into())),
+                ("sketch", &Link::Note("sketch".into())),
+                ("top", &Link::Url("#top".into())),
+            ]
+        );
+        let plain = text.find("See").expect("plain text");
+        assert_eq!(laid.link_at(plain), None);
+        let at = text[..text.find("plan").expect("label")].chars().count();
+        assert_eq!(laid.link_at(at), Some(&Link::Note("notes/plan".into())));
     }
 
     #[test]

@@ -79,7 +79,7 @@ PDFs are converted to markdown (headings from font size, paragraphs rejoined, ru
 
 Markdown files (`.md`, `.markdown`) show as written, with GitHub's extensions: tables, task lists, strikethrough, footnotes and alerts (`> [!NOTE]`), plus definition lists and math (kept as source). Front matter is hidden, HTML blocks such as a README's centered logo are read as markdown, and images next to the file show inline (PNG, JPEG, GIF, WebP, SVG), as do `data:` images.
 
-Headings use the theme's blue. Wikilinks such as `[[note]]`, `[[path/note|label]]`, and `![[note]]` show as underlined text.
+Headings use the theme's blue. Wikilinks such as `[[note]]`, `[[path/note|label]]`, and `![[note]]` show as underlined text. Click a link to follow it. Web and `mailto:` links open in your browser. A wikilink opens its note in leaf: the note beside the file, or the nearest one with that name in the Obsidian vault (the folder holding `.obsidian`), or below the file's folder outside a vault. A relative link such as `[setup](docs/setup.md)` opens that file. Dragging across a link selects it instead.
 
 HTML pages saved on disk (`.html`, `.htm`, `.xhtml`) read like markdown: headings, lists, tables, links and pictures, in the terminal's font and colors. Pictures beside the page and pictures bundled into it as `data:` URIs both show. Stylesheets and scripts are left out, so a page that builds its content with JavaScript shows an error instead.
 

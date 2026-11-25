@@ -17,6 +17,7 @@ mod doc;
 mod drawing;
 mod edge;
 mod find;
+mod follow;
 mod font;
 mod gec;
 mod github;
@@ -859,14 +860,21 @@ fn open(first: &str) -> ExitCode {
         }
         match result {
             Ok(None) => return ExitCode::SUCCESS,
-            Ok(Some(go)) => match picture::neighbour(&go.path, go.step) {
-                Some(next) => {
-                    moving = Some((go.step, picture::in_folder(&go.path).len()));
-                    target = next.to_string_lossy().into_owned();
-                    path_override = Some(next);
+            Ok(Some(viewer::Go::Neighbour { path, step })) => {
+                match picture::neighbour(&path, step) {
+                    Some(next) => {
+                        moving = Some((step, picture::in_folder(&path).len()));
+                        target = next.to_string_lossy().into_owned();
+                        path_override = Some(next);
+                    }
+                    None => return ExitCode::SUCCESS,
                 }
-                None => return ExitCode::SUCCESS,
-            },
+            }
+            Ok(Some(viewer::Go::Open(next))) => {
+                moving = None;
+                target = next.to_string_lossy().into_owned();
+                path_override = Some(next);
+            }
             Err(e) => {
                 eprintln!(
                     "leaf: the terminal failed ({e}). Your place and highlights up to now are saved."
