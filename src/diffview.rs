@@ -68,12 +68,19 @@ struct Palette {
     added_word: Color,
     removed_word: Color,
     focus: Color,
+    /// The cursor line: a faint wash on unchanged code, and stronger
+    /// added and removed tints so a changed line keeps its color.
+    cursor: Color,
+    added_cursor: Color,
+    removed_cursor: Color,
 }
 
 /// How strongly each tint shows over the theme's background.
 const LINE_TINT: f32 = 0.2;
 const WORD_TINT: f32 = 0.4;
 const FOCUS_TINT: f32 = 0.3;
+const CURSOR_TINT: f32 = 0.12;
+const CHANGED_CURSOR_TINT: f32 = 0.3;
 
 impl Palette {
     fn new(light: bool) -> Self {
@@ -91,6 +98,9 @@ impl Palette {
             added_word: Color::Rgb(0x00, 0x87, 0x00),
             removed_word: Color::Rgb(0x87, 0x00, 0x00),
             focus: Color::Rgb(0x00, 0x5f, 0x87),
+            cursor: Color::Rgb(0x1c, 0x26, 0x30),
+            added_cursor: Color::Rgb(0x00, 0x73, 0x00),
+            removed_cursor: Color::Rgb(0x73, 0x00, 0x00),
         }
     }
 
@@ -101,6 +111,9 @@ impl Palette {
             added_word: Color::Rgb(0xaf, 0xff, 0xaf),
             removed_word: Color::Rgb(0xff, 0xaf, 0xaf),
             focus: Color::Rgb(0xaf, 0xd7, 0xff),
+            cursor: Color::Rgb(0xea, 0xf2, 0xfb),
+            added_cursor: Color::Rgb(0xc3, 0xff, 0xc3),
+            removed_cursor: Color::Rgb(0xff, 0xc3, 0xc3),
         }
     }
 
@@ -115,6 +128,9 @@ impl Palette {
             added_word: tint(theme.green, WORD_TINT),
             removed_word: tint(theme.red, WORD_TINT),
             focus: tint(theme.blue, FOCUS_TINT),
+            cursor: tint(theme.blue, CURSOR_TINT),
+            added_cursor: tint(theme.green, CHANGED_CURSOR_TINT),
+            removed_cursor: tint(theme.red, CHANGED_CURSOR_TINT),
         }
     }
 
@@ -2871,7 +2887,7 @@ impl App {
         let rule_style = if side.highlighted {
             Style::default().fg(ACCENT).bg(self.palette.focus)
         } else if current {
-            Style::default().fg(ACCENT)
+            Style::default().fg(ACCENT).bg(self.palette.cursor)
         } else {
             Style::default().fg(DIM)
         };
@@ -2912,6 +2928,12 @@ impl App {
         };
         let bg = if state.highlighted {
             Some(self.palette.focus)
+        } else if state.current {
+            Some(match (diff_row.kind, side) {
+                (RowKind::Added, Side::New) => self.palette.added_cursor,
+                (RowKind::Removed, Side::Old) => self.palette.removed_cursor,
+                _ => self.palette.cursor,
+            })
         } else {
             tint
         };
@@ -2926,6 +2948,7 @@ impl App {
                 };
                 ("●", base.fg(color))
             }
+            (None, _) if state.current => ("▌", base.fg(ACCENT)),
             (None, RowKind::Added) if side == Side::New => ("▌", base.fg(ADDED_FG)),
             (None, RowKind::Removed) if side == Side::Old => ("▌", base.fg(REMOVED_FG)),
             _ => (" ", base),
@@ -2983,7 +3006,11 @@ impl App {
     }
 
     fn empty_bg(&self, state: SideState) -> Option<Color> {
-        state.highlighted.then_some(self.palette.focus)
+        if state.highlighted {
+            Some(self.palette.focus)
+        } else {
+            state.current.then_some(self.palette.cursor)
+        }
     }
 
     fn number_width(&self) -> usize {
@@ -4582,6 +4609,54 @@ diff --git a/a.rs b/a.rs
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_cursor_line_is_washed_end_to_end_and_marked_at_its_edge() {
+        for layout in [Layout::Split, Layout::Inline] {
+            let mut app = App::new(
+                loaded(PATCH),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            let (cursor, added, removed) = (
+                app.palette.cursor,
+                app.palette.added_cursor,
+                app.palette.removed_cursor,
+            );
+            let line = app.split_content(app.cursor, 80);
+            let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(width, 80, "{layout:?}");
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(cursor)),
+                "{layout:?}: every cell of an unchanged cursor line is washed"
+            );
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.content == "▌" && s.style.fg == Some(ACCENT)),
+                "{layout:?}"
+            );
+
+            press(&mut app, KeyCode::Char('j'));
+            let line = app.split_content(app.cursor, 80);
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.style.bg == Some(added) || s.style.bg == Some(removed)),
+                "{layout:?}: a changed cursor line keeps its color, stronger"
+            );
+            let other = app.split_content(app.cursor + 1, 80);
+            assert!(
+                other
+                    .spans
+                    .iter()
+                    .all(|s| s.style.bg != Some(cursor) && s.style.fg != Some(ACCENT)),
+                "{layout:?}: other lines are left alone"
+            );
+        }
     }
 
     fn big_patch(lines: usize) -> String {
