@@ -194,6 +194,8 @@ struct Run {
     style: Style,
     /// The link this text belongs to.
     link: Option<Link>,
+    /// A destination appended after a visible link label.
+    link_url_suffix: bool,
 }
 
 type Inlines = Vec<Run>;
@@ -299,11 +301,14 @@ impl Builder {
         let style = self.style();
         let link = self.links.last().cloned();
         match self.inlines.last_mut() {
-            Some(run) if run.style == style && run.link == link => run.text.push_str(text),
+            Some(run) if run.style == style && run.link == link && !run.link_url_suffix => {
+                run.text.push_str(text);
+            }
             _ => self.inlines.push(Run {
                 text: text.to_owned(),
                 style,
                 link,
+                link_url_suffix: false,
             }),
         }
     }
@@ -332,8 +337,7 @@ impl Builder {
                     .into_iter()
                     .map(|r| Run {
                         text: r.text.replace(IMAGE_MARK, ""),
-                        style: r.style,
-                        link: r.link,
+                        ..r
                     })
                     .collect()
             };
@@ -603,14 +607,26 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 TagEnd::Link => {
                     b.styles.pop();
                     // The URL shown after the label is part of the link, so it's clickable too.
-                    if let Some(Link::Url(url)) = b.links.last().cloned() {
-                        let label: String =
-                            b.inlines.last().map(|r| r.text.clone()).unwrap_or_default();
-                        if !label.ends_with(&url) && !url.starts_with('#') {
-                            b.push_style(|s| s.fg(DIM).remove_modifier(Modifier::UNDERLINED));
-                            b.text(&format!(" ({url})"));
-                            b.styles.pop();
-                        }
+                    let last = b.inlines.last();
+                    let label = last.map_or("", |run| run.text.as_str());
+                    if let Some(Link::Url(url)) = b.links.last()
+                        && !url.starts_with('#')
+                        && !label.ends_with(url)
+                    {
+                        let has_label = last.is_some_and(|run| {
+                            run.link.as_ref() == b.links.last()
+                                && run.style.add_modifier.contains(Modifier::UNDERLINED)
+                                && run
+                                    .text
+                                    .chars()
+                                    .any(|c| !c.is_whitespace() && c != IMAGE_MARK)
+                        });
+                        b.inlines.push(Run {
+                            text: format!(" ({url})"),
+                            style: b.style().fg(DIM).remove_modifier(Modifier::UNDERLINED),
+                            link: Some(Link::Url(url.clone())),
+                            link_url_suffix: has_label,
+                        });
                     }
                     b.links.pop();
                 }
@@ -720,10 +736,17 @@ enum Wrap {
     Char,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LinkUrls {
+    Show,
+    Hide,
+}
+
 struct Ctx<'a> {
     laid: Laid,
     image_sizes: ImageSizes<'a>,
     colors: MarkdownColors,
+    link_urls: LinkUrls,
     /// A terminal cell's size in pixels.
     cell: (u16, u16),
 }
@@ -759,9 +782,15 @@ impl Ctx<'_> {
             {
                 style = style.fg(color);
             }
-            for c in run.text.chars() {
-                cells.push((c, style, Some(self.laid.text.len())));
-                self.laid.text.push(c);
+            // Keep saved reading positions, highlights and ink at the same offsets.
+            self.laid.text.extend(run.text.chars());
+            if self.link_urls == LinkUrls::Show || !run.link_url_suffix {
+                cells.extend(
+                    run.text
+                        .chars()
+                        .enumerate()
+                        .map(|(i, c)| (c, style, Some(start + i))),
+                );
             }
             let end = self.laid.text.len();
             if let Some(link) = &run.link
@@ -832,9 +861,8 @@ impl Ctx<'_> {
         let runs: Vec<Run> = runs
             .iter()
             .map(|r| Run {
-                text: r.text.clone(),
                 style: style.patch(r.style),
-                link: r.link.clone(),
+                ..r.clone()
             })
             .collect();
         let cells = self.cells(&runs);
@@ -874,6 +902,7 @@ impl Ctx<'_> {
                         text: m[2].to_owned(),
                         style: Style::default(),
                         link: None,
+                        link_url_suffix: false,
                     }],
                     x,
                     width,
@@ -897,6 +926,7 @@ impl Ctx<'_> {
                 text,
                 style,
                 link: None,
+                link_url_suffix: false,
             }]);
             self.flow(&cells, x, width, Align::Center, Wrap::Word);
         }
@@ -1057,13 +1087,12 @@ impl Ctx<'_> {
                     .map(|r| {
                         r.iter()
                             .map(|run| Run {
-                                text: run.text.clone(),
                                 style: if *is_head {
                                     run.style.patch(bold)
                                 } else {
                                     run.style
                                 },
-                                link: run.link.clone(),
+                                ..run.clone()
                             })
                             .collect()
                     })
@@ -1169,6 +1198,7 @@ impl Ctx<'_> {
                                 text: m[2].to_owned(),
                                 style: Style::default(),
                                 link: None,
+                                link_url_suffix: false,
                             }],
                             x,
                             width,
@@ -1373,21 +1403,24 @@ pub fn layout_with_heading_color(
         cell,
         image_sizes,
         MarkdownColors::uniform(heading_color),
+        LinkUrls::Show,
     )
 }
 
-/// Lays a page out with the reader's colors for headings and links.
+/// Lays out a page with the reader's Markdown colors and link URL visibility.
 pub fn layout_with_colors(
     markdown: &str,
     width: u16,
     cell: (u16, u16),
     image_sizes: ImageSizes,
     colors: MarkdownColors,
+    link_urls: LinkUrls,
 ) -> Laid {
     let mut ctx = Ctx {
         laid: Laid::default(),
         image_sizes,
         colors,
+        link_urls,
         cell,
     };
     for node in parse(markdown, true) {
@@ -1564,6 +1597,7 @@ mod tests {
                 (8, 16),
                 &no_images,
                 MarkdownColors::colorful(colors),
+                LinkUrls::Show,
             );
             let fg: Vec<_> = laid
                 .rows
@@ -1667,6 +1701,27 @@ mod tests {
             draw("See [1] and [x](https://e.com).", 60)[0],
             "See [1] and x (https://e.com)."
         );
+    }
+
+    #[test]
+    fn hiding_link_urls_preserves_text_offsets_and_url_only_links() {
+        let markdown = "[**guide**](../guide.md) then <https://x.dev> or [](../index.md).";
+        let colors = MarkdownColors::colorful(Colors::DARK);
+        let shown = layout_with_colors(markdown, 80, (8, 16), &no_images, colors, LinkUrls::Show);
+        let hidden = layout_with_colors(markdown, 80, (8, 16), &no_images, colors, LinkUrls::Hide);
+        let row = &hidden.rows[0];
+        let visible: String = row.segs.iter().map(|seg| seg.text.as_str()).collect();
+        assert_eq!(visible, "guide then https://x.dev or  (../index.md).");
+        assert_eq!(row.segs[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(hidden.text, shown.text);
+        assert_eq!(hidden.links, shown.links);
+        assert_eq!(hidden.link_at(0), Some(&Link::Url("../guide.md".into())));
+        let after = row
+            .segs
+            .iter()
+            .find(|seg| seg.text.contains("then"))
+            .unwrap();
+        assert_eq!(after.offset, Some("guide (../guide.md)".len()));
     }
 
     #[test]

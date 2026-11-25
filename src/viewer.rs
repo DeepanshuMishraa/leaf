@@ -368,6 +368,7 @@ pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 pub struct ViewerOptions {
     pub max_text_width: u16,
     pub colorful_markdown: bool,
+    pub hide_link_urls: bool,
     /// For paged documents, where reading resumes (1-based).
     pub start_page: Option<usize>,
     pub image_mode: ImageMode,
@@ -412,6 +413,7 @@ impl Default for ViewerOptions {
         ViewerOptions {
             max_text_width: crate::config::DEFAULT_MAX_WIDTH,
             colorful_markdown: false,
+            hide_link_urls: false,
             start_page: None,
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
@@ -761,12 +763,18 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
+        let link_urls = if self.options.hide_link_urls {
+            render::LinkUrls::Hide
+        } else {
+            render::LinkUrls::Show
+        };
         let laid = Rc::new(render::layout_with_colors(
             &markdown,
             self.width,
             (font.width, font.height),
             &sizes,
             self.markdown_colors(),
+            link_urls,
         ));
         self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
@@ -4050,6 +4058,32 @@ mod tests {
         click(&mut s, (x + 1, y));
         assert_eq!(opened.borrow().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_label_works_with_the_url_hidden() {
+        let options = ViewerOptions {
+            hide_link_urls: true,
+            ..ViewerOptions::default()
+        };
+        let url = "https://x.dev/a";
+        let mut s = Screen::new(
+            Doc::whole("Notes", format!("Read [the docs]({url}) now.")),
+            80,
+            20,
+            options,
+        );
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let log = opened.clone();
+        s.app.open_url = Box::new(move |url| {
+            log.borrow_mut().push(url.to_owned());
+            Ok(())
+        });
+        let frame = s.draw();
+        assert!(frame.contains("Read the docs now."));
+        assert!(!frame.contains(url));
+        click_text(&mut s, "docs");
+        assert_eq!(*opened.borrow(), [url]);
     }
 
     #[test]

@@ -858,6 +858,7 @@ fn open(first: &str) -> ExitCode {
         let mut options = resume(&target, doc.page_count, &failure);
         options.max_text_width = config.reader.max_width;
         options.colorful_markdown = config.reader.colorful_markdown;
+        options.hide_link_urls = config.reader.hide_link_urls;
         options.picture_path = watch.as_ref().map(|_| source_path);
         options.watch = watch;
         options.start_viewport = viewport;
