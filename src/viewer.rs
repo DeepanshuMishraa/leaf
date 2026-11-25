@@ -1,6 +1,7 @@
 //! The reader: pages on screen, keys, mouse selection, highlights and figures.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -86,6 +87,8 @@ const FALLBACK_PAPER: Rgb = [30, 30, 30];
 const KEPT_PAGES: usize = 4;
 /// How much of a page's first line names its bookmark.
 const BOOKMARK_LABEL_CHARS: usize = 48;
+/// How much text to look for when an edited page is reopened from history.
+const HISTORY_ANCHOR_CHARS: usize = 48;
 /// How long a search reads pages before the screen is drawn and keys are read again.
 const SEARCH_SLICE: Duration = Duration::from_millis(30);
 /// How often the word read aloud is checked: fast enough that the mark
@@ -118,15 +121,22 @@ enum Mode {
     Scroll,
 }
 
-/// A place in a document, with a text anchor in case the rows reflow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A place in a document, with a text anchor in case the page changes or reflows.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Viewport {
     page: usize,
     offset: usize,
-    anchor: Option<usize>,
+    anchor: Option<HistoryAnchor>,
     width: u16,
     mode: Mode,
     look: Option<crate::doc::Look>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryAnchor {
+    offset: usize,
+    excerpt: Vec<char>,
+    page_hash: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -574,7 +584,11 @@ impl App {
             .collect();
         let watch = options.watch.take();
         let notice = options.start_notice.take();
-        if let Some(look) = options.start_viewport.and_then(|viewport| viewport.look) {
+        if let Some(look) = options
+            .start_viewport
+            .as_ref()
+            .and_then(|viewport| viewport.look)
+        {
             doc.source.set_look(look);
         }
         let folder = Self::folder_place(&doc, options.picture_path.as_deref());
@@ -982,12 +996,21 @@ impl App {
 
     fn reading_location(&mut self) -> Option<ReadingLocation> {
         let path = std::path::absolute(self.options.picture_path.as_deref()?).ok()?;
+        let anchor = self.first_anchor().map(|offset| {
+            let laid = self.laid(self.current);
+            let end = (offset + HISTORY_ANCHOR_CHARS).min(laid.text.len());
+            HistoryAnchor {
+                offset,
+                excerpt: laid.text[offset..end].to_vec(),
+                page_hash: self.current_page_hash(),
+            }
+        });
         Some(ReadingLocation {
             path,
             viewport: Viewport {
                 page: self.current,
                 offset: self.offset,
-                anchor: self.first_anchor(),
+                anchor,
                 width: self.width,
                 mode: self.mode,
                 look: self.shown_as,
@@ -995,14 +1018,37 @@ impl App {
         })
     }
 
+    fn current_page_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.doc.source.page(self.current).hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn restore_viewport(&mut self, viewport: Viewport) {
         self.current = viewport.page.min(self.last());
         self.offset = viewport.offset;
-        if (self.width != viewport.width || self.mode != viewport.mode)
-            && self.current == viewport.page
-            && let Some(anchor) = viewport.anchor
-        {
-            self.scroll_to_anchor(anchor);
+        if self.current != viewport.page {
+            return;
+        }
+        let Some(anchor) = viewport.anchor else {
+            return;
+        };
+        if anchor.page_hash != self.current_page_hash() {
+            let laid = self.laid(self.current);
+            let offset = laid
+                .text
+                .windows(anchor.excerpt.len())
+                .enumerate()
+                .filter(|(_, text)| *text == anchor.excerpt)
+                .map(|(offset, _)| offset)
+                .min_by_key(|offset| offset.abs_diff(anchor.offset));
+            if let Some(offset) = offset {
+                self.scroll_to_anchor(offset);
+                return;
+            }
+        }
+        if self.width != viewport.width || self.mode != viewport.mode {
+            self.scroll_to_anchor(anchor.offset);
         }
     }
 
@@ -4024,7 +4070,12 @@ mod tests {
         let origin = s.app.reading_location().unwrap();
         assert_eq!(origin.viewport.offset, 12);
         click_text(&mut s, "Open Plan");
-        let anchor = origin.viewport.anchor.expect("text follows the blank row");
+        let anchor = origin
+            .viewport
+            .anchor
+            .as_ref()
+            .expect("text follows the blank row")
+            .offset;
         assert_eq!(s.app.screen_row(origin.viewport.page, anchor), Some(1));
         assert_eq!(s.history.back.back(), Some(&origin));
         s.open_next(ViewerOptions::default());
@@ -4046,6 +4097,48 @@ mod tests {
     }
 
     #[test]
+    fn history_finds_the_same_text_after_edits_above_it_while_away() {
+        let filler = "A short paragraph.\n\n".repeat(40);
+        let intro = "A paragraph before the saved position.\n\n".repeat(6);
+        let text = format!("{intro}The saved passage. [[plan|Open Plan]]\n\n{filler}");
+        let plan = format!("{intro}The saved line in the plan.\n\n{filler}");
+        let (mut s, dir, _) = linked_note("history-edits", &text);
+        let plan_path = dir.join("plan.md");
+        std::fs::write(&plan_path, plan).unwrap();
+        let (_, row) = s.find("The saved passage.");
+        s.app.scroll_by(row as isize);
+        assert_eq!(s.find("The saved passage.").1, 0);
+        click_text(&mut s, "Open Plan");
+        s.open_next(ViewerOptions::default());
+
+        let (_, row) = s.find("The saved line in the plan.");
+        s.app.scroll_by(row as isize);
+        assert_eq!(s.find("The saved line in the plan.").1, 0);
+        std::fs::write(
+            dir.join("today.md"),
+            format!("{}{}", "A new paragraph.\n\n".repeat(14), text),
+        )
+        .unwrap();
+
+        s.press(KeyCode::Char('H'));
+        let frame = s.open_next(ViewerOptions::default());
+        assert!(frame.starts_with("  The saved passage."), "{frame}");
+
+        std::fs::write(
+            &plan_path,
+            format!("The saved line in the plan.\n\n{filler}"),
+        )
+        .unwrap();
+        s.press(KeyCode::Char('L'));
+        let frame = s.open_next(ViewerOptions::default());
+        assert!(
+            frame.starts_with("  The saved line in the plan."),
+            "{frame}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn history_reflows_text_when_the_terminal_is_resized_while_away() {
         let words = "one two three four five six seven eight nine ten ";
         let text = format!(
@@ -4056,7 +4149,7 @@ mod tests {
         let (mut s, dir, _) = linked_note("history-reflow", &text);
         s.app.scroll_by(10);
         let before = s.app.reading_location().unwrap().viewport;
-        let anchor = before.anchor.expect("visible text has an anchor");
+        let anchor = before.anchor.expect("visible text has an anchor").offset;
         click_text(&mut s, "Open Plan");
         s.open_next(ViewerOptions::default());
 
@@ -4087,7 +4180,10 @@ mod tests {
         assert_eq!(before.mode, Mode::Paged);
         assert_eq!(before.page, 1);
         assert_eq!(before.look, Some(crate::doc::Look::Terminal));
-        let anchor = before.anchor.expect("visible cells have a text anchor");
+        let anchor = before
+            .anchor
+            .expect("visible cells have a text anchor")
+            .offset;
 
         s.press(KeyCode::Char('H'));
         s.open_next(ViewerOptions::default());
