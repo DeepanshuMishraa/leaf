@@ -1425,12 +1425,8 @@ impl App {
                 self.leave = Leave::Checks;
                 self.quit = true;
             }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.left = self.left.saturating_sub(4);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.left = self.left.saturating_add(4);
-            }
+            KeyCode::Char('h') | KeyCode::Left => self.scroll_sideways(false),
+            KeyCode::Char('l') | KeyCode::Right => self.scroll_sideways(true),
             KeyCode::Char('0') => self.left = 0,
             KeyCode::Char('?') => self.dialog = Dialog::Help,
             _ => {}
@@ -1555,6 +1551,15 @@ impl App {
         {
             return;
         }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) {
+            if self.overview.is_none() && self.note_editor.is_none() && self.rex_command.is_none() {
+                self.scroll_sideways(mouse.kind == MouseEventKind::ScrollRight);
+            }
+            return;
+        }
         let (top, height, scroll) = (self.view.y, self.view.height, self.scroll);
         let pinned = self.pinned_header();
         let offset = u16::from(pinned.is_some());
@@ -1608,6 +1613,10 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => self.drag_origin = None,
             _ => {}
         }
+    }
+
+    fn scroll_sideways(&mut self, right: bool) {
+        self.left = self.left.saturating_add_signed(if right { 4 } else { -4 });
     }
 
     /// Scrolls when a drag reaches past the top or bottom of the view.
@@ -3411,7 +3420,10 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
         ("i", "split or inline layout"),
-        ("h l  ← →", "scroll sideways; 0 resets"),
+        (
+            "h l  ← →",
+            "scroll sideways with keys, wheel or trackpad; 0 resets",
+        ),
         ("? q", "this help, quit"),
     ];
     let mut lines: Vec<Line> = keys
@@ -4806,6 +4818,56 @@ diff --git a/b.rs b/b.rs
         assert_eq!(app.scroll, 0, "the file heading scrolls back into view");
         let screen = draw(&mut app, 100, 22);
         assert!(screen.contains("big.rs"));
+    }
+
+    #[test]
+    fn the_horizontal_wheel_pans_code_but_not_gutters_or_selection() {
+        let patch = PATCH
+            .replace("let b = 2;", "000-old-TAIL")
+            .replace("let b = 3;", "000-new-TAIL");
+        for (layout, width, panned) in [
+            (Layout::Split, 27, "▌ 11 old-TAIL│▌ 11 new-TAIL"),
+            (Layout::Inline, 17, "▌ 11     old-TAIL\n▌     11 new-TAIL"),
+        ] {
+            let mut app = App::new(
+                loaded(&patch),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            app.scroll = 2;
+            app.cursor = 3;
+            app.selection = Some(2);
+            let before = draw(&mut app, width, 5);
+            assert!(!before.contains("TAIL"));
+
+            wheel(&mut app, MouseEventKind::ScrollRight);
+            let after = draw(&mut app, width, 5);
+            assert!(after.contains(panned), "{layout:?}:\n{after}");
+            assert_eq!((app.scroll, app.cursor, app.selection), (2, 3, Some(2)));
+
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(draw(&mut app, width, 5), before);
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(app.left, 0);
+        }
+    }
+
+    #[test]
+    fn the_horizontal_wheel_does_not_pan_behind_overlays_or_inputs() {
+        for key in [
+            KeyCode::Char('?'),
+            KeyCode::Char('c'),
+            KeyCode::Char('O'),
+            KeyCode::Char('M'),
+            remote::WAKE,
+        ] {
+            let mut app = app();
+            press(&mut app, key);
+            wheel(&mut app, MouseEventKind::ScrollRight);
+            assert_eq!(app.left, 0, "after {key:?}");
+        }
     }
 
     #[test]
