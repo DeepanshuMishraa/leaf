@@ -7,7 +7,7 @@
 use std::sync::LazyLock;
 
 use pulldown_cmark::{
-    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
 };
 use ratatui::style::{Color, Modifier, Style};
 use regex::Regex;
@@ -71,6 +71,15 @@ pub struct Figure {
     pub rows: u16,
 }
 
+/// Where a link in the text points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// A markdown link's destination, as written: a URL, a path or an `#anchor`.
+    Url(String),
+    /// A wikilink's target, such as `note` in `[[note|label]]` or `![[note]]`.
+    Note(String),
+}
+
 /// A page laid out at one width.
 #[derive(Debug, Default)]
 pub struct Laid {
@@ -78,9 +87,19 @@ pub struct Laid {
     pub figures: Vec<Figure>,
     /// The page's readable text: each block's text followed by a newline.
     pub text: Vec<char>,
+    /// Each link's span of the page text, in order.
+    pub links: Vec<(std::ops::Range<usize>, Link)>,
 }
 
 impl Laid {
+    /// The link drawn at character `offset` of the page text.
+    pub fn link_at(&self, offset: usize) -> Option<&Link> {
+        self.links
+            .iter()
+            .find(|(span, _)| span.contains(&offset))
+            .map(|(_, link)| link)
+    }
+
     /// The row and column character `offset` of the page text is drawn at.
     /// An offset that isn't drawn (a block's closing newline) takes the next
     /// character drawn, or the end of the last; a page with no text puts it at the top left.
@@ -142,6 +161,8 @@ pub fn image_cells(max_cols: u16, size: ImageSize, cell: (u16, u16)) -> (u16, u1
 struct Run {
     text: String,
     style: Style,
+    /// The link this text belongs to.
+    link: Option<Link>,
 }
 
 type Inlines = Vec<Run>;
@@ -184,7 +205,8 @@ struct Builder {
     styles: Vec<Style>,
     inlines: Inlines,
     images: Vec<String>,
-    links: Vec<String>,
+    /// Open links and wikilink embeds, innermost last.
+    links: Vec<Link>,
     code: Option<(Option<String>, String)>,
     html: Option<String>,
     table: Option<TableParts>,
@@ -244,11 +266,13 @@ impl Builder {
 
     fn text(&mut self, text: &str) {
         let style = self.style();
+        let link = self.links.last().cloned();
         match self.inlines.last_mut() {
-            Some(run) if run.style == style => run.text.push_str(text),
+            Some(run) if run.style == style && run.link == link => run.text.push_str(text),
             _ => self.inlines.push(Run {
                 text: text.to_owned(),
                 style,
+                link,
             }),
         }
     }
@@ -278,6 +302,7 @@ impl Builder {
                     .map(|r| Run {
                         text: r.text.replace(IMAGE_MARK, ""),
                         style: r.style,
+                        link: r.link,
                     })
                     .collect()
             };
@@ -330,7 +355,9 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
         read_html,
     };
     let mut image_depth = 0usize;
-    for event in Parser::new_ext(markdown, MARKDOWN) {
+    let mut image_kinds = Vec::new();
+    // Keep wikilink embeds out of the image loader, which uses MARKDOWN.
+    for event in Parser::new_ext(markdown, MARKDOWN.union(Options::ENABLE_WIKILINKS)) {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => b.flush_paragraph(),
@@ -387,14 +414,31 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 Tag::Strikethrough => {
                     b.push_style(|s| s.add_modifier(Modifier::DIM | Modifier::CROSSED_OUT))
                 }
-                Tag::Link { dest_url, .. } => {
-                    b.links.push(dest_url.to_string());
+                Tag::Link {
+                    link_type,
+                    dest_url,
+                    ..
+                } => {
+                    b.links.push(match link_type {
+                        LinkType::WikiLink { .. } => Link::Note(dest_url.to_string()),
+                        _ => Link::Url(dest_url.to_string()),
+                    });
                     b.push_style(|s| s.add_modifier(Modifier::UNDERLINED));
                 }
-                Tag::Image { dest_url, .. } => {
-                    image_depth += 1;
-                    b.images.push(dest_url.to_string());
-                    b.text(&IMAGE_MARK.to_string());
+                Tag::Image {
+                    link_type,
+                    dest_url,
+                    ..
+                } => {
+                    image_kinds.push(link_type);
+                    if matches!(link_type, LinkType::WikiLink { .. }) {
+                        b.links.push(Link::Note(dest_url.to_string()));
+                        b.push_style(|s| s.add_modifier(Modifier::UNDERLINED));
+                    } else {
+                        image_depth += 1;
+                        b.images.push(dest_url.to_string());
+                        b.text(&IMAGE_MARK.to_string());
+                    }
                 }
                 _ => {}
             },
@@ -527,7 +571,8 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 }
                 TagEnd::Link => {
                     b.styles.pop();
-                    if let Some(url) = b.links.pop() {
+                    // The URL shown after the label is part of the link, so it's clickable too.
+                    if let Some(Link::Url(url)) = b.links.last().cloned() {
                         let label: String =
                             b.inlines.last().map(|r| r.text.clone()).unwrap_or_default();
                         if !label.ends_with(&url) && !url.starts_with('#') {
@@ -536,8 +581,15 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                             b.styles.pop();
                         }
                     }
+                    b.links.pop();
                 }
-                TagEnd::Image => image_depth = image_depth.saturating_sub(1),
+                TagEnd::Image => match image_kinds.pop() {
+                    Some(LinkType::WikiLink { .. }) => {
+                        b.styles.pop();
+                        b.links.pop();
+                    }
+                    _ => image_depth = image_depth.saturating_sub(1),
+                },
                 _ => {}
             },
             Event::Text(text) => {
@@ -640,6 +692,7 @@ enum Wrap {
 struct Ctx<'a> {
     laid: Laid,
     image_sizes: ImageSizes<'a>,
+    heading_color: Color,
     /// A terminal cell's size in pixels.
     cell: (u16, u16),
 }
@@ -667,9 +720,20 @@ impl Ctx<'_> {
         let mut cells = Vec::with_capacity(bytes);
         self.laid.text.reserve(bytes + 1);
         for run in runs {
+            let start = self.laid.text.len();
             for c in run.text.chars() {
                 cells.push((c, run.style, Some(self.laid.text.len())));
                 self.laid.text.push(c);
+            }
+            let end = self.laid.text.len();
+            if let Some(link) = &run.link
+                && start < end
+            {
+                // A link split across styles (`[**a** b](x)`) is one span.
+                match self.laid.links.last_mut() {
+                    Some((span, last)) if span.end == start && last == link => span.end = end,
+                    _ => self.laid.links.push((start..end, link.clone())),
+                }
             }
         }
         self.laid.text.push('\n');
@@ -694,9 +758,16 @@ impl Ctx<'_> {
 
     fn heading(&mut self, depth: u8, runs: &[Run], x: u16, width: u16, align: Align) {
         let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        let accent = Style::default().fg(self.heading_color);
         // The terminal has one font size, so rank comes from size where it fits
-        // (large letters for a short title), then weight and space.
-        if depth == 1 && font::width(&text) <= width as usize {
+        // (large letters for a short title), then weight and space. Links
+        // stay in regular text so their underline and label are readable.
+        if depth == 1
+            && !runs
+                .iter()
+                .any(|r| r.style.add_modifier.contains(Modifier::UNDERLINED))
+            && font::width(&text) <= width as usize
+        {
             let w = font::width(&text) as u16;
             let x = if align == Align::Center {
                 x + (width - w) / 2
@@ -708,7 +779,7 @@ impl Ctx<'_> {
                     segs: vec![Seg {
                         x,
                         text: row,
-                        style: Style::default(),
+                        style: accent,
                         offset: None,
                     }],
                 });
@@ -716,17 +787,16 @@ impl Ctx<'_> {
             return;
         }
         let style = if depth <= 3 {
-            Style::default().add_modifier(Modifier::BOLD)
+            accent.add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .fg(DIM)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+            accent.add_modifier(Modifier::BOLD | Modifier::ITALIC)
         };
         let runs: Vec<Run> = runs
             .iter()
             .map(|r| Run {
                 text: r.text.clone(),
-                style: r.style.patch(style),
+                style: style.patch(r.style),
+                link: r.link.clone(),
             })
             .collect();
         let cells = self.cells(&runs);
@@ -765,6 +835,7 @@ impl Ctx<'_> {
                     &[Run {
                         text: m[2].to_owned(),
                         style: Style::default(),
+                        link: None,
                     }],
                     x,
                     width,
@@ -784,7 +855,11 @@ impl Ctx<'_> {
                 Some(rest) => format!("• {rest}"),
                 None => text,
             };
-            let cells = self.cells(&[Run { text, style }]);
+            let cells = self.cells(&[Run {
+                text,
+                style,
+                link: None,
+            }]);
             self.flow(&cells, x, width, Align::Center, Wrap::Word);
         }
     }
@@ -942,6 +1017,7 @@ impl Ctx<'_> {
                                 } else {
                                     run.style
                                 },
+                                link: run.link.clone(),
                             })
                             .collect()
                     })
@@ -1046,6 +1122,7 @@ impl Ctx<'_> {
                             &[Run {
                                 text: m[2].to_owned(),
                                 style: Style::default(),
+                                link: None,
                             }],
                             x,
                             width,
@@ -1235,12 +1312,19 @@ fn segs(line: &[Cell], x: u16) -> Vec<Seg> {
     out
 }
 
-/// Lays a page of markdown out `width` columns wide. Each block has a blank
-/// row below it; headings and figures have one above too.
-pub fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
+/// Lays a page out `width` columns wide with the active heading color.
+/// Each block has a blank row below it; headings and figures have one above too.
+pub fn layout_with_heading_color(
+    markdown: &str,
+    width: u16,
+    cell: (u16, u16),
+    image_sizes: ImageSizes,
+    heading_color: Color,
+) -> Laid {
     let mut ctx = Ctx {
         laid: Laid::default(),
         image_sizes,
+        heading_color,
         cell,
     };
     for node in parse(markdown, true) {
@@ -1256,6 +1340,17 @@ pub fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheme::Colors;
+
+    fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
+        layout_with_heading_color(
+            markdown,
+            width,
+            cell,
+            image_sizes,
+            Colors::DARK.heading_color(),
+        )
+    }
 
     fn no_images(_: &str) -> Option<ImageSize> {
         None
@@ -1309,6 +1404,62 @@ mod tests {
         assert_eq!(rows[1], "█ █ █");
         assert_eq!(rows[4], "Text");
         assert_eq!(draw("## Sub", 40), vec!["", "Sub", ""]);
+    }
+
+    #[test]
+    fn headings_take_their_color_from_light_and_dark_schemes() {
+        use crate::theme::Theme;
+
+        for (light, background, blue, accent, fallback) in [
+            (
+                true,
+                [250; 3],
+                [24, 62, 133],
+                Color::Rgb(24, 62, 133),
+                Color::Blue,
+            ),
+            (
+                false,
+                [16; 3],
+                [0, 0, 238],
+                Color::Rgb(102, 102, 245),
+                Color::LightBlue,
+            ),
+        ] {
+            let theme = Theme {
+                background,
+                blue,
+                red: [160, 35, 55],
+                green: [35, 146, 77],
+                accent: [100, 70, 140],
+                magenta: [100, 70, 140],
+            };
+            for (theme, expected) in [(Some(theme), accent), (None, fallback)] {
+                let colors = Colors { theme, light };
+                let md = "# Hi\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\nBody";
+                let laid =
+                    layout_with_heading_color(md, 40, (8, 16), &no_images, colors.heading_color());
+                let mut segs = laid.rows.iter().flat_map(|row| &row.segs);
+                for heading in segs.by_ref().take(7) {
+                    assert_eq!(heading.style.fg, Some(expected));
+                }
+                let body = segs.next().expect("body follows the headings");
+                assert_eq!(body.text, "Body");
+                assert_eq!(body.style.fg, None);
+
+                let wrapped = layout_with_heading_color(
+                    "# Long title",
+                    5,
+                    (8, 16),
+                    &no_images,
+                    colors.heading_color(),
+                );
+                let title = &wrapped.rows[1].segs[0];
+                assert_eq!(title.text, "Long");
+                assert_eq!(title.style.fg, Some(expected));
+                assert!(title.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
     }
 
     #[test]
@@ -1402,6 +1553,69 @@ mod tests {
             draw("See [1] and [x](https://e.com).", 60)[0],
             "See [1] and x (https://e.com)."
         );
+    }
+
+    #[test]
+    fn wikilinks_and_embeds_show_their_labels_as_underlined_text() {
+        let input = "[[target]] ![[embed]] ![[asset|caption]] end\n\n# [[path/target|alias]]";
+        let doc = crate::markdown::from_converted(
+            "Notes".into(),
+            input,
+            std::path::Path::new("/docs/notes.md"),
+        );
+        let laid = layout(&doc.source.page(0), 80, (8, 16), &no_images);
+        assert_eq!(
+            laid.text.iter().collect::<String>(),
+            "target embed caption end\nalias\n"
+        );
+        let underlined: Vec<_> = laid
+            .rows
+            .iter()
+            .flat_map(|row| &row.segs)
+            .filter(|seg| seg.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|seg| seg.text.as_str())
+            .collect();
+        assert_eq!(underlined, ["target", "embed", "caption", "alias"]);
+        assert!(laid.figures.is_empty());
+    }
+
+    #[test]
+    fn links_know_where_they_point_and_what_text_they_cover() {
+        let laid = layout(
+            "See [the **docs**](https://x.dev) and [[notes/plan|the plan]], ![[sketch]] or [top](#top).",
+            80,
+            (8, 16),
+            &no_images,
+        );
+        let text: String = laid.text.iter().collect();
+        let spans: Vec<(&str, &Link)> = laid
+            .links
+            .iter()
+            .map(|(span, link)| {
+                let start = text.char_indices().nth(span.start).map_or(0, |(i, _)| i);
+                let end = text
+                    .char_indices()
+                    .nth(span.end)
+                    .map_or(text.len(), |(i, _)| i);
+                (&text[start..end], link)
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (
+                    "the docs (https://x.dev)",
+                    &Link::Url("https://x.dev".into())
+                ),
+                ("the plan", &Link::Note("notes/plan".into())),
+                ("sketch", &Link::Note("sketch".into())),
+                ("top", &Link::Url("#top".into())),
+            ]
+        );
+        let plain = text.find("See").expect("plain text");
+        assert_eq!(laid.link_at(plain), None);
+        let at = text[..text.find("plan").expect("label")].chars().count();
+        assert_eq!(laid.link_at(at), Some(&Link::Note("notes/plan".into())));
     }
 
     #[test]

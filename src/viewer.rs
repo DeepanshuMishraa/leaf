@@ -33,6 +33,7 @@ use crate::article;
 use crate::doc::{Doc, ImageRef, WATCH_TICK, Watch};
 use crate::edge;
 use crate::find::Query;
+use crate::follow::{self, Follow};
 use crate::highlight::{self, Highlight};
 use crate::hue::Hue;
 use crate::kitty::{self, Kitty};
@@ -310,6 +311,9 @@ struct ScreenRow {
 
 /// Hears the full set of highlights after each change.
 pub type HighlightsListener = Box<dyn FnMut(&[Highlight])>;
+
+/// Opens a web link outside leaf.
+type UrlOpener = Box<dyn Fn(&str) -> io::Result<()>>;
 pub type BookmarksListener = Box<dyn FnMut(&[Bookmark])>;
 pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 
@@ -416,6 +420,8 @@ pub struct App {
     /// Where a question about a selection is sent. Tests stand in for the
     /// agent pane; otherwise leaf finds one in this Rex session.
     ask: Option<Box<dyn FnMut(&str) -> Result<Agent, AgentFailed>>>,
+    /// Opens a web link from the page. Tests stand in for the browser.
+    open_url: UrlOpener,
     /// A command from Rex's command palette, being typed in after F12.
     rex_command: Option<String>,
     bookmarks: Vec<Bookmark>,
@@ -545,6 +551,7 @@ impl App {
             hue: Hue::default(),
             notice: None,
             ask: None,
+            open_url: Box::new(crate::prmedia::open),
             rex_command: None,
             bookmarks: options.bookmarks.clone(),
             reading_width: ReadingWidth::Columns(options.max_text_width),
@@ -604,7 +611,7 @@ impl App {
         if self.folder.is_some() {
             let step = if forward { 1 } else { -1 };
             if let Some(path) = self.options.picture_path.clone() {
-                self.go = Some(Go { path, step });
+                self.go = Some(Go::Neighbour { path, step });
                 self.quit = true;
             }
         } else if forward {
@@ -682,11 +689,12 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
-        let laid = Rc::new(render::layout(
+        let laid = Rc::new(render::layout_with_heading_color(
             &markdown,
             self.width,
             (font.width, font.height),
             &sizes,
+            self.look.colors().heading_color(),
         ));
         self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
@@ -1580,7 +1588,7 @@ impl App {
             },
         ));
         rows.extend([
-            ("drag", "select and copy text"),
+            ("drag  click", "select and copy text; click follows a link"),
             ("@  ^enter", "ask an agent about the selection (⇧⌘A in Rex)"),
             ("y", "highlight selection, or clear one"),
             ("1-6", "pick a color; paints the selection"),
@@ -2838,6 +2846,53 @@ impl App {
         (self.options.on_image_mode)(self.image_mode);
     }
 
+    /// The link drawn in the screen cell at `x`, `y`, if any. Unlike `hit`,
+    /// only a cell the link's own text covers counts.
+    fn link_under(&mut self, x: u16, y: u16) -> Option<render::Link> {
+        let row = y.checked_sub(self.column.y)?;
+        let slot = (*self.screen.get(row as usize)?)?;
+        let laid = self.laid(slot.page);
+        let row = laid
+            .rows
+            .get(slot.row.checked_sub(self.prefix(slot.page))?)?;
+        let col = x.checked_sub(self.column.x)?;
+        for seg in &row.segs {
+            let Some(offset) = seg.offset else { continue };
+            let mut sx = seg.x;
+            for (n, c) in seg.text.chars().enumerate() {
+                let w = char_width(c).max(1);
+                if (sx..sx + w).contains(&col) {
+                    return laid.link_at(offset + n).cloned();
+                }
+                sx += w;
+            }
+        }
+        None
+    }
+
+    /// Opens a web link in the browser, or closes this document so `main`
+    /// opens the file a link leads to. Where it leads nowhere, the footer says why.
+    fn follow_link(&mut self, link: &render::Link) {
+        let doc = self
+            .options
+            .picture_path
+            .as_deref()
+            .filter(|path| path.is_file());
+        match follow::resolve(link, doc) {
+            Ok(Follow::Web(url)) => {
+                self.notice = Some(match (self.open_url)(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(e) => format!("couldn't open {url} ({e})"),
+                });
+            }
+            Ok(Follow::Open(path)) => {
+                self.go = Some(Go::Open(path));
+                self.quit = true;
+            }
+            Err(why) => self.notice = Some(why),
+        }
+    }
+
     /// Where in the text a screen cell falls: the character under it, or
     /// the nearest edge of the text on its row.
     fn hit(&mut self, x: u16, y: u16) -> Option<TextPos> {
@@ -2966,6 +3021,10 @@ impl App {
                         let text = self.selected_text();
                         if text.is_empty() {
                             self.selection = None;
+                            // A click, not a drag: follow the link under it.
+                            if let Some(link) = self.link_under(x, y) {
+                                self.follow_link(&link);
+                            }
                         } else {
                             // Taking over the mouse turns off the terminal's own selection, so copy here.
                             let context = self.selection_context(&text);
@@ -3416,7 +3475,11 @@ impl App {
             }
             // Following the terminal's theme reads its reply from stdin, so it's
             // asked only after a wait that no key broke.
+            let heading_color = self.look.colors().heading_color();
             if self.look.refresh(quiet && !event::poll(Duration::ZERO)?) {
+                if self.look.colors().heading_color() != heading_color {
+                    self.laid.clear();
+                }
                 quiet = false;
             }
             // Between words nothing on screen changes, so there's nothing to draw.
@@ -3585,13 +3648,14 @@ fn parse_color_reply(reply: &str) -> Option<Rgb> {
     Some([*channels.first()?, *channels.get(1)?, *channels.get(2)?])
 }
 
-/// A request to move along to another picture in the same folder.
+/// What the reader asks `main` to open next.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Go {
-    /// The picture that was open.
-    pub path: PathBuf,
-    /// 1 for the next picture, -1 for the previous one.
-    pub step: i32,
+pub enum Go {
+    /// The next or previous picture in the same folder as `path`, the picture
+    /// that was open: `step` is 1 for the next, -1 for the previous.
+    Neighbour { path: PathBuf, step: i32 },
+    /// A file a clicked link leads to.
+    Open(PathBuf),
 }
 
 /// Runs the reader in the terminal until the reader quits, or asks for
@@ -3713,6 +3777,95 @@ mod tests {
                         .map(|x| (line[..x].chars().count() as u16, y as u16))
                 })
                 .expect("text is on screen")
+        }
+    }
+
+    /// A markdown file on disk, read in a screen whose browser records what it was asked to open.
+    fn linked_note(name: &str, text: &str) -> (Screen, PathBuf, Rc<RefCell<Vec<String>>>) {
+        let dir = std::env::temp_dir().join(format!("leaf-links-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("today.md");
+        std::fs::write(&path, text).unwrap();
+        std::fs::write(dir.join("plan.md"), "# Plan").unwrap();
+        let options = ViewerOptions {
+            picture_path: Some(path.clone()),
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(crate::markdown::open(&path).unwrap(), 80, 20, options);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let log = opened.clone();
+        s.app.open_url = Box::new(move |url| {
+            log.borrow_mut().push(url.to_owned());
+            Ok(())
+        });
+        (s, dir, opened)
+    }
+
+    fn click(s: &mut Screen, (x, y): (u16, u16)) {
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+    }
+
+    #[test]
+    fn clicking_a_web_link_opens_it_in_the_browser() {
+        let (mut s, dir, opened) = linked_note("web", "Read [the docs](https://x.dev/a) now.");
+        let (x, y) = s.find("docs");
+        click(&mut s, (x + 1, y));
+        assert_eq!(*opened.borrow(), ["https://x.dev/a"]);
+        assert!(!s.app.quit);
+        // The URL shown after the label opens it too.
+        let (x, y) = s.find("x.dev");
+        click(&mut s, (x, y));
+        assert_eq!(opened.borrow().len(), 2);
+        // Plain text beside a link is just text.
+        let (x, y) = s.find("Read");
+        click(&mut s, (x, y));
+        let (x, y) = s.find("now");
+        click(&mut s, (x + 1, y));
+        assert_eq!(opened.borrow().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_wikilink_opens_its_note_in_leaf() {
+        let (mut s, dir, opened) = linked_note("wiki", "Next: [[plan|the plan]] and [[nowhere]].");
+        let (x, y) = s.find("nowhere");
+        click(&mut s, (x, y));
+        assert!(!s.app.quit);
+        assert!(s.draw().contains("no note named nowhere"));
+        let (x, y) = s.find("the plan");
+        click(&mut s, (x + 2, y));
+        assert_eq!(s.app.go, Some(Go::Open(dir.join("plan.md"))));
+        assert!(s.app.quit);
+        assert!(opened.borrow().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dragging_across_a_link_selects_instead_of_following_it() {
+        let (mut s, dir, opened) = linked_note("drag", "Read [the docs](https://x.dev/a) now.");
+        let (x, y) = s.find("the docs");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 5, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), x + 5, y);
+        assert!(opened.borrow().is_empty());
+        assert_eq!(s.app.copy.as_deref(), Some("the d"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn headings_follow_the_reader_theme() {
+        for (colors, expected) in crate::scheme::HEADING_COLOR_CASES {
+            let doc = book(&["## Heading"]);
+            let mut app = App::new(doc, ViewerOptions::default(), Picker::halfblocks());
+            app.look.set_test_colors(colors);
+            let mut screen = Screen {
+                app,
+                terminal: Terminal::new(TestBackend::new(80, 20)).expect("test terminal"),
+            };
+            let position = screen.find("Heading");
+            assert_eq!(screen.terminal.backend().buffer()[position].fg, expected);
         }
     }
 
@@ -4324,7 +4477,7 @@ mod tests {
         };
         for code in [KeyCode::Right, KeyCode::Char('l'), KeyCode::Char('n')] {
             let (asked, quit) = go(code);
-            let want = Go {
+            let want = Go::Neighbour {
                 path: middle.clone(),
                 step: 1,
             };
@@ -4333,7 +4486,7 @@ mod tests {
         }
         for code in [KeyCode::Left, KeyCode::Char('h'), KeyCode::Char('p')] {
             let (asked, quit) = go(code);
-            let want = Go {
+            let want = Go::Neighbour {
                 path: middle.clone(),
                 step: -1,
             };

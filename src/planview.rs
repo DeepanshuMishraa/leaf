@@ -18,6 +18,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::doc::{WATCH_TICK, Watch};
 use crate::hue::Hue;
+use crate::look::Look;
 use crate::planblocks::{self, Block};
 use crate::render::{self, DIM, Laid};
 use crate::review::{Notes, Outcome, PlanEdit, PlanNote, PlanTarget, Review, Verdict};
@@ -160,9 +161,11 @@ struct App {
     before: Option<std::collections::HashMap<String, usize>>,
     /// How many of the round before's blocks are gone.
     dropped_blocks: usize,
-    /// Each block laid out at `laid_width`.
+    /// Each block laid out at `laid_width` with `laid_heading_color`.
     laid: Vec<Laid>,
     laid_width: u16,
+    laid_heading_color: Color,
+    look: Look,
     notes: Vec<PlanNote>,
     global: Option<String>,
     focus: Focus,
@@ -198,6 +201,7 @@ impl App {
         } else {
             Focus::Block(0)
         };
+        let look = Look::detect();
         let mut app = App {
             subject: plan.subject,
             source: plan.source,
@@ -208,6 +212,8 @@ impl App {
             blocks,
             laid: Vec::new(),
             laid_width: 0,
+            laid_heading_color: look.colors().heading_color(),
+            look,
             notes: Vec::new(),
             global: None,
             focus,
@@ -425,17 +431,26 @@ impl App {
     }
 
     fn lay_out(&mut self, width: u16) {
-        if width == self.laid_width && self.laid.len() == self.blocks.len() {
+        let heading_color = self.look.colors().heading_color();
+        let same_layout = width == self.laid_width && self.laid.len() == self.blocks.len();
+        if same_layout && heading_color == self.laid_heading_color {
             return;
         }
         self.laid_width = width;
+        self.laid_heading_color = heading_color;
         self.laid = self
             .blocks
             .iter()
             .map(|block| {
                 // Layout spaces blocks apart; here the gaps are drawn between
                 // blocks instead, so each starts on its first line of text.
-                let mut laid = render::layout(&block.text, width, (8, 16), &no_images);
+                let mut laid = render::layout_with_heading_color(
+                    &block.text,
+                    width,
+                    (8, 16),
+                    &no_images,
+                    heading_color,
+                );
                 let lead = laid.rows.iter().take_while(|r| r.segs.is_empty()).count();
                 laid.rows.drain(..lead);
                 while laid.rows.last().is_some_and(|r| r.segs.is_empty()) {
@@ -444,6 +459,9 @@ impl App {
                 laid
             })
             .collect();
+        if same_layout {
+            return;
+        }
         // Rows move with the width, so the cursor goes to a row that exists
         // and a visual selection ends.
         if self.visual.take().is_some() {
@@ -2156,7 +2174,9 @@ fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Res
         if app.outcome.is_some() {
             return Ok(());
         }
-        if !event::poll(WATCH_TICK)? {
+        let ready = event::poll(WATCH_TICK)?;
+        app.look.refresh(!ready);
+        if !ready {
             continue;
         }
         match event::read()? {
@@ -2520,6 +2540,22 @@ create table tokens (id int);
         match &app.outcome {
             Some(Outcome::Sent { text, .. }) => text,
             other => panic!("expected a sent review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn headings_follow_the_theme_at_the_same_plan_width() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).expect("test terminal");
+        let position = find(&draw(&mut app, 90, 30), "Steps");
+        press(&mut app, KeyCode::Char('V'));
+        let visual = app.visual.expect("started a visual selection");
+
+        for (colors, expected) in crate::scheme::HEADING_COLOR_CASES {
+            app.look.set_test_colors(colors);
+            terminal.draw(|f| app.draw(f)).expect("draws");
+            assert_eq!(terminal.backend().buffer()[position].fg, expected);
+            assert_eq!(app.visual, Some(visual));
         }
     }
 
