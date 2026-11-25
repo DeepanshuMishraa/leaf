@@ -165,6 +165,23 @@ impl Layout {
         }
     }
 
+    fn pane_widths(self, width: u16) -> (u16, u16) {
+        match self {
+            Layout::Inline => (width, width),
+            Layout::Split => {
+                let space = width.saturating_sub(1); // split divider
+                (space / 2, space - space / 2)
+            }
+        }
+    }
+
+    fn gutter(self, number: usize) -> usize {
+        match self {
+            Layout::Split => number + 2,
+            Layout::Inline => 2 * number + 3,
+        }
+    }
+
     fn toggled(self) -> Self {
         match self {
             Layout::Split => Layout::Inline,
@@ -538,7 +555,9 @@ struct App {
     cursor: usize,
     /// First split line on screen.
     scroll: usize,
-    left: u16,
+    left: usize,
+    /// Maximum old/new content widths, measured only on the first pan in a diff.
+    content_widths: Option<(usize, usize)>,
     /// The split line where a visual selection started.
     selection: Option<usize>,
     /// Vim-style visual mode: movement extends the selection, and Escape leaves
@@ -621,6 +640,7 @@ impl App {
             cursor,
             scroll: 0,
             left: 0,
+            content_widths: None,
             selection: None,
             visual: false,
             focus: None,
@@ -877,6 +897,7 @@ impl App {
                         .and_then(|at| self.loaded.diff.file(at - 1))
                         .map(|file| file.path().to_owned());
                     self.loaded = loaded;
+                    self.content_widths = None;
                     self.key = self.loaded.key.clone();
                     self.split = Split::new(&self.loaded.diff, self.layout);
                     if !same_key {
@@ -1615,8 +1636,41 @@ impl App {
         }
     }
 
+    fn max_left(&mut self) -> usize {
+        let diff = &self.loaded.diff;
+        let (old, new) = *self.content_widths.get_or_insert_with(|| {
+            let (mut old, mut new) = (0, 0);
+            for (i, row) in diff
+                .rows()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.kind.is_content())
+            {
+                let width = cells(diff.content(i));
+                if row.kind != RowKind::Added {
+                    old = old.max(width);
+                }
+                if row.kind != RowKind::Removed {
+                    new = new.max(width);
+                }
+            }
+            (old, new)
+        });
+        let (left, right) = self.layout.pane_widths(self.view.width);
+        let gutter = self.layout.gutter(self.number_width());
+        let overflow = |width: usize, pane: u16| match (pane as usize).saturating_sub(gutter) {
+            0 => 0,
+            room => width.saturating_sub(room),
+        };
+        overflow(old, left).max(overflow(new, right))
+    }
+
     fn scroll_sideways(&mut self, right: bool) {
-        self.left = self.left.saturating_add_signed(if right { 4 } else { -4 });
+        self.left = if right {
+            self.left.saturating_add(4).min(self.max_left())
+        } else {
+            self.left.saturating_sub(4)
+        };
     }
 
     /// Scrolls when a drag reaches past the top or bottom of the view.
@@ -2375,6 +2429,9 @@ impl App {
         }
         let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         self.view = body;
+        if self.left > 0 {
+            self.left = self.left.min(self.max_left());
+        }
         self.follow_cursor();
         if let Some(selected) = self.overview {
             self.draw_overview(f, body, selected);
@@ -2684,8 +2741,7 @@ impl App {
             self.side_line(&mut spans, Some(row), drawn, width, side, true);
             return Line::from(spans);
         }
-        let left_width = width.saturating_sub(1) / 2;
-        let right_width = width.saturating_sub(1 + left_width);
+        let (left_width, right_width) = self.layout.pane_widths(width);
         self.side_line(&mut spans, line.left, Side::Old, left_width, side, false);
         let rule_style = if side.highlighted {
             Style::default().fg(ACCENT).bg(self.palette.focus)
@@ -2786,19 +2842,11 @@ impl App {
             (RowKind::Removed, Side::Old) => self.palette.removed_word,
             _ => Color::Reset,
         };
-        let gutter = if both { 2 * number + 3 } else { number + 2 };
+        let gutter = self.layout.gutter(number);
         let available = (width as usize).saturating_sub(gutter);
         let overlay = state.highlighted.then_some(self.palette.focus);
         let used = text_spans(
-            spans,
-            &text,
-            self.left as usize,
-            available,
-            base,
-            kinds_line,
-            emphasis,
-            word,
-            overlay,
+            spans, &text, self.left, available, base, kinds_line, emphasis, word, overlay,
         );
         let filled = (gutter + used).min(width as usize);
         if filled < width as usize {
@@ -3273,16 +3321,16 @@ fn hunk_note(text: &str) -> Option<&str> {
     (!note.is_empty()).then_some(note)
 }
 
+fn cell_width(ch: char, column: usize) -> usize {
+    if ch == '\t' {
+        4 - column % 4
+    } else {
+        ch.width().unwrap_or(0)
+    }
+}
+
 fn cells(text: &str) -> usize {
-    text.chars()
-        .map(|ch| {
-            if ch == '\t' {
-                4
-            } else {
-                ch.width().unwrap_or(0)
-            }
-        })
-        .sum()
+    text.chars().fold(0, |col, ch| col + cell_width(ch, col))
 }
 
 /// Appends `text` to `spans` one style run at a time, skipping `start` columns
@@ -3318,8 +3366,8 @@ fn text_spans(
         if let Some(selection) = selection {
             style = style.bg(selection);
         }
+        let width = cell_width(*ch, column);
         if *ch == '\t' {
-            let width = 4 - column % 4;
             if column >= start {
                 if used + width > avail {
                     break;
@@ -3330,7 +3378,6 @@ fn text_spans(
             column += width;
             continue;
         }
-        let width = ch.width().unwrap_or(0);
         if column + width <= start {
             column += width;
             continue;
@@ -4852,6 +4899,59 @@ diff --git a/b.rs b/b.rs
             wheel(&mut app, MouseEventKind::ScrollLeft);
             assert_eq!(app.left, 0);
         }
+    }
+
+    #[test]
+    fn horizontal_scroll_stops_at_the_last_content_column() {
+        // 14 display columns: the tab after "ab" occupies two, as does 界.
+        let patch = PATCH.replace("let b = 3;", "ab\t界12345END");
+        for (layout, width, limit) in [(Layout::Split, 26, 6), (Layout::Inline, 18, 5)] {
+            let mut app = App::new(
+                loaded(&patch),
+                Options {
+                    layout,
+                    ..Options::default()
+                },
+            );
+            draw(&mut app, width, 12);
+            for _ in 0..20 {
+                wheel(&mut app, MouseEventKind::ScrollRight);
+            }
+            assert_eq!(app.left, limit, "{layout:?}");
+            assert!(draw(&mut app, width, 12).contains("END"));
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(app.left, limit - 4);
+            draw(&mut app, 80, 12);
+            assert_eq!(app.left, 0, "all lines fit after resize");
+            press(&mut app, KeyCode::Char('l'));
+            assert_eq!(app.left, 0, "keys share the wheel limit");
+        }
+    }
+
+    #[test]
+    fn horizontal_scroll_reclamps_after_a_layout_switch_or_diff_refresh() {
+        let patch = PATCH.replace("let b = 2;", "123456789abcde");
+        let mut app = App::new(loaded(&patch), Options::default());
+        draw(&mut app, 26, 12);
+        for _ in 0..4 {
+            wheel(&mut app, MouseEventKind::ScrollRight);
+        }
+        assert_eq!(app.left, 7, "the old side has seven columns for code");
+        press(&mut app, KeyCode::Char('i'));
+        draw(&mut app, 26, 12);
+        assert_eq!(app.left, 0, "the whole line fits inline");
+        press(&mut app, KeyCode::Char('i'));
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(TWO_FILES))),
+            remember: None,
+            background: true,
+        });
+        draw(&mut app, 26, 12);
+        assert_eq!(
+            app.left, 0,
+            "the replacement diff contains only short lines"
+        );
     }
 
     #[test]
