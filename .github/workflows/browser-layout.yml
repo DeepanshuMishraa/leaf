@@ -1,0 +1,24 @@
+name: Browser layout
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/browser-layout.yml
+      - build.rs
+      - src/browser.swift
+      - src/browser/**
+      - tests/browser_layout/**
+
+permissions:
+  contents: read
+
+jobs:
+  browser-layout:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile and run the Swift layout tests
+        run: |
+          xcrun swiftc -swift-version 5 src/browser.swift tests/browser_layout/main.swift -o "$RUNNER_TEMP/leaf-layout"
+          "$RUNNER_TEMP/leaf-layout"
