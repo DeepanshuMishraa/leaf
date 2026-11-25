@@ -3721,6 +3721,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn headings_follow_the_reader_theme() {
+        for (colors, expected) in crate::scheme::HEADING_COLOR_CASES {
+            let doc = book(&["## Heading"]);
+            let mut app = App::new(doc, ViewerOptions::default(), Picker::halfblocks());
+            app.look.set_test_colors(colors);
+            let mut screen = Screen {
+                app,
+                terminal: Terminal::new(TestBackend::new(80, 20)).expect("test terminal"),
+            };
+            let position = screen.find("Heading");
+            assert_eq!(screen.terminal.backend().buffer()[position].fg, expected);
+        }
+    }
+
     /// A page with one figure that never decodes, counting the tries.
     struct Broken(Rc<std::cell::Cell<usize>>);
 

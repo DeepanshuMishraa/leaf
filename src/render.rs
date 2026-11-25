@@ -1265,13 +1265,8 @@ fn segs(line: &[Cell], x: u16) -> Vec<Seg> {
     out
 }
 
-/// Lays a page of markdown out `width` columns wide. Each block has a blank
-/// row below it; headings and figures have one above too.
-pub fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
-    layout_with_heading_color(markdown, width, cell, image_sizes, Color::Blue)
-}
-
-/// Lays out a page with the reader's active heading color.
+/// Lays a page out `width` columns wide with the active heading color.
+/// Each block has a blank row below it; headings and figures have one above too.
 pub fn layout_with_heading_color(
     markdown: &str,
     width: u16,
@@ -1298,6 +1293,17 @@ pub fn layout_with_heading_color(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheme::Colors;
+
+    fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
+        layout_with_heading_color(
+            markdown,
+            width,
+            cell,
+            image_sizes,
+            Colors::DARK.heading_color(),
+        )
+    }
 
     fn no_images(_: &str) -> Option<ImageSize> {
         None
@@ -1355,7 +1361,6 @@ mod tests {
 
     #[test]
     fn headings_take_their_color_from_light_and_dark_schemes() {
-        use crate::scheme::Colors;
         use crate::theme::Theme;
 
         for (light, background, blue, accent, fallback) in [

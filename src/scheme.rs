@@ -54,6 +54,25 @@ impl Colors {
     }
 }
 
+#[cfg(test)]
+pub(crate) const HEADING_COLOR_CASES: [(Colors, Color); 2] = [
+    (Colors::DARK, Color::LightBlue),
+    (
+        Colors {
+            theme: Some(Theme {
+                background: [16; 3],
+                blue: [90, 170, 230],
+                red: [160, 35, 55],
+                green: [35, 146, 77],
+                accent: [100, 70, 140],
+                magenta: [100, 70, 140],
+            }),
+            light: false,
+        },
+        Color::Rgb(90, 170, 230),
+    ),
+];
+
 /// Where the colors came from, which says whether and how they're rechecked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
