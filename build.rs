@@ -9,6 +9,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/browser.swift");
+    println!("cargo:rerun-if-changed=src/browser/main.swift");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     let helper = out.join("leaf-webkit-host");
@@ -20,7 +21,7 @@ fn main() {
         let triple = format!("{arch}-apple-macos13.0");
         let result = Command::new("xcrun")
             .args(["swiftc", "-O", "-swift-version", "5", "-target", &triple])
-            .arg("src/browser.swift")
+            .args(["src/browser.swift", "src/browser/main.swift"])
             .arg("-o")
             .arg(&helper)
             .env_remove("MACOSX_DEPLOYMENT_TARGET")
