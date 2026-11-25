@@ -3,6 +3,14 @@
 //! defaults, so asking the terminal can't tell which theme is on. The
 //! settings are read through cfprefsd, which has a switch the moment Rex
 //! makes it; the plist on disk catches up only seconds later.
+//!
+//! They're only the theme on screen when the Rex app showing the pane runs on
+//! this machine. A pane on a remote Rex host is shown by the app on the
+//! person's own Mac, whose settings this host can't read, while the host may
+//! have a Rex app of its own with another theme, or in light mode.
+//! [`shown_elsewhere`] tells the two apart. There, the showing app gives the
+//! pane its theme once it claims it, and the terminal answers color queries
+//! with that theme from then on (see `Scheme::Pushed`).
 
 use serde_json::Value;
 
@@ -28,14 +36,14 @@ fn home() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// The theme Rex shows now. `None` outside Rex, on a host without Rex's
-/// settings (a remote pane), or when they can't be read; the caller then
-/// asks the terminal.
+/// The theme Rex shows now. `None` outside Rex, in a pane another machine's
+/// Rex app shows, on a host without Rex's settings, or when they can't be
+/// read; the caller then asks the terminal.
 #[cfg(target_os = "macos")]
 pub fn active() -> Option<Theme> {
     use crate::prefs::{self, Pref};
 
-    if !inside_rex() {
+    if !inside_rex() || !shown_here() {
         return None;
     }
     prefs::sync(DOMAIN);
@@ -68,6 +76,75 @@ pub fn active() -> Option<Theme> {
 #[cfg(not(target_os = "macos"))]
 pub fn active() -> Option<Theme> {
     None
+}
+
+/// Whether this is a Rex pane that another machine's Rex app shows, so this
+/// machine's settings aren't the theme on screen and the terminal is asked
+/// instead. Every Rex pane off macOS is: Rex's app runs only on a Mac.
+#[cfg_attr(test, allow(dead_code))]
+pub fn shown_elsewhere() -> bool {
+    inside_rex() && !shown_here()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shown_here() -> bool {
+    false
+}
+
+/// Whether the Rex app showing this pane runs on this machine, so the
+/// settings here are its own. Asked once, since it takes two `rex` calls and
+/// the theme is read again every quarter second. When Rex can't say, the
+/// settings here are used, as before.
+#[cfg(target_os = "macos")]
+fn shown_here() -> bool {
+    static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HERE.get_or_init(|| {
+        let json = |args: &[&str]| -> Option<Value> {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            serde_json::from_str(&crate::agent::rex_output(&args).ok()?).ok()
+        };
+        let (Some(block), Some(session)) =
+            (crate::agent::rex_block(), crate::agent::rex_session_id())
+        else {
+            return true;
+        };
+        let Some(blocks) = json(&["block", "ls", "-s", &session, "--json"]) else {
+            return true;
+        };
+        let Some(clients) = json(&["api", "call", "client.list"]) else {
+            return true;
+        };
+        shown_by_local_app(&blocks, &clients, &block).unwrap_or(true)
+    })
+}
+
+/// Whether the client showing `block` reached Rex over its local socket, from
+/// `rex block ls --json` and the `client.list` API. The client showing a pane
+/// owns it; a pane just opened may not have an owner yet, so the owner of
+/// another pane in its window stands in. `None` when no owner is known.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn shown_by_local_app(blocks: &Value, clients: &Value, block: &str) -> Option<bool> {
+    let blocks = blocks.get("blocks")?.as_array()?;
+    fn owner(entry: &Value) -> Option<&str> {
+        entry.get("owner").and_then(Value::as_str)
+    }
+    let this = blocks
+        .iter()
+        .find(|entry| entry.get("block_id").and_then(Value::as_str) == Some(block))?;
+    let window = this.get("window_id").and_then(Value::as_str);
+    let client = owner(this).or_else(|| {
+        let window = window?;
+        blocks
+            .iter()
+            .filter(|entry| entry.get("window_id").and_then(Value::as_str) == Some(window))
+            .find_map(owner)
+    })?;
+    let entry = clients
+        .get("clients")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("client_id").and_then(Value::as_str) == Some(client))?;
+    Some(entry.pointer("/principal/transport")?.as_str()? == "unix")
 }
 
 /// The built-in themes, read once: they only change when Rex updates.
@@ -236,6 +313,45 @@ mod tests {
                 accent: [204, 204, 204],
                 magenta: [204, 204, 204],
             })
+        );
+    }
+
+    #[test]
+    fn the_app_showing_a_pane_is_local_only_over_the_unix_socket() {
+        // A remote host's session: this Mac's app (over Tailscale) shows the
+        // window, while the host's own Rex app is attached too.
+        let clients = json!({ "clients": [
+            { "client_id": "client:host-app",
+              "principal": { "kind": "peer", "transport": "unix" },
+              "info": { "kind": "app" } },
+            { "client_id": "client:mac-app",
+              "principal": { "kind": "tailscale", "transport": "tailscale" },
+              "info": { "kind": "app" } }
+        ] });
+        let blocks = json!({ "blocks": [
+            { "block_id": "block:agent", "window_id": "window:w", "owner": "client:mac-app" },
+            { "block_id": "block:review", "window_id": "window:w", "owner": null },
+            { "block_id": "block:mine", "window_id": "window:x", "owner": "client:host-app" },
+            { "block_id": "block:alone", "window_id": null, "owner": null }
+        ] });
+        assert_eq!(
+            shown_by_local_app(&blocks, &clients, "block:agent"),
+            Some(false)
+        );
+        // Not owned yet: its window's owner shows it.
+        assert_eq!(
+            shown_by_local_app(&blocks, &clients, "block:review"),
+            Some(false)
+        );
+        assert_eq!(
+            shown_by_local_app(&blocks, &clients, "block:mine"),
+            Some(true)
+        );
+        assert_eq!(shown_by_local_app(&blocks, &clients, "block:alone"), None);
+        assert_eq!(shown_by_local_app(&blocks, &clients, "block:missing"), None);
+        assert_eq!(
+            shown_by_local_app(&json!({}), &clients, "block:agent"),
+            None
         );
     }
 
