@@ -4,6 +4,7 @@
 
 - Rex's command palette has **Leaf: Open Whiteboard**, which starts a new board in the active pane's folder, beside it when the pane is busy.
 - `ctrl+w` deletes the word before the cursor in `leaf plan` comments and in `leaf diff` file notes, like `alt+backspace`.
+- In the diff viewer, `h` folds the file under the cursor down to its heading and `l` opens it again. Marking a file viewed with `w` folds it, unmarking opens it, and files already marked viewed open folded. A viewed file's heading is muted and says `✓ viewed`, whether it's folded or open, so a file you only folded out of the way still looks unread. A folded file that changes on reload opens again, and jumping to a file from the overview, the file picker or a comment opens it. Scrolling sideways moves to `H`/`L` (`←`/`→` still work outside a pull request's Code tab).
 
 ## 0.18.2
 
