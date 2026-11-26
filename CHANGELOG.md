@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.3
 
 - Rex's command palette has **Leaf: Open Whiteboard**, which starts a new board in the active pane's folder, beside it when the pane is busy.
 - `ctrl+w` deletes the word before the cursor in `leaf plan` comments and in `leaf diff` file notes, like `alt+backspace`.
