@@ -2908,7 +2908,10 @@ impl App {
         if let Some(index) = pinned
             && let Some(row) = self.split.lines()[index].band
         {
-            let drawn = self.row_line(row);
+            let mut drawn = self.row_line(row);
+            if self.split.lines()[index].folded {
+                fold_heading(&mut drawn);
+            }
             headers.push((0, drawn.width() as u16));
             lines.push(drawn);
         }
@@ -4060,9 +4063,7 @@ impl App {
         // A viewed file folds out of the way; unmarked, it opens again.
         self.set_folded(file, viewed);
         let count = self.loaded.diff.files().len();
-        let seen = (0..count)
-            .filter(|f| self.notes.is_viewed(&self.loaded.diff, *f))
-            .count();
+        let seen = self.viewed.len();
         self.toast(if viewed {
             format!("Viewed · {seen} of {count} files")
         } else {
@@ -4210,7 +4211,7 @@ impl App {
             .min(files.len().saturating_sub(room));
         for (index, file) in files.iter().enumerate().skip(first).take(room) {
             let row = index + 1;
-            let viewed = self.notes.is_viewed(diff, index);
+            let viewed = self.viewed.contains(&index);
             let old = file.old_path.as_deref().filter(|old| *old != file.path());
             let has_note = self.notes.files.contains_key(file.path());
             let comments = self.draft_comments_in(file.path())
