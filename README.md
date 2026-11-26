@@ -52,7 +52,32 @@ Optional, at `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config
 max_width = 100   # reading column width, default 76
 colorful_markdown = true   # terminal palette colors for heading levels and links, default false
 hide_link_urls = true   # hide URLs printed after clickable link labels, default false
+
+[diff]
+layout = "inline"   # "split" or "inline"; left out, a diff opens in the layout last used
+
+[outline]
+width = 40   # the outline sidebar's width when it opens, 20 through 80, default 32
+
+# Rebind keys. Each line names an action and one key or a list of them.
+# Actions you leave out keep their keys; an empty list unbinds one.
+[keys.reader]
+quit = ["q", "ctrl+q"]
+scroll_down = ["j", "down", "ctrl+e"]
+pen = []
+
+[keys.diff]
+next_file = ["]", "n", "tab"]
+
+[keys.board]
+tool_box = "R"
 ```
+
+Every view has its own key table: `reader`, `ink`, `bookmarks`, `outline`, `diff`, `diff_comments`, `diff_overview`, `confirm_post`, `verdict`, `plan`, `plan_notes`, `plan_quit`, `board`, `pr_list` and `pr`. `leaf config keys` prints them all with every action, its default keys and what it does, ready to copy. Text you type, such as comments, find and filters, keeps its own keys.
+
+Keys are written as `q`, `G`, `ctrl+d`, `alt+enter`, `shift+tab`, `space`, `enter`, `esc`, `tab`, `up`, `pagedown`, `home`, `f1` and so on. A key an action didn't have before is taken from any other action that had it, so each key does one thing; restating an action's defaults changes nothing. A reader color can't share a key with a `[keys.ink]` action, since ink keys come first while a stroke is picked. `?` lists the keys as you set them.
+
+`leaf config check` reads the file as leaf would. A file that doesn't read stops the reader, `leaf diff`, `leaf review`, `leaf plan`, `leaf board` and `leaf pr` with a message naming the line. If it breaks while `leaf pr` is open, opening the Code tab shows the error instead and `leaf pr` stays as it was. A misspelled action lists the actions its table has, and a misspelled key says how to write one. `leaf config path` prints where the file is.
 
 ## Diffs
 

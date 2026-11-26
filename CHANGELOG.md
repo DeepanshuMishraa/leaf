@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Rebind any view's keys in `config.toml`: the reader, its ink and bookmarks, the outline, the diff and its comments, overview and verdict, `leaf plan`, `leaf board` and `leaf pr`, each under its own `[keys.<view>]` table. Each line names an action and a key or a list of keys, such as `quit = ["q", "ctrl+q"]`. Actions left out keep their keys, an empty list unbinds one, and a new key given to one action is taken from the others. `?` and the hints at the bottom of each view show the keys as you set them. Text you type, such as comments, find and filters, keeps its own keys. The defaults are the keys leaf had before.
+- `leaf config keys` prints every key table with each action, its default keys and what it does. `leaf config check` reads `config.toml` as leaf would, and `leaf config path` says where it is.
+- A `config.toml` that doesn't read now stops `leaf diff`, `leaf review`, `leaf plan`, `leaf board` and `leaf pr` as it already stopped the reader, with a message naming the table, action and key. If the file breaks while `leaf pr` is open, the Code tab says so and stays closed.
+- `[diff] layout = "split"` or `"inline"` sets the layout a diff opens in, over the one last used. `[outline] width` sets the outline sidebar's width when it opens.
+- `leaf agent setup` installs a `leaf-config` skill, so an agent can rebind keys and change settings for you and check the file afterwards.
 - A review that an agent in tmux opened beside itself delivers its verdict to the agent's pane again when tmux's session environment carries Rex's variables (#85). It used to fail with `block target "%N" not found` and copy the text to the clipboard instead.
 - `t` opens an outline beside the text and `T` opens it over the text, in the reader and the diff viewer (#78). Either key closes what it opened or switches to the other form. Go to page moves from `t` to `:`.
 - In the reader, the outline lists a PDF's bookmarks or an EPUB's table of contents, and the headings on the page when the document has none (#59). The marked entry follows the text as it scrolls, and moving in the outline scrolls the text to that entry.

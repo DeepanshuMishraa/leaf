@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::keymap::{Keymap, actions};
 use crate::render;
 
 /// Where an entry goes, as an index only the view can resolve into a place.
@@ -332,6 +333,8 @@ pub struct OpenOutline {
     pub page: Option<usize>,
     /// Whether the mouse holds the sidebar's right edge, between a press on it and the release.
     pub dragging: bool,
+    /// The keys it answers to, as `[keys.outline]` sets them.
+    keys: Keymap<OutlineAction>,
 }
 
 #[derive(Clone, Copy)]
@@ -356,8 +359,8 @@ pub enum Ask {
 /// The sidebar's width when it first opens.
 pub const SIDEBAR_COLUMNS: u16 = 32;
 /// The narrowest and widest `<` and `>` take the sidebar; the screen may hold it narrower still.
-const SIDEBAR_MIN: u16 = 20;
-const SIDEBAR_MAX: u16 = 80;
+pub const SIDEBAR_MIN: u16 = 20;
+pub const SIDEBAR_MAX: u16 = 80;
 const SIDEBAR_STEP: u16 = 4;
 
 /// The sidebar's width one step wider or narrower than `columns`.
@@ -382,6 +385,25 @@ pub fn edge(height: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+actions! {
+    /// While the outline is open. A filter being typed takes every key but
+    /// `enter`, `esc`, `tab` and the arrows, so these don't apply to it.
+    pub enum OutlineAction in "outline", "The outline, in the reader and the diff" {
+        Filter = "filter" ["/"] "filter the entries by typed characters",
+        Close = "close" ["esc", "q"] "close the outline",
+        Sidebar = "sidebar" ["t"] "outline beside the text, or close it",
+        Window = "window" ["T"] "outline over the text, or close it",
+        Narrower = "narrower" ["<"] "narrow the sidebar",
+        Wider = "wider" [">"] "widen the sidebar",
+        Down = "down" ["j", "down"] "next entry",
+        Up = "up" ["k", "up"] "previous entry",
+        First = "first" ["g", "home"] "first entry",
+        Last = "last" ["G", "end"] "last entry",
+        Unfold = "unfold" ["l", "right"] "open the group",
+        Fold = "fold" ["h", "left"] "close the group",
+    }
+}
+
 impl OpenOutline {
     pub fn new(tree: Outline) -> Self {
         OpenOutline {
@@ -392,7 +414,13 @@ impl OpenOutline {
             pinned: None,
             page: None,
             dragging: false,
+            keys: Keymap::default(),
         }
+    }
+
+    /// The outline answering to `keys` rather than the default keys.
+    pub fn with_keys(self, keys: Keymap<OutlineAction>) -> Self {
+        OpenOutline { keys, ..self }
     }
 
     /// Brings `nodes` as the tree, keeping what's typed. `renewed` says the text moved to
@@ -461,40 +489,33 @@ impl OpenOutline {
         if self.typing {
             return self.type_key(key.code, key.modifiers.contains(KeyModifiers::CONTROL));
         }
-        match key.code {
-            KeyCode::Char('/') => {
+        let Some(action) = self.keys.actions(key).first().copied() else {
+            return (false, None);
+        };
+        let ask = match action {
+            OutlineAction::Filter => {
                 self.tree.filter.clear();
                 self.picked = None;
                 self.typing = true;
-                (true, None)
+                None
             }
-            KeyCode::Esc | KeyCode::Char('q') => (true, Some(Ask::Close)),
-            KeyCode::Char('t') => (true, Some(Ask::Show(OutlineForm::Sidebar))),
-            KeyCode::Char('T') => (true, Some(Ask::Show(OutlineForm::Window))),
-            KeyCode::Char('<') => (true, Some(Ask::Resize { wider: false })),
-            KeyCode::Char('>') => (true, Some(Ask::Resize { wider: true })),
-            KeyCode::Down | KeyCode::Char('j') => {
-                (true, Some(Ask::Go(self.tree.step(self.followed, 1))))
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                (true, Some(Ask::Go(self.tree.step(self.followed, -1))))
-            }
-            KeyCode::Home | KeyCode::Char('g') => (true, Some(Ask::Go(self.tree.step(None, 1)))),
-            KeyCode::End | KeyCode::Char('G') => (true, Some(Ask::Go(self.tree.step(None, -1)))),
-            KeyCode::Right | KeyCode::Char('l') => {
+            OutlineAction::Close => Some(Ask::Close),
+            OutlineAction::Sidebar => Some(Ask::Show(OutlineForm::Sidebar)),
+            OutlineAction::Window => Some(Ask::Show(OutlineForm::Window)),
+            OutlineAction::Narrower => Some(Ask::Resize { wider: false }),
+            OutlineAction::Wider => Some(Ask::Resize { wider: true }),
+            OutlineAction::Down => Some(Ask::Go(self.tree.step(self.followed, 1))),
+            OutlineAction::Up => Some(Ask::Go(self.tree.step(self.followed, -1))),
+            OutlineAction::First => Some(Ask::Go(self.tree.step(None, 1))),
+            OutlineAction::Last => Some(Ask::Go(self.tree.step(None, -1))),
+            OutlineAction::Unfold | OutlineAction::Fold => {
                 if let Some(here) = self.followed {
-                    self.tree.fold_from(here, false);
+                    self.tree.fold_from(here, action == OutlineAction::Fold);
                 }
-                (true, None)
+                None
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(here) = self.followed {
-                    self.tree.fold_from(here, true);
-                }
-                (true, None)
-            }
-            _ => (false, None),
-        }
+        };
+        (true, ask)
     }
 
     /// The keys of a filter being typed; every key is the outline's, letters among them.
@@ -581,7 +602,13 @@ impl OpenOutline {
             spans.extend(row(entry, style, picked));
             lines.push(Line::from(spans));
         }
-        let mut keys = vec![Span::styled("j/k · h/l fold · / ", dim())];
+        let said = format!(
+            "{} · {} fold · {} ",
+            self.keys.pair(OutlineAction::Down, OutlineAction::Up),
+            self.keys.pair(OutlineAction::Fold, OutlineAction::Unfold),
+            self.keys.first(OutlineAction::Filter),
+        );
+        let mut keys = vec![Span::styled(said, dim())];
         keys.push(Span::styled(
             "filter",
             if self.typing { Style::default() } else { dim() },

@@ -118,5 +118,5 @@ Documents open in the pane the palette was called from. If that pane is busy (an
 ## Things to know
 
 - Progress, highlights, bookmarks, comments and unsent review notes are stored in SQLite at `~/.local/share/leaf/leaf.db`. Never edit leaf's data files by hand.
-- Reader settings: `~/.config/leaf/config.toml` (`[reader] max_width = 100`). leaf never writes this file.
+- Settings and keys: `~/.config/leaf/config.toml`. Every view's keys can be rebound there, so the keys listed above may differ for this person; `?` in each view shows their own. leaf never writes this file; to change it for the person, use the `leaf-config` skill.
 - Ink and inline pictures need a Kitty-graphics terminal (Kitty, Ghostty, WezTerm, Rex) and don't work inside tmux.
