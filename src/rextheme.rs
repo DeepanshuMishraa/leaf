@@ -1,6 +1,6 @@
-//! Rex's theme, read from the Mac app's settings. Rex paints its theme in the
-//! app, while the terminal leaf talks to answers color queries with built-in
-//! defaults, so asking the terminal can't tell which theme is on. The
+//! Rex's theme, read from the Mac app's settings. Until the app showing a pane
+//! claims it, the terminal leaf talks to answers color queries with built-in
+//! defaults, so asking the terminal can't be relied on as leaf starts. The
 //! settings are read through cfprefsd, which has a switch the moment Rex
 //! makes it; the plist on disk catches up only seconds later.
 //!
@@ -79,8 +79,8 @@ pub fn active() -> Option<Theme> {
 }
 
 /// Whether this Rex pane follows the terminal instead of this machine's
-/// settings: another machine's Rex app shows it, or no app has claimed it
-/// yet, so which one will is unknown. Either way, the app that claims it
+/// settings: another machine's Rex app shows it, or one is attached and no
+/// app claimed the pane in time, so which one will is unknown. Either way, the app that claims it
 /// gives it its theme, which the terminal then answers with. Every Rex pane
 /// off macOS does: Rex's app runs only on a Mac.
 #[cfg_attr(test, allow(dead_code))]
@@ -94,33 +94,83 @@ fn shown_here() -> bool {
 }
 
 /// Whether a Rex app on this machine shows this pane, so the settings here
-/// are its own. Asked once, since it takes two `rex` calls and the theme is
-/// read again every quarter second; a pane no app has claimed yet counts as
-/// not shown here, since `Scheme::Pushed` takes the theme from whichever app
-/// claims it. When Rex itself can't be asked, the settings here are used, as
-/// before.
+/// are its own. Asked once, since it takes `rex` calls and the theme is read
+/// again every quarter second. With no other machine's app attached, it's
+/// this one's. Otherwise a pane no app has claimed yet is asked about again
+/// for up to `CLAIM_WAIT`, since the claim comes about half a second after a
+/// pane opens; still unclaimed then, it follows the terminal
+/// (`Scheme::Pushed`). When Rex itself can't be asked in time, the settings
+/// here are used, as before.
 #[cfg(target_os = "macos")]
 fn shown_here() -> bool {
+    use std::time::{Duration, Instant};
+
+    const CLAIM_WAIT: Duration = Duration::from_secs(1);
     static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HERE.get_or_init(|| {
-        let json = |args: &[&str]| -> Option<Value> {
-            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-            serde_json::from_str(&crate::agent::rex_output(&args).ok()?).ok()
-        };
         let (Some(block), Some(session)) =
             (crate::agent::rex_block(), crate::agent::rex_session_id())
         else {
             return true;
         };
-        let Some(blocks) = json(&["block", "ls", "-s", &session, "--json", "--short=false"]) else {
+        let Some(clients) = rex_json(&["api", "call", "client.list"]) else {
             return true;
         };
-        let Some(clients) = json(&["api", "call", "client.list"]) else {
+        if !remote_app_attached(&clients) {
             return true;
-        };
-        // Unclaimed, or claimed by another machine's app: follow the terminal.
-        shown_by_local_app(&blocks, &clients, &block) == Some(true)
+        }
+        let deadline = Instant::now() + CLAIM_WAIT;
+        loop {
+            let Some(blocks) =
+                rex_json(&["block", "ls", "-s", &session, "--json", "--short=false"])
+            else {
+                return true;
+            };
+            if let Some(local) = shown_by_local_app(&blocks, &clients, &block) {
+                return local;
+            }
+            if Instant::now() >= deadline {
+                // Still unclaimed: follow the terminal until an app claims it.
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
     })
+}
+
+/// A `rex` call's JSON output, or `None` when it fails or takes over a
+/// second, so a stuck Rex server can't hold up leaf's start. A call that
+/// overruns is left to finish on its own thread.
+#[cfg(target_os = "macos")]
+fn rex_json(args: &[&str]) -> Option<Value> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(crate::agent::rex_output(&args));
+    });
+    let text = receive
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .ok()?
+        .ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Whether an app reached Rex other than over its local socket, from the
+/// `client.list` API: only then can another machine show a pane.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn remote_app_attached(clients: &Value) -> bool {
+    clients
+        .get("clients")
+        .and_then(Value::as_array)
+        .is_some_and(|clients| {
+            clients.iter().any(|entry| {
+                entry.pointer("/info/kind").and_then(Value::as_str) == Some("app")
+                    && entry
+                        .pointer("/principal/transport")
+                        .and_then(Value::as_str)
+                        != Some("unix")
+            })
+        })
 }
 
 /// Whether the client showing `block` reached Rex over its local socket, from
@@ -358,6 +408,19 @@ mod tests {
             shown_by_local_app(&json!({}), &clients, "block:agent"),
             None
         );
+        assert!(remote_app_attached(&clients));
+    }
+
+    #[test]
+    fn only_an_app_off_the_unix_socket_counts_as_remote() {
+        let local = json!({ "clients": [
+            { "client_id": "client:app",
+              "principal": { "transport": "unix" }, "info": { "kind": "app" } },
+            { "client_id": "client:cli",
+              "principal": { "transport": "tailscale" }, "info": { "kind": "cli" } }
+        ] });
+        assert!(!remote_app_attached(&local));
+        assert!(!remote_app_attached(&json!({})));
     }
 
     #[test]
