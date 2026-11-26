@@ -341,7 +341,13 @@ pub fn review_command(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     let failure = Rc::new(RefCell::new(None));
-    let mut options = crate::diff_options(&loaded.key, failure.clone());
+    let mut options = match crate::diff_options(&loaded.key, failure.clone()) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("leaf: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Some(layout) = layout {
         options.layout = layout;
     }

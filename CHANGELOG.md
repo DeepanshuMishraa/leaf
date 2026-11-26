@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Rebind the reader's and the diff viewer's keys in `config.toml`, under `[keys.reader]` and `[keys.diff]`. Each line names an action and a key or a list of keys, such as `quit = ["q", "ctrl+q"]`. Actions left out keep their keys, an empty list unbinds one, and a key given to one action is taken from the others. `?` lists the keys as you set them. A misspelled action or key stops leaf with a message naming it, and the diff viewer now reads `config.toml` too.
 - A review that an agent in tmux opened beside itself delivers its verdict to the agent's pane again when tmux's session environment carries Rex's variables (#85). It used to fail with `block target "%N" not found` and copy the text to the clipboard instead.
 - `t` opens an outline beside the text and `T` opens it over the text, in the reader and the diff viewer (#78). Either key closes what it opened or switches to the other form. Go to page moves from `t` to `:`.
 - In the reader, the outline lists a PDF's bookmarks or an EPUB's table of contents, and the headings on the page when the document has none (#59). The marked entry follows the text as it scrolls, and moving in the outline scrolls the text to that entry.

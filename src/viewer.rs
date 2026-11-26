@@ -37,6 +37,7 @@ use crate::find::Query;
 use crate::follow::{self, Follow};
 use crate::highlight::{self, Highlight};
 use crate::hue::Hue;
+use crate::keymap::Keymap;
 use crate::kitty::{self, Kitty};
 use crate::look::Look;
 use crate::mono::{self, Rgb};
@@ -44,6 +45,7 @@ use crate::news::News;
 use crate::outline::{self, Ask, OpenOutline, OutlineForm, Pinned};
 use crate::picture;
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
+use crate::readerkeys::ReaderAction;
 use crate::remote::{self, Command};
 use crate::render::{self, DIM, Laid};
 use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
@@ -395,6 +397,8 @@ pub struct ViewerOptions {
     pub max_text_width: u16,
     pub colorful_markdown: bool,
     pub hide_link_urls: bool,
+    /// The keys the reader answers to, as `[keys.reader]` sets them.
+    pub keys: Keymap<ReaderAction>,
     /// For paged documents, where reading resumes (1-based).
     pub start_page: Option<usize>,
     pub image_mode: ImageMode,
@@ -440,6 +444,7 @@ impl Default for ViewerOptions {
             max_text_width: crate::config::DEFAULT_MAX_WIDTH,
             colorful_markdown: false,
             hide_link_urls: false,
+            keys: Keymap::default(),
             start_page: None,
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
@@ -1740,22 +1745,40 @@ impl App {
         rect
     }
 
-    fn help_rows(&self) -> Vec<(&'static str, &'static str)> {
+    /// The keys as `[keys.reader]` binds them, so a rebound key shows here too.
+    fn help_rows(&self) -> Vec<(String, &'static str)> {
+        use ReaderAction as A;
         let paged = self.doc.page_count.is_some();
+        let keys = |actions: &[ReaderAction]| self.options.keys.labels(actions);
         let mut rows = Vec::new();
         if paged {
-            rows.push(("←/→  h/l", "previous / next page"));
+            rows.push((
+                keys(&[A::PreviousPage, A::NextPage]),
+                "previous / next page",
+            ));
         } else if self.folder.is_some() {
-            rows.push(("←/→  h/l  p/n", "previous / next picture in the folder"));
+            rows.push((
+                keys(&[A::PreviousPage, A::NextPage]),
+                "previous / next picture in the folder",
+            ));
         }
         rows.extend([
-            ("H/L", "back / forward through followed links"),
-            ("j/k  ↓/↑", "scroll"),
-            ("^d  u", "half screen down / up"),
-            ("space/b", "next / previous screen"),
+            (
+                keys(&[A::LinkBack, A::LinkForward]),
+                "back / forward through followed links",
+            ),
+            (keys(&[A::ScrollDown, A::ScrollUp]), "scroll"),
+            (
+                keys(&[A::HalfScreenDown, A::HalfScreenUp]),
+                "half screen down / up",
+            ),
+            (
+                keys(&[A::ScreenDown, A::ScreenUp]),
+                "next / previous screen",
+            ),
         ]);
         rows.push((
-            "g/G",
+            keys(&[A::First, A::Last]),
             if paged {
                 "first / last page"
             } else {
@@ -1763,32 +1786,48 @@ impl App {
             },
         ));
         if paged {
-            rows.push((":  t  T", "go to page / outline beside or over the text"));
             rows.extend([
-                ("m", "bookmark this page, or remove it"),
-                ("'", "bookmarks"),
+                (
+                    keys(&[A::GoToPage, A::Outline, A::OutlineWindow]),
+                    "go to page / outline beside or over the text",
+                ),
+                (keys(&[A::Bookmark]), "bookmark this page, or remove it"),
+                (keys(&[A::Bookmarks]), "bookmarks"),
             ]);
         } else {
-            rows.push(("t  T", "outline beside or over the text"));
+            rows.push((
+                keys(&[A::Outline, A::OutlineWindow]),
+                "outline beside or over the text",
+            ));
         }
         if self.outline.is_some() {
             rows.push((
-                "<  >",
+                "<  >".to_owned(),
                 "narrow or widen the outline beside the text (or drag its edge)",
             ));
         }
-        rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
         rows.extend([
-            ("a", "read aloud from here; pause / go on"),
-            ("A", "stop reading aloud"),
-            ("[  ]", "read slower / faster"),
-            (",  .", "previous / next sentence aloud"),
-            ("s", "pick a voice"),
-            ("<  >  =", "narrower / wider / fit column (- + too)"),
+            (keys(&[A::Find]), "find text"),
+            (
+                keys(&[A::NextMatch, A::PreviousMatch]),
+                "next / previous match",
+            ),
+            (keys(&[A::ReadAloud]), "read aloud from here; pause / go on"),
+            (keys(&[A::StopReading]), "stop reading aloud"),
+            (keys(&[A::Slower, A::Faster]), "read slower / faster"),
+            (
+                keys(&[A::PreviousSentence, A::NextSentence]),
+                "previous / next sentence aloud",
+            ),
+            (keys(&[A::Voices]), "pick a voice"),
+            (
+                keys(&[A::Narrower, A::Wider, A::FitWidth]),
+                "narrower / wider / fit column",
+            ),
         ]);
         if let Some(look) = self.shown_as {
             rows.push((
-                "o",
+                keys(&[A::Look]),
                 match look {
                     crate::doc::Look::Original => "show in the terminal's font",
                     crate::doc::Look::Terminal => "show as designed",
@@ -1796,7 +1835,7 @@ impl App {
             ));
         }
         rows.push((
-            "i",
+            keys(&[A::Images]),
             if self.image_mode == ImageMode::Color {
                 "paint images"
             } else {
@@ -1804,21 +1843,38 @@ impl App {
             },
         ));
         rows.extend([
-            ("drag  click", "select and copy text; click follows a link"),
-            ("@  ^enter", "ask an agent about the selection (⇧⌘A in Rex)"),
-            ("y", "highlight selection, or clear one"),
-            ("1-6", "pick a color; paints the selection"),
-            ("d  e", "pen / eraser: drag to draw or erase"),
-            ("v", "move tool: pick, move, resize ink"),
-            ("!", "how to highlight and draw"),
-            ("?  q", "help / quit"),
+            (
+                "drag  click".to_owned(),
+                "select and copy text; click follows a link",
+            ),
+            (
+                keys(&[A::Ask]),
+                "ask an agent about the selection (⇧⌘A in Rex)",
+            ),
+            (keys(&[A::Highlight]), "highlight selection, or clear one"),
+            ("1-6".to_owned(), "pick a color; paints the selection"),
+            (
+                keys(&[A::Pen, A::Eraser]),
+                "pen / eraser: drag to draw or erase",
+            ),
+            (keys(&[A::MoveInk]), "move tool: pick, move, resize ink"),
+            (keys(&[A::Guide]), "how to highlight and draw"),
+            (keys(&[A::Help, A::Quit]), "help / quit"),
         ]);
+        // An action left with no key has nothing to show.
+        rows.retain(|(keys, _)| !keys.is_empty());
         rows
     }
 
     fn draw_help(&self, f: &mut Frame, area: Rect) -> Rect {
         let rows = self.help_rows();
-        let width = 12
+        let key_width = rows
+            .iter()
+            .map(|(keys, _)| keys.chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .max(12);
+        let width = key_width as u16
             + rows
                 .iter()
                 .map(|(_, a)| a.chars().count() as u16)
@@ -1829,7 +1885,7 @@ impl App {
             .map(|(keys, action)| {
                 Line::from(vec![
                     Span::styled(
-                        format!("{keys:<12}"),
+                        format!("{keys:<key_width$}"),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(action, Style::default().fg(DIM)),
@@ -3093,10 +3149,13 @@ impl App {
                 return;
             }
             Dialog::Help | Dialog::Guide => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('!')
-                ) {
+                let closes = self.options.keys.actions(&key).into_iter().any(|action| {
+                    matches!(
+                        action,
+                        ReaderAction::Quit | ReaderAction::Help | ReaderAction::Guide
+                    )
+                });
+                if closes || key.code == KeyCode::Esc {
                     self.dialog = Dialog::None;
                 }
                 return;
@@ -3111,14 +3170,44 @@ impl App {
         if self.tool == Tool::Move && self.arrange_key(&key) {
             return;
         }
+        for action in self.options.keys.actions(&key) {
+            if self.perform(action, &key, history) {
+                return;
+            }
+        }
         if let Some(hue) = typed(&key).and_then(Hue::of_key) {
             return self.pick_hue(hue);
         }
+        // Esc lets go of a picked stroke, puts the pen down, then lets
+        // go of a selection, then a search, then quits.
+        if key.code == KeyCode::Esc {
+            if self.picked.take().is_some() {
+            } else if self.tool != Tool::Select {
+                self.tool = Tool::Select;
+            } else if self.selection.take().is_none() && self.search.take().is_none() {
+                if self.narrator.active() {
+                    self.narrator.stop();
+                } else {
+                    self.quit = true;
+                }
+            }
+        }
+    }
+
+    /// Does what `action` asks, and says whether it did anything. One that
+    /// can't act now lets the next action bound to the same key have it.
+    fn perform(
+        &mut self,
+        action: ReaderAction,
+        key: &KeyEvent,
+        history: &mut ReaderHistory,
+    ) -> bool {
         let paged = self.mode == Mode::Paged;
-        match typed(&key) {
-            Some('?') | Some('/') => self.dialog = Dialog::Help,
-            Some('!') => self.dialog = Dialog::Guide,
-            Some(':') => {
+        let pressed = key.kind == KeyEventKind::Press;
+        match action {
+            ReaderAction::Help => self.dialog = Dialog::Help,
+            ReaderAction::Guide => self.dialog = Dialog::Guide,
+            ReaderAction::GoToPage => {
                 if let Some(page_count) = self.doc.page_count {
                     self.dialog = Dialog::Goto {
                         digits: String::new(),
@@ -3126,10 +3215,10 @@ impl App {
                     };
                 }
             }
-            Some('t') => self.toggle_outline(OutlineForm::Sidebar),
-            Some('T') => self.toggle_outline(OutlineForm::Window),
-            Some('m') if key.kind == KeyEventKind::Press => self.toggle_bookmark(),
-            Some('\'') if self.doc.page_count.is_some() => {
+            ReaderAction::Outline => self.toggle_outline(OutlineForm::Sidebar),
+            ReaderAction::OutlineWindow => self.toggle_outline(OutlineForm::Window),
+            ReaderAction::Bookmark if pressed => self.toggle_bookmark(),
+            ReaderAction::Bookmarks if self.doc.page_count.is_some() => {
                 // Opens on the bookmark at or before the page being read.
                 let reading = self.reading();
                 let selected = self
@@ -3138,91 +3227,67 @@ impl App {
                     .saturating_sub(1);
                 self.dialog = Dialog::Bookmarks { selected };
             }
-            Some('f') | Some('F') => {
+            ReaderAction::Find => {
                 self.dialog = Dialog::Find {
                     typed: String::new(),
                 }
             }
-            Some('n') if self.found_here().is_some() => self.next_match(Direction::Forward),
-            Some('N') => self.next_match(Direction::Backward),
-            Some('q') => self.quit = true,
-            Some('y') => self.toggle_highlight(),
-            Some('@') => self.open_ask(),
-            Some('j') => self.scroll_by(1),
-            Some('k') => self.scroll_by(-1),
-            // Plain d is the pen, so half a screen down is ctrl+d, as in vim.
-            Some('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_by(self.screen_step() / 2)
+            ReaderAction::NextMatch if self.found_here().is_some() => {
+                self.next_match(Direction::Forward)
             }
-            Some('u') => self.scroll_by(-(self.screen_step() / 2)),
-            Some(' ') => self.next_screen(paged),
-            Some('b') => self.previous_screen(paged),
-            Some('l') | Some('n') => self.turn(true),
-            Some('h') | Some('p') => self.turn(false),
-            Some('H') => self.revisit(history, Direction::Backward),
-            Some('L') => self.revisit(history, Direction::Forward),
-            Some('g') => self.go_to_page(0, false),
-            Some('G') => self.go_to_page(self.last(), !paged),
-            Some('i') => self.toggle_images(),
-            Some('o') => self.toggle_look(),
-            Some('d') | Some('D') => self.take_tool(Tool::Pen),
-            Some('e') | Some('E') => self.take_tool(Tool::Eraser),
-            Some('v') | Some('V') => self.take_tool(Tool::Move),
-            Some('a') if key.kind == KeyEventKind::Press => self.read_aloud(),
-            Some('A') if self.narrator.active() => self.narrator.stop(),
-            Some('s') | Some('S') => self.open_voices(),
-            Some('[') => self.change_speed(false),
-            Some(']') => self.change_speed(true),
+            ReaderAction::PreviousMatch => self.next_match(Direction::Backward),
+            ReaderAction::Quit => self.quit = true,
+            ReaderAction::Highlight => self.toggle_highlight(),
+            ReaderAction::Ask if pressed => self.open_ask(),
+            ReaderAction::ScrollDown => self.scroll_by(1),
+            ReaderAction::ScrollUp => self.scroll_by(-1),
+            ReaderAction::HalfScreenDown => self.scroll_by(self.screen_step() / 2),
+            ReaderAction::HalfScreenUp => self.scroll_by(-(self.screen_step() / 2)),
+            ReaderAction::ScreenDown => self.next_screen(paged),
+            ReaderAction::ScreenUp => self.previous_screen(paged),
+            ReaderAction::NextPage => self.turn(true),
+            ReaderAction::PreviousPage => self.turn(false),
+            ReaderAction::LinkBack => self.revisit(history, Direction::Backward),
+            ReaderAction::LinkForward => self.revisit(history, Direction::Forward),
+            ReaderAction::First => self.go_to_page(0, false),
+            ReaderAction::Last => self.go_to_page(self.last(), !paged),
+            ReaderAction::Images => self.toggle_images(),
+            ReaderAction::Look => self.toggle_look(),
+            ReaderAction::Pen => self.take_tool(Tool::Pen),
+            ReaderAction::Eraser => self.take_tool(Tool::Eraser),
+            ReaderAction::MoveInk => self.take_tool(Tool::Move),
+            ReaderAction::ReadAloud if pressed => self.read_aloud(),
+            ReaderAction::StopReading if self.narrator.active() => self.narrator.stop(),
+            ReaderAction::Voices => self.open_voices(),
+            ReaderAction::Slower => self.change_speed(false),
+            ReaderAction::Faster => self.change_speed(true),
             // From the width the screen allows, so a column it narrowed answers at
             // once, and from the one asked for, so presses before the next frame add up.
-            Some('<' | '-') => {
+            ReaderAction::Narrower => {
                 let now = self.reading_width.within(self.room);
                 self.reading_width =
                     ReadingWidth::Columns(now.saturating_sub(WIDTH_STEP).max(MIN_WIDTH))
             }
-            Some('>' | '+') => {
+            ReaderAction::Wider => {
                 let now = self.reading_width.within(self.room);
                 self.reading_width = ReadingWidth::Columns(now.saturating_add(WIDTH_STEP))
             }
-            Some('=') => {
+            ReaderAction::FitWidth => {
                 self.reading_width = match self.reading_width {
                     ReadingWidth::Fit => ReadingWidth::Columns(self.options.max_text_width),
                     ReadingWidth::Columns(_) => ReadingWidth::Fit,
                 }
             }
-            Some(',') => self.skip_sentence(Direction::Backward),
-            Some('.') => self.skip_sentence(Direction::Forward),
-            _ => match key.code {
-                KeyCode::Enter
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.kind == KeyEventKind::Press =>
-                {
-                    self.open_ask()
-                }
-                // Esc lets go of a picked stroke, puts the pen down, then lets
-                // go of a selection, then a search, then quits.
-                KeyCode::Esc if self.picked.take().is_some() => {}
-                KeyCode::Esc if self.tool != Tool::Select => self.tool = Tool::Select,
-                KeyCode::Esc => {
-                    if self.selection.take().is_none() && self.search.take().is_none() {
-                        if self.narrator.active() {
-                            self.narrator.stop();
-                        } else {
-                            self.quit = true;
-                        }
-                    }
-                }
-                KeyCode::Down => self.scroll_by(1),
-                KeyCode::Up => self.scroll_by(-1),
-                KeyCode::PageDown => self.next_screen(paged),
-                KeyCode::PageUp => self.previous_screen(paged),
-                KeyCode::Right => self.turn(true),
-                KeyCode::Left => self.turn(false),
-                KeyCode::Home => self.go_to_page(0, false),
-                KeyCode::End => self.go_to_page(self.last(), !paged),
-                _ => {}
-            },
+            ReaderAction::PreviousSentence => self.skip_sentence(Direction::Backward),
+            ReaderAction::NextSentence => self.skip_sentence(Direction::Forward),
+            ReaderAction::Bookmark
+            | ReaderAction::Bookmarks
+            | ReaderAction::NextMatch
+            | ReaderAction::Ask
+            | ReaderAction::ReadAloud
+            | ReaderAction::StopReading => return false,
         }
+        true
     }
 
     /// Paged: finish the page on screen, then turn it.
@@ -5506,6 +5571,25 @@ mod tests {
             assert!(!s.press(close).contains("go to page"));
             assert!(!s.app.quit);
         }
+    }
+
+    #[test]
+    fn a_rebound_key_acts_and_shows_in_the_key_list() {
+        let config: crate::config::Config =
+            toml::from_str("[keys.reader]\nquit = \"x\"\nhelp = \"f1\"").unwrap();
+        let options = ViewerOptions {
+            keys: config.keys.reader,
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&["Alpha", "Bravo"]), 120, 30, options);
+        assert!(!s.press(KeyCode::Char('?')).contains("Keys"));
+        let frame = s.press(KeyCode::F(1));
+        assert!(frame.contains("f1") && frame.contains("x"), "{frame}");
+        s.press(KeyCode::Esc);
+        s.press(KeyCode::Char('q'));
+        assert!(!s.app.quit);
+        s.press(KeyCode::Char('x'));
+        assert!(s.app.quit);
     }
 
     #[test]

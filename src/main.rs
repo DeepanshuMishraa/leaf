@@ -11,6 +11,7 @@ mod chart;
 mod comment;
 mod config;
 mod diff;
+mod diffkeys;
 mod diffreview;
 mod diffview;
 mod doc;
@@ -28,6 +29,7 @@ mod hook;
 mod host;
 mod html;
 mod hue;
+mod keymap;
 mod kitty;
 mod linediff;
 mod look;
@@ -55,6 +57,7 @@ mod prefs;
 mod prmedia;
 mod progress;
 mod prview;
+mod readerkeys;
 mod remote;
 mod render;
 mod review;
@@ -860,6 +863,7 @@ fn open(first: &str) -> ExitCode {
         options.max_text_width = config.reader.max_width;
         options.colorful_markdown = config.reader.colorful_markdown;
         options.hide_link_urls = config.reader.hide_link_urls;
+        options.keys = config.keys.reader.clone();
         options.picture_path = watch.as_ref().map(|_| source_path);
         options.watch = watch;
         options.start_viewport = viewport;
@@ -918,7 +922,13 @@ fn diff_command(args: &[String]) -> ExitCode {
         }
     };
     let failure = Rc::new(RefCell::new(None));
-    let mut options = diff_options(&loaded.key, failure.clone());
+    let mut options = match diff_options(&loaded.key, failure.clone()) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("leaf: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Some(layout) = layout {
         options.layout = layout;
     }
@@ -1235,14 +1245,20 @@ fn comments_json(comments: &[progress::KeyedComment]) -> String {
 }
 
 /// Opens the comment store and the comments saved for this diff. A store that
-/// can't be opened only means comments last for this run.
-fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Options {
+/// can't be opened only means comments last for this run. Settings that can't
+/// be read stop the diff before it opens, as they stop the reader.
+fn diff_options(
+    key: &str,
+    failure: Rc<RefCell<Option<String>>>,
+) -> Result<diffview::Options, config::ConfigFailed> {
+    let config = config::load()?;
     let mut options = diffview::Options {
         comments: Vec::new(),
         store: None,
         failure: failure.clone(),
         tabs: false,
         layout: diffview::Layout::Split,
+        keys: config.keys.diff,
         margin: margin::diff_margin(key, failure.clone()),
     };
     match Store::open(&progress::default_path()) {
@@ -1259,7 +1275,7 @@ fn diff_options(key: &str, failure: Rc<RefCell<Option<String>>>) -> diffview::Op
         }
         Err(e) => *failure.borrow_mut() = Some(e.to_string()),
     }
-    options
+    Ok(options)
 }
 
 fn is_patch(path: &Path) -> bool {

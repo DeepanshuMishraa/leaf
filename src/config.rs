@@ -3,12 +3,26 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::diffkeys::DiffAction;
+use crate::keymap::Keymap;
+use crate::readerkeys::ReaderAction;
+
 pub const DEFAULT_MAX_WIDTH: u16 = 76;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub reader: ReaderConfig,
+    pub keys: KeysConfig,
+}
+
+/// `[keys.reader]` and `[keys.diff]`: each names an action and the key, or
+/// list of keys, that does it. Actions left out keep their default keys.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeysConfig {
+    pub reader: Keymap<ReaderAction>,
+    pub diff: Keymap<DiffAction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +87,31 @@ pub fn load() -> Result<Config, ConfigFailed> {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use crate::diffkeys::DiffAction;
+    use crate::readerkeys::ReaderAction;
+
+    #[test]
+    fn keys_rebind_per_view() {
+        let config: Config = toml::from_str(
+            "[keys.reader]\nquit = [\"x\", \"ctrl+q\"]\n\n[keys.diff]\nnext_file = \"tab\"",
+        )
+        .unwrap();
+        assert_eq!(config.keys.reader.label(ReaderAction::Quit), "x/^q");
+        assert_eq!(config.keys.reader.label(ReaderAction::ScrollDown), "j/↓");
+        assert_eq!(config.keys.diff.label(DiffAction::NextFile), "tab");
+    }
+
+    #[test]
+    fn a_bad_binding_names_where_it_is() {
+        let error = toml::from_str::<Config>("[keys.reader]\nquit = \"ctl+q\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("keys.reader.quit"), "{error}");
+        let error = toml::from_str::<Config>("[keys.board]\nquit = \"q\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("board"), "{error}");
+    }
 
     #[test]
     fn colorful_markdown_is_opt_in() {

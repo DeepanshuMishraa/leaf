@@ -1402,7 +1402,17 @@ impl App {
         };
         let loaded = request.github(patch, pr.resource());
         let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let mut options = crate::diff_options(&loaded.key, failure.clone());
+        let mut options = match crate::diff_options(&loaded.key, failure.clone()) {
+            Ok(options) => options,
+            Err(error) => {
+                // The Code tab stays closed; the pull request is as it was.
+                if let Some(page) = &mut self.page {
+                    page.code = false;
+                    page.toast = Some(error.to_string());
+                }
+                return Ok(());
+            }
+        };
         options.tabs = true;
         self.gallery.stop();
         self.gallery.clear()?;

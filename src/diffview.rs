@@ -30,8 +30,10 @@ use crate::agent;
 use crate::art;
 use crate::comment::{Anchor, Comment, Side, State};
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
+use crate::diffkeys::DiffAction;
 use crate::diffreview::{self, FileNotes, Margin, Reopen, SaveNotes, Sends};
 use crate::github;
+use crate::keymap::Keymap;
 use crate::linediff;
 use crate::look::Look;
 use crate::news::News;
@@ -157,6 +159,8 @@ pub struct Options {
     /// other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
     pub layout: Layout,
+    /// The keys the diff answers to, as `[keys.diff]` sets them.
+    pub keys: Keymap<DiffAction>,
     /// File and global notes, and where `S` sends the review.
     pub margin: Margin,
 }
@@ -220,6 +224,7 @@ impl Default for Options {
             failure: Rc::new(RefCell::new(None)),
             tabs: false,
             layout: Layout::Split,
+            keys: Keymap::default(),
             margin: Margin::default(),
         }
     }
@@ -765,6 +770,7 @@ struct App {
     /// Where `quit` goes, for a pull request's Code tab.
     leave: Leave,
     tabs: bool,
+    keys: Keymap<DiffAction>,
     layout: Layout,
     split: Split,
     /// The paths of the files shown as their heading alone.
@@ -848,6 +854,7 @@ impl App {
             quit: false,
             leave: Leave::Quit,
             tabs: options.tabs,
+            keys: options.keys,
             layout: options.layout,
             split,
             folded: HashSet::new(),
@@ -1612,81 +1619,86 @@ impl App {
         if self.outline.is_some() && self.outline_key(key) {
             return;
         }
-        if !matches!(key.code, KeyCode::Char('q')) {
+        let actions = self.keys.actions(&key);
+        // `q` quits on the second press; any other key between starts over.
+        if !actions.contains(&DiffAction::Quit) {
             self.quit_armed = false;
         }
-        match key.code {
-            KeyCode::Char('q') => self.ask_quit(),
-            KeyCode::Char('F') => self.edit_file_note(None),
-            KeyCode::Char('M') => self.edit_global_note(),
-            KeyCode::Char('w') => self.toggle_viewed(None),
-            KeyCode::Char('S') => self.open_verdict(),
-            KeyCode::Char('O') => self.show_overview(),
-            KeyCode::Tab if !self.tabs => self.show_overview(),
-            KeyCode::Esc => {
-                // Escape drops whatever is highlighted before it quits.
-                if self.visual {
-                    self.visual = false;
-                    self.selection = None;
-                } else if self.selection.is_some() || self.focus.is_some() {
-                    self.selection = None;
-                    self.focus = None;
-                } else {
-                    self.quit = true;
-                }
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(true),
-            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(false),
-            // Ctrl+d and Ctrl+u also arrive as these characters, so both work.
-            KeyCode::Char('d') => self.page(true, true),
-            KeyCode::Char('u') => self.page(false, true),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.page(true, false),
-            KeyCode::PageUp | KeyCode::Char('b') => self.page(false, false),
-            KeyCode::Char('g') | KeyCode::Home => self.go_edge(false),
-            KeyCode::Char('G') | KeyCode::End => self.go_edge(true),
-            KeyCode::Char(']') | KeyCode::Char('n') => self.next_file(true),
-            KeyCode::Char('[') | KeyCode::Char('N') => self.next_file(false),
-            KeyCode::Char('f') => self.show_files(),
-            KeyCode::Char('t') => self.toggle_outline(OutlineForm::Sidebar),
-            KeyCode::Char('T') => self.toggle_outline(OutlineForm::Window),
-            KeyCode::Char('v' | 'V') => self.toggle_selection(),
-            KeyCode::Char('c' | 'C') => self.compose(Purpose::Comment),
-            KeyCode::Char('@') => self.compose(Purpose::Ask),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.compose(Purpose::Ask)
-            }
-            KeyCode::Char('m') => self.show_comments(),
-            KeyCode::Char('y') => self.copy_payload(false),
-            KeyCode::Char('Y') => self.copy_payload(true),
-            KeyCode::Char('o') => self.other_side(),
-            KeyCode::Char('i') => self.toggle_layout(),
-            KeyCode::Char('r') => self.reload(),
-            KeyCode::Char('1') if self.tabs => {
-                self.leave = Leave::Summary;
-                self.quit = true;
-            }
-            KeyCode::Char('2') if self.tabs => {
-                self.leave = Leave::Timeline;
-                self.quit = true;
-            }
-            KeyCode::Char('3') | KeyCode::Left | KeyCode::BackTab if self.tabs => {
-                self.leave = Leave::Comments;
-                self.quit = true;
-            }
-            KeyCode::Char('4') if self.tabs => {}
-            KeyCode::Char('5') | KeyCode::Right | KeyCode::Tab if self.tabs => {
-                self.leave = Leave::Checks;
-                self.quit = true;
-            }
-            KeyCode::Char('h') => self.fold_current(true),
-            KeyCode::Char('l') => self.fold_current(false),
-            KeyCode::Char('H') | KeyCode::Left => self.scroll_sideways(false),
-            KeyCode::Char('L') | KeyCode::Right => self.scroll_sideways(true),
-            KeyCode::Char('0') => self.left = 0,
-            KeyCode::Char('?') => self.dialog = Dialog::Help,
-            _ => {}
+        if actions.into_iter().any(|action| self.perform(action)) {
+            return;
         }
+        if key.code == KeyCode::Esc {
+            // Escape drops whatever is highlighted before it quits.
+            if self.visual {
+                self.visual = false;
+                self.selection = None;
+            } else if self.selection.is_some() || self.focus.is_some() {
+                self.selection = None;
+                self.focus = None;
+            } else {
+                self.quit = true;
+            }
+        }
+    }
+
+    /// Does what `action` asks, and says whether it did anything. One that
+    /// can't act now lets the next action bound to the same key have it.
+    fn perform(&mut self, action: DiffAction) -> bool {
+        let tab = |leave| (self.tabs).then_some(leave);
+        let leave = match action {
+            DiffAction::TabSummary => tab(Leave::Summary),
+            DiffAction::TabTimeline => tab(Leave::Timeline),
+            DiffAction::TabComments => tab(Leave::Comments),
+            DiffAction::TabChecks => tab(Leave::Checks),
+            _ => None,
+        };
+        if let Some(leave) = leave {
+            self.leave = leave;
+            self.quit = true;
+            return true;
+        }
+        match action {
+            DiffAction::TabSummary
+            | DiffAction::TabTimeline
+            | DiffAction::TabComments
+            | DiffAction::TabChecks => return false,
+            DiffAction::Quit => self.ask_quit(),
+            DiffAction::QuitNow => self.quit = true,
+            DiffAction::FileNote => self.edit_file_note(None),
+            DiffAction::GlobalNote => self.edit_global_note(),
+            DiffAction::Viewed => self.toggle_viewed(None),
+            DiffAction::SendReview => self.open_verdict(),
+            DiffAction::Overview => self.show_overview(),
+            DiffAction::Down => self.move_cursor(true),
+            DiffAction::Up => self.move_cursor(false),
+            DiffAction::HalfPageDown => self.page(true, true),
+            DiffAction::HalfPageUp => self.page(false, true),
+            DiffAction::PageDown => self.page(true, false),
+            DiffAction::PageUp => self.page(false, false),
+            DiffAction::First => self.go_edge(false),
+            DiffAction::Last => self.go_edge(true),
+            DiffAction::NextFile => self.next_file(true),
+            DiffAction::PreviousFile => self.next_file(false),
+            DiffAction::Files => self.show_files(),
+            DiffAction::Outline => self.toggle_outline(OutlineForm::Sidebar),
+            DiffAction::OutlineWindow => self.toggle_outline(OutlineForm::Window),
+            DiffAction::Select => self.toggle_selection(),
+            DiffAction::Comment => self.compose(Purpose::Comment),
+            DiffAction::Ask => self.compose(Purpose::Ask),
+            DiffAction::Comments => self.show_comments(),
+            DiffAction::Copy => self.copy_payload(false),
+            DiffAction::CopyAll => self.copy_payload(true),
+            DiffAction::OtherSide => self.other_side(),
+            DiffAction::Layout => self.toggle_layout(),
+            DiffAction::Reload => self.reload(),
+            DiffAction::Fold => self.fold_current(true),
+            DiffAction::Unfold => self.fold_current(false),
+            DiffAction::ScrollLeft => self.scroll_sideways(false),
+            DiffAction::ScrollRight => self.scroll_sideways(true),
+            DiffAction::ScrollReset => self.left = 0,
+            DiffAction::Help => self.dialog = Dialog::Help,
+        }
+        true
     }
 
     fn composer_key(&mut self, key: KeyEvent) {
@@ -1716,10 +1728,9 @@ impl App {
             Some(DialogKind::Loading) => {}
             Some(DialogKind::Verdict) => self.verdict_key(key),
             Some(DialogKind::Help | DialogKind::Error) | None => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
+                let closes =
+                    self.keys.is(&key, DiffAction::Quit) || self.keys.is(&key, DiffAction::Help);
+                if closes || matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.dialog = Dialog::None;
                 }
             }
@@ -3447,7 +3458,7 @@ impl App {
 
     fn draw_dialog(&mut self, f: &mut Frame, area: Rect, kind: DialogKind) {
         match kind {
-            DialogKind::Help => draw_help(f, area, self.look.ink()),
+            DialogKind::Help => draw_help(f, area, self.look.ink(), &self.keys),
             DialogKind::Loading => {
                 let text = match &self.dialog {
                     Dialog::Loading(text) => text.clone(),
@@ -3831,56 +3842,95 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
-    let keys = [
-        ("j k  ↑ ↓", "move between code lines"),
-        ("d u", "half page down or up"),
-        ("space b", "page down or up"),
-        ("g G  Home End", "first or last line"),
-        ("[ ]  N n", "previous or next file"),
-        ("h l", "fold this file to its heading, or open it"),
-        ("f", "files: filter by path, open one"),
-        ("t T", "outline of every file beside the diff, or over it"),
+/// The keys as `[keys.diff]` binds them, so a rebound key shows here too.
+fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, keymap: &Keymap<DiffAction>) {
+    use DiffAction as A;
+    let keys = |actions: &[DiffAction]| keymap.labels(actions);
+    let rows = [
+        (keys(&[A::Down, A::Up]), "move between code lines"),
         (
-            "< >",
+            keys(&[A::HalfPageDown, A::HalfPageUp]),
+            "half page down or up",
+        ),
+        (keys(&[A::PageDown, A::PageUp]), "page down or up"),
+        (keys(&[A::First, A::Last]), "first or last line"),
+        (
+            keys(&[A::PreviousFile, A::NextFile]),
+            "previous or next file",
+        ),
+        (
+            keys(&[A::Fold, A::Unfold]),
+            "fold this file to its heading, or open it",
+        ),
+        (keys(&[A::Files]), "files: filter by path, open one"),
+        (
+            keys(&[A::Outline, A::OutlineWindow]),
+            "outline of every file beside the diff, or over it",
+        ),
+        (
+            "< >".to_owned(),
             "outline open: narrow or widen its sidebar (or drag its edge)",
         ),
-        ("V v", "visual mode; move to select, esc clears"),
-        ("c C", "comment on the line or selection"),
         (
-            "@  ^enter",
+            keys(&[A::Select]),
+            "visual mode; move to select, esc clears",
+        ),
+        (keys(&[A::Comment]), "comment on the line or selection"),
+        (
+            keys(&[A::Ask]),
             "ask the agent about the line or selection (⇧⌘A in Rex)",
         ),
-        ("m", "comments: jump, resend, delete, post"),
+        (keys(&[A::Comments]), "comments: jump, resend, delete, post"),
         (
-            "tab O",
+            keys(&[A::Overview]),
             "overview of every file, with notes and viewed marks",
         ),
-        ("F", "note on this whole file"),
-        ("M", "global note on the whole change"),
-        ("w", "mark this file viewed and fold it (again: not viewed)"),
-        ("S", "send drafts and notes as one review, with a verdict"),
-        ("y Y", "copy this range or every comment"),
-        ("o r", "other side of the diff, or reload"),
-        ("i", "split or inline layout"),
+        (keys(&[A::FileNote]), "note on this whole file"),
+        (keys(&[A::GlobalNote]), "global note on the whole change"),
         (
-            "H L  ← →",
-            "scroll sideways with keys, wheel or trackpad; 0 resets",
+            keys(&[A::Viewed]),
+            "mark this file viewed and fold it (again: not viewed)",
         ),
-        ("? q", "this help, quit"),
+        (
+            keys(&[A::SendReview]),
+            "send drafts and notes as one review, with a verdict",
+        ),
+        (
+            keys(&[A::Copy, A::CopyAll]),
+            "copy this range or every comment",
+        ),
+        (
+            keys(&[A::OtherSide, A::Reload]),
+            "other side of the diff, or reload",
+        ),
+        (keys(&[A::Layout]), "split or inline layout"),
+        (
+            keys(&[A::ScrollLeft, A::ScrollRight]),
+            "scroll sideways with keys, wheel or trackpad",
+        ),
+        (keys(&[A::ScrollReset]), "scroll back to the left edge"),
+        (keys(&[A::Help, A::Quit]), "this help, quit"),
     ];
-    let mut lines: Vec<Line> = keys
+    let column = rows
         .iter()
+        .map(|(key, _)| key.chars().count() + 1)
+        .max()
+        .unwrap_or(0)
+        .max(16);
+    let mut lines: Vec<Line> = rows
+        .into_iter()
+        // An action left with no key has nothing to show.
+        .filter(|(key, _)| !key.is_empty())
         .map(|(key, what)| {
             Line::from(vec![
-                Span::styled(format!(" {key:<16}"), Style::default().fg(ACCENT)),
-                Span::styled(*what, Style::default()),
+                Span::styled(format!(" {key:<column$}"), Style::default().fg(ACCENT)),
+                Span::styled(what, Style::default()),
             ])
         })
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " C, write, Enter saves the comment on that line.",
+        " Comment, write, Enter saves the comment on that line.",
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(Span::styled(
