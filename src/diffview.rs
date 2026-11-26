@@ -3849,16 +3849,8 @@ impl App {
                 self.persist_notes();
                 self.toast(message);
             }
-            KeyCode::Backspace if alt || ctrl => {
-                let word = editor
-                    .text
-                    .trim_end()
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |at| {
-                        at + editor.text[at..].chars().next().map_or(1, char::len_utf8)
-                    });
-                editor.text.truncate(word);
-            }
+            KeyCode::Backspace if alt || ctrl => crate::comment::delete_word(&mut editor.text),
+            KeyCode::Char('w') if ctrl => crate::comment::delete_word(&mut editor.text),
             KeyCode::Backspace => {
                 editor.text.pop();
             }
@@ -5505,6 +5497,18 @@ diff --git a/x b/x
         assert_eq!(
             app.note_editor.as_ref().map(|e| e.text.as_str()),
             Some("foo\u{3000}")
+        );
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_in_the_note_editor() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        app.paste("keep this word");
+        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.note_editor.as_ref().map(|e| e.text.as_str()),
+            Some("keep this ")
         );
     }
 

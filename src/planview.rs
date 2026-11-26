@@ -1357,13 +1357,8 @@ impl App {
                 composer.text.push('\n')
             }
             KeyCode::Enter => self.save_composer(),
-            KeyCode::Backspace if alt || ctrl => {
-                let kept = composer.text.trim_end().len();
-                let word = composer.text[..kept]
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |at| at + 1);
-                composer.text.truncate(word);
-            }
+            KeyCode::Backspace if alt || ctrl => crate::comment::delete_word(&mut composer.text),
+            KeyCode::Char('w') if ctrl => crate::comment::delete_word(&mut composer.text),
             KeyCode::Backspace => {
                 composer.text.pop();
             }
@@ -2431,6 +2426,25 @@ create table tokens (id int);
         let lost = round(twice, once);
         assert_eq!(lost.changed_count(), 0);
         assert_eq!(lost.dropped_blocks, 1);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor_in_a_comment() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "keep this word  ");
+        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.composer.as_ref().map(|c| c.text.as_str()),
+            Some("keep this ")
+        );
+        app.paste("wide\u{3000}gap");
+        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.composer.as_ref().map(|c| c.text.as_str()),
+            Some("keep this wide\u{3000}"),
+            "a wide space is kept whole"
+        );
     }
 
     #[test]
