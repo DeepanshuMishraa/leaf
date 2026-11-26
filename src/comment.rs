@@ -100,3 +100,12 @@ impl Comment {
         self.anchor.label()
     }
 }
+
+/// Deletes the word at the end of `text` and the spaces after it, as ctrl+w
+/// and alt+backspace do in a shell. The whitespace before the word stays.
+pub fn delete_word(text: &mut String) {
+    let word = text.trim_end().rfind(char::is_whitespace).map_or(0, |at| {
+        at + text[at..].chars().next().map_or(1, char::len_utf8)
+    });
+    text.truncate(word);
+}

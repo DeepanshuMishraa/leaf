@@ -117,7 +117,7 @@ This is text to speech in the reader. leaf has no speech-to-text input. `a` star
 
 `leaf rex install` adds leaf to Rex's command palette (`cmd+shift+p`, type Leaf). Updates keep the plugin current. Actions:
 
-- Always: **Open Document…** (a floating picker), **Open Browser**, **Minimal Address Bar**, **Open Simulator…**, **Review Diff**, **Review Staged Changes**, **Review This Branch**, **Pull Requests & Issues**, **Choose Agent…**
+- Always: **Open Document…** (a floating picker), **Open Browser**, **Minimal Address Bar**, **Open Simulator…**, **Open Whiteboard**, **Review Diff**, **Review Staged Changes**, **Review This Branch**, **Pull Requests & Issues**, **Choose Agent…**
 - While a document or diff is open: **Ask Agent About Selection** (`⇧⌘A`)
 - While a document is open: **Read Aloud / Pause**, **Stop Reading Aloud**, **Read Faster**, **Read Slower**, **Next Sentence**, **Previous Sentence**, **Change Voice…**
 
@@ -125,9 +125,11 @@ Documents open in the pane the palette was called from. If that pane is busy (an
 
 ## Keys, so you can tell the person what to press
 
-**Reader:** `j/k` scroll, `space/b` screen, `ctrl+d/u` half, `←/→` page, `g/G` ends, `t` go to page, `f` find (`n/N`), `m` bookmark, `'` bookmarks, `i` original/painted images, `<`/`>` column width, `=` fit. Drag to select and copy, `@` ask the agent, `y` highlight, `1`–`6` color, `d` pen, `e` eraser, `v` move ink, `a` read aloud, `s` voice, `?` all keys, `q` quit.
+**Reader:** `j/k` scroll, `space/b` screen, `ctrl+d/u` half, `←/→` page, `g/G` ends, `:` go to page, `t` outline beside the text and `T` over it (`/` searches it, `enter` goes), `f` find (`n/N`), `m` bookmark, `'` bookmarks, `i` original/painted images, `<`/`>` column width, `=` fit. Drag to select and copy, `@` ask the agent, `y` highlight, `1`–`6` color, `d` pen, `e` eraser, `v` move ink, `a` read aloud, `s` voice, `?` all keys, `q` quit.
 
-**Diff:** `j/k` move, `[`/`]` files, `f` file picker, `tab` overview, `V` select lines, `c` comment, `F` file note, `M` global note, `m` list comments, `w` viewed, `S` send review, `@` ask the agent, `ctrl+enter` send one comment now, `ctrl+g` post to GitHub, `i` split/inline, `o` other side, `r` reload, `?` keys.
+**Diff:** `j/k` move, `[`/`]` files, `h`/`l` fold/open a file, `f` file picker, `tab` overview, `t` outline of the files beside the diff and `T` over it (`/` searches it, `enter` opens; while it is open, `h`/`l` fold one of its directories), `V` select lines, `c` comment, `F` file note, `M` global note, `m` list comments, `w` viewed (and folded), `S` send review, `@` ask the agent, `ctrl+enter` send one comment now, `ctrl+g` post to GitHub, `i` split/inline, `o` other side, `r` reload, `?` keys.
+
+**Outline** (`t` beside, `T` over, in the reader and the diff): one tree of where the person can go. In the reader it lists a PDF's bookmarks or an EPUB's table of contents, or the headings on the page when the document has none. In a diff it lists the files grouped by folder, each with its status, any `+`/`−` counts (a pure rename has none), and `✓` viewed or `●` noted. While the outline is open, `j/k` and `g/G` move between its entries and take the text or diff with them, `h/l` fold and open groups, `/` filters by typed characters in order (`tab` next match, `enter` go, `esc` cancel; while it is typed every letter, `q` among them, goes to the filter), `<`/`>` or dragging its right edge narrow or widen the sidebar, and `q` or `esc` close it (press `esc` once more after a filter). A diff file it opens goes to the top of the screen. Suggest it to someone who wants to get around a long document, a book or a large diff.
 
 **Pull request:** `tab` or `1`–`5` for Summary, Timeline, Comments, Code, Checks. `m` merge, `a` approve, `c` comment, `]`/`[` pick a comment and `enter` to reply, `x` close/reopen, `r` ready/draft. On Checks, `enter` opens a job's log and `r` re-runs. `o` opens on GitHub, `q` returns to the list. In the list, `←/→` switch PRs and issues, `tab` switches open and done, `@` shows only assigned, `R` reloads. Needs `gh` signed in.
 
@@ -145,5 +147,5 @@ Documents open in the pane the palette was called from. If that pane is busy (an
 ## Things to know
 
 - Progress, highlights, bookmarks, comments and unsent review notes are stored in SQLite at `~/.local/share/leaf/leaf.db`. Never edit leaf's data files by hand.
-- Reader settings: `~/.config/leaf/config.toml` (`[reader] max_width = 100`). leaf never writes this file.
+- Settings and keys: `~/.config/leaf/config.toml`. Every view's keys can be rebound there, so the keys listed above may differ for this person; `?` in each view shows their own. leaf never writes this file; to change it for the person, use the `leaf-config` skill.
 - Ink and inline pictures need a Kitty-graphics terminal (Kitty, Ghostty, WezTerm, Rex) and don't work inside tmux.

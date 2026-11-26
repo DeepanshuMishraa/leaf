@@ -147,6 +147,7 @@ pub fn open(path: &Path) -> Result<Doc, SheetFailed> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         page_count: Some(pages.len()),
+        bookmarks: Vec::new(),
         source: Box::new(Book {
             looks: Looks::read(path),
             sheets,

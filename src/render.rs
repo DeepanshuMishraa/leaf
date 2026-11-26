@@ -14,6 +14,7 @@ use regex::Regex;
 use unicode_width::UnicodeWidthChar;
 
 use crate::font;
+use crate::scheme::Colors;
 use crate::syntax;
 
 /// Tallest an image gets, in rows, so one figure never fills several screens.
@@ -23,6 +24,36 @@ const REMOTE_IMAGE_ROWS: u16 = 12;
 
 pub const DIM: Color = Color::Indexed(8);
 pub const CODE: Color = Color::Indexed(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownColors {
+    headings: [Color; 3],
+    link: Option<Color>,
+}
+
+impl MarkdownColors {
+    pub fn uniform(heading: Color) -> Self {
+        Self {
+            headings: [heading; 3],
+            link: None,
+        }
+    }
+
+    pub fn colorful(colors: Colors) -> Self {
+        Self {
+            headings: [
+                colors.readable(|t| t.magenta, Color::Magenta, Color::LightMagenta),
+                colors.heading_color(),
+                colors.readable(|t| t.green, Color::Green, Color::LightGreen),
+            ],
+            link: Some(if colors.light {
+                Color::Cyan
+            } else {
+                Color::LightCyan
+            }),
+        }
+    }
+}
 
 /// A block of centered lines, as PDF pages mark title pages and captions.
 static CENTERED: LazyLock<Regex> = LazyLock::new(|| {
@@ -80,6 +111,14 @@ pub enum Link {
     Note(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    pub index: usize,
+    pub level: u8,
+    pub title: String,
+    pub row: usize,
+}
+
 /// A page laid out at one width.
 #[derive(Debug, Default)]
 pub struct Laid {
@@ -89,6 +128,10 @@ pub struct Laid {
     pub text: Vec<char>,
     /// Each link's span of the page text, in order.
     pub links: Vec<(std::ops::Range<usize>, Link)>,
+    /// Hidden URL suffixes, in page text order.
+    pub hidden_link_urls: Vec<std::ops::Range<usize>>,
+    /// Numbered in the order they are drawn.
+    pub headings: Vec<Heading>,
 }
 
 impl Laid {
@@ -98,6 +141,10 @@ impl Laid {
             .iter()
             .find(|(span, _)| span.contains(&offset))
             .map(|(_, link)| link)
+    }
+
+    pub fn heading(&self, index: usize) -> Option<&Heading> {
+        self.headings.iter().find(|heading| heading.index == index)
     }
 
     /// The row and column character `offset` of the page text is drawn at.
@@ -163,6 +210,8 @@ struct Run {
     style: Style,
     /// The link this text belongs to.
     link: Option<Link>,
+    /// A destination appended after a visible link label.
+    link_url_suffix: bool,
 }
 
 type Inlines = Vec<Run>;
@@ -268,11 +317,14 @@ impl Builder {
         let style = self.style();
         let link = self.links.last().cloned();
         match self.inlines.last_mut() {
-            Some(run) if run.style == style && run.link == link => run.text.push_str(text),
+            Some(run) if run.style == style && run.link == link && !run.link_url_suffix => {
+                run.text.push_str(text);
+            }
             _ => self.inlines.push(Run {
                 text: text.to_owned(),
                 style,
                 link,
+                link_url_suffix: false,
             }),
         }
     }
@@ -301,8 +353,7 @@ impl Builder {
                     .into_iter()
                     .map(|r| Run {
                         text: r.text.replace(IMAGE_MARK, ""),
-                        style: r.style,
-                        link: r.link,
+                        ..r
                     })
                     .collect()
             };
@@ -572,14 +623,26 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 TagEnd::Link => {
                     b.styles.pop();
                     // The URL shown after the label is part of the link, so it's clickable too.
-                    if let Some(Link::Url(url)) = b.links.last().cloned() {
-                        let label: String =
-                            b.inlines.last().map(|r| r.text.clone()).unwrap_or_default();
-                        if !label.ends_with(&url) && !url.starts_with('#') {
-                            b.push_style(|s| s.fg(DIM).remove_modifier(Modifier::UNDERLINED));
-                            b.text(&format!(" ({url})"));
-                            b.styles.pop();
-                        }
+                    let last = b.inlines.last();
+                    let label = last.map_or("", |run| run.text.as_str());
+                    if let Some(Link::Url(url)) = b.links.last()
+                        && !url.starts_with('#')
+                        && !label.ends_with(url)
+                    {
+                        let has_label = last.is_some_and(|run| {
+                            run.link.as_ref() == b.links.last()
+                                && run.style.add_modifier.contains(Modifier::UNDERLINED)
+                                && run
+                                    .text
+                                    .chars()
+                                    .any(|c| !c.is_whitespace() && c != IMAGE_MARK)
+                        });
+                        b.inlines.push(Run {
+                            text: format!(" ({url})"),
+                            style: b.style().fg(DIM).remove_modifier(Modifier::UNDERLINED),
+                            link: Some(Link::Url(url.clone())),
+                            link_url_suffix: has_label,
+                        });
                     }
                     b.links.pop();
                 }
@@ -689,10 +752,17 @@ enum Wrap {
     Char,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LinkUrls {
+    Show,
+    Hide,
+}
+
 struct Ctx<'a> {
     laid: Laid,
     image_sizes: ImageSizes<'a>,
-    heading_color: Color,
+    colors: MarkdownColors,
+    link_urls: LinkUrls,
     /// A terminal cell's size in pixels.
     cell: (u16, u16),
 }
@@ -721,11 +791,26 @@ impl Ctx<'_> {
         self.laid.text.reserve(bytes + 1);
         for run in runs {
             let start = self.laid.text.len();
-            for c in run.text.chars() {
-                cells.push((c, run.style, Some(self.laid.text.len())));
-                self.laid.text.push(c);
+            let mut style = run.style;
+            if let Some(color) = self.colors.link
+                && run.link.is_some()
+                && style.add_modifier.contains(Modifier::UNDERLINED)
+            {
+                style = style.fg(color);
             }
+            // Keep saved reading positions, highlights and ink at the same offsets.
+            self.laid.text.extend(run.text.chars());
             let end = self.laid.text.len();
+            if self.link_urls == LinkUrls::Show || !run.link_url_suffix {
+                cells.extend(
+                    run.text
+                        .chars()
+                        .enumerate()
+                        .map(|(i, c)| (c, style, Some(start + i))),
+                );
+            } else {
+                self.laid.hidden_link_urls.push(start..end);
+            }
             if let Some(link) = &run.link
                 && start < end
             {
@@ -758,7 +843,14 @@ impl Ctx<'_> {
 
     fn heading(&mut self, depth: u8, runs: &[Run], x: u16, width: u16, align: Align) {
         let text: String = runs.iter().map(|r| r.text.as_str()).collect();
-        let accent = Style::default().fg(self.heading_color);
+        let accent = Style::default().fg(self.colors.headings[usize::from(depth.min(3) - 1)]);
+        // Numbered as they are drawn, here and nowhere else.
+        self.laid.headings.push(Heading {
+            index: self.laid.headings.len(),
+            level: depth,
+            title: text.replace(IMAGE_MARK, "").trim().to_owned(),
+            row: self.laid.rows.len(),
+        });
         // The terminal has one font size, so rank comes from size where it fits
         // (large letters for a short title), then weight and space. Links
         // stay in regular text so their underline and label are readable.
@@ -794,9 +886,8 @@ impl Ctx<'_> {
         let runs: Vec<Run> = runs
             .iter()
             .map(|r| Run {
-                text: r.text.clone(),
                 style: style.patch(r.style),
-                link: r.link.clone(),
+                ..r.clone()
             })
             .collect();
         let cells = self.cells(&runs);
@@ -836,6 +927,7 @@ impl Ctx<'_> {
                         text: m[2].to_owned(),
                         style: Style::default(),
                         link: None,
+                        link_url_suffix: false,
                     }],
                     x,
                     width,
@@ -859,6 +951,7 @@ impl Ctx<'_> {
                 text,
                 style,
                 link: None,
+                link_url_suffix: false,
             }]);
             self.flow(&cells, x, width, Align::Center, Wrap::Word);
         }
@@ -943,7 +1036,7 @@ impl Ctx<'_> {
         self.laid.rows[first].segs.insert(0, marker);
     }
 
-    /// A quote is dim and italic beside a dim bar. An alert keeps its text
+    /// A quote is muted and italic beside a dim bar. An alert keeps its text
     /// plain under its kind, beside a bar in the text color.
     fn quote(&mut self, kind: Option<BlockQuoteKind>, blocks: &[Node], x: u16, width: u16) {
         let first = self.laid.rows.len();
@@ -970,7 +1063,15 @@ impl Ctx<'_> {
         if kind.is_none() {
             for row in &mut self.laid.rows[body..] {
                 for seg in &mut row.segs {
-                    seg.style = seg.style.fg(DIM).add_modifier(Modifier::ITALIC);
+                    // Colored link labels stay colored; everything else is muted.
+                    if self
+                        .colors
+                        .link
+                        .is_none_or(|link| seg.style.fg != Some(link))
+                    {
+                        seg.style = seg.style.fg(DIM);
+                    }
+                    seg.style = seg.style.add_modifier(Modifier::ITALIC);
                 }
             }
         }
@@ -1011,13 +1112,12 @@ impl Ctx<'_> {
                     .map(|r| {
                         r.iter()
                             .map(|run| Run {
-                                text: run.text.clone(),
                                 style: if *is_head {
                                     run.style.patch(bold)
                                 } else {
                                     run.style
                                 },
-                                link: run.link.clone(),
+                                ..run.clone()
                             })
                             .collect()
                     })
@@ -1123,6 +1223,7 @@ impl Ctx<'_> {
                                 text: m[2].to_owned(),
                                 style: Style::default(),
                                 link: None,
+                                link_url_suffix: false,
                             }],
                             x,
                             width,
@@ -1321,10 +1422,30 @@ pub fn layout_with_heading_color(
     image_sizes: ImageSizes,
     heading_color: Color,
 ) -> Laid {
+    layout_with_colors(
+        markdown,
+        width,
+        cell,
+        image_sizes,
+        MarkdownColors::uniform(heading_color),
+        LinkUrls::Show,
+    )
+}
+
+/// Lays out a page with the reader's Markdown colors and link URL visibility.
+pub fn layout_with_colors(
+    markdown: &str,
+    width: u16,
+    cell: (u16, u16),
+    image_sizes: ImageSizes,
+    colors: MarkdownColors,
+    link_urls: LinkUrls,
+) -> Laid {
     let mut ctx = Ctx {
         laid: Laid::default(),
         image_sizes,
-        heading_color,
+        colors,
+        link_urls,
         cell,
     };
     for node in parse(markdown, true) {
@@ -1340,7 +1461,6 @@ pub fn layout_with_heading_color(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheme::Colors;
 
     fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
         layout_with_heading_color(
@@ -1463,6 +1583,59 @@ mod tests {
     }
 
     #[test]
+    fn colorful_headings_take_readable_palette_colors() {
+        let theme = crate::theme::Theme {
+            background: [250; 3],
+            blue: [24, 62, 133],
+            red: [160, 35, 55],
+            green: [35, 146, 77],
+            accent: [100, 70, 140],
+            magenta: [120, 40, 140],
+        };
+        for (colors, expected) in [
+            (
+                Colors::DARK,
+                [Color::LightMagenta, Color::LightBlue, Color::LightGreen],
+            ),
+            (
+                Colors {
+                    theme: None,
+                    light: true,
+                },
+                [Color::Magenta, Color::Blue, Color::Green],
+            ),
+            (
+                Colors {
+                    theme: Some(theme),
+                    light: true,
+                },
+                [
+                    Color::Rgb(120, 40, 140),
+                    Color::Rgb(24, 62, 133),
+                    Color::Rgb(35, 146, 77),
+                ],
+            ),
+        ] {
+            let laid = layout_with_colors(
+                "## One\n\n### Two\n\n#### Three",
+                40,
+                (8, 16),
+                &no_images,
+                MarkdownColors::colorful(colors),
+                LinkUrls::Show,
+            );
+            let fg: Vec<_> = laid
+                .rows
+                .iter()
+                .flat_map(|row| &row.segs)
+                .map(|seg| seg.style.fg)
+                .collect();
+            assert_eq!(fg, [expected[1], expected[2], expected[2]].map(Some));
+            assert_eq!(MarkdownColors::colorful(colors).headings, expected);
+        }
+    }
+
+    #[test]
     fn lists_hang_their_text_and_number_from_the_start() {
         assert_eq!(
             draw("3. alpha beta\n4. gamma", 10),
@@ -1553,6 +1726,27 @@ mod tests {
             draw("See [1] and [x](https://e.com).", 60)[0],
             "See [1] and x (https://e.com)."
         );
+    }
+
+    #[test]
+    fn hiding_link_urls_preserves_text_offsets_and_url_only_links() {
+        let markdown = "[**guide**](../guide.md) then <https://x.dev> or [](../index.md).";
+        let colors = MarkdownColors::colorful(Colors::DARK);
+        let shown = layout_with_colors(markdown, 80, (8, 16), &no_images, colors, LinkUrls::Show);
+        let hidden = layout_with_colors(markdown, 80, (8, 16), &no_images, colors, LinkUrls::Hide);
+        let row = &hidden.rows[0];
+        let visible: String = row.segs.iter().map(|seg| seg.text.as_str()).collect();
+        assert_eq!(visible, "guide then https://x.dev or  (../index.md).");
+        assert_eq!(row.segs[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(hidden.text, shown.text);
+        assert_eq!(hidden.links, shown.links);
+        assert_eq!(hidden.link_at(0), Some(&Link::Url("../guide.md".into())));
+        let after = row
+            .segs
+            .iter()
+            .find(|seg| seg.text.contains("then"))
+            .unwrap();
+        assert_eq!(after.offset, Some("guide (../guide.md)".len()));
     }
 
     #[test]
@@ -1802,5 +1996,60 @@ mod tests {
         let text: String = laid.text.iter().collect();
         assert_eq!(text, "see  here\n");
         assert!(laid.figures.is_empty());
+    }
+
+    #[test]
+    fn headings_are_numbered_in_the_order_they_are_drawn() {
+        let laid = layout(
+            "# One\n\n> ## In a quote\n\n- ### In a list\n\n<div align=\"center\">\n#### Centered\n</div>",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        let told: Vec<(usize, u8, &str)> = laid
+            .headings
+            .iter()
+            .map(|heading| (heading.index, heading.level, heading.title.as_str()))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (0, 1, "One"),
+                (1, 2, "In a quote"),
+                (2, 3, "In a list"),
+                (3, 4, "Centered"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heading_with_an_image_in_it_is_named_by_its_words_alone() {
+        let laid = layout(
+            "# ![icon](icon.png) Title\n\nwords",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        assert_eq!(laid.headings[0].title, "Title");
+    }
+
+    #[test]
+    fn a_heading_is_recorded_at_the_row_it_starts_on() {
+        // A short title is drawn as big letters, which the page text leaves out.
+        let laid = layout("# Hi\n\nAfter", 40, (8, 16), &no_images);
+        let hi = laid.heading(0).expect("the heading is numbered");
+        assert_eq!((hi.level, hi.title.as_str(), hi.row), (1, "Hi", 1));
+        assert_eq!(draw("# Hi\n\nAfter", 40)[hi.row], "█ █ █");
+        // A long one is an ordinary row of text.
+        let laid = layout(
+            "## A long enough title to wrap\n\nAfter",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        let sub = laid.heading(0).expect("the heading is numbered");
+        assert_eq!(sub.title, "A long enough title to wrap");
+        assert!(draw("## A long enough title to wrap\n\nAfter", 40)[sub.row].starts_with("A long"));
+        assert_eq!(laid.heading(1), None);
     }
 }

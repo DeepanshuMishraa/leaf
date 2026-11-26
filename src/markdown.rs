@@ -355,6 +355,7 @@ fn document(title: String, text: &str, base: Base) -> Doc {
     Doc {
         title,
         page_count: None,
+        bookmarks: Vec::new(),
         source: Box::new(MarkdownSource {
             text: markdown.into(),
             images,

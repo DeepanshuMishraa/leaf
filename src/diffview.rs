@@ -2,7 +2,7 @@
 //! sending them to an agent or a pull request.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
@@ -29,12 +29,15 @@ use unicode_width::UnicodeWidthChar;
 use crate::agent;
 use crate::art;
 use crate::comment::{Anchor, Comment, Side, State};
+use crate::config::KeysConfig;
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
+use crate::diffkeys::{CommentsAction, ConfirmAction, DiffAction, OverviewAction, VerdictAction};
 use crate::diffreview::{self, FileNotes, Margin, Reopen, SaveNotes, Sends};
 use crate::github;
 use crate::linediff;
 use crate::look::Look;
 use crate::news::News;
+use crate::outline::{self, Ask, OpenOutline, OutlineAction, OutlineForm};
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::remote;
 use crate::render::DIM;
@@ -56,6 +59,8 @@ const HIGHLIGHT_CACHE: usize = 64;
 const HIGHLIGHT_BYTES: usize = 128 * 1024;
 /// How many rows one wheel notch moves.
 const WHEEL_ROWS: usize = 3;
+const OUTLINE_COLUMNS: u16 = 32;
+const OUTLINE_MIN_SCREEN: u16 = OUTLINE_COLUMNS + 40;
 
 /// Line tints: the theme's own green, red and blue mixed over its background
 /// when the theme is known, otherwise fixed shades. Exact RGB either way, not
@@ -154,12 +159,17 @@ pub struct Options {
     /// other tabs, and `h`/`l` scroll sideways.
     pub tabs: bool,
     pub layout: Layout,
+    /// The keys the diff answers to, as `[keys.diff]` sets them.
+    pub keys: KeysConfig,
+    /// The outline sidebar's width when it first opens, as `[outline] width` sets it.
+    pub outline_width: u16,
     /// File and global notes, and where `S` sends the review.
     pub margin: Margin,
 }
 
 /// How changed lines are laid out; `i` switches between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// Old code on the left, new code on the right.
     #[default]
@@ -217,6 +227,8 @@ impl Default for Options {
             failure: Rc::new(RefCell::new(None)),
             tabs: false,
             layout: Layout::Split,
+            keys: KeysConfig::default(),
+            outline_width: outline::SIDEBAR_COLUMNS,
             margin: Margin::default(),
         }
     }
@@ -242,6 +254,7 @@ enum DialogKind {
     Confirm,
     Loading,
     Verdict,
+    Outline,
 }
 
 struct Confirm {
@@ -269,6 +282,8 @@ enum Dialog {
     Loading(String),
     /// Picking the verdict the review goes out with.
     Verdict,
+    /// The tree stays in `outline`; this only holds the keys.
+    Outline,
 }
 
 impl Dialog {
@@ -282,6 +297,7 @@ impl Dialog {
             Dialog::Confirm(_) => DialogKind::Confirm,
             Dialog::Loading(_) => DialogKind::Loading,
             Dialog::Verdict => DialogKind::Verdict,
+            Dialog::Outline => DialogKind::Outline,
         }
     }
 }
@@ -363,12 +379,14 @@ type Deliver = Box<dyn FnMut(&str) -> Result<agent::Agent, agent::AgentFailed>>;
 
 /// One line on screen. In the split layout changed blocks are paired
 /// left-to-right; inline, each line holds one changed row, or a context row on
-/// both sides. Headings and notes span the width.
+/// both sides. Headings and notes span the width. A folded file is its
+/// heading alone, with `folded` set.
 #[derive(Debug, Clone, Copy)]
 struct SplitRow {
     left: Option<usize>,
     right: Option<usize>,
     band: Option<usize>,
+    folded: bool,
 }
 
 /// What a split line is going through this frame.
@@ -379,8 +397,14 @@ struct SideState {
 }
 
 impl SplitRow {
+    /// A line of code, on either side.
     fn is_content(self) -> bool {
         self.left.is_some() || self.right.is_some()
+    }
+
+    /// A line the cursor can rest on: code, or a folded file's heading.
+    fn is_stop(self) -> bool {
+        self.is_content() || self.folded
     }
 
     /// The side the cursor and a new comment prefer: the new side.
@@ -498,7 +522,9 @@ impl Split {
         }
     }
 
-    fn new(diff: &Diff, layout: Layout) -> Self {
+    /// The lines for `diff`, with the files in `folded` shown as their
+    /// heading alone.
+    fn new(diff: &Diff, layout: Layout, folded: &HashSet<usize>) -> Self {
         let rows = diff.rows();
         let shifts = block_shifts(diff);
         let mut lines = Vec::new();
@@ -515,12 +541,31 @@ impl Split {
         let mut at = 0;
         while at < rows.len() {
             match rows[at].kind {
+                RowKind::File if folded.contains(&(rows[at].file as usize)) => {
+                    push(
+                        SplitRow {
+                            left: None,
+                            right: None,
+                            band: Some(at),
+                            folded: true,
+                        },
+                        &mut line_of_row,
+                    );
+                    // The file's rows all land on its heading.
+                    let line = line_of_row[at];
+                    at += 1;
+                    while at < rows.len() && rows[at].kind != RowKind::File {
+                        line_of_row[at] = line;
+                        at += 1;
+                    }
+                }
                 RowKind::Context => {
                     push(
                         SplitRow {
                             left: Some(at),
                             right: Some(at),
                             band: None,
+                            folded: false,
                         },
                         &mut line_of_row,
                     );
@@ -532,6 +577,7 @@ impl Split {
                             left: Some(at),
                             right: None,
                             band: None,
+                            folded: false,
                         },
                         &mut line_of_row,
                     );
@@ -561,6 +607,7 @@ impl Split {
                                 left: side(left_shift, old, old_start),
                                 right: side(right_shift, new, new_start),
                                 band: None,
+                                folded: false,
                             },
                             &mut line_of_row,
                         );
@@ -577,6 +624,7 @@ impl Split {
                                 left: None,
                                 right: Some(row),
                                 band: None,
+                                folded: false,
                             },
                             &mut line_of_row,
                         );
@@ -588,6 +636,7 @@ impl Split {
                             left: None,
                             right: None,
                             band: Some(at),
+                            folded: false,
                         },
                         &mut line_of_row,
                     );
@@ -652,25 +701,25 @@ impl Split {
     }
 
     fn first_content(&self) -> Option<usize> {
-        self.lines.iter().position(|line| line.is_content())
+        self.lines.iter().position(|line| line.is_stop())
     }
 
     fn last_content(&self) -> Option<usize> {
-        self.lines.iter().rposition(|line| line.is_content())
+        self.lines.iter().rposition(|line| line.is_stop())
     }
 
     fn next_content(&self, line: usize, forward: bool) -> Option<usize> {
         if forward {
-            (line + 1..self.lines.len()).find(|&i| self.lines[i].is_content())
+            (line + 1..self.lines.len()).find(|&i| self.lines[i].is_stop())
         } else {
             (0..line.min(self.lines.len()))
                 .rev()
-                .find(|&i| self.lines[i].is_content())
+                .find(|&i| self.lines[i].is_stop())
         }
     }
 
     fn snap(&self, line: usize) -> usize {
-        if self.lines.get(line).is_some_and(|line| line.is_content()) {
+        if self.lines.get(line).is_some_and(|line| line.is_stop()) {
             return line;
         }
         self.next_content(line, true)
@@ -725,8 +774,14 @@ struct App {
     /// Where `quit` goes, for a pull request's Code tab.
     leave: Leave,
     tabs: bool,
+    keys: KeysConfig,
     layout: Layout,
     split: Split,
+    /// The paths of the files shown as their heading alone.
+    folded: HashSet<String>,
+    /// The files marked viewed, kept so headings don't fingerprint a file
+    /// every frame.
+    viewed: HashSet<usize>,
     /// The diff's lines on screen.
     view: Rect,
     /// Rows inside the comment box, for moving the cursor.
@@ -742,6 +797,9 @@ struct App {
     /// The overview of every file, with the row picked: 0 is the global
     /// note, then one row per file. `None` while reading a file.
     overview: Option<usize>,
+    outline: Option<OpenOutline>,
+    /// How wide the outline's sidebar is asked to be; `<` and `>` change it for the session.
+    outline_columns: u16,
     note_editor: Option<NoteEditor>,
     /// How the review ended, for `leaf review`.
     outcome: Option<Outcome>,
@@ -764,7 +822,7 @@ struct NoteEditor {
 
 impl App {
     fn new(loaded: Loaded, options: Options) -> Self {
-        let split = Split::new(&loaded.diff, options.layout);
+        let split = Split::new(&loaded.diff, options.layout, &HashSet::new());
         let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
         let look = Look::detect();
@@ -800,8 +858,11 @@ impl App {
             quit: false,
             leave: Leave::Quit,
             tabs: options.tabs,
+            keys: options.keys,
             layout: options.layout,
             split,
+            folded: HashSet::new(),
+            viewed: HashSet::new(),
             view: Rect::default(),
             composer_view: 0,
             highlight: HashMap::new(),
@@ -817,6 +878,8 @@ impl App {
             reopen_notes: options.margin.reopen,
             sends: options.margin.sends,
             overview: None,
+            outline: None,
+            outline_columns: options.outline_width,
             note_editor: None,
             outcome: None,
             quit_armed: false,
@@ -826,6 +889,12 @@ impl App {
         }
         app.rebuild_marks();
         app.follow_renames();
+        app.refresh_viewed();
+        app.fold_viewed();
+        if !app.folded.is_empty() {
+            app.rebuild_split();
+            app.cursor = app.split.first_content().unwrap_or(0);
+        }
         app
     }
 
@@ -1037,15 +1106,44 @@ impl App {
                         .filter(|at| *at > 0)
                         .and_then(|at| self.loaded.diff.file(at - 1))
                         .map(|file| file.path().to_owned());
+                    // A folded file that changed opens again, so the change
+                    // isn't hidden under its heading.
+                    let changed: Vec<String> = if same_key {
+                        self.folded
+                            .iter()
+                            .filter(|path| {
+                                let print = |diff: &Diff| {
+                                    diff.files()
+                                        .iter()
+                                        .position(|file| file.path() == path.as_str())
+                                        .map(|file| diffreview::fingerprint(diff, file))
+                                };
+                                print(&self.loaded.diff) != print(&loaded.diff)
+                            })
+                            .cloned()
+                            .collect()
+                    } else {
+                        self.folded.iter().cloned().collect()
+                    };
+                    for path in changed {
+                        self.folded.remove(&path);
+                    }
                     self.loaded = loaded;
                     self.content_widths = None;
                     self.key = self.loaded.key.clone();
-                    self.split = Split::new(&self.loaded.diff, self.layout);
                     if !same_key {
                         self.load_comments();
                         self.load_notes();
                     }
                     self.follow_renames();
+                    self.refresh_viewed();
+                    if !same_key {
+                        self.fold_viewed();
+                    }
+                    self.split = Split::new(&self.loaded.diff, self.layout, &self.folded_files());
+                    if let Some(open) = self.outline.as_mut() {
+                        open.retarget(outline::from_diff_files(self.loaded.diff.files()), false);
+                    }
                     self.cursor = if background {
                         remember
                             .and_then(|(file, side, line)| {
@@ -1522,77 +1620,93 @@ impl App {
             self.overview_key(key);
             return;
         }
-        if !matches!(key.code, KeyCode::Char('q')) {
+        if self.outline.is_some() && self.outline_key(key) {
+            return;
+        }
+        let done = self
+            .keys
+            .diff
+            .actions(&key)
+            .into_iter()
+            .find(|action| self.perform(*action));
+        // `q` quits on the second press; any other key between starts over.
+        if done != Some(DiffAction::Quit) {
             self.quit_armed = false;
         }
-        match key.code {
-            KeyCode::Char('q') => self.ask_quit(),
-            KeyCode::Char('F') => self.edit_file_note(None),
-            KeyCode::Char('M') => self.edit_global_note(),
-            KeyCode::Char('w') => self.toggle_viewed(None),
-            KeyCode::Char('S') => self.open_verdict(),
-            KeyCode::Char('O') => self.show_overview(),
-            KeyCode::Tab if !self.tabs => self.show_overview(),
-            KeyCode::Esc => {
-                // Escape drops whatever is highlighted before it quits.
-                if self.visual {
-                    self.visual = false;
-                    self.selection = None;
-                } else if self.selection.is_some() || self.focus.is_some() {
-                    self.selection = None;
-                    self.focus = None;
-                } else {
-                    self.quit = true;
-                }
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(true),
-            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(false),
-            // Ctrl+d and Ctrl+u also arrive as these characters, so both work.
-            KeyCode::Char('d') => self.page(true, true),
-            KeyCode::Char('u') => self.page(false, true),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.page(true, false),
-            KeyCode::PageUp | KeyCode::Char('b') => self.page(false, false),
-            KeyCode::Char('g') | KeyCode::Home => self.go_edge(false),
-            KeyCode::Char('G') | KeyCode::End => self.go_edge(true),
-            KeyCode::Char(']') | KeyCode::Char('n') => self.next_file(true),
-            KeyCode::Char('[') | KeyCode::Char('N') => self.next_file(false),
-            KeyCode::Char('f') => self.show_files(),
-            KeyCode::Char('v' | 'V') => self.toggle_selection(),
-            KeyCode::Char('c' | 'C') => self.compose(Purpose::Comment),
-            KeyCode::Char('@') => self.compose(Purpose::Ask),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.compose(Purpose::Ask)
-            }
-            KeyCode::Char('m') => self.show_comments(),
-            KeyCode::Char('y') => self.copy_payload(false),
-            KeyCode::Char('Y') => self.copy_payload(true),
-            KeyCode::Char('o') => self.other_side(),
-            KeyCode::Char('i') => self.toggle_layout(),
-            KeyCode::Char('r') => self.reload(),
-            KeyCode::Char('1') if self.tabs => {
-                self.leave = Leave::Summary;
-                self.quit = true;
-            }
-            KeyCode::Char('2') if self.tabs => {
-                self.leave = Leave::Timeline;
-                self.quit = true;
-            }
-            KeyCode::Char('3') | KeyCode::Left | KeyCode::BackTab if self.tabs => {
-                self.leave = Leave::Comments;
-                self.quit = true;
-            }
-            KeyCode::Char('4') if self.tabs => {}
-            KeyCode::Char('5') | KeyCode::Right | KeyCode::Tab if self.tabs => {
-                self.leave = Leave::Checks;
-                self.quit = true;
-            }
-            KeyCode::Char('h') | KeyCode::Left => self.scroll_sideways(false),
-            KeyCode::Char('l') | KeyCode::Right => self.scroll_sideways(true),
-            KeyCode::Char('0') => self.left = 0,
-            KeyCode::Char('?') => self.dialog = Dialog::Help,
-            _ => {}
+    }
+
+    /// Drops whatever is highlighted before it quits.
+    fn escape(&mut self) {
+        if self.visual {
+            self.visual = false;
+            self.selection = None;
+        } else if self.selection.is_some() || self.focus.is_some() {
+            self.selection = None;
+            self.focus = None;
+        } else {
+            self.quit = true;
         }
+    }
+
+    /// Does what `action` asks, and says whether it did anything. One that
+    /// can't act now lets the next action bound to the same key have it.
+    fn perform(&mut self, action: DiffAction) -> bool {
+        let tab = |leave| (self.tabs).then_some(leave);
+        let leave = match action {
+            DiffAction::TabSummary => tab(Leave::Summary),
+            DiffAction::TabTimeline => tab(Leave::Timeline),
+            DiffAction::TabComments => tab(Leave::Comments),
+            DiffAction::TabChecks => tab(Leave::Checks),
+            _ => None,
+        };
+        if let Some(leave) = leave {
+            self.leave = leave;
+            self.quit = true;
+            return true;
+        }
+        match action {
+            DiffAction::TabSummary
+            | DiffAction::TabTimeline
+            | DiffAction::TabComments
+            | DiffAction::TabChecks => return false,
+            DiffAction::Quit => self.ask_quit(),
+            DiffAction::QuitNow => self.quit = true,
+            DiffAction::Escape => self.escape(),
+            DiffAction::FileNote => self.edit_file_note(None),
+            DiffAction::GlobalNote => self.edit_global_note(),
+            DiffAction::Viewed => self.toggle_viewed(None),
+            DiffAction::SendReview => self.open_verdict(),
+            DiffAction::Overview => self.show_overview(),
+            DiffAction::Down => self.move_cursor(true),
+            DiffAction::Up => self.move_cursor(false),
+            DiffAction::HalfPageDown => self.page(true, true),
+            DiffAction::HalfPageUp => self.page(false, true),
+            DiffAction::PageDown => self.page(true, false),
+            DiffAction::PageUp => self.page(false, false),
+            DiffAction::First => self.go_edge(false),
+            DiffAction::Last => self.go_edge(true),
+            DiffAction::NextFile => self.next_file(true),
+            DiffAction::PreviousFile => self.next_file(false),
+            DiffAction::Files => self.show_files(),
+            DiffAction::Outline => self.toggle_outline(OutlineForm::Sidebar),
+            DiffAction::OutlineWindow => self.toggle_outline(OutlineForm::Window),
+            DiffAction::Select => self.toggle_selection(),
+            DiffAction::Comment => self.compose(Purpose::Comment),
+            DiffAction::Ask => self.compose(Purpose::Ask),
+            DiffAction::Comments => self.show_comments(),
+            DiffAction::Copy => self.copy_payload(false),
+            DiffAction::CopyAll => self.copy_payload(true),
+            DiffAction::OtherSide => self.other_side(),
+            DiffAction::Layout => self.toggle_layout(),
+            DiffAction::Reload => self.reload(),
+            DiffAction::Fold => self.fold_current(true),
+            DiffAction::Unfold => self.fold_current(false),
+            DiffAction::ScrollLeft => self.scroll_sideways(false),
+            DiffAction::ScrollRight => self.scroll_sideways(true),
+            DiffAction::ScrollReset => self.left = 0,
+            DiffAction::Help => self.dialog = Dialog::Help,
+        }
+        true
     }
 
     fn composer_key(&mut self, key: KeyEvent) {
@@ -1615,13 +1729,20 @@ impl App {
             Some(DialogKind::Comments) => self.comments_key(key),
             Some(DialogKind::Files) => self.files_key(key),
             Some(DialogKind::Confirm) => self.confirm_key(key),
+            // Every key is the window's.
+            Some(DialogKind::Outline) => {
+                self.outline_key(key);
+            }
             Some(DialogKind::Loading) => {}
             Some(DialogKind::Verdict) => self.verdict_key(key),
             Some(DialogKind::Help | DialogKind::Error) | None => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
+                let closes = self.keys.diff.actions(&key).into_iter().any(|action| {
+                    matches!(
+                        action,
+                        DiffAction::Quit | DiffAction::Help | DiffAction::Escape
+                    )
+                });
+                if closes || key.code == KeyCode::Enter {
                     self.dialog = Dialog::None;
                 }
             }
@@ -1639,27 +1760,30 @@ impl App {
     }
 
     fn comments_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => self.dialog = Dialog::None,
-            KeyCode::Down | KeyCode::Char('j') => {
+        let Some(action) = self.keys.diff_comments.actions(&key).first().copied() else {
+            return;
+        };
+        match action {
+            CommentsAction::Close => self.dialog = Dialog::None,
+            CommentsAction::Down => {
                 let last = self.comments.len().saturating_sub(1);
                 if let Dialog::Comments { selected } = &mut self.dialog {
                     *selected = (*selected + 1).min(last);
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            CommentsAction::Up => {
                 if let Dialog::Comments { selected } = &mut self.dialog {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            KeyCode::Enter => {
+            CommentsAction::Jump => {
                 if let Some((_, comment)) = self.selected_comment() {
                     let anchor = comment.anchor;
                     self.dialog = Dialog::None;
                     self.jump_to(&anchor);
                 }
             }
-            KeyCode::Char('d') => {
+            CommentsAction::Delete => {
                 if let Some((index, _)) = self.selected_comment() {
                     self.remove(index);
                     self.toast("Comment deleted");
@@ -1670,33 +1794,32 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('g') => {
+            CommentsAction::Github => {
                 if let Some((index, comment)) = self.selected_comment() {
                     self.dialog = Dialog::None;
                     self.comment_to_github(&comment, Some(index));
                 }
             }
-            KeyCode::Char('a') => {
+            CommentsAction::Agent => {
                 if let Some((index, comment)) = self.selected_comment() {
                     self.dialog = Dialog::None;
                     self.comment_to_agent(&comment, Some(index));
                 }
             }
-            KeyCode::Char('y') => {
+            CommentsAction::Copy => {
                 if let Some((_, comment)) = self.selected_comment() {
                     let text = self.anchor_payload(&comment.anchor, &comment.body);
                     self.copy = Some(text);
                     self.toast("Comment copied");
                 }
             }
-            _ => {}
         }
     }
 
     fn confirm_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.start_post(),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        match self.keys.confirm_post.actions(&key).first() {
+            Some(ConfirmAction::Yes) => self.start_post(),
+            Some(ConfirmAction::No) => {
                 if let Dialog::Confirm(confirm) = std::mem::replace(&mut self.dialog, Dialog::None)
                 {
                     self.composer = Some(confirm.composer);
@@ -1712,6 +1835,34 @@ impl App {
             || self.composer.is_some()
         {
             return;
+        }
+        let beside = match self.form() {
+            Some(OutlineForm::Sidebar) => self.view.x,
+            _ => 0,
+        };
+        if let Some(open) = self.outline.as_mut() {
+            let (taken, width) = open.edge_mouse(mouse.kind, mouse.column, beside);
+            if let Some(width) = width {
+                self.outline_columns = width;
+            }
+            if taken {
+                return;
+            }
+        }
+        match self.form() {
+            // A release is let through, so a drag begun in the diff still ends.
+            Some(OutlineForm::Sidebar)
+                if mouse.column < self.view.x
+                    && !matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::Up(_)
+                    ) =>
+            {
+                return;
+            }
+            _ => {}
         }
         if matches!(
             mouse.kind,
@@ -1945,6 +2096,12 @@ impl App {
         }
     }
 
+    /// Jumps to file `index`, opening it when it's folded.
+    fn open_file(&mut self, index: usize) {
+        self.set_folded(index, false);
+        self.jump_file(index);
+    }
+
     fn show_files(&mut self) {
         if self.loaded.diff.files().is_empty() {
             self.toast("This diff has no files");
@@ -2006,7 +2163,7 @@ impl App {
                 let files = self.picker_files();
                 if let Some(&index) = files.get(self.pick_selected()) {
                     self.dialog = Dialog::None;
-                    self.jump_file(index);
+                    self.open_file(index);
                 }
             }
             KeyCode::Char(c) if !control => {
@@ -2090,13 +2247,23 @@ impl App {
     /// The line a scroll can stop at when bringing `line` to the top: the
     /// line itself, plus the file and hunk headings directly above it.
     fn heading_start(&self, line: usize) -> usize {
+        let diff = &self.loaded.diff;
+        let lines = self.split.lines();
+        // A file's own name is as far up as its headings go: above it is another file.
+        let is_file = |at: usize| {
+            lines
+                .get(at)
+                .and_then(|line| line.band)
+                .is_some_and(|row| diff.rows()[row].kind == RowKind::File)
+        };
         let mut top = line;
         while top > 0
+            && !is_file(top)
             && self
                 .split
                 .lines()
                 .get(top - 1)
-                .is_some_and(|line| line.band.is_some())
+                .is_some_and(|line| line.band.is_some() && !line.folded)
         {
             top -= 1;
         }
@@ -2120,13 +2287,6 @@ impl App {
     /// Switches between split and inline, keeping the cursor, selection and
     /// focused comment on the same diff rows.
     fn toggle_layout(&mut self) {
-        let row_of =
-            |split: &Split, line: usize| split.lines().get(line).and_then(|l| l.focus_row());
-        let cursor = row_of(&self.split, self.cursor);
-        let selection = self.selection.and_then(|line| row_of(&self.split, line));
-        let focus = self
-            .focus
-            .and_then(|(first, last)| self.split.rows_between(first, last));
         self.layout = self.layout.toggled();
         // Remembered, so the next diff opens the same way.
         match self
@@ -2147,9 +2307,54 @@ impl App {
                 ));
             }
         }
-        self.split = Split::new(&self.loaded.diff, self.layout);
+        self.rebuild_split();
+    }
+
+    /// The indices of the folded files in this diff.
+    fn folded_files(&self) -> HashSet<usize> {
+        if self.folded.is_empty() {
+            return HashSet::new();
+        }
+        self.loaded
+            .diff
+            .files()
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| self.folded.contains(file.path()))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Works out again which files are marked viewed.
+    fn refresh_viewed(&mut self) {
+        let diff = &self.loaded.diff;
+        self.viewed = (0..diff.files().len())
+            .filter(|&index| self.notes.is_viewed(diff, index))
+            .collect();
+    }
+
+    /// Folds every file marked viewed.
+    fn fold_viewed(&mut self) {
+        let files = self.loaded.diff.files();
+        for &index in &self.viewed {
+            self.folded.insert(files[index].path().to_owned());
+        }
+    }
+
+    /// Lays the lines out again after a layout switch or a fold, keeping the
+    /// cursor, selection and focused comment on the same diff rows.
+    fn rebuild_split(&mut self) {
+        let row_of =
+            |split: &Split, line: usize| split.lines().get(line).and_then(|l| l.focus_row());
+        let cursor = row_of(&self.split, self.cursor);
+        let selection = self.selection.and_then(|line| row_of(&self.split, line));
+        let focus = self
+            .focus
+            .and_then(|(first, last)| self.split.rows_between(first, last));
+        self.split = Split::new(&self.loaded.diff, self.layout, &self.folded_files());
         self.cursor = cursor
             .and_then(|row| self.split.line_for_row(row))
+            .map(|line| self.split.snap(line))
             .or_else(|| self.split.first_content())
             .unwrap_or(0);
         self.selection = selection.and_then(|row| self.split.line_for_row(row));
@@ -2157,6 +2362,42 @@ impl App {
         match self.focus {
             Some((first, last)) => self.follow_focus(first, last),
             None => self.follow_cursor(),
+        }
+    }
+
+    /// Folds file `file` to its heading, or opens it, leaving the cursor on
+    /// its heading or its first line. Returns whether anything changed.
+    fn set_folded(&mut self, file: usize, fold: bool) -> bool {
+        let Some(info) = self.loaded.diff.file(file) else {
+            return false;
+        };
+        let path = info.path().to_owned();
+        let header = info.header_row;
+        let changed = if fold {
+            self.folded.insert(path)
+        } else {
+            self.folded.remove(&path)
+        };
+        if !changed {
+            return false;
+        }
+        self.visual = false;
+        self.selection = None;
+        self.focus = None;
+        self.rebuild_split();
+        if let Some(line) = self.split.line_for_row(header) {
+            self.cursor = self.split.snap(line);
+            // Keep the heading on screen.
+            self.scroll = self.scroll.min(line);
+        }
+        self.follow_cursor();
+        true
+    }
+
+    /// `h` folds the file under the cursor, `l` opens it.
+    fn fold_current(&mut self, fold: bool) {
+        if let Some(file) = self.current_file() {
+            self.set_folded(file, fold);
         }
     }
 
@@ -2214,9 +2455,12 @@ impl App {
                 }
                 self.composer = Some(Composer::new(anchor, first, last, purpose));
             }
-            None => self.fail(
-                "That range has no code line to comment on. Move to a line that changed, then press C.",
-            ),
+            None => {
+                let key = self.keys.diff.first(DiffAction::Comment);
+                self.fail(format!(
+                    "That range has no code line to comment on. Move to a line that changed, then press {key}."
+                ))
+            }
         }
     }
 
@@ -2427,6 +2671,9 @@ impl App {
             .row_for(&anchor.file, anchor.side, anchor.end_line)
             .unwrap_or(first)
             .max(first);
+        if let Some(file) = diff.file_index(first) {
+            self.set_folded(file, false);
+        }
         let lines = self.split.lines_for_rows(first, last);
         let Some((first, last)) = lines else {
             self.fail(format!(
@@ -2488,7 +2735,10 @@ impl App {
             self.copy = Some(payload(&self.loaded.diff, &anchor, first, last, ""));
             self.toast(format!("Copied {} {}", anchor.file, anchor.range_label()));
         } else {
-            self.fail("That range has no code line to copy. Move to a changed line, then press y.");
+            let key = self.keys.diff.first(DiffAction::Copy);
+            self.fail(format!(
+                "That range has no code line to copy. Move to a changed line, then press {key}."
+            ));
         }
     }
 
@@ -2568,16 +2818,37 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        if self.form() == Some(OutlineForm::Sidebar) && area.width < OUTLINE_MIN_SCREEN {
+            self.outline = None;
+        }
+        let beside = match self.form() {
+            Some(OutlineForm::Sidebar) => outline::sidebar(
+                self.outline_columns,
+                area.width,
+                OUTLINE_MIN_SCREEN - OUTLINE_COLUMNS,
+            ),
+            _ => 0,
+        };
+        let body = Rect::new(
+            area.x + beside,
+            area.y,
+            area.width - beside,
+            area.height.saturating_sub(1),
+        );
         self.view = body;
         if self.left > 0 {
             self.left = self.left.min(self.max_left());
         }
         self.follow_cursor();
+        // The cursor also moves without a key: by a reload.
+        self.sync_outline();
         if let Some(selected) = self.overview {
             self.draw_overview(f, body, selected);
         } else {
             self.draw_rows(f, body);
+        }
+        if beside > 0 {
+            self.draw_outline_side(f, Rect::new(area.x, area.y, beside, body.height));
         }
         self.draw_note_editor(f, body);
         self.draw_footer(
@@ -2698,19 +2969,31 @@ impl App {
                 "selected · "
             };
             let unit = if lines == 1 { "line" } else { "lines" };
-            left.push_str(&format!("  {mode}{lines} {unit} · c comment"));
+            let comment = self.keys.diff.first(DiffAction::Comment);
+            left.push_str(&format!("  {mode}{lines} {unit} · {comment} comment"));
         }
         let (added, removed) = totals(diff);
         let unsent = self.unsent();
+        let keys = &self.keys.diff;
+        let send = keys.first(DiffAction::SendReview);
         let review = if unsent > 0 {
-            format!("{unsent} unsent · S send   ")
+            format!("{unsent} unsent · {send} send   ")
         } else if self.sends == Sends::Return {
-            "tab files · S send   ".to_owned()
+            format!(
+                "{} files · {send} send   ",
+                keys.first(DiffAction::Overview)
+            )
         } else {
             String::new()
         };
         let stats = if self.tabs {
-            format!("{review}1 summary · 2 timeline · 3 comments · 5 checks   +{added} −{removed} ")
+            format!(
+                "{review}{} summary · {} timeline · {} comments · {} checks   +{added} −{removed} ",
+                keys.first(DiffAction::TabSummary),
+                keys.first(DiffAction::TabTimeline),
+                keys.first(DiffAction::TabComments),
+                keys.first(DiffAction::TabChecks),
+            )
         } else {
             format!("{review}+{added} −{removed} ")
         };
@@ -2751,20 +3034,36 @@ impl App {
         if let Some(index) = pinned
             && let Some(row) = self.split.lines()[index].band
         {
-            let drawn = self.row_line(row);
+            let mut drawn = self.row_line(row);
+            if self.split.lines()[index].folded {
+                fold_heading(&mut drawn);
+            }
             headers.push((0, drawn.width() as u16));
             lines.push(drawn);
         }
         for index in self.scroll..end {
             let line = self.split.lines()[index];
-            let drawn = match line.band {
+            let mut drawn = match line.band {
                 Some(row) => self.row_line(row),
                 None => self.split_content(index, area.width),
             };
             if let Some(row) = line.band
                 && self.loaded.diff.rows()[row].kind == RowKind::File
             {
-                headers.push((lines.len() as u16, drawn.width() as u16));
+                if line.folded {
+                    fold_heading(&mut drawn);
+                }
+                if index == self.cursor {
+                    // The cursor on a folded heading: a full-width bar, drawn
+                    // over the ink so it shows.
+                    let width = drawn.width();
+                    drawn.spans.push(Span::raw(
+                        " ".repeat((area.width as usize).saturating_sub(width)),
+                    ));
+                    drawn = drawn.patch_style(Style::default().bg(self.palette.cursor));
+                } else {
+                    headers.push((lines.len() as u16, drawn.width() as u16));
+                }
             }
             lines.push(drawn);
         }
@@ -2801,21 +3100,33 @@ impl App {
                 let (added, removed) = file.map_or((0, 0), |file| (file.added, file.removed));
                 let path = file.map(|file| file.display()).unwrap_or_default();
                 let note = file.and_then(|file| file.note.clone());
+                // A viewed file's heading is muted, folded or not.
+                let viewed = self.viewed.contains(&(row.file as usize));
+                let (path_style, added_style, removed_style) = if viewed {
+                    let muted = Style::default().fg(DIM);
+                    (muted, muted, muted)
+                } else {
+                    (
+                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default().fg(ADDED_FG),
+                        Style::default().fg(REMOVED_FG),
+                    )
+                };
                 let mut spans = vec![
-                    Span::styled(" ▎ ", Style::default().fg(ACCENT)),
-                    Span::styled(path, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " ▎ ",
+                        Style::default().fg(if viewed { DIM } else { ACCENT }),
+                    ),
+                    Span::styled(path, path_style),
                 ];
                 if added > 0 {
-                    spans.push(Span::styled(
-                        format!(" +{added}"),
-                        Style::default().fg(ADDED_FG),
-                    ));
+                    spans.push(Span::styled(format!(" +{added}"), added_style));
                 }
                 if removed > 0 {
-                    spans.push(Span::styled(
-                        format!(" −{removed}"),
-                        Style::default().fg(REMOVED_FG),
-                    ));
+                    spans.push(Span::styled(format!(" −{removed}"), removed_style));
+                }
+                if viewed {
+                    spans.push(Span::styled("  ✓ viewed", Style::default().fg(DIM)));
                 }
                 if let Some(note) = note {
                     spans.push(Span::styled(format!("  {note}"), Style::default().fg(DIM)));
@@ -3179,7 +3490,7 @@ impl App {
 
     fn draw_dialog(&mut self, f: &mut Frame, area: Rect, kind: DialogKind) {
         match kind {
-            DialogKind::Help => draw_help(f, area, self.look.ink()),
+            DialogKind::Help => draw_help(f, area, self.look.ink(), &self.keys),
             DialogKind::Loading => {
                 let text = match &self.dialog {
                     Dialog::Loading(text) => text.clone(),
@@ -3211,6 +3522,7 @@ impl App {
                 )));
                 panel(f, area, self.look.ink(), "could not finish", lines, width);
             }
+            DialogKind::Outline => self.draw_outline_window(f, area),
             DialogKind::Comments => self.draw_comments(f, area),
             DialogKind::Files => self.draw_files(f, area),
             DialogKind::Confirm => self.draw_confirm(f, area),
@@ -3323,8 +3635,17 @@ impl App {
             lines.truncate(max_rows);
         }
         lines.push(Line::from(""));
+        let keys = &self.keys.diff_comments;
         lines.push(Line::from(Span::styled(
-            "enter jump · a agent · g github · d delete · y copy · esc close",
+            format!(
+                "{} jump · {} agent · {} github · {} delete · {} copy · {} close",
+                keys.first(CommentsAction::Jump),
+                keys.first(CommentsAction::Agent),
+                keys.first(CommentsAction::Github),
+                keys.first(CommentsAction::Delete),
+                keys.first(CommentsAction::Copy),
+                keys.first(CommentsAction::Close),
+            ),
             Style::default().fg(DIM),
         )));
         panel(f, area, self.look.ink(), "comments", lines, width);
@@ -3364,9 +3685,15 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("y", Style::default().fg(ADDED_FG)),
+            Span::styled(
+                self.keys.confirm_post.first(ConfirmAction::Yes),
+                Style::default().fg(ADDED_FG),
+            ),
             Span::styled(" post    ", Style::default().fg(DIM)),
-            Span::styled("n", Style::default().fg(REMOVED_FG)),
+            Span::styled(
+                self.keys.confirm_post.first(ConfirmAction::No),
+                Style::default().fg(REMOVED_FG),
+            ),
             Span::styled(" back to editing", Style::default().fg(DIM)),
         ]));
         panel(f, area, self.look.ink(), "post to github", lines, width);
@@ -3520,6 +3847,13 @@ fn push_text(spans: &mut Vec<Span<'static>>, style: Style, text: &str) {
     spans.push(Span::styled(text.to_owned(), style));
 }
 
+/// Marks a file heading as folded: its bar turns into a closed arrow.
+fn fold_heading(line: &mut Line<'static>) {
+    if let Some(bar) = line.spans.first_mut() {
+        bar.content = " ▸ ".into();
+    }
+}
+
 /// Pads a band row to the full width with its background still drawn.
 fn clip(text: &str, width: usize) -> String {
     let mut out = String::new();
@@ -3555,50 +3889,106 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
-    let keys = [
-        ("j k  ↑ ↓", "move between code lines"),
-        ("d u", "half page down or up"),
-        ("space b", "page down or up"),
-        ("g G  Home End", "first or last line"),
-        ("[ ]  N n", "previous or next file"),
-        ("f", "files: filter by path, open one"),
-        ("V v", "visual mode; move to select, esc clears"),
-        ("c C", "comment on the line or selection"),
+/// The keys as `[keys.diff]` binds them, so a rebound key shows here too.
+fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, all: &KeysConfig) {
+    let keymap = &all.diff;
+    use DiffAction as A;
+    let keys = |actions: &[DiffAction]| keymap.labels(actions);
+    let rows = [
+        (keys(&[A::Down, A::Up]), "move between code lines"),
         (
-            "@  ^enter",
+            keys(&[A::HalfPageDown, A::HalfPageUp]),
+            "half page down or up",
+        ),
+        (keys(&[A::PageDown, A::PageUp]), "page down or up"),
+        (keys(&[A::First, A::Last]), "first or last line"),
+        (
+            keys(&[A::PreviousFile, A::NextFile]),
+            "previous or next file",
+        ),
+        (
+            keys(&[A::Fold, A::Unfold]),
+            "fold this file to its heading, or open it",
+        ),
+        (keys(&[A::Files]), "files: filter by path, open one"),
+        (
+            keys(&[A::Outline, A::OutlineWindow]),
+            "outline of every file beside the diff, or over it",
+        ),
+        (
+            all.outline
+                .labels(&[OutlineAction::Narrower, OutlineAction::Wider]),
+            "outline open: narrow or widen its sidebar (or drag its edge)",
+        ),
+        (
+            keys(&[A::Select]),
+            "visual mode; move to select, esc clears",
+        ),
+        (keys(&[A::Comment]), "comment on the line or selection"),
+        (
+            keys(&[A::Ask]),
             "ask the agent about the line or selection (⇧⌘A in Rex)",
         ),
-        ("m", "comments: jump, resend, delete, post"),
+        (keys(&[A::Comments]), "comments: jump, resend, delete, post"),
         (
-            "tab O",
+            keys(&[A::Overview]),
             "overview of every file, with notes and viewed marks",
         ),
-        ("F", "note on this whole file"),
-        ("M", "global note on the whole change"),
-        ("w", "mark this file viewed (again: not viewed)"),
-        ("S", "send drafts and notes as one review, with a verdict"),
-        ("y Y", "copy this range or every comment"),
-        ("o r", "other side of the diff, or reload"),
-        ("i", "split or inline layout"),
+        (keys(&[A::FileNote]), "note on this whole file"),
+        (keys(&[A::GlobalNote]), "global note on the whole change"),
         (
-            "h l  ← →",
-            "scroll sideways with keys, wheel or trackpad; 0 resets",
+            keys(&[A::Viewed]),
+            "mark this file viewed and fold it (again: not viewed)",
         ),
-        ("? q", "this help, quit"),
+        (
+            keys(&[A::SendReview]),
+            "send drafts and notes as one review, with a verdict",
+        ),
+        (
+            keys(&[A::Copy, A::CopyAll]),
+            "copy this range or every comment",
+        ),
+        (
+            keys(&[A::OtherSide, A::Reload]),
+            "other side of the diff, or reload",
+        ),
+        (keys(&[A::Layout]), "split or inline layout"),
+        (
+            keys(&[A::ScrollLeft, A::ScrollRight]),
+            "scroll sideways with keys, wheel or trackpad",
+        ),
+        (keys(&[A::ScrollReset]), "scroll back to the left edge"),
+        (
+            keys(&[A::Help, A::Quit, A::QuitNow]),
+            "this help, quit, quit at once",
+        ),
     ];
-    let mut lines: Vec<Line> = keys
+    let column = rows
         .iter()
+        .map(|(key, _)| unicode_width::UnicodeWidthStr::width(key.as_str()) + 1)
+        .max()
+        .unwrap_or(0)
+        .max(16);
+    let mut lines: Vec<Line> = rows
+        .into_iter()
+        // An action left with no key has nothing to show.
+        .filter(|(key, _)| !key.is_empty())
         .map(|(key, what)| {
             Line::from(vec![
-                Span::styled(format!(" {key:<16}"), Style::default().fg(ACCENT)),
-                Span::styled(*what, Style::default()),
+                Span::styled(
+                    format!(" {}", crate::keymap::pad_end(&key, column)),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(what, Style::default()),
             ])
         })
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " C, write, Enter saves the comment on that line.",
+        format!(
+            " {}, write, Enter saves the comment on that line.",
+            keymap.first(A::Comment)
+        ),
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(Span::styled(
@@ -3648,6 +4038,211 @@ fn panel(
         f.render_widget(Paragraph::new(lines), body);
     }
     rect
+}
+
+// The outline: the diff's files as a tree beside the diff or over it, and the
+// way between its entries.
+
+impl App {
+    fn form(&self) -> Option<OutlineForm> {
+        debug_assert!(
+            self.outline.is_some() || !matches!(self.dialog, Dialog::Outline),
+            "the outline window is open with no tree"
+        );
+        self.outline
+            .as_ref()
+            .map(|open| open.form(matches!(self.dialog, Dialog::Outline)))
+    }
+
+    fn close_outline(&mut self) {
+        self.outline = None;
+        if matches!(self.dialog, Dialog::Outline) {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// `t`/`T`: toggle the outline beside the diff or over it. The form
+    /// already shown closes; the other form switches to it, tree and all.
+    fn toggle_outline(&mut self, form: OutlineForm) {
+        if self.form() == Some(form) {
+            self.close_outline();
+            return;
+        }
+        if form == OutlineForm::Sidebar && self.view.width < OUTLINE_MIN_SCREEN {
+            self.toast("The screen is too narrow for the outline");
+            return;
+        }
+        if self.outline.is_none() {
+            let nodes = outline::from_diff_files(self.loaded.diff.files());
+            if nodes.is_empty() {
+                self.toast("This diff has no files");
+                return;
+            }
+            self.outline = Some(
+                OpenOutline::new(outline::Outline::new(nodes)).with_keys(self.keys.outline.clone()),
+            );
+        }
+        // Only the outline's own window can be open here: any other dialog
+        // would have taken the key.
+        self.dialog = match form {
+            OutlineForm::Sidebar => Dialog::None,
+            OutlineForm::Window => Dialog::Outline,
+        };
+    }
+
+    /// The cursor also moves without a key: by a reload. The tree itself is brought
+    /// in where the reload lands.
+    fn sync_outline(&mut self) {
+        let here = self.outline_here();
+        if let Some(open) = self.outline.as_mut() {
+            open.follows(here);
+        }
+    }
+
+    /// The cursor's file; with no file under it, the first entry that goes somewhere.
+    fn outline_here(&self) -> Option<usize> {
+        let open = self.outline.as_ref()?;
+        self.current_file()
+            .and_then(|file| open.tree.at(outline::Locator::Diff(file)))
+            .or_else(|| {
+                open.tree
+                    .nodes
+                    .iter()
+                    .position(|node| node.locator.is_some())
+            })
+    }
+
+    fn outline_go(&mut self, node: usize) {
+        let locator = self
+            .outline
+            .as_ref()
+            .and_then(|open| open.tree.nodes[node].locator);
+        if let Some(outline::Locator::Diff(index)) = locator {
+            self.open_file(index);
+            // The file starts at the top of the diff, its name and first hunk above the cursor.
+            self.scroll = self.heading_start(self.cursor).min(self.max_scroll());
+        }
+    }
+
+    fn outline_key(&mut self, key: KeyEvent) -> bool {
+        // Before the next draw: a jump earlier in this batch of keys must be seen by the next.
+        self.sync_outline();
+        let Some((taken, ask)) = self.outline.as_mut().map(|open| open.key(&key)) else {
+            return false;
+        };
+        match ask {
+            Some(Ask::Close) => self.close_outline(),
+            Some(Ask::Show(form)) => self.toggle_outline(form),
+            Some(Ask::Go(Some(node))) => self.outline_go(node),
+            Some(Ask::Resize { wider }) => {
+                self.outline_columns = outline::resized(self.outline_columns, wider);
+            }
+            Some(Ask::Go(None)) | None => {}
+        }
+        taken
+    }
+
+    fn draw_outline_side(&self, f: &mut Frame, area: Rect) {
+        let here = self.outline_here();
+        let Some(open) = self.outline.as_ref() else {
+            return;
+        };
+        let rows = (area.height as usize).saturating_sub(2);
+        let lines = self.outline_lines(open, here, rows);
+        let body = Rect {
+            x: area.x + 1,
+            width: area.width.saturating_sub(2),
+            ..area
+        };
+        f.render_widget(Paragraph::new(lines), body);
+        let edge = Rect {
+            x: (area.x + area.width).saturating_sub(1),
+            width: 1,
+            ..area
+        };
+        f.render_widget(Paragraph::new(outline::edge(area.height)), edge);
+    }
+
+    fn draw_outline_window(&self, f: &mut Frame, area: Rect) {
+        let here = self.outline_here();
+        let Some(open) = self.outline.as_ref() else {
+            return;
+        };
+        let rows = (area.height as usize).saturating_sub(8);
+        let lines = self.outline_lines(open, here, rows);
+        let width = lines
+            .iter()
+            .map(|line| line.width() as u16)
+            .max()
+            .unwrap_or(0);
+        panel(f, area, self.look.ink(), "Outline", lines, width);
+    }
+
+    fn outline_lines(
+        &self,
+        open: &OpenOutline,
+        here: Option<usize>,
+        rows: usize,
+    ) -> Vec<Line<'static>> {
+        open.lines(
+            here,
+            rows,
+            "No files in this diff.",
+            |entry, style, picked| match entry.locator {
+                Some(outline::Locator::Diff(index)) => {
+                    self.file_spans(index, &entry.label, style, picked)
+                }
+                _ => vec![Span::styled(format!("{}/", entry.label), style)],
+            },
+        )
+    }
+
+    /// The notes come from the file's own index, not from a row on the panel.
+    fn file_spans(
+        &self,
+        index: usize,
+        label: &str,
+        style: Style,
+        picked: bool,
+    ) -> Vec<Span<'static>> {
+        let diff = &self.loaded.diff;
+        let Some(file) = diff.file(index) else {
+            return vec![Span::styled(label.to_owned(), style)];
+        };
+        let viewed = self.notes.is_viewed(diff, index);
+        let old = file.old_path.as_deref().filter(|old| *old != file.path());
+        let comments =
+            self.draft_comments_in(file.path()) + old.map_or(0, |old| self.draft_comments_in(old));
+        let notes = comments + usize::from(self.notes.files.contains_key(file.path()));
+        let mark = match (viewed, notes > 0) {
+            (_, true) => "●",
+            (true, false) => "✓",
+            (false, false) => " ",
+        };
+        let (status, color) = file_status(file);
+        let tint = |color: Color| {
+            if picked { style } else { style.fg(color) }
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{mark} "),
+                tint(if notes > 0 { ACCENT } else { DIM }),
+            ),
+            Span::styled(format!("{status} "), tint(color)),
+            Span::styled(label.to_owned(), if viewed { tint(DIM) } else { style }),
+        ];
+        if file.added > 0 || file.removed > 0 {
+            spans.push(Span::styled(format!(" +{}", file.added), tint(ADDED_FG)));
+            spans.push(Span::styled(
+                format!(" −{}", file.removed),
+                tint(REMOVED_FG),
+            ));
+        }
+        if let Some(note) = &file.note {
+            spans.push(Span::styled(format!(" · {note}"), tint(DIM)));
+        }
+        spans
+    }
 }
 
 impl App {
@@ -3700,8 +4295,22 @@ impl App {
         if self.sends == Sends::Return && unsent > 0 && !self.quit_armed {
             self.quit_armed = true;
             let notes = if unsent == 1 { "1 note" } else { "notes" };
+            // The overview has keys of its own; the hint names the ones in force.
+            let (send, quit) = if self.overview.is_some() {
+                let keys = &self.keys.diff_overview;
+                (
+                    keys.first(OverviewAction::SendReview),
+                    keys.first(OverviewAction::Quit),
+                )
+            } else {
+                let keys = &self.keys.diff;
+                (
+                    keys.first(DiffAction::SendReview),
+                    keys.first(DiffAction::Quit),
+                )
+            };
             self.toast(format!(
-                "{notes} not sent yet: S sends the review, q again quits and keeps them"
+                "{notes} not sent yet: {send} sends the review, {quit} again quits and keeps them"
             ));
         } else {
             self.quit = true;
@@ -3731,33 +4340,37 @@ impl App {
             return;
         };
         let last = self.overview_rows() - 1;
-        if !matches!(key.code, KeyCode::Char('q')) {
+        let action = self.keys.diff_overview.actions(&key).first().copied();
+        if action != Some(OverviewAction::Quit) {
             self.quit_armed = false;
         }
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Char('j') | KeyCode::Down => self.overview = Some((selected + 1).min(last)),
-            KeyCode::Char('k') | KeyCode::Up => self.overview = Some(selected.saturating_sub(1)),
-            KeyCode::Char('g') | KeyCode::Home => self.overview = Some(0),
-            KeyCode::Char('G') | KeyCode::End => self.overview = Some(last),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => match self.overview_file() {
+        let Some(action) = action else {
+            return;
+        };
+        match action {
+            OverviewAction::QuitNow => self.quit = true,
+            OverviewAction::Down => self.overview = Some((selected + 1).min(last)),
+            OverviewAction::Up => self.overview = Some(selected.saturating_sub(1)),
+            OverviewAction::First => self.overview = Some(0),
+            OverviewAction::Last => self.overview = Some(last),
+            OverviewAction::Open => match self.overview_file() {
                 Some(file) => {
                     self.overview = None;
-                    self.jump_file(file);
+                    self.open_file(file);
                 }
                 None => self.edit_global_note(),
             },
-            KeyCode::Char('c') => match self.overview_file() {
+            OverviewAction::FileNote => match self.overview_file() {
                 Some(file) => self.edit_file_note(Some(file)),
                 None => self.edit_global_note(),
             },
-            KeyCode::Char('C') | KeyCode::Char('M') => self.edit_global_note(),
-            KeyCode::Char('w' | 'V') => {
+            OverviewAction::GlobalNote => self.edit_global_note(),
+            OverviewAction::Viewed => {
                 if let Some(file) = self.overview_file() {
                     self.toggle_viewed(Some(file));
                 }
             }
-            KeyCode::Char('x') => match self.overview_file() {
+            OverviewAction::DeleteNote => match self.overview_file() {
                 Some(file) => {
                     let path = self.loaded.diff.files()[file].path().to_owned();
                     if self.notes.files.remove(&path).is_some() {
@@ -3772,18 +4385,19 @@ impl App {
                     }
                 }
             },
-            KeyCode::Char('S') => self.open_verdict(),
-            KeyCode::Char('m') => self.show_comments(),
-            KeyCode::Char('?') => self.dialog = Dialog::Help,
-            KeyCode::Tab | KeyCode::Char('O') | KeyCode::Esc => {
+            OverviewAction::SendReview => self.open_verdict(),
+            OverviewAction::Comments => self.show_comments(),
+            OverviewAction::Help => self.dialog = Dialog::Help,
+            // A review opened from `leaf review` starts on the overview, so
+            // escape there asks to quit rather than show the diff.
+            OverviewAction::Close => {
                 if self.sends == Sends::Return && key.code == KeyCode::Esc {
                     self.ask_quit();
                 } else {
                     self.overview = None;
                 }
             }
-            KeyCode::Char('q') => self.ask_quit(),
-            _ => {}
+            OverviewAction::Quit => self.ask_quit(),
         }
     }
 
@@ -3849,16 +4463,8 @@ impl App {
                 self.persist_notes();
                 self.toast(message);
             }
-            KeyCode::Backspace if alt || ctrl => {
-                let word = editor
-                    .text
-                    .trim_end()
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |at| {
-                        at + editor.text[at..].chars().next().map_or(1, char::len_utf8)
-                    });
-                editor.text.truncate(word);
-            }
+            KeyCode::Backspace if alt || ctrl => crate::comment::delete_word(&mut editor.text),
+            KeyCode::Char('w') if ctrl => crate::comment::delete_word(&mut editor.text),
             KeyCode::Backspace => {
                 editor.text.pop();
             }
@@ -3874,10 +4480,11 @@ impl App {
         };
         let viewed = self.notes.toggle_viewed(&self.loaded.diff, file);
         self.persist_notes();
+        self.refresh_viewed();
+        // A viewed file folds out of the way; unmarked, it opens again.
+        self.set_folded(file, viewed);
         let count = self.loaded.diff.files().len();
-        let seen = (0..count)
-            .filter(|f| self.notes.is_viewed(&self.loaded.diff, *f))
-            .count();
+        let seen = self.viewed.len();
         self.toast(if viewed {
             format!("Viewed · {seen} of {count} files")
         } else {
@@ -3890,12 +4497,12 @@ impl App {
     }
 
     fn verdict_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('a') => self.send_review(Verdict::Approve),
-            KeyCode::Char('n') => self.send_review(Verdict::ApproveWithNotes),
-            KeyCode::Char('c') | KeyCode::Char('r') => self.send_review(Verdict::RequestChanges),
-            KeyCode::Esc | KeyCode::Char('q') => self.dialog = Dialog::None,
-            _ => {}
+        match self.keys.verdict.actions(&key).first() {
+            Some(VerdictAction::Approve) => self.send_review(Verdict::Approve),
+            Some(VerdictAction::ApproveWithNotes) => self.send_review(Verdict::ApproveWithNotes),
+            Some(VerdictAction::RequestChanges) => self.send_review(Verdict::RequestChanges),
+            Some(VerdictAction::Cancel) => self.dialog = Dialog::None,
+            None => {}
         }
     }
 
@@ -3912,7 +4519,13 @@ impl App {
             &self.comments,
         );
         if asked == Verdict::RequestChanges && !review.has_notes() {
-            self.fail("Add a note first (C on lines, F on a file, M for the whole change), so the agent knows what to change.");
+            let keys = &self.keys.diff;
+            self.fail(format!(
+                "Add a note first ({} on lines, {} on a file, {} for the whole change), so the agent knows what to change.",
+                keys.first(DiffAction::Comment),
+                keys.first(DiffAction::FileNote),
+                keys.first(DiffAction::GlobalNote),
+            ));
             return;
         }
         let verdict = review.verdict(asked);
@@ -3998,7 +4611,10 @@ impl App {
                 "   Whole change  {}",
                 note.lines().next().unwrap_or_default()
             ),
-            None if selected == 0 => "   Whole change · c adds a note on all of it".to_owned(),
+            None if selected == 0 => format!(
+                "   Whole change · {} adds a note on all of it",
+                self.keys.diff_overview.first(OverviewAction::FileNote)
+            ),
             None => "   Whole change".to_owned(),
         };
         let global_style = if self.notes.global.is_some() {
@@ -4025,7 +4641,7 @@ impl App {
             .min(files.len().saturating_sub(room));
         for (index, file) in files.iter().enumerate().skip(first).take(room) {
             let row = index + 1;
-            let viewed = self.notes.is_viewed(diff, index);
+            let viewed = self.viewed.contains(&index);
             let old = file.old_path.as_deref().filter(|old| *old != file.path());
             let has_note = self.notes.files.contains_key(file.path());
             let comments = self.draft_comments_in(file.path())
@@ -4113,6 +4729,13 @@ impl App {
             Sends::Return => "the agent that asked",
             Sends::Agent => "the agent pane",
         };
+        let keys = &self.keys.verdict;
+        let key = |action| {
+            Span::styled(
+                format!(" {} ", keys.first(action)),
+                Style::default().fg(ACCENT),
+            )
+        };
         let lines = vec![
             Line::from(Span::styled(
                 format!("Send {notes} to {to}"),
@@ -4120,7 +4743,7 @@ impl App {
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled(" a ", Style::default().fg(ACCENT)),
+                key(VerdictAction::Approve),
                 Span::raw(if unsent > 0 {
                     "approve, with these notes"
                 } else {
@@ -4128,16 +4751,16 @@ impl App {
                 }),
             ]),
             Line::from(vec![
-                Span::styled(" n ", Style::default().fg(ACCENT)),
+                key(VerdictAction::ApproveWithNotes),
                 Span::raw("approve with notes"),
             ]),
             Line::from(vec![
-                Span::styled(" c ", Style::default().fg(ACCENT)),
+                key(VerdictAction::RequestChanges),
                 Span::raw("request changes"),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "esc keeps reviewing",
+                format!("{} keeps reviewing", keys.first(VerdictAction::Cancel)),
                 Style::default().fg(DIM),
             )),
         ];
@@ -4245,7 +4868,7 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn a_line_inserted_above_an_edit_pairs_the_edit_with_its_old_line() {
         let diff = Diff::parse(SHIFTED.to_owned());
-        let split = Split::new(&diff, Layout::Split);
+        let split = Split::new(&diff, Layout::Split, &HashSet::new());
         let rows: Vec<(Option<&str>, Option<&str>)> = split
             .lines()
             .iter()
@@ -4336,6 +4959,40 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
+    fn rebound_keys_act_and_the_old_ones_let_go() {
+        let config: crate::config::Config =
+            toml::from_str("[keys.diff]\nlayout = \"x\"\nescape = \"e\"").unwrap();
+        let options = Options {
+            keys: config.keys,
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(PATCH), options);
+        app.view = Rect::new(0, 1, 120, 20);
+        let before = app.layout;
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.layout, before, "i no longer switches the layout");
+        press(&mut app, KeyCode::Char('x'));
+        assert_ne!(app.layout, before);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.quit, "esc was given away");
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_key_between_two_qs_starts_the_quit_over() {
+        let mut app = app();
+        app.sends = Sends::Return;
+        app.notes.set_global("look again");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit_armed && !app.quit);
+        press(&mut app, KeyCode::Char('0'));
+        assert!(!app.quit_armed);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "the first q after another key only asks");
+    }
+
+    #[test]
     fn live_diff_refreshes_wait_for_drafts_and_keep_saved_comments() {
         let path =
             std::env::temp_dir().join(format!("leaf-diff-live-{}.patch", std::process::id()));
@@ -4396,6 +5053,34 @@ diff --git a/a.rs b/a.rs
         assert!(!app.stale);
         assert!(app.loaded.diff.same_content(&Diff::parse(changed)));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_window_over_the_diff_holds_off_a_reload_under_it() {
+        // A sidebar is the live view: the diff goes on being reloaded beside it.
+        let mut side = app();
+        side.polled -= Duration::from_secs(2);
+        press(&mut side, KeyCode::Char('t'));
+        side.poll();
+        assert!(
+            matches!(
+                side.job,
+                Some(Job::Load {
+                    background: true,
+                    ..
+                })
+            ),
+            "the sidebar keeps the diff live"
+        );
+        // A window is a snapshot, and nothing is reloaded under it.
+        let mut window = app();
+        window.polled -= Duration::from_secs(2);
+        press(&mut window, KeyCode::Char('T'));
+        window.poll();
+        assert!(
+            window.job.is_none(),
+            "a window over the diff is a snapshot and stays one"
+        );
     }
 
     #[test]
@@ -5175,7 +5860,7 @@ diff --git a/a.rs b/a.rs
             assert_eq!(app.left, limit - 4);
             draw(&mut app, 80, 12);
             assert_eq!(app.left, 0, "all lines fit after resize");
-            press(&mut app, KeyCode::Char('l'));
+            press(&mut app, KeyCode::Char('L'));
             assert_eq!(app.left, 0, "keys share the wheel limit");
         }
     }
@@ -5247,6 +5932,18 @@ diff --git a/a.rs b/a.rs
             wheel(&mut app, MouseEventKind::ScrollRight);
             assert_eq!(app.left, 0, "after {key:?}");
         }
+    }
+
+    #[test]
+    fn the_outline_window_keeps_the_horizontal_wheel_off_the_diff() {
+        let mut app = app();
+        draw(&mut app, 19, 12);
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        assert!(app.left > 0);
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Char('T'));
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.left, 0, "the window covers the diff");
     }
 
     #[test]
@@ -5509,6 +6206,18 @@ diff --git a/x b/x
     }
 
     #[test]
+    fn ctrl_w_deletes_a_word_in_the_note_editor() {
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('C'));
+        app.paste("keep this word");
+        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.note_editor.as_ref().map(|e| e.text.as_str()),
+            Some("keep this ")
+        );
+    }
+
+    #[test]
     fn the_note_editor_fits_a_short_area() {
         let mut app = reviewing(TWO_FILES);
         press(&mut app, KeyCode::Char('C'));
@@ -5660,6 +6369,110 @@ rename to new.rs
         assert!(screen.contains(" ✓ M a.rs"), "{screen}");
     }
 
+    fn on_file(app: &App) -> Option<String> {
+        app.current_file()
+            .map(|file| app.loaded.diff.files()[file].path().to_owned())
+    }
+
+    #[test]
+    fn h_folds_the_file_to_its_heading_and_l_opens_it() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        draw(&mut app, 80, 12);
+        let open = app.split.lines().len();
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.folded.contains("a.rs"));
+        assert!(app.split.lines().len() < open);
+        assert!(
+            app.split.lines()[app.cursor].folded,
+            "cursor rests on the heading"
+        );
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("▸ a.rs"), "{screen}");
+        assert!(
+            !screen.contains("✓ viewed"),
+            "folded isn't viewed: {screen}"
+        );
+        assert!(!screen.contains("old"), "{screen}");
+        assert!(screen.contains("two"), "{screen}");
+        // j moves from the folded heading into the next file.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(on_file(&app).as_deref(), Some("b.rs"));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+        press(&mut app, KeyCode::Char('l'));
+        assert!(app.folded.is_empty());
+        assert_eq!(app.split.lines().len(), open);
+        assert!(
+            app.split.lines()[app.cursor].is_content(),
+            "cursor on its first line"
+        );
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+        assert!(draw(&mut app, 80, 12).contains("old"));
+    }
+
+    #[test]
+    fn marking_a_file_viewed_folds_it_and_unmarking_opens_it() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.notes.is_viewed(&app.loaded.diff, 0));
+        assert!(app.folded.contains("a.rs"));
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("▸ a.rs +1 −1  ✓ viewed"), "{screen}");
+        // Opened again, it still says viewed.
+        press(&mut app, KeyCode::Char('l'));
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("▎ a.rs +1 −1  ✓ viewed"), "{screen}");
+        assert!(screen.contains("old"), "{screen}");
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!app.notes.is_viewed(&app.loaded.diff, 0));
+        assert!(app.folded.is_empty());
+        assert!(!draw(&mut app, 80, 12).contains("✓ viewed"));
+        // From the overview too.
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.folded.contains("b.rs"));
+    }
+
+    #[test]
+    fn viewed_files_open_folded_and_opening_one_from_the_overview_unfolds_it() {
+        let mut first = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut first, KeyCode::Char('w'));
+        let draft = first.notes.to_json();
+        let options = Options {
+            margin: Margin {
+                draft,
+                overview_first: true,
+                ..Margin::default()
+            },
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(TWO_FILES), options);
+        assert!(app.folded.contains("a.rs"));
+        assert!(app.split.lines()[app.cursor].folded);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.folded.is_empty());
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+    }
+
+    #[test]
+    fn a_folded_file_that_changes_on_reload_opens_again() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.folded.len(), 2);
+        let changed = TWO_FILES.replace("+two", "+three");
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&changed))),
+            remember: None,
+            background: true,
+        });
+        assert!(app.folded.contains("a.rs"));
+        assert!(!app.folded.contains("b.rs"));
+    }
+
     #[test]
     fn quitting_a_review_with_unsent_notes_takes_a_second_q() {
         let mut app = reviewing(TWO_FILES);
@@ -5700,5 +6513,486 @@ rename to new.rs
             },
         );
         assert_eq!(again.notes.global.as_deref(), Some("kept"));
+    }
+
+    /// Three files under two directories, two of them a directory deep.
+    const TREE: &str = "\
+diff --git a/src/core/a.rs b/src/core/a.rs
+--- a/src/core/a.rs
++++ b/src/core/a.rs
+@@ -1,1 +1,2 @@
+ one
++two
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,1 +1,1 @@
+-old main
++new main
+diff --git a/docs/links.md b/docs/links.md
+--- a/docs/links.md
++++ b/docs/links.md
+@@ -1,1 +1,1 @@
+-old link
++new link
+";
+
+    fn tree_app() -> App {
+        let mut app = App::new(loaded(TREE), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
+        app
+    }
+
+    /// The outline's own columns of the screen, above the footer.
+    fn beside(frame: &str) -> String {
+        let rows: Vec<&str> = frame.lines().collect();
+        rows[..rows.len().saturating_sub(1)]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .take(OUTLINE_COLUMNS as usize)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The entry the outline marks as the one the cursor is in, as far as the
+    /// row goes.
+    fn picked(frame: &str) -> String {
+        beside(frame)
+            .lines()
+            .find_map(|row| row.split_once('›').map(|(_, row)| row.to_owned()))
+            .unwrap_or_default()
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn a_release_over_the_outline_ends_a_drag_begun_in_the_diff() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        click(&mut app, 60, 3);
+        assert!(app.drag_origin.is_some(), "the press began a drag");
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.drag_origin.is_none(),
+            "the release over the outline did not end the drag"
+        );
+        assert!(
+            app.can_refresh(),
+            "the diff waits on a drag that never ends"
+        );
+    }
+    #[test]
+    fn the_outline_beside_the_diff_lists_the_files_by_directory() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        let screen = draw(&mut app, 120, 20);
+        let side = beside(&screen);
+        for entry in ["src/", "core/", "a.rs", "main.rs", "docs/", "links.md"] {
+            assert!(side.contains(entry), "{entry} missing:\n{screen}");
+        }
+        // The diff keeps a column of its own beside it, and still shows.
+        assert!(app.view.x >= OUTLINE_COLUMNS);
+        assert!(screen.contains("new main"), "{screen}");
+        assert!(picked(&screen).contains("a.rs"), "{screen}");
+    }
+
+    /// `src` left for `docs` and met again: the directory is one entry.
+    #[test]
+    fn an_outline_move_opens_that_file() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        // Down the tree: a directory holds no file, so the move goes past it.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.current_file(), Some(1));
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("new main"), "{screen}");
+        assert!(picked(&screen).contains("main.rs"), "{screen}");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.current_file(), Some(0));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.current_file(), Some(2));
+        assert!(draw(&mut app, 120, 20).contains("new link"));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.current_file(), Some(0));
+    }
+
+    #[test]
+    fn dragging_the_outline_s_edge_resizes_it_beside_the_diff() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        let drag = |app: &mut App, kind: MouseEventKind, column: u16| {
+            app.mouse(MouseEvent {
+                kind,
+                column,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        drag(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            OUTLINE_COLUMNS - 1,
+        );
+        drag(&mut app, MouseEventKind::Drag(MouseButton::Left), 49);
+        drag(&mut app, MouseEventKind::Up(MouseButton::Left), 49);
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, 50);
+        assert!(
+            app.drag_origin.is_none(),
+            "the edge's drag is no drag in the diff"
+        );
+    }
+
+    #[test]
+    fn angle_brackets_resize_the_outline_beside_the_diff() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, OUTLINE_COLUMNS);
+        press(&mut app, KeyCode::Char('>'));
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, OUTLINE_COLUMNS + 4);
+        press(&mut app, KeyCode::Char('<'));
+        press(&mut app, KeyCode::Char('<'));
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, OUTLINE_COLUMNS - 4);
+    }
+
+    #[test]
+    fn an_outline_move_to_a_file_with_no_hunks_puts_its_own_name_at_the_top() {
+        // Pure renames have no hunks, so their headers sit one under the other.
+        let patch: String = (0..30)
+            .map(|n| {
+                format!(
+                    "diff --git a/old{n}.rs b/new{n}.rs\nsimilarity index 100%\nrename from old{n}.rs\nrename to new{n}.rs\n"
+                )
+            })
+            .collect();
+        let mut app = App::new(loaded(&patch), Options::default());
+        draw(&mut app, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let screen = draw(&mut app, 120, 20);
+        let top: String = screen
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .skip(OUTLINE_COLUMNS as usize)
+            .collect();
+        let file = app.current_file().expect("a file is under the cursor");
+        let name = app.loaded.diff.files()[file].path().to_owned();
+        assert!(top.contains(&name), "{name} is not at the top:\n{screen}");
+    }
+
+    #[test]
+    fn an_outline_move_brings_that_file_to_the_top_of_the_diff() {
+        // Three files, each taller than the screen, so a jump down lands the
+        // next file's first line at the bottom unless the view is moved to it.
+        let patch: String = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| {
+                let added: String = (0..40).map(|n| format!("+{name} line {n}\n")).collect();
+                format!(
+                    "diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -0,0 +1,40 @@\n{added}"
+                )
+            })
+            .collect();
+        let mut app = App::new(loaded(&patch), Options::default());
+        draw(&mut app, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        for (key, name) in [('j', "b.rs"), ('j', "c.rs"), ('k', "b.rs")] {
+            press(&mut app, KeyCode::Char(key));
+            let screen = draw(&mut app, 120, 20);
+            let top: String = screen
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .skip(OUTLINE_COLUMNS as usize)
+                .collect();
+            assert!(top.contains(name), "{name} is not at the top:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn h_and_l_fold_the_directories_around_the_cursor() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        // The cursor is in `src/core`: h folds that, and the files under it go.
+        press(&mut app, KeyCode::Char('h'));
+        let side = beside(&draw(&mut app, 120, 20));
+        assert!(!side.contains("a.rs"), "{side}");
+        assert!(side.contains("main.rs"), "{side}");
+        press(&mut app, KeyCode::Char('l'));
+        assert!(beside(&draw(&mut app, 120, 20)).contains("a.rs"));
+        // h again goes up a directory; l opens them from the inside out.
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('h'));
+        let side = beside(&draw(&mut app, 120, 20));
+        assert!(!side.contains("main.rs"), "{side}");
+        press(&mut app, KeyCode::Char('l'));
+        let side = beside(&draw(&mut app, 120, 20));
+        assert!(
+            !side.contains("a.rs"),
+            "the outer fold still holds it:\n{side}"
+        );
+        press(&mut app, KeyCode::Char('l'));
+        let side = beside(&draw(&mut app, 120, 20));
+        assert!(side.contains("a.rs"), "{side}");
+        assert!(side.contains("main.rs"), "{side}");
+    }
+
+    /// `src` holds the files the cursor walks to, and `docs` has one of its
+    /// own before them.
+    const DEEP: &str = "\
+diff --git a/docs/c.md b/docs/c.md
+--- a/docs/c.md
++++ b/docs/c.md
+@@ -1,1 +1,1 @@
+-old c
++new c
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,1 +1,1 @@
+-old a
++new a
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1,1 +1,1 @@
+-old b
++new b
+diff --git a/src/d.rs b/src/d.rs
+--- a/src/d.rs
++++ b/src/d.rs
+@@ -1,1 +1,1 @@
+-old d
++new d
+";
+
+    #[test]
+    fn folding_from_a_deep_file_leaves_the_other_directories_alone() {
+        let mut app = App::new(loaded(DEEP), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        // Past `docs/c.md` and the first two files of `src`, to `src/d.rs`.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('j'));
+            draw(&mut app, 120, 20);
+        }
+        assert_eq!(app.current_file(), Some(3));
+        press(&mut app, KeyCode::Char('h'));
+        draw(&mut app, 120, 20);
+        press(&mut app, KeyCode::Char('h'));
+        let side = beside(&draw(&mut app, 120, 20));
+        assert!(
+            side.contains("▸ src/"),
+            "the deep file's own directory folded:\n{side}"
+        );
+        assert!(
+            side.contains("▾ docs/"),
+            "a directory the file does not hang under was folded:\n{side}"
+        );
+        assert!(side.contains("c.md"), "{side}");
+    }
+    #[test]
+    fn a_file_folded_in_the_diff_opens_when_the_outline_goes_to_it() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.folded.contains("src/core/a.rs"));
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.current_file(), Some(1));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.current_file(), Some(0));
+        assert!(app.folded.is_empty(), "going to the file opens it");
+    }
+
+    #[test]
+    fn a_match_inside_a_folded_directory_is_reached() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.current_file(), Some(2));
+        press(&mut app, KeyCode::Char('h'));
+        let frame = draw(&mut app, 120, 20);
+        assert!(!beside(&frame).contains("links.md"), "{frame}");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.current_file(), Some(1));
+        // A fold holds nothing back from a search.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "links");
+        let frame = draw(&mut app, 120, 20);
+        assert!(beside(&frame).contains("links.md"), "{frame}");
+        // The match is gone to, and its directory shows around it.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_file(), Some(2));
+        let frame = draw(&mut app, 120, 20);
+        assert!(beside(&frame).contains("links.md"), "{frame}");
+    }
+    #[test]
+    fn t_and_t_toggle_and_switch_the_outline_form() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.form(), Some(OutlineForm::Sidebar));
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.outline.is_none());
+        press(&mut app, KeyCode::Char('T'));
+        assert_eq!(app.form(), Some(OutlineForm::Window));
+        // A fold made in one form is kept in the other.
+        press(&mut app, KeyCode::Char('h'));
+        let shown = |app: &App| -> Vec<String> {
+            let open = app.outline.as_ref().expect("the outline is open");
+            open.tree
+                .visible()
+                .iter()
+                .map(|&node| open.tree.nodes[node].label.clone())
+                .collect()
+        };
+        let folded = shown(&app);
+        assert!(!folded.iter().any(|label| label == "a.rs"), "{folded:?}");
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.form(), Some(OutlineForm::Sidebar));
+        assert_eq!(shown(&app), folded);
+        press(&mut app, KeyCode::Char('T'));
+        assert_eq!(app.form(), Some(OutlineForm::Window));
+        assert_eq!(shown(&app), folded);
+        press(&mut app, KeyCode::Char('T'));
+        assert!(app.outline.is_none());
+    }
+    #[test]
+    fn a_window_over_the_diff_takes_every_key() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('T'));
+        let before = (
+            app.current_file(),
+            app.toast.as_ref().map(|toast| toast.text.clone()),
+        );
+        // Nothing reaches the diff behind the window: not its overview, its
+        // reloads, nor its next file.
+        for key in ['O', 'r', 'o', ']'] {
+            press(&mut app, KeyCode::Char(key));
+        }
+        assert!(app.overview.is_none());
+        assert_eq!(app.current_file(), before.0);
+        assert_eq!(app.toast.as_ref().map(|toast| toast.text.clone()), before.1);
+        assert_eq!(app.form(), Some(OutlineForm::Window));
+        // `q` closes the window and leaves the diff open.
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.form(), None);
+        assert!(!app.quit);
+    }
+    #[test]
+    fn a_diff_without_files_says_there_is_nothing_to_outline() {
+        let mut app = App::new(loaded(""), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.outline.is_none());
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("This diff has no files")
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_outline_is_not_a_click_on_the_diff() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        let before = (app.cursor, app.scroll);
+        click(&mut app, 3, 6);
+        assert_eq!((app.cursor, app.scroll), before);
+        // The diff itself still takes a click.
+        click(&mut app, 100, 6);
+        assert_ne!((app.cursor, app.scroll), before);
+    }
+
+    /// Files of `lines` rows each, so the diff is taller than the screen.
+    fn tall_tree(lines: usize) -> String {
+        let mut patch = String::new();
+        for name in ["a", "b"] {
+            patch.push_str(&format!(
+                "diff --git a/{name}.rs b/{name}.rs\n--- a/{name}.rs\n+++ b/{name}.rs\n@@ -1,{lines} +1,{lines} @@\n"
+            ));
+            for line in 1..=lines {
+                patch.push_str(&format!(" line {line}\n"));
+            }
+        }
+        patch
+    }
+
+    #[test]
+    fn the_outline_follows_the_diff_as_the_wheel_moves_it() {
+        let mut app = App::new(loaded(&tall_tree(30)), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        assert!(picked(&draw(&mut app, 120, 20)).contains("a.rs"));
+        // The cursor is the authority: a wheel over the panel scrolls the
+        // diff, and the panel marks the file the cursor came to.
+        for _ in 0..10 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+        }
+        let screen = draw(&mut app, 120, 20);
+        assert_eq!(app.current_file(), Some(1));
+        assert!(picked(&screen).contains("b.rs"), "{screen}");
+    }
+
+    #[test]
+    fn a_reload_changes_the_tree() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        assert!(beside(&draw(&mut app, 120, 20)).contains("main.rs"));
+        let remember = app.remember();
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(TWO_FILES))),
+            remember,
+            background: true,
+        });
+        let side = beside(&draw(&mut app, 120, 20));
+        assert!(side.contains("a.rs") && side.contains("b.rs"), "{side}");
+        assert!(!side.contains("main.rs"), "{side}");
+    }
+
+    #[test]
+    fn a_screen_too_narrow_for_both_keeps_the_diff_alone() {
+        let mut app = tree_app();
+        app.view.width = OUTLINE_MIN_SCREEN - 1;
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.outline.is_none());
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("The screen is too narrow for the outline")
+        );
+        app.view.width = OUTLINE_MIN_SCREEN;
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.outline.is_some());
+        draw(&mut app, OUTLINE_MIN_SCREEN - 1, 20);
+        assert!(app.outline.is_none());
     }
 }

@@ -1,6 +1,8 @@
 //! Which theme leaf draws in, and following it as it changes: `LEAF_THEME`,
 //! then Rex's theme, then the terminal's own colors.
 
+use crate::mono::Rgb;
+
 use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
@@ -37,19 +39,27 @@ impl Colors {
 
     /// Blue from the active palette, with ANSI colors when it is unknown.
     pub fn heading_color(self) -> Color {
+        self.readable(|theme| theme.blue, Color::Blue, Color::LightBlue)
+    }
+
+    /// A palette slot made readable on the background: mixed toward the text
+    /// color when it is as light (or dark) as the background. Without the
+    /// palette, the ANSI color for a light or a dark background.
+    pub fn readable(self, slot: fn(Theme) -> Rgb, on_light: Color, on_dark: Color) -> Color {
         match self.theme {
             Some(theme) => {
-                // The standard ANSI blue can be faint on a dark background.
-                let [r, g, b] = if theme::is_light(theme.blue) == self.light {
+                // A standard ANSI color can be faint on a background of its own lightness.
+                let color = slot(theme);
+                let [r, g, b] = if theme::is_light(color) == self.light {
                     let ink = if self.light { [0; 3] } else { [255; 3] };
-                    theme::mix(theme.blue, ink, 0.4)
+                    theme::mix(color, ink, 0.4)
                 } else {
-                    theme.blue
+                    color
                 };
                 Color::Rgb(r, g, b)
             }
-            None if self.light => Color::Blue,
-            None => Color::LightBlue,
+            None if self.light => on_light,
+            None => on_dark,
         }
     }
 }
@@ -83,6 +93,19 @@ pub enum Scheme {
     /// The terminal reports its light or dark theme (Ghostty does), so it is
     /// asked again every `EVERY`, and its colors read again on a switch.
     Followed { light: bool, checked: Instant },
+    /// A Rex pane that another machine's Rex app shows, or that no app has
+    /// claimed yet. Until an app claims the pane, the terminal answers with
+    /// Rex's built-in palette and doesn't give its background; once one does,
+    /// every color is that app's theme. So the background is asked for every
+    /// `EVERY`, and all the colors read again when it starts answering and
+    /// whenever it changes, as it does when the theme is switched. While it
+    /// doesn't answer, only light or dark is followed, and the last theme an
+    /// app gave is kept.
+    Pushed {
+        light: bool,
+        background: Option<Rgb>,
+        checked: Instant,
+    },
 }
 
 impl Scheme {
@@ -96,6 +119,20 @@ impl Scheme {
         // The setting holds even when stdin isn't a terminal to ask.
         if let Some(light) = theme_hint(std::env::var("LEAF_THEME").ok().as_deref()) {
             return (Scheme::Fixed, Colors { theme: None, light });
+        }
+        if rextheme::shown_elsewhere() && std::io::stdin().is_terminal() {
+            let background = crate::viewer::query_color(11);
+            let colors = pushed(background).unwrap_or_else(|| Colors {
+                theme: None,
+                light: crate::viewer::query_color_scheme().unwrap_or(false),
+            });
+            let checked = Instant::now();
+            let scheme = Scheme::Pushed {
+                light: colors.light,
+                background,
+                checked,
+            };
+            return (scheme, colors);
         }
         if let Some(theme) = rextheme::active() {
             let checked = Instant::now();
@@ -125,7 +162,7 @@ impl Scheme {
     fn every(self) -> Duration {
         match self {
             Scheme::Rex { .. } => REX_EVERY,
-            Scheme::Fixed | Scheme::Followed { .. } => EVERY,
+            Scheme::Fixed | Scheme::Followed { .. } | Scheme::Pushed { .. } => EVERY,
         }
     }
 
@@ -135,7 +172,9 @@ impl Scheme {
         let every = self.every();
         let checked = match self {
             Scheme::Fixed => return None,
-            Scheme::Rex { checked } | Scheme::Followed { checked, .. } => checked,
+            Scheme::Rex { checked }
+            | Scheme::Followed { checked, .. }
+            | Scheme::Pushed { checked, .. } => checked,
         };
         if checked.elapsed() < every {
             return None;
@@ -143,6 +182,33 @@ impl Scheme {
         *checked = Instant::now();
         match self {
             Scheme::Fixed => None,
+            Scheme::Pushed {
+                light, background, ..
+            } => {
+                let now = crate::viewer::query_color(11);
+                if now != *background {
+                    // Recorded both ways, so a later claim is read again even
+                    // when it brings the same background.
+                    *background = now;
+                    if now.is_some() {
+                        // An app gave the pane its theme, or a new one.
+                        let colors = pushed(now)?;
+                        *light = colors.light;
+                        return Some(colors);
+                    }
+                }
+                if now.is_none()
+                    && let Some(light_now) = crate::viewer::query_color_scheme()
+                    && light_now != *light
+                {
+                    *light = light_now;
+                    return Some(Colors {
+                        theme: None,
+                        light: light_now,
+                    });
+                }
+                None
+            }
             Scheme::Rex { .. } => rextheme::active().map(Colors::of),
             Scheme::Followed { light, .. } => match crate::viewer::query_color_scheme() {
                 Some(now) if now != *light => {
@@ -157,22 +223,51 @@ impl Scheme {
         }
     }
 
+    /// Puts the next check off for another wait, when the caller can't let it
+    /// ask the terminal now (a key is waiting or being typed), so `due` doesn't
+    /// stay at zero and spin the event loop meanwhile.
+    pub fn defer(&mut self) {
+        match self {
+            Scheme::Fixed | Scheme::Rex { .. } => {}
+            Scheme::Followed { checked, .. } | Scheme::Pushed { checked, .. } => {
+                *checked = Instant::now();
+            }
+        }
+    }
+
     /// Whether checking again asks the terminal, which reads its reply from
     /// stdin and could swallow a key typed meanwhile. Rex's theme comes from
     /// cfprefsd, which is safe at any moment.
     pub fn asks_terminal(self) -> bool {
-        matches!(self, Scheme::Followed { .. })
+        matches!(self, Scheme::Followed { .. } | Scheme::Pushed { .. })
     }
 
     /// How long an event loop may sleep before the scheme is due again.
     pub fn due(self) -> Option<Duration> {
         match self {
             Scheme::Fixed => None,
-            Scheme::Rex { checked } | Scheme::Followed { checked, .. } => {
+            Scheme::Rex { checked }
+            | Scheme::Followed { checked, .. }
+            | Scheme::Pushed { checked, .. } => {
                 Some(self.every().saturating_sub(checked.elapsed()))
             }
         }
     }
+}
+
+/// The colors of a pane another machine's Rex app shows, once the terminal
+/// gives its `background`: the app's whole theme when the terminal says all of
+/// it, else just whether the background is light. `None` before the app has
+/// claimed the pane.
+fn pushed(background: Option<Rgb>) -> Option<Colors> {
+    let background = background?;
+    Some(match Theme::query() {
+        Some(theme) => Colors::of(theme),
+        None => Colors {
+            theme: None,
+            light: theme::is_light(background),
+        },
+    })
 }
 
 /// `LEAF_THEME=light` or `dark` sets the theme outright.
@@ -209,5 +304,26 @@ mod tests {
         };
         assert!(rex.due().is_some_and(|wait| wait <= REX_EVERY));
         assert_eq!(rex.refresh(), None);
+        let mut pushed = Scheme::Pushed {
+            light: false,
+            background: None,
+            checked: Instant::now(),
+        };
+        assert!(pushed.asks_terminal());
+        assert!(pushed.due().is_some_and(|wait| wait <= EVERY));
+        assert_eq!(pushed.refresh(), None);
+        // Overdue but not allowed to ask: deferring puts it off a whole wait.
+        let long_ago = Instant::now().checked_sub(EVERY * 2).unwrap();
+        let mut overdue = Scheme::Pushed {
+            light: false,
+            background: None,
+            checked: long_ago,
+        };
+        assert_eq!(overdue.due(), Some(Duration::ZERO));
+        overdue.defer();
+        assert!(overdue.due().is_some_and(|wait| wait > EVERY / 2));
+        let mut rex = Scheme::Rex { checked: long_ago };
+        rex.defer();
+        assert_eq!(rex.due(), Some(Duration::ZERO));
     }
 }

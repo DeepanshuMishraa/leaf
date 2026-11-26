@@ -28,6 +28,7 @@ impl Hue {
         Hue::Red,
     ];
 
+    #[cfg(test)]
     /// The hue a number key picks: `1` is yellow, `6` red.
     pub fn of_key(c: char) -> Option<Hue> {
         let n = c.to_digit(10)? as usize;

@@ -194,7 +194,7 @@ pub fn deliver(text: &str) -> Result<Agent, AgentFailed> {
 /// Sends `text` to the agent in pane `pane` of whichever multiplexer leaf
 /// runs in: the pane that asked for a review.
 pub fn deliver_to_pane(pane: &str, text: &str) -> Result<Agent, AgentFailed> {
-    match crate::host::Host::detect() {
+    match crate::host::Host::for_pane(pane) {
         None => Err(AgentFailed::NoTmux),
         Some(crate::host::Host::Rex) => deliver_to(pane, text),
         Some(host) => host
