@@ -3965,7 +3965,7 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, all: &KeysConfig)
     ];
     let column = rows
         .iter()
-        .map(|(key, _)| key.chars().count() + 1)
+        .map(|(key, _)| unicode_width::UnicodeWidthStr::width(key.as_str()) + 1)
         .max()
         .unwrap_or(0)
         .max(16);
@@ -3975,7 +3975,10 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, all: &KeysConfig)
         .filter(|(key, _)| !key.is_empty())
         .map(|(key, what)| {
             Line::from(vec![
-                Span::styled(format!(" {key:<column$}"), Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!(" {}", crate::keymap::pad_end(&key, column)),
+                    Style::default().fg(ACCENT),
+                ),
                 Span::styled(what, Style::default()),
             ])
         })

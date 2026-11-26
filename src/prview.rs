@@ -3674,7 +3674,7 @@ fn draw_help(
         .map(|(key, what)| {
             Line::from(vec![
                 Span::styled(
-                    format!(" {key:<column$}"),
+                    format!(" {}", crate::keymap::pad_end(key, column)),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled((*what).to_owned(), Style::default().fg(DIM)),

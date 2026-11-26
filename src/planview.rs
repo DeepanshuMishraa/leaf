@@ -2237,7 +2237,7 @@ fn draw_help(f: &mut Frame, area: Rect, keymap: &Keymap<PlanAction>) {
     ];
     let column = rows
         .iter()
-        .map(|(keys, _)| keys.chars().count())
+        .map(|(keys, _)| keys.width())
         .max()
         .unwrap_or(0)
         .max(10);
@@ -2247,7 +2247,10 @@ fn draw_help(f: &mut Frame, area: Rect, keymap: &Keymap<PlanAction>) {
         .filter(|(keys, _)| !keys.is_empty())
         .map(|(keys, what)| {
             Line::from(vec![
-                Span::styled(format!("{keys:>column$}  "), Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{}  ", crate::keymap::pad_start(&keys, column)),
+                    Style::default().fg(ACCENT),
+                ),
                 Span::raw(what),
             ])
         })

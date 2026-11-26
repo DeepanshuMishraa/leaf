@@ -2764,7 +2764,7 @@ fn draw_help(f: &mut Screen, area: Rect, keys: &Keymap<BoardAction>) {
         .map(|(keys, what)| {
             Line::from(vec![
                 Span::styled(
-                    format!("{keys:>column$}  "),
+                    format!("{}  ", crate::keymap::pad_start(&keys, column)),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(what),

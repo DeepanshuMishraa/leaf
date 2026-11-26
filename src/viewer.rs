@@ -1881,7 +1881,7 @@ impl App {
         let rows = self.help_rows();
         let key_width = rows
             .iter()
-            .map(|(keys, _)| keys.chars().count() + 2)
+            .map(|(keys, _)| unicode_width::UnicodeWidthStr::width(keys.as_str()) + 2)
             .max()
             .unwrap_or(0)
             .max(12);
@@ -1896,7 +1896,7 @@ impl App {
             .map(|(keys, action)| {
                 Line::from(vec![
                     Span::styled(
-                        format!("{keys:<key_width$}"),
+                        crate::keymap::pad_end(&keys, key_width),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(action, Style::default().fg(DIM)),

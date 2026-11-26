@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
+use unicode_width::UnicodeWidthStr;
 
 /// What a view can do from a key. `TABLE` lists every action once, by the
 /// name `config.toml` calls it, with its default keys. A key bound to several
@@ -386,6 +387,19 @@ impl<A: Action> Keymap<A> {
     }
 }
 
+/// `label` padded on the right to `cells` terminal cells, for a help column.
+/// `format!` pads by characters, which a wide key would throw out of line.
+pub fn pad_end(label: &str, cells: usize) -> String {
+    let fill = cells.saturating_sub(UnicodeWidthStr::width(label));
+    format!("{label}{}", " ".repeat(fill))
+}
+
+/// `label` padded on the left to `cells` terminal cells.
+pub fn pad_start(label: &str, cells: usize) -> String {
+    let fill = cells.saturating_sub(UnicodeWidthStr::width(label));
+    format!("{}{label}", " ".repeat(fill))
+}
+
 /// One key or several, as `config.toml` writes them: `quit = "q"` or
 /// `quit = ["q", "ctrl+c"]`. An empty list unbinds the action.
 #[derive(Debug, Clone, Deserialize)]
@@ -562,6 +576,13 @@ mod tests {
         assert_eq!(keys.actions(&char('n')), vec![Test::Quit]);
         assert!(keys.actions(&char('q')).is_empty());
         assert_eq!(keys.label(Test::Turn), "d");
+    }
+
+    #[test]
+    fn help_labels_pad_by_cells() {
+        assert_eq!(pad_end("全", 4), "全  ");
+        assert_eq!(pad_start("全", 4), "  全");
+        assert_eq!(pad_end("j/k", 2), "j/k");
     }
 
     #[test]
