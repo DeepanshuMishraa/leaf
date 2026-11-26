@@ -476,6 +476,10 @@ pub struct App {
     reading_width: ReadingWidth,
     /// Columns the last frame left for the reading column; unbounded before it.
     room: u16,
+    /// How wide the outline's sidebar is asked to be; `<` and `>` change it for the session.
+    outline_columns: u16,
+    /// The columns the last frame gave the sidebar, 0 when it isn't shown.
+    beside: u16,
     /// The terminal's width, from the last frame or a resize since; unbounded before either.
     screen_width: u16,
     laid: HashMap<usize, (Rc<Laid>, bool)>,
@@ -652,6 +656,8 @@ impl App {
             reading_width: ReadingWidth::Columns(options.max_text_width),
             room: u16::MAX,
             screen_width: u16::MAX,
+            outline_columns: outline::SIDEBAR_COLUMNS,
+            beside: 0,
             doc,
             options,
             picker,
@@ -1251,9 +1257,12 @@ impl App {
             self.outline = None;
         }
         let beside = match self.form() {
-            Some(OutlineForm::Sidebar) => OUTLINE_COLUMNS,
+            Some(OutlineForm::Sidebar) => {
+                outline::sidebar(self.outline_columns, area.width, MIN_WIDTH + 4)
+            }
             _ => 0,
         };
+        self.beside = beside;
         let text = Rect {
             x: area.x + beside,
             width: area.width - beside,
@@ -1761,6 +1770,12 @@ impl App {
             ]);
         } else {
             rows.push(("t  T", "outline beside or over the text"));
+        }
+        if self.outline.is_some() {
+            rows.push((
+                "<  >",
+                "narrow or widen the outline beside the text (or drag its edge)",
+            ));
         }
         rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
         rows.extend([
@@ -2680,6 +2695,9 @@ impl App {
             Some(Ask::Close) => self.close_outline(),
             Some(Ask::Show(form)) => self.toggle_outline(form),
             Some(Ask::Go(Some(node))) => self.outline_go(node),
+            Some(Ask::Resize { wider }) => {
+                self.outline_columns = outline::resized(self.outline_columns, wider);
+            }
             Some(Ask::Go(None)) | None => {}
         }
         taken
@@ -2721,6 +2739,12 @@ impl App {
             ..area
         };
         f.render_widget(Paragraph::new(lines), body);
+        let edge = Rect {
+            x: (area.x + area.width).saturating_sub(1),
+            width: 1,
+            ..area
+        };
+        f.render_widget(Paragraph::new(outline::edge(area.height)), edge);
     }
 
     fn draw_outline_window(&mut self, f: &mut Frame, area: Rect) -> Option<Rect> {
@@ -3399,9 +3423,19 @@ impl App {
         if News::mouse(&mut self.news, mouse) || self.overlaying() {
             return;
         }
+        let beside = self.beside;
+        if let Some(open) = self.outline.as_mut() {
+            let (taken, width) = open.edge_mouse(mouse.kind, mouse.column, beside);
+            if let Some(width) = width {
+                self.outline_columns = width;
+            }
+            if taken {
+                return;
+            }
+        }
         // A release is let through, so a drag begun in the text still ends.
         if self.form() == Some(OutlineForm::Sidebar)
-            && mouse.column < OUTLINE_COLUMNS
+            && mouse.column < self.beside
             && mouse.row < self.view_height
             && !matches!(mouse.kind, MouseEventKind::Up(_))
         {
@@ -6453,7 +6487,8 @@ mod tests {
         frame
             .lines()
             .find_map(|line| {
-                let beside: String = line.chars().take(OUTLINE_COLUMNS as usize).collect();
+                // Up to the sidebar's edge, which is no part of an entry.
+                let beside: String = line.chars().take_while(|&c| c != '│').collect();
                 beside.split_once('›').map(|(_, entry)| {
                     entry
                         .trim()
@@ -6475,6 +6510,57 @@ mod tests {
         // The text keeps its own column to the right of it, and still shows.
         assert!(s.app.column.x >= OUTLINE_COLUMNS);
         assert!(frame.contains("Short too."), "{frame}");
+    }
+
+    #[test]
+    fn dragging_the_outline_s_edge_resizes_it() {
+        let text = format!("# One\n\n{}", filler(40));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('t'));
+        let edge = OUTLINE_COLUMNS - 1;
+        // A faint line marks the edge to take hold of.
+        let first = frame.lines().next().unwrap_or_default();
+        assert_eq!(first.chars().nth(edge as usize), Some('│'), "{frame}");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), edge, 5);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5);
+        assert_eq!(s.app.beside, 51);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), 5, 6);
+        assert_eq!(s.app.beside, 20, "no narrower than its least");
+        s.mouse(MouseEventKind::Up(MouseButton::Left), 5, 6);
+        // Let go, a drag elsewhere is the text's again and leaves the sidebar alone.
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), 60, 6);
+        assert_eq!(s.app.beside, 20);
+        assert!(s.app.selection.is_none());
+    }
+
+    #[test]
+    fn angle_brackets_resize_the_outline_beside_the_text() {
+        let doc = Doc::whole("Doc", "# One\n\nShort.\n\n## Two\n\nShort too.");
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.beside, OUTLINE_COLUMNS);
+        let width = s.app.width;
+        s.press(KeyCode::Char('>'));
+        assert_eq!(s.app.beside, OUTLINE_COLUMNS + 4);
+        // The keys go to the sidebar, not to the reading column's width.
+        assert_eq!(s.app.width, width);
+        // It narrows no further than its least, and widens no further than the screen allows.
+        for _ in 0..20 {
+            s.press(KeyCode::Char('<'));
+        }
+        assert_eq!(s.app.beside, 20);
+        for _ in 0..40 {
+            s.press(KeyCode::Char('>'));
+        }
+        assert_eq!(s.app.beside, 80);
+        s.terminal.backend_mut().resize(90, 30);
+        s.draw();
+        assert_eq!(s.app.beside, 90 - MIN_WIDTH - 4);
+        // Closed and opened again, it keeps the width it was given.
+        s.terminal.backend_mut().resize(120, 30);
+        s.press(KeyCode::Char('t'));
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.beside, 80);
     }
 
     #[test]

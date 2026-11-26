@@ -788,6 +788,8 @@ struct App {
     /// note, then one row per file. `None` while reading a file.
     overview: Option<usize>,
     outline: Option<OpenOutline>,
+    /// How wide the outline's sidebar is asked to be; `<` and `>` change it for the session.
+    outline_columns: u16,
     note_editor: Option<NoteEditor>,
     /// How the review ended, for `leaf review`.
     outcome: Option<Outcome>,
@@ -866,6 +868,7 @@ impl App {
             sends: options.margin.sends,
             overview: None,
             outline: None,
+            outline_columns: outline::SIDEBAR_COLUMNS,
             note_editor: None,
             outcome: None,
             quit_armed: false,
@@ -1808,6 +1811,19 @@ impl App {
         {
             return;
         }
+        let beside = match self.form() {
+            Some(OutlineForm::Sidebar) => self.view.x,
+            _ => 0,
+        };
+        if let Some(open) = self.outline.as_mut() {
+            let (taken, width) = open.edge_mouse(mouse.kind, mouse.column, beside);
+            if let Some(width) = width {
+                self.outline_columns = width;
+            }
+            if taken {
+                return;
+            }
+        }
         match self.form() {
             // A release is let through, so a drag begun in the diff still ends.
             Some(OutlineForm::Sidebar)
@@ -2206,8 +2222,18 @@ impl App {
     /// The line a scroll can stop at when bringing `line` to the top: the
     /// line itself, plus the file and hunk headings directly above it.
     fn heading_start(&self, line: usize) -> usize {
+        let diff = &self.loaded.diff;
+        let lines = self.split.lines();
+        // A file's own name is as far up as its headings go: above it is another file.
+        let is_file = |at: usize| {
+            lines
+                .get(at)
+                .and_then(|line| line.band)
+                .is_some_and(|row| diff.rows()[row].kind == RowKind::File)
+        };
         let mut top = line;
         while top > 0
+            && !is_file(top)
             && self
                 .split
                 .lines()
@@ -2765,7 +2791,11 @@ impl App {
             self.outline = None;
         }
         let beside = match self.form() {
-            Some(OutlineForm::Sidebar) => OUTLINE_COLUMNS,
+            Some(OutlineForm::Sidebar) => outline::sidebar(
+                self.outline_columns,
+                area.width,
+                OUTLINE_MIN_SCREEN - OUTLINE_COLUMNS,
+            ),
             _ => 0,
         };
         let body = Rect::new(
@@ -3811,6 +3841,10 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ("h l", "fold this file to its heading, or open it"),
         ("f", "files: filter by path, open one"),
         ("t T", "outline of every file beside the diff, or over it"),
+        (
+            "< >",
+            "outline open: narrow or widen its sidebar (or drag its edge)",
+        ),
         ("V v", "visual mode; move to select, esc clears"),
         ("c C", "comment on the line or selection"),
         (
@@ -3990,6 +4024,9 @@ impl App {
             Some(Ask::Close) => self.close_outline(),
             Some(Ask::Show(form)) => self.toggle_outline(form),
             Some(Ask::Go(Some(node))) => self.outline_go(node),
+            Some(Ask::Resize { wider }) => {
+                self.outline_columns = outline::resized(self.outline_columns, wider);
+            }
             Some(Ask::Go(None)) | None => {}
         }
         taken
@@ -4008,6 +4045,12 @@ impl App {
             ..area
         };
         f.render_widget(Paragraph::new(lines), body);
+        let edge = Rect {
+            x: (area.x + area.width).saturating_sub(1),
+            width: 1,
+            ..area
+        };
+        f.render_widget(Paragraph::new(outline::edge(area.height)), edge);
     }
 
     fn draw_outline_window(&self, f: &mut Frame, area: Rect) {
@@ -6409,6 +6452,79 @@ diff --git a/docs/links.md b/docs/links.md
         assert!(draw(&mut app, 120, 20).contains("new link"));
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(app.current_file(), Some(0));
+    }
+
+    #[test]
+    fn dragging_the_outline_s_edge_resizes_it_beside_the_diff() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        let drag = |app: &mut App, kind: MouseEventKind, column: u16| {
+            app.mouse(MouseEvent {
+                kind,
+                column,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        drag(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            OUTLINE_COLUMNS - 1,
+        );
+        drag(&mut app, MouseEventKind::Drag(MouseButton::Left), 49);
+        drag(&mut app, MouseEventKind::Up(MouseButton::Left), 49);
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, 50);
+        assert!(
+            app.drag_origin.is_none(),
+            "the edge's drag is no drag in the diff"
+        );
+    }
+
+    #[test]
+    fn angle_brackets_resize_the_outline_beside_the_diff() {
+        let mut app = tree_app();
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, OUTLINE_COLUMNS);
+        press(&mut app, KeyCode::Char('>'));
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, OUTLINE_COLUMNS + 4);
+        press(&mut app, KeyCode::Char('<'));
+        press(&mut app, KeyCode::Char('<'));
+        draw(&mut app, 120, 20);
+        assert_eq!(app.view.x, OUTLINE_COLUMNS - 4);
+    }
+
+    #[test]
+    fn an_outline_move_to_a_file_with_no_hunks_puts_its_own_name_at_the_top() {
+        // Pure renames have no hunks, so their headers sit one under the other.
+        let patch: String = (0..30)
+            .map(|n| {
+                format!(
+                    "diff --git a/old{n}.rs b/new{n}.rs\nsimilarity index 100%\nrename from old{n}.rs\nrename to new{n}.rs\n"
+                )
+            })
+            .collect();
+        let mut app = App::new(loaded(&patch), Options::default());
+        draw(&mut app, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let screen = draw(&mut app, 120, 20);
+        let top: String = screen
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .skip(OUTLINE_COLUMNS as usize)
+            .collect();
+        let file = app.current_file().expect("a file is under the cursor");
+        let name = app.loaded.diff.files()[file].path().to_owned();
+        assert!(top.contains(&name), "{name} is not at the top:\n{screen}");
     }
 
     #[test]

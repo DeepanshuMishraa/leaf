@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -330,6 +330,8 @@ pub struct OpenOutline {
     /// The reader's alone: the page whose headings the tree holds, `None` for the document's
     /// own bookmarks.
     pub page: Option<usize>,
+    /// Whether the mouse holds the sidebar's right edge, between a press on it and the release.
+    pub dragging: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -345,6 +347,39 @@ pub enum Ask {
     Show(OutlineForm),
     /// The entry to go to, if the tree has one to move to.
     Go(Option<usize>),
+    /// Make the sidebar wider, or narrower.
+    Resize {
+        wider: bool,
+    },
+}
+
+/// The sidebar's width when it first opens.
+pub const SIDEBAR_COLUMNS: u16 = 32;
+/// The narrowest and widest `<` and `>` take the sidebar; the screen may hold it narrower still.
+const SIDEBAR_MIN: u16 = 20;
+const SIDEBAR_MAX: u16 = 80;
+const SIDEBAR_STEP: u16 = 4;
+
+/// The sidebar's width one step wider or narrower than `columns`.
+pub fn resized(columns: u16, wider: bool) -> u16 {
+    let next = if wider {
+        columns.saturating_add(SIDEBAR_STEP)
+    } else {
+        columns.saturating_sub(SIDEBAR_STEP)
+    };
+    next.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+}
+
+/// The columns the sidebar takes on a screen `width` wide that must leave `text` for the text.
+pub fn sidebar(columns: u16, width: u16, text: u16) -> u16 {
+    columns.min(width.saturating_sub(text))
+}
+
+/// The sidebar's right edge, a column of `│` a mouse can take hold of.
+pub fn edge(height: u16) -> Vec<Line<'static>> {
+    (0..height)
+        .map(|_| Line::from(Span::styled("│", dim())))
+        .collect()
 }
 
 impl OpenOutline {
@@ -356,12 +391,39 @@ impl OpenOutline {
             picked: None,
             pinned: None,
             page: None,
+            dragging: false,
         }
     }
 
     /// Brings `nodes` as the tree, keeping what's typed. `renewed` says the text moved to
     /// another page even though the entries read the same. What was followed, picked or
     /// pinned belongs to the tree before.
+    /// A mouse event at `column` while the sidebar takes `beside` columns: a press on its right
+    /// edge takes hold of it, a drag moves it, a release lets go. Says whether the event was
+    /// the edge's, and the width a drag asks for.
+    pub fn edge_mouse(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        beside: u16,
+    ) -> (bool, Option<u16>) {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) if beside > 0 && column + 1 == beside => {
+                self.dragging = true;
+                (true, None)
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => (
+                true,
+                Some(column.saturating_add(1).clamp(SIDEBAR_MIN, SIDEBAR_MAX)),
+            ),
+            MouseEventKind::Up(_) if self.dragging => {
+                self.dragging = false;
+                (true, None)
+            }
+            _ => (false, None),
+        }
+    }
+
     pub fn retarget(&mut self, nodes: Vec<OutlineNode>, renewed: bool) -> bool {
         if !self.tree.retarget(nodes, renewed) {
             return false;
@@ -409,6 +471,8 @@ impl OpenOutline {
             KeyCode::Esc | KeyCode::Char('q') => (true, Some(Ask::Close)),
             KeyCode::Char('t') => (true, Some(Ask::Show(OutlineForm::Sidebar))),
             KeyCode::Char('T') => (true, Some(Ask::Show(OutlineForm::Window))),
+            KeyCode::Char('<') => (true, Some(Ask::Resize { wider: false })),
+            KeyCode::Char('>') => (true, Some(Ask::Resize { wider: true })),
             KeyCode::Down | KeyCode::Char('j') => {
                 (true, Some(Ask::Go(self.tree.step(self.followed, 1))))
             }
