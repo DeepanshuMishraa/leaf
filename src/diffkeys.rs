@@ -80,7 +80,7 @@ actions! {
         SendReview = "send_review" ["S"] "send drafts and notes as one review",
         Comments = "comments" ["m"] "list the comments",
         Help = "help" ["?"] "list the keys",
-        Close = "close" ["tab", "O", "esc"] "back to the diff",
+        Close = "close" ["tab", "O", "esc"] "back to the diff; in leaf review, esc asks to quit",
         Quit = "quit" ["q"] "quit",
     }
 }

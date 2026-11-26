@@ -36,6 +36,8 @@ use serde_json::{Value, json};
 use crate::board::{
     Board, Dash, Element, End, Fill, FillStyle, Frame, INK, Order, Pt, Shape, text_size,
 };
+use unicode_width::UnicodeWidthStr;
+
 use crate::boardkeys::BoardAction;
 use crate::boardsvg::{self, Overlay, Paint};
 use crate::doc::{LIVE_TICK, Watch};
@@ -1984,7 +1986,8 @@ impl App {
             } else {
                 (format!(" {key}"), dim)
             };
-            let width = label.chars().count() as u16;
+            // In cells, so a wide key keeps the buttons after it where clicks land.
+            let width = label.width() as u16;
             self.buttons.push((tool, at, at + width));
             at += width;
             spans.push(Span::styled(label, style));
@@ -2744,7 +2747,7 @@ fn draw_help(f: &mut Screen, area: Rect, keys: &Keymap<BoardAction>) {
     let rows = help_rows(keys);
     let column = rows
         .iter()
-        .map(|(keys, _)| keys.chars().count())
+        .map(|(keys, _)| keys.width())
         .max()
         .unwrap_or(0)
         .max(13);

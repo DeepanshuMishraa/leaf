@@ -4292,10 +4292,22 @@ impl App {
         if self.sends == Sends::Return && unsent > 0 && !self.quit_armed {
             self.quit_armed = true;
             let notes = if unsent == 1 { "1 note" } else { "notes" };
+            // The overview has keys of its own; the hint names the ones in force.
+            let (send, quit) = if self.overview.is_some() {
+                let keys = &self.keys.diff_overview;
+                (
+                    keys.first(OverviewAction::SendReview),
+                    keys.first(OverviewAction::Quit),
+                )
+            } else {
+                let keys = &self.keys.diff;
+                (
+                    keys.first(DiffAction::SendReview),
+                    keys.first(DiffAction::Quit),
+                )
+            };
             self.toast(format!(
-                "{notes} not sent yet: {} sends the review, {} again quits and keeps them",
-                self.keys.diff.first(DiffAction::SendReview),
-                self.keys.diff.first(DiffAction::Quit),
+                "{notes} not sent yet: {send} sends the review, {quit} again quits and keeps them"
             ));
         } else {
             self.quit = true;

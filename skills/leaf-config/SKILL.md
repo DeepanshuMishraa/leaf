@@ -72,7 +72,8 @@ Text you type keeps its own keys and can't be rebound. That covers comment and n
 ## How bindings combine
 
 - Setting an action replaces that action's keys. The rest of the table stays at its defaults.
-- When you give an action a key that another action had by default, the other action loses it. That way each key does one thing.
+- When you give an action a key it didn't have, any other action that had that key by default loses it. That way each key does one thing. Keys an action already had stay where they were, so restating `next_match = "n"` leaves `n` on `next_page` too.
+- A reader color (`color_1` to `color_6`) can't share a key with a `keys.ink` action: with a stroke picked, ink keys are heard first.
 - Naming the same new key for two actions in one table is an error. Some keys are shared by default and that's fine: in the reader `n` finds the next match while a search has one on the page and turns the page otherwise. Restating defaults never changes anything.
 - A key with modifiers wins over the plain key, so `ctrl+d` and `d` can do different things. A plain key also answers with ctrl or alt held when nothing else claims that combination.
 - Tables are separate. Rebinding `quit` in `keys.reader` doesn't touch `keys.diff`.
@@ -89,4 +90,4 @@ Text you type keeps its own keys and can't be rebound. That covers comment and n
 
 ## When leaf won't start
 
-`Could not load settings in <path>` means the file didn't read, and leaf opens nothing until it does. In `leaf pr`, the Code tab stays closed and shows the error. The message names the table, action and key, for example ``keys.reader.quit: `ctl+q` is not a key: `ctl` is not a modifier; use ctrl, alt or shift``. A misspelled action lists the actions the table has. Fix that line, or delete it to go back to the default, then run `leaf config check`.
+`Could not load settings in <path>` means the file didn't read, and leaf opens nothing until it does. If the file breaks while `leaf pr` is already open, its Code tab shows the error and stays closed. The message names the table, action and key, for example ``keys.reader.quit: `ctl+q` is not a key: `ctl` is not a modifier; use ctrl, alt or shift``. A misspelled action lists the actions the table has. Fix that line, or delete it to go back to the default, then run `leaf config check`.

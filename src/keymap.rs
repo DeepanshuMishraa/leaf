@@ -331,6 +331,14 @@ impl<A: Action> Keymap<A> {
             .unwrap_or_default()
     }
 
+    /// The keys `action` is bound to.
+    pub fn chords(&self, action: A) -> &[Chord] {
+        self.bindings
+            .iter()
+            .find(|(mine, _)| *mine == action)
+            .map_or(&[], |(_, chords)| chords.as_slice())
+    }
+
     /// The first key of `action`, for a hint that shows one; empty when unbound.
     pub fn first(&self, action: A) -> String {
         self.bindings

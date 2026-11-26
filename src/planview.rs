@@ -1859,31 +1859,34 @@ impl App {
                 Style::default().fg(DIM),
             )],
             None => {
-                let keys: &[(&str, &str)] = if self.composer.is_some() {
-                    &[
-                        ("enter", "save"),
-                        ("alt+enter", "new line"),
-                        ("esc", "cancel"),
+                // The comment box's keys are the editor's own; the rest are
+                // the plan's, as `[keys.plan]` binds them.
+                let key = |action| self.keys.plan.first(action);
+                let keys: Vec<(String, &str)> = if self.composer.is_some() {
+                    vec![
+                        ("enter".to_owned(), "save"),
+                        ("alt+enter".to_owned(), "new line"),
+                        ("esc".to_owned(), "cancel"),
                     ]
                 } else if self.selection.is_some() {
-                    &[
-                        ("c", "comment"),
-                        ("x", "remove"),
-                        ("r", "replace"),
-                        ("esc", "clear"),
+                    vec![
+                        (key(PlanAction::Comment), "comment"),
+                        (key(PlanAction::Remove), "remove"),
+                        (key(PlanAction::Replace), "replace"),
+                        (key(PlanAction::Escape), "clear"),
                     ]
                 } else {
-                    &[
-                        ("c", "comment line"),
-                        ("V", "select lines"),
-                        ("B", "comment block"),
-                        ("S", "send"),
-                        ("C", "whole plan"),
-                        ("L", "notes"),
-                        ("?", "keys"),
+                    vec![
+                        (key(PlanAction::Comment), "comment line"),
+                        (key(PlanAction::Select), "select lines"),
+                        (key(PlanAction::BlockComment), "comment block"),
+                        (key(PlanAction::SendReview), "send"),
+                        (key(PlanAction::GlobalNote), "whole plan"),
+                        (key(PlanAction::Notes), "notes"),
+                        (key(PlanAction::Help), "keys"),
                     ]
                 };
-                hints(keys, room)
+                hints(&keys, room)
             }
         };
         let used: usize = spans.iter().map(|span| span.content.width()).sum();
@@ -2034,16 +2037,17 @@ fn one_line(body: &str) -> String {
 }
 
 /// Key hints, `key action` apart, as many as fit `room` columns.
-fn hints(keys: &[(&str, &str)], room: usize) -> Vec<Span<'static>> {
+fn hints(keys: &[(String, &str)], room: usize) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
-    for (key, action) in keys {
+    // An action left with no key has nothing to show.
+    for (key, action) in keys.iter().filter(|(key, _)| !key.is_empty()) {
         let width = key.width() + 1 + action.width() + 3;
         if used + width > room {
             break;
         }
         used += width;
-        spans.push(Span::styled((*key).to_owned(), Style::default().fg(ACCENT)));
+        spans.push(Span::styled(key.clone(), Style::default().fg(ACCENT)));
         spans.push(Span::styled(
             format!(" {action}   "),
             Style::default().fg(DIM),

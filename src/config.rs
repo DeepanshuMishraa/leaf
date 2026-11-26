@@ -51,7 +51,7 @@ macro_rules! keys_config {
     ($($field:ident: $action:ty),+ $(,)?) => {
         /// `[keys.<view>]`: each names an action and the key, or list of keys,
         /// that does it. Actions left out keep their default keys.
-        #[derive(Debug, Default, Clone, Deserialize)]
+        #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct KeysConfig {
             $(pub $field: Keymap<$action>,)+
@@ -160,7 +160,32 @@ pub fn load() -> Result<Config, ConfigFailed> {
             config.outline.width
         )));
     }
+    config.keys.check_overlaps().map_err(failed)?;
     Ok(config)
+}
+
+impl KeysConfig {
+    /// Refuses keys two tables would both want at once. With a stroke picked,
+    /// `[keys.ink]` hears a key before the reader, so a color sharing an ink
+    /// key could never be picked there.
+    pub fn check_overlaps(&self) -> Result<(), String> {
+        use keymap::Action;
+        let colors = ReaderAction::TABLE
+            .iter()
+            .filter(|(_, action, _)| action.hue().is_some());
+        for ((ink_name, ink, _), what) in InkAction::TABLE.iter().zip(InkAction::ABOUT) {
+            for (color_name, color, _) in colors.clone() {
+                let theirs = self.reader.chords(*color);
+                if let Some(chord) = self.ink.chords(*ink).iter().find(|c| theirs.contains(c)) {
+                    return Err(format!(
+                        "keys.ink.{ink_name} and keys.reader.{color_name} both use `{}`, so with a stroke picked that key would only {what}. Give one of them another key.",
+                        chord.label(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -181,9 +206,22 @@ mod tests {
     fn the_printed_defaults_read_back_as_the_defaults() {
         let printed = super::KeysConfig::defaults_toml();
         let config: Config = toml::from_str(&printed).unwrap();
-        assert_eq!(config.keys.reader, Default::default());
-        assert_eq!(config.keys.board, Default::default());
-        assert_eq!(config.keys.pr, Default::default());
+        assert_eq!(config.keys, super::KeysConfig::default());
+        assert!(config.keys.check_overlaps().is_ok());
+    }
+
+    #[test]
+    fn a_color_on_an_ink_key_is_refused() {
+        let config: Config = toml::from_str("[keys.reader]\ncolor_1 = \"h\"").unwrap();
+        let error = config.keys.check_overlaps().unwrap_err();
+        assert!(
+            error.contains("keys.ink.left") && error.contains("keys.reader.color_1"),
+            "{error}"
+        );
+        let moved: Config =
+            toml::from_str("[keys.reader]\ncolor_1 = \"h\"\n\n[keys.ink]\nleft = \"left\"")
+                .unwrap();
+        assert!(moved.keys.check_overlaps().is_ok());
     }
 
     #[test]
