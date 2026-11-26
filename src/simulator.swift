@@ -1,6 +1,8 @@
 // Leaf's iOS Simulator pane: a simulator's live screen on a 3D iPhone, in a
-// window kept over one Rex block (see src/pane.swift). The iPhone Duo uses
-// the same screen: folded on the cover display, open on the inner one.
+// window kept over one Rex block (see src/pane.swift). The iPhone Duo
+// (LEAF_SIM_DUO=1) is drawn on a foldable model that swings open and shut;
+// its iOS draws on the cover display, which shows on whichever glass faces
+// front.
 //
 // The screen is the simulator's own framebuffer: CoreSimulator hands out the
 // IOSurface it draws into, and a Metal texture over that surface is the
@@ -102,11 +104,12 @@ enum CoreSim {
 
     private typealias UInt16Fn = @convention(c) (AnyObject, Selector) -> UInt16
 
-    /// The main display's port descriptor: the one that renders to an
-    /// IOSurface, preferring display class 0 (the built-in screen).
-    static func mainDisplay(of device: NSObject) -> NSObject? {
+    /// The built-in screens' port descriptors: those that render to an
+    /// IOSurface with display class 0, or any that render when none says so.
+    /// The iPhone Duo has two, its cover and its inner screen.
+    static func builtInDisplays(of device: NSObject) -> [NSObject] {
         guard let io = object(device, "io") as? NSObject,
-              let ports = object(io, "ioPorts") as? [NSObject] else { return nil }
+              let ports = object(io, "ioPorts") as? [NSObject] else { return [] }
         var found: [NSObject] = []
         for port in ports {
             guard let descriptor = object(port, "descriptor") as? NSObject,
@@ -115,13 +118,14 @@ enum CoreSim {
             found.append(descriptor)
         }
         let displayClass = NSSelectorFromString("displayClass")
-        return found.first { descriptor in
+        let builtIn = found.filter { descriptor in
             guard let state = object(descriptor, "state") as? NSObject,
                   state.responds(to: displayClass) else { return false }
             // displayClass is a small integer, not an object, so it can't go
             // through perform; the low 16 bits hold it whatever its width.
             return unsafeBitCast(state.method(for: displayClass), to: UInt16Fn.self)(state, displayClass) == 0
-        } ?? found.first
+        }
+        return builtIn.isEmpty ? Array(found.prefix(1)) : builtIn
     }
 
     /// The surface `descriptor` draws the screen into right now.
@@ -373,6 +377,31 @@ enum Keys {
 
 // MARK: - The phone
 
+/// Glass the live screen can be drawn on.
+struct Glass {
+    /// Its nodes. The Duo's inner screen is two: the half that stays and,
+    /// below it in the tree, the half that folds.
+    let nodes: [SCNNode]
+    /// Its size in `pivot`'s units, the main screen being 1 tall.
+    let size: CGSize
+
+    func contains(_ node: SCNNode) -> Bool { nodes.contains { $0 === node } }
+}
+
+/// The iPhone Duo's hinge. Its left half turns about the hinge onto the
+/// right; folded, the cover on the back of that half faces front.
+struct Fold {
+    /// Turn these about Y from 0 (open) to π (folded).
+    let hinges: [SCNNode]
+    /// Moves so the glass in use stays centred.
+    let holder: SCNNode
+    let cover: Glass
+    let openPosition: SIMD3<Float>
+    let foldedPosition: SIMD3<Float>
+    let openSize: CGSize
+    let foldedSize: CGSize
+}
+
 /// The 3D phone: leaf's iPhone model, turned to face +Z with its screen
 /// centred on the origin and 1 unit tall, and the screen mesh given UVs that
 /// span the display, (0, 0) at its top left.
@@ -380,67 +409,62 @@ struct Phone {
     let scene: SCNScene
     /// Turn this to turn the phone.
     let pivot: SCNNode
-    let screen: SCNNode
+    /// The main screen. In `pivot`'s space it spans ±width/2 across and
+    /// ±0.5 up and down, at z = 0.
+    let screen: Glass
+    /// Shows the simulator. Glass not in use is `dark`.
     let material: SCNMaterial
+    let dark: SCNMaterial
     /// The whole phone's size, screen heights.
     let size: CGSize
-    /// The screen's width over its height; in `pivot`'s space it spans
-    /// ±aspect/2 across and ±0.5 up and down, at z = 0.
-    let aspect: CGFloat
+    /// Present on the iPhone Duo.
+    let fold: Fold?
 
     /// The model's screen material, and the nodes that sit on the screen
     /// (the Dynamic Island), which are lifted just above it.
     static let screenMaterial = "COLOUR_Cherry_Screen"
+    /// The Duo's cover display, on the back of its left half.
+    static let coverMaterial = "C_NS_Screen_Outer"
     static let onScreen = ["Front_Cam", "Front_Sensor"]
+    /// The Duo's hinge line, in the model's own space: x = 0, z = this. Its
+    /// open and folded models differ by half a turn about it.
+    static let hingeZ: Float = 0.002584
 
-    static func load(_ url: URL) -> Result<Phone, SimFailure> {
+    static func load(_ url: URL, foldable: Bool) -> Result<Phone, SimFailure> {
         let scene: SCNScene
         do { scene = try SCNScene(url: url, options: nil) } catch {
             return .failure(SimFailure(message: "leaf's phone model at \(url.path) couldn't be read (\(error.localizedDescription)). Reinstall leaf to restore it."))
         }
-        var found: SCNNode?
-        scene.rootNode.enumerateHierarchy { node, stop in
-            if node.geometry?.materials.contains(where: { $0.name == screenMaterial }) == true {
-                found = node
-                stop.pointee = true
-            }
-        }
-        guard let screen = found, let geometry = screen.geometry,
-              let vertices = geometry.sources(for: .vertex).first, vertices.usesFloatComponents,
-              vertices.bytesPerComponent == 4, vertices.componentsPerVector >= 2 else {
-            return .failure(SimFailure(message: "leaf's phone model has no screen mesh (material \(screenMaterial)). Reinstall leaf to restore it."))
+        guard let screen = node(in: scene, material: screenMaterial),
+              let (width, height) = mapUVs(screen, mirrored: false) else {
+            return .failure(SimFailure(message: "leaf's phone model at \(url.path) has no screen mesh (material \(screenMaterial)). Reinstall leaf to restore it."))
         }
         let (low, high) = screen.boundingBox
-        let width = Float(high.x - low.x), height = Float(high.y - low.y)
-        guard width > 0, height > 0 else {
-            return .failure(SimFailure(message: "leaf's phone model has an empty screen mesh. Reinstall leaf to restore it."))
-        }
-
-        // UVs straight across the display, from the mesh's own flat XY plane.
-        var uvs: [SIMD2<Float>] = []
-        uvs.reserveCapacity(vertices.vectorCount)
-        vertices.data.withUnsafeBytes { raw in
-            for index in 0..<vertices.vectorCount {
-                let base = vertices.dataOffset + index * vertices.dataStride
-                let x = raw.loadUnaligned(fromByteOffset: base, as: Float.self)
-                let y = raw.loadUnaligned(fromByteOffset: base + 4, as: Float.self)
-                uvs.append(SIMD2((x - Float(low.x)) / width, (Float(high.y) - y) / height))
-            }
-        }
-        let uvSource = SCNGeometrySource(data: uvs.withUnsafeBufferPointer { Data(buffer: $0) }, semantic: .texcoord,
-                                         vectorCount: uvs.count, usesFloatComponents: true, componentsPerVector: 2,
-                                         bytesPerComponent: 4, dataOffset: 0, dataStride: MemoryLayout<SIMD2<Float>>.stride)
-        let mapped = SCNGeometry(sources: geometry.sources.filter { $0.semantic != .texcoord } + [uvSource],
-                                 elements: geometry.elements)
         let material = SCNMaterial()
         material.lightingModel = .constant
         material.diffuse.contents = NSColor.black
         material.diffuse.mipFilter = .none
         material.diffuse.magnificationFilter = .linear
         material.diffuse.minificationFilter = .linear
+        material.diffuse.wrapS = .clamp
+        material.diffuse.wrapT = .clamp
+        // Letterboxing: a mask in the glass's own UVs blacks out around the picture.
+        material.multiply.contents = NSColor.white
         material.isDoubleSided = false
-        mapped.materials = [material]
-        screen.geometry = mapped
+        let dark = SCNMaterial()
+        dark.lightingModel = .constant
+        dark.diffuse.contents = NSColor.black
+        screen.geometry?.materials = [material]
+
+        var cover: (node: SCNNode, width: Float, height: Float)?
+        if foldable {
+            guard let node = node(in: scene, material: coverMaterial),
+                  let (width, height) = mapUVs(node, mirrored: true) else {
+                return .failure(SimFailure(message: "leaf's iPhone Duo model at \(url.path) has no cover display (material \(coverMaterial)). Reinstall leaf to restore it."))
+            }
+            node.geometry?.materials = [dark]
+            cover = (node, width, height)
+        }
 
         // The screen and the island share a depth; lift each a hair so the
         // island stays on top and nothing flickers.
@@ -460,10 +484,240 @@ struct Phone {
         let pivot = SCNNode()
         pivot.addChildNode(holder)
         scene.rootNode.addChildNode(pivot)
-        let (bodyLow, bodyHigh) = pivot.boundingBox
-        let size = CGSize(width: CGFloat(bodyHigh.x - bodyLow.x), height: CGFloat(bodyHigh.y - bodyLow.y))
-        return .success(Phone(scene: scene, pivot: pivot, screen: screen, material: material, size: size,
-                              aspect: CGFloat(width / height)))
+        // Every mesh's box corners in `pivot`'s space. A node's own bounding
+        // box doesn't follow its children's turns until a frame draws.
+        func bodySize() -> CGSize {
+            var low = SIMD2<Float>(repeating: .infinity), high = SIMD2<Float>(repeating: -.infinity)
+            pivot.enumerateHierarchy { node, _ in
+                guard node.geometry != nil else { return }
+                let (a, b) = node.boundingBox
+                for corner in 0..<8 {
+                    let local = SIMD3<Float>(Float(corner & 1 == 0 ? a.x : b.x), Float(corner & 2 == 0 ? a.y : b.y),
+                                             Float(corner & 4 == 0 ? a.z : b.z))
+                    let point = pivot.simdConvertPosition(local, from: node)
+                    low = simd_min(low, SIMD2(point.x, point.y))
+                    high = simd_max(high, SIMD2(point.x, point.y))
+                }
+            }
+            return low.x <= high.x ? CGSize(width: CGFloat(high.x - low.x), height: CGFloat(high.y - low.y)) : .zero
+        }
+        let main = Glass(nodes: [screen], size: CGSize(width: CGFloat(width / height), height: 1))
+
+        guard let cover else {
+            return .success(Phone(scene: scene, pivot: pivot, screen: main, material: material, dark: dark,
+                                  size: bodySize(), fold: nil))
+        }
+        let (hinges, moved) = splitAtHinge(holder)
+        let openSize = bodySize()
+        let openPosition = holder.simdPosition
+        for hinge in hinges { hinge.simdEulerAngles.y = .pi }
+        let coverNode = moved[ObjectIdentifier(cover.node)] ?? cover.node
+        let (coverLow, coverHigh) = coverNode.boundingBox
+        let coverCenter = pivot.simdConvertPosition((SIMD3<Float>(coverLow) + SIMD3<Float>(coverHigh)) / 2, from: coverNode)
+        let foldedSize = bodySize()
+        for hinge in hinges { hinge.simdEulerAngles.y = 0 }
+        let fold = Fold(hinges: hinges, holder: holder,
+                        cover: Glass(nodes: [coverNode],
+                                     size: CGSize(width: CGFloat(cover.width / height), height: CGFloat(cover.height / height))),
+                        openPosition: openPosition, foldedPosition: openPosition - coverCenter,
+                        openSize: openSize, foldedSize: foldedSize)
+        let screenNodes = [screen] + (moved[ObjectIdentifier(screen)].map { [$0] } ?? [])
+        return .success(Phone(scene: scene, pivot: pivot, screen: Glass(nodes: screenNodes, size: main.size),
+                              material: material, dark: dark, size: openSize, fold: fold))
+    }
+
+    /// The first node drawn with `material`.
+    static func node(in scene: SCNScene, material: String) -> SCNNode? {
+        var found: SCNNode?
+        scene.rootNode.enumerateHierarchy { node, stop in
+            if node.geometry?.materials.contains(where: { $0.name == material }) == true {
+                found = node
+                stop.pointee = true
+            }
+        }
+        return found
+    }
+
+    /// Gives `node`'s flat mesh UVs straight across it, from its own XY
+    /// plane, (0, 0) at the top left; `mirrored` for glass that faces -Z.
+    /// Returns its width and height, or nil for a mesh it can't read.
+    static func mapUVs(_ node: SCNNode, mirrored: Bool) -> (Float, Float)? {
+        guard let geometry = node.geometry, let vertices = geometry.sources(for: .vertex).first,
+              vertices.usesFloatComponents, vertices.bytesPerComponent == 4, vertices.componentsPerVector >= 2 else { return nil }
+        let (low, high) = node.boundingBox
+        let width = Float(high.x - low.x), height = Float(high.y - low.y)
+        guard width > 0, height > 0 else { return nil }
+        var uvs: [SIMD2<Float>] = []
+        uvs.reserveCapacity(vertices.vectorCount)
+        vertices.data.withUnsafeBytes { raw in
+            for index in 0..<vertices.vectorCount {
+                let base = vertices.dataOffset + index * vertices.dataStride
+                let x = raw.loadUnaligned(fromByteOffset: base, as: Float.self)
+                let y = raw.loadUnaligned(fromByteOffset: base + 4, as: Float.self)
+                let u = mirrored ? (Float(high.x) - x) / width : (x - Float(low.x)) / width
+                uvs.append(SIMD2(u, (Float(high.y) - y) / height))
+            }
+        }
+        let uvSource = SCNGeometrySource(data: uvs.withUnsafeBufferPointer { Data(buffer: $0) }, semantic: .texcoord,
+                                         vectorCount: uvs.count, usesFloatComponents: true, componentsPerVector: 2,
+                                         bytesPerComponent: 4, dataOffset: 0, dataStride: MemoryLayout<SIMD2<Float>>.stride)
+        // The new UVs follow the positions' indices.
+        let kept = geometry.sources.indices.filter { geometry.sources[$0].semantic != .texcoord }
+        let channels = geometry.geometrySourceChannels.map { channels in
+            kept.map { channels[$0] } + [channels[geometry.sources.firstIndex { $0 === vertices } ?? 0]]
+        }
+        let mapped = SCNGeometry(sources: kept.map { geometry.sources[$0] } + [uvSource], elements: geometry.elements,
+                                 sourceChannels: channels)
+        mapped.materials = geometry.materials
+        node.geometry = mapped
+        return (width, height)
+    }
+
+    /// Splits every mesh under `root` at the hinge: triangles left of it move
+    /// onto a node that turns about the hinge line. Returns those turning
+    /// nodes, and the node each split mesh's left half went to, by the
+    /// original node.
+    static func splitAtHinge(_ root: SCNNode) -> ([SCNNode], [ObjectIdentifier: SCNNode]) {
+        var meshes: [SCNNode] = []
+        root.enumerateHierarchy { node, _ in if node.geometry != nil { meshes.append(node) } }
+        var hinges: [SCNNode] = []
+        var moved: [ObjectIdentifier: SCNNode] = [:]
+        for node in meshes {
+            guard let geometry = node.geometry, let (points, channel) = positions(geometry) else { continue }
+            var stay: [(SCNGeometryElement, SCNMaterial?)] = [], turn: [(SCNGeometryElement, SCNMaterial?)] = []
+            // The halves share the vertex data, so each gets the box of the
+            // corners it uses rather than the whole mesh's.
+            var stayBox = Box(), turnBox = Box()
+            for (index, part) in geometry.elements.enumerated() {
+                let material = geometry.materials.isEmpty ? nil : geometry.materials[index % geometry.materials.count]
+                guard part.primitiveType == .triangles, let triangles = Triangles(part) else {
+                    stay.append((part, material))
+                    stayBox.add(SIMD3<Float>(geometry.boundingBox.min))
+                    stayBox.add(SIMD3<Float>(geometry.boundingBox.max))
+                    continue
+                }
+                var left: [Int] = [], right: [Int] = []
+                for triangle in 0..<triangles.count {
+                    let corners = (0..<3).compactMap { corner -> SIMD3<Float>? in
+                        let vertex = Int(triangles.index(triangle, corner, channel))
+                        return vertex < points.count ? points[vertex] : nil
+                    }
+                    let middle = corners.reduce(Float(0)) { $0 + $1.x } / Float(max(corners.count, 1))
+                    if middle < 0 {
+                        left.append(triangle)
+                        corners.forEach { turnBox.add($0) }
+                    } else {
+                        right.append(triangle)
+                        corners.forEach { stayBox.add($0) }
+                    }
+                }
+                if !right.isEmpty { stay.append((triangles.element(right), material)) }
+                if !left.isEmpty { turn.append((triangles.element(left), material)) }
+            }
+            guard !turn.isEmpty else { continue }
+            let flap = SCNNode(geometry: rebuilt(geometry, turn, turnBox))
+            node.geometry = stay.isEmpty ? nil : rebuilt(geometry, stay, stayBox)
+            let hinge = SCNNode()
+            hinge.simdPosition = SIMD3(0, 0, hingeZ)
+            flap.simdPosition = SIMD3(0, 0, -hingeZ)
+            hinge.addChildNode(flap)
+            node.addChildNode(hinge)
+            hinges.append(hinge)
+            moved[ObjectIdentifier(node)] = flap
+        }
+        return (hinges, moved)
+    }
+
+    /// A bounding box grown one point at a time.
+    struct Box {
+        var low = SIMD3<Float>(repeating: .infinity)
+        var high = SIMD3<Float>(repeating: -.infinity)
+
+        mutating func add(_ point: SIMD3<Float>) {
+            low = simd_min(low, point)
+            high = simd_max(high, point)
+        }
+    }
+
+    private static func rebuilt(_ geometry: SCNGeometry, _ parts: [(SCNGeometryElement, SCNMaterial?)], _ box: Box) -> SCNGeometry {
+        let result = SCNGeometry(sources: geometry.sources, elements: parts.map(\.0),
+                                 sourceChannels: geometry.geometrySourceChannels)
+        result.materials = parts.compactMap(\.1)
+        if box.low.x <= box.high.x { result.boundingBox = (SCNVector3(box.low), SCNVector3(box.high)) }
+        return result
+    }
+
+    /// Each vertex's position, and the index channel positions use; nil for
+    /// a vertex format this can't read.
+    private static func positions(_ geometry: SCNGeometry) -> ([SIMD3<Float>], Int)? {
+        guard let vertices = geometry.sources(for: .vertex).first, vertices.usesFloatComponents,
+              vertices.bytesPerComponent == 4, vertices.componentsPerVector >= 3 else { return nil }
+        let channel = geometry.sources.firstIndex { $0 === vertices }
+            .flatMap { index in geometry.geometrySourceChannels.map { $0[index].intValue } } ?? 0
+        let points = vertices.data.withUnsafeBytes { raw in
+            (0..<vertices.vectorCount).map { index -> SIMD3<Float> in
+                let base = vertices.dataOffset + index * vertices.dataStride
+                return SIMD3(raw.loadUnaligned(fromByteOffset: base, as: Float.self),
+                             raw.loadUnaligned(fromByteOffset: base + 4, as: Float.self),
+                             raw.loadUnaligned(fromByteOffset: base + 8, as: Float.self))
+            }
+        }
+        return (points, channel)
+    }
+}
+
+/// A triangle element's indices, one or more channels of them (positions,
+/// normals and UVs can each have their own), interleaved per corner or not.
+struct Triangles {
+    let count: Int
+    let channels: Int
+    let interleaved: Bool
+    /// Every index, widened, in the element's own order.
+    let words: [UInt32]
+
+    init?(_ element: SCNGeometryElement) {
+        count = element.primitiveCount
+        channels = max(1, element.indicesChannelCount)
+        interleaved = element.hasInterleavedIndicesChannels
+        let total = count * 3 * channels
+        let size = element.bytesPerIndex
+        guard [1, 2, 4].contains(size), element.data.count >= total * size else { return nil }
+        words = element.data.withUnsafeBytes { raw in
+            (0..<total).map { index -> UInt32 in
+                switch size {
+                case 1: return UInt32(raw.load(fromByteOffset: index, as: UInt8.self))
+                case 2: return UInt32(raw.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self))
+                default: return raw.loadUnaligned(fromByteOffset: index * 4, as: UInt32.self)
+                }
+            }
+        }
+    }
+
+    /// Where corner `corner` of `triangle`'s index in `channel` sits in `words`.
+    private func offset(_ triangle: Int, _ corner: Int, _ channel: Int) -> Int {
+        interleaved ? (triangle * 3 + corner) * channels + channel : channel * count * 3 + triangle * 3 + corner
+    }
+
+    func index(_ triangle: Int, _ corner: Int, _ channel: Int) -> UInt32 {
+        words[offset(triangle, corner, min(channel, channels - 1))]
+    }
+
+    /// An element of just `triangles`, laid out like this one.
+    func element(_ triangles: [Int]) -> SCNGeometryElement {
+        var picked: [UInt32] = []
+        picked.reserveCapacity(triangles.count * 3 * channels)
+        if interleaved {
+            for triangle in triangles {
+                for corner in 0..<3 { for channel in 0..<channels { picked.append(index(triangle, corner, channel)) } }
+            }
+        } else {
+            for channel in 0..<channels {
+                for triangle in triangles { for corner in 0..<3 { picked.append(index(triangle, corner, channel)) } }
+            }
+        }
+        return SCNGeometryElement(data: picked.withUnsafeBufferPointer { Data(buffer: $0) }, primitiveType: .triangles,
+                                  primitiveCount: triangles.count, indicesChannelCount: channels,
+                                  interleavedIndicesChannels: interleaved, bytesPerIndex: 4)
     }
 }
 
@@ -528,8 +782,10 @@ final class Marquee: NSView {
 enum Chassis {
     /// The single-screen iPhone.
     case phone
-    /// The foldable, on its cover or its inner display.
-    case duo
+    /// The foldable iPhone Duo, folded or open.
+    case duo(Pose)
+
+    enum Pose { case folded, open }
 }
 
 /// The card at the bottom: the question about the screen, and what became of it.
@@ -601,7 +857,6 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     let home: ToolButton
     let lock: ToolButton
     let turn: ToolButton
-    let model: ToolButton
     let fold: ToolButton
     let ask: ToolButton
     let close: ToolButton
@@ -613,10 +868,10 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     var askCard: AskCard!
 
     var phone: Phone?
-    /// The body the screen is drawn on. A simulator whose name says Duo starts there.
+    /// The body the screen is drawn on. The Duo starts folded, as its iOS does.
     var chassis: Chassis
-    /// The Duo's inner display, rather than its cover.
-    var duoOpen = true
+    /// True while the Duo folds or opens; touches wait for it.
+    var folding = false
     var orbit = Orbit()
     var device: NSObject?
     var display: NSObject?
@@ -659,19 +914,12 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         home = ToolButton(symbol: "house", label: "Home (⇧⌘H)", target: nil, action: #selector(Simulator.pressHome))
         lock = ToolButton(symbol: "lock", label: "Lock (⌘L)", target: nil, action: #selector(Simulator.pressLock))
         turn = ToolButton(symbol: "rotate.3d", label: "Face Front (⌘0)", target: nil, action: #selector(Simulator.toggleFront))
-        model = ToolButton(symbol: "ipad.landscape", label: "iPhone Duo (⌘D)", target: nil, action: #selector(Simulator.toggleChassis))
-        fold = ToolButton(symbol: "book.closed", label: "Fold (⌘F)", target: nil, action: #selector(Simulator.toggleFold))
+        fold = ToolButton(symbol: "book", label: "Open (⌘F)", target: nil, action: #selector(Simulator.toggleFold))
         ask = ToolButton(symbol: "text.bubble", label: "Ask", target: nil, action: #selector(Simulator.toggleAsk))
         close = ToolButton(symbol: "xmark", label: "Close Pane (⌘W)", target: nil, action: #selector(Simulator.closePane))
-        let environment = ProcessInfo.processInfo.environment
-        switch environment["LEAF_SIM_CHASSIS"] {
-        case "duo": chassis = .duo
-        case "phone": chassis = .phone
-        default: chassis = name.localizedStandardContains("duo") ? .duo : .phone
-        }
-        duoOpen = environment["LEAF_SIM_POSE"] != "folded"
+        chassis = ProcessInfo.processInfo.environment["LEAF_SIM_DUO"] == "1" ? .duo(.folded) : .phone
         super.init(session: session, block: block)
-        for button in [home, lock, turn, model, fold, ask, close] { button.target = self }
+        for button in [home, lock, turn, fold, ask, close] { button.target = self }
         askCard = AskCard(target: self, action: #selector(sendAsk))
         build()
     }
@@ -713,7 +961,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.stringValue = runtime.isEmpty ? name : "\(name) · \(runtime)"
         bar.addSubview(titleLabel)
-        for button in [home, lock, turn, model, fold, ask, close] { bar.addSubview(button) }
+        for button in [home, lock, turn, fold, ask, close] { bar.addSubview(button) }
 
         spinner.style = .spinning
         spinner.controlSize = .small
@@ -751,7 +999,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     /// Simulator shortcuts that stay here even when Rex binds them.
     static let reserved: Set<Chord> = Set([
-        "cmd+w", "cmd+q", "shift+cmd+h", "cmd+l", "cmd+v", "cmd+0", "cmd+=", "cmd+-", "cmd+d", "cmd+f", "shift+cmd+a",
+        "cmd+w", "cmd+q", "shift+cmd+h", "cmd+l", "cmd+v", "cmd+0", "cmd+=", "cmd+-", "cmd+f", "shift+cmd+a",
     ].compactMap(Chord.init))
 
     override var reservedKeys: Set<Chord> { Simulator.reserved }
@@ -770,8 +1018,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         bar.frame = NSRect(x: 0, y: height - barHeight, width: width, height: barHeight)
         let size: CGFloat = 28, top = (barHeight - size) / 2
         var x = width - 8 - size
-        for button in [close, ask, model, fold, turn, lock, home] {
-            let shown = button !== fold || chassis == .duo
+        for button in [close, ask, fold, turn, lock, home] {
+            let shown = button !== fold || pose != nil
             button.isHidden = !shown
             guard shown else { continue }
             button.frame = NSRect(x: x, y: top, width: size, height: size)
@@ -794,9 +1042,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         lock.isEnabled = live
         ask.isEnabled = true
         turn.setSymbol(orbit.front ? "rotate.3d" : "iphone", label: orbit.front ? "Turn in 3D (⌘0)" : "Face Front (⌘0)")
-        model.setSymbol(chassis == .duo ? "iphone" : "ipad.landscape",
-                        label: chassis == .duo ? "iPhone (⌘D)" : "iPhone Duo (⌘D)")
-        fold.setSymbol(duoOpen ? "book.closed" : "book", label: duoOpen ? "Fold (⌘F)" : "Open (⌘F)")
+        let open = pose == .open
+        fold.setSymbol(open ? "book.closed" : "book", label: open ? "Fold (⌘F)" : "Open (⌘F)")
         ask.contentTintColor = askShown ? .controlAccentColor : (ask.isEnabled ? .secondaryLabelColor : .tertiaryLabelColor)
     }
 
@@ -816,20 +1063,72 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     // MARK: The phone
 
-    /// Which body to draw, beside the helper the way `iphone.usdz` is.
+    /// The Duo's pose; nil on the iPhone.
+    var pose: Chassis.Pose? {
+        if case .duo(let pose) = chassis { return pose }
+        return nil
+    }
+
+    /// The glass the simulator is drawn on: the Duo's cover while it's folded.
+    var glass: Glass? {
+        guard let phone else { return nil }
+        if pose == .folded, let fold = phone.fold { return fold.cover }
+        return phone.screen
+    }
+
+    /// The whole body's size now, screen heights.
+    var bodySize: CGSize {
+        guard let phone else { return .zero }
+        guard let fold = phone.fold else { return phone.size }
+        return pose == .folded ? fold.foldedSize : fold.openSize
+    }
+
+    /// Where the picture sits on the glass, as fractions of it. The Duo's
+    /// iOS draws on its cover even when the phone is open, so on the wider
+    /// inner glass the picture is fitted in the middle with black beside it.
+    var picture: CGRect {
+        let whole = CGRect(x: 0, y: 0, width: 1, height: 1)
+        guard let glass, let surface, surface.width > 0, surface.height > 0 else { return whole }
+        let ratio = (CGFloat(surface.width) / CGFloat(surface.height)) / (glass.size.width / glass.size.height)
+        if abs(ratio - 1) < 0.1 { return whole }
+        if ratio < 1 { return CGRect(x: (1 - ratio) / 2, y: 0, width: ratio, height: 1) }
+        return CGRect(x: 0, y: (1 - 1 / ratio) / 2, width: 1, height: 1 / ratio)
+    }
+
+    /// Lights the glass in use and darkens the rest.
+    func dressGlass() {
+        guard let phone, let live = glass else { return }
+        for glass in [phone.screen] + (phone.fold.map { [$0.cover] } ?? []) {
+            let lit = glass.nodes.first === live.nodes.first
+            for node in glass.nodes { node.geometry?.materials = [lit ? phone.material : phone.dark] }
+        }
+        let fit = picture
+        phone.material.diffuse.contentsTransform = SCNMatrix4Mult(
+            SCNMatrix4MakeTranslation(-fit.minX, -fit.minY, 0), SCNMatrix4MakeScale(1 / fit.width, 1 / fit.height, 1))
+        guard fit != CGRect(x: 0, y: 0, width: 1, height: 1) else {
+            phone.material.multiply.contents = NSColor.white
+            return
+        }
+        let side: CGFloat = 512
+        phone.material.multiply.contents = NSImage(size: NSSize(width: side, height: side), flipped: true) { rect in
+            NSColor.black.setFill()
+            rect.fill()
+            NSColor.white.setFill()
+            NSRect(x: fit.minX * side, y: fit.minY * side, width: fit.width * side, height: fit.height * side).fill()
+            return true
+        }
+    }
+
+    /// Which body to draw, beside the helper.
     func modelURL() -> URL? {
         guard let executable = Bundle.main.executableURL else { return nil }
-        let name: String
-        switch chassis {
-        case .phone: name = "iphone.usdz"
-        case .duo: name = duoOpen ? "iphone-duo-open.usdz" : "iphone-duo-folded.usdz"
-        }
+        let name = pose == nil ? "iphone.usdz" : "iphone-duo-open.usdz"
         return executable.deletingLastPathComponent().appendingPathComponent(name)
     }
 
     func loadPhone() {
         guard let url = modelURL() else { return }
-        switch Phone.load(url) {
+        switch Phone.load(url, foldable: pose != nil) {
         case .success(let phone):
             self.phone = phone
             phoneView.scene = phone.scene
@@ -841,6 +1140,11 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             cameraNode.camera = camera
             phone.scene.rootNode.addChildNode(cameraNode)
             phoneView.pointOfView = cameraNode
+            if let fold = phone.fold, pose == .folded {
+                for hinge in fold.hinges { hinge.simdEulerAngles.y = .pi }
+                fold.holder.simdPosition = fold.foldedPosition
+            }
+            dressGlass()
             if let surface {
                 show(surface)
             } else {
@@ -853,41 +1157,66 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         }
     }
 
-    /// The iPhone, or the iPhone Duo. The live screen comes along.
-    @objc func toggleChassis() {
-        chassis = chassis == .duo ? .phone : .duo
-        loadPhone()
-        updateControls()
-        layout()
-    }
-
-    /// Fold or open the Duo. The cover shows while it's folded, the inner display while it's open.
+    /// Folds or opens the Duo: its left half swings about the hinge. Folded,
+    /// the cover faces front; open, the inner screen does.
     @objc func toggleFold() {
-        guard chassis == .duo else { return }
-        duoOpen.toggle()
-        loadPhone()
+        guard let pose, let phone, let fold = phone.fold, !folding else { return }
+        let opening = pose == .folded
+        if case .touch(let last) = dragging {
+            hid?.touch(.up, at: last)
+            dragging = .none
+        }
+        folding = true
+        chassis = .duo(opening ? .open : .folded)
         updateControls()
+        let duration: CGFloat = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.05 : 0.9
+        let from: Float = opening ? .pi : 0, to: Float = opening ? 0 : .pi
+        let start = fold.holder.simdPosition, end = opening ? fold.openPosition : fold.foldedPosition
+        var swapped = false
+        let swing = SCNAction.customAction(duration: duration) { [weak self] _, elapsed in
+            let t = Float(min(1, elapsed / duration))
+            let eased = t < 0.5 ? 4 * t * t * t : 1 - pow(2 - 2 * t, 3) / 2
+            for hinge in fold.hinges { hinge.simdEulerAngles.y = from + (to - from) * eased }
+            fold.holder.simdPosition = start + (end - start) * eased
+            // Halfway, the glass that ends up in front takes the picture.
+            if !swapped, eased >= 0.5 {
+                swapped = true
+                DispatchQueue.main.async { self?.dressGlass() }
+            }
+        }
+        phone.pivot.runAction(swing, forKey: "fold") { [weak self] in
+            DispatchQueue.main.async {
+                self?.folding = false
+                self?.dressGlass()
+            }
+        }
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = Double(duration)
+        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        frameCamera()
+        SCNTransaction.commit()
     }
 
     /// The dark screen breathes while the simulator starts.
     func pulseScreen() {
         guard let phone else { return }
         let period = 2.4
-        let pulse = SCNAction.customAction(duration: period) { node, elapsed in
+        let material = phone.material
+        let pulse = SCNAction.customAction(duration: period) { _, elapsed in
             let phase = (1 - cos(Double(elapsed) / period * 2 * .pi)) / 2
-            node.geometry?.firstMaterial?.diffuse.contents = NSColor(white: 0.04 + 0.08 * phase, alpha: 1)
+            material.diffuse.contents = NSColor(white: 0.04 + 0.08 * phase, alpha: 1)
         }
-        phone.screen.runAction(.repeatForever(pulse), forKey: "loading")
+        phone.pivot.runAction(.repeatForever(pulse), forKey: "loading")
     }
 
     /// Moves the camera back far enough that the whole phone fits, with room.
     func frameCamera() {
-        guard let phone, let camera = phoneView.pointOfView, phoneView.bounds.width > 0, phoneView.bounds.height > 0 else { return }
+        guard phone != nil, let camera = phoneView.pointOfView, phoneView.bounds.width > 0, phoneView.bounds.height > 0 else { return }
         let aspect = phoneView.bounds.width / phoneView.bounds.height
         let tangent = tan(26 * CGFloat.pi / 180 / 2)
         let margin: CGFloat = 1.14
-        let forHeight = phone.size.height * margin / (2 * tangent)
-        let forWidth = phone.size.width * margin / (2 * tangent * aspect)
+        let forHeight = bodySize.height * margin / (2 * tangent)
+        let forWidth = bodySize.width * margin / (2 * tangent * aspect)
         let distance = max(forHeight, forWidth) / orbit.zoom
         camera.simdPosition = SIMD3(0, 0, Float(distance))
     }
@@ -941,34 +1270,30 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     @objc func zoomOut() { orbit.zoom = max(0.5, orbit.zoom / 1.15); frameCamera() }
 
     @objc func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        switch item.action {
-        case #selector(toggleChassis):
-            item.state = chassis == .duo ? .on : .off
-        case #selector(toggleFold):
-            item.title = duoOpen ? "Fold" : "Open"
-            return chassis == .duo
-        default:
-            break
-        }
-        return true
+        guard item.action == #selector(toggleFold) else { return true }
+        item.title = pose == .open ? "Fold" : "Open"
+        return pose != nil && !folding
     }
 
-    /// Where `event` lands on the screen, as fractions from its top left; nil
-    /// when it misses the screen. `slide` keeps a finger that's already down
-    /// on the screen even when the phone's body is in front.
+    /// Where `event` lands on the simulator's picture, as fractions from its
+    /// top left; nil when it misses. `slide` keeps a finger that's already
+    /// down on the screen even when the phone's body is in front.
     func screenPoint(_ event: NSEvent, slide: Bool) -> CGPoint? {
-        guard let phone else { return nil }
+        guard let glass, let root = glass.nodes.first, !folding else { return nil }
         let point = phoneView.convert(event.locationInWindow, from: nil)
         var options: [SCNHitTestOption: Any] = [.ignoreHiddenNodes: true]
         if slide {
-            options[.rootNode] = phone.screen
+            options[.rootNode] = root
         } else {
             options[.searchMode] = SCNHitTestSearchMode.closest.rawValue
         }
-        guard let hit = phoneView.hitTest(point, options: options).first, hit.node === phone.screen else { return nil }
-        // SceneKit reports V from the bottom; the screen's UVs start at the top.
+        guard let hit = phoneView.hitTest(point, options: options).first, glass.contains(hit.node) else { return nil }
+        // SceneKit reports V from the bottom; the glass's UVs start at the top.
         let uv = hit.textureCoordinates(withMappingChannel: 0)
-        return CGPoint(x: uv.x, y: 1 - uv.y)
+        let fit = picture
+        let x = (uv.x - fit.minX) / fit.width, y = (1 - uv.y - fit.minY) / fit.height
+        if slide { return CGPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1)) }
+        return (0...1).contains(x) && (0...1).contains(y) ? CGPoint(x: x, y: y) : nil
     }
 
     // MARK: Mouse
@@ -1221,10 +1546,17 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     }
 
     /// Waits for the display to appear (it does early in the boot, so the
-    /// boot animation shows), then puts it on the phone.
+    /// boot animation shows), then puts it on the phone. The Duo's iOS draws
+    /// on its cover, the smaller of its two screens, so that one is wanted
+    /// once both are up (or after a few seconds, whichever came).
     func attachDisplay(tries: Int) {
         guard let device else { return }
-        guard let display = CoreSim.mainDisplay(of: device), let surface = CoreSim.surface(of: display) else {
+        let screens = CoreSim.builtInDisplays(of: device).compactMap { display in
+            CoreSim.surface(of: display).map { (display: display, surface: $0) }
+        }
+        let wanted = pose != nil && tries < 50 ? 2 : 1
+        guard screens.count >= wanted,
+              let (display, surface) = screens.min(by: { $0.surface.width * $0.surface.height < $1.surface.width * $1.surface.height }) else {
             if tries > 300 {
                 fail(SimFailure(message: "\(name) booted, but its screen never appeared. Close this pane and open the simulator again; if it keeps happening, `xcrun simctl shutdown \(udid)` resets it."))
                 return
@@ -1274,8 +1606,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             return
         }
         self.surface = surface
-        phone.screen.removeAction(forKey: "loading")
+        phone.pivot.removeAction(forKey: "loading")
         phone.material.diffuse.contents = texture
+        dressGlass()
     }
 
     // MARK: Agent control
@@ -1363,7 +1696,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// A ring where the agent touches, so the person sees what it does.
     func ripple(_ at: CGPoint) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, let phone = self.phone else { return }
+            guard let self, let phone = self.phone, let glass = self.glass else { return }
+            let fit = self.picture
+            let x = fit.minX + at.x * fit.width, y = fit.minY + at.y * fit.height
             let ring = SCNNode(geometry: SCNTorus(ringRadius: 0.035, pipeRadius: 0.004))
             let material = SCNMaterial()
             material.lightingModel = .constant
@@ -1371,7 +1706,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             material.readsFromDepthBuffer = false
             ring.geometry?.materials = [material]
             ring.renderingOrder = 10
-            ring.simdPosition = SIMD3(Float((at.x - 0.5) * phone.aspect), Float(0.5 - at.y), 0.002)
+            ring.simdPosition = SIMD3(Float((x - 0.5) * glass.size.width), Float((0.5 - y) * glass.size.height), 0.002)
             ring.simdEulerAngles = SIMD3(Float.pi / 2, 0, 0)
             phone.pivot.addChildNode(ring)
             ring.runAction(.sequence([
@@ -1802,8 +2137,7 @@ final class SimulatorDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             item("Ask About the Screen", #selector(Simulator.toggleAsk), "a", [.command, .shift], target: s),
         ])
         submenu("Device", [
-            item("iPhone Duo", #selector(Simulator.toggleChassis), "d", target: s),
-            item("Fold", #selector(Simulator.toggleFold), "f", target: s),
+            item("Open", #selector(Simulator.toggleFold), "f", target: s),
             .separator(),
             item("Home", #selector(Simulator.pressHome), "h", [.command, .shift], target: s),
             item("Lock", #selector(Simulator.pressLock), "l", target: s),

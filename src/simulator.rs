@@ -27,10 +27,9 @@ use crate::helper::{Part, macos_version};
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
 const PHONE: &[u8] = include_bytes!("../vendor/devices/iphone.usdz");
 const DUO_OPEN: &[u8] = include_bytes!("../vendor/devices/iphone-duo-open.usdz");
-const DUO_FOLDED: &[u8] = include_bytes!("../vendor/devices/iphone-duo-folded.usdz");
 
 const USAGE: &str = "Usage: leaf sim list [--json]          installed iPhone simulators
-       leaf sim open <udid> [--duo]      show one in this Rex pane, on a 3D iPhone or the iPhone Duo
+       leaf sim open <udid>              show one in this Rex pane, on a 3D iPhone
        leaf sim info                     the device and its screen size in pixels
        leaf sim screenshot [file.png]    save the screen; prints the file's path
        leaf sim tap <x> <y>              tap, in screenshot pixels (0,0 is the top left)
@@ -51,6 +50,9 @@ pub struct Device {
     pub runtime: String,
     /// simctl's state: "Booted", "Shutdown", "Booting"…
     pub state: String,
+    /// The foldable iPhone Duo, drawn on its own model.
+    #[serde(skip)]
+    duo: bool,
     #[serde(skip)]
     version: Vec<u32>,
 }
@@ -83,16 +85,14 @@ fn available() -> bool {
 }
 
 /// A runtime identifier such as `com.apple.CoreSimulator.SimRuntime.iOS-26-1`
-/// as its platform and version.
+/// as its platform and version. A device-specific runtime adds the model
+/// after the version (`iOS-27-2-iPhone19-4`); the version stops there.
 fn runtime(identifier: &str) -> Option<(&str, Vec<u32>)> {
     let tail = identifier.rsplit('.').next()?;
     let mut parts = tail.split('-');
     let platform = parts.next()?;
-    let version = parts
-        .map(str::parse)
-        .collect::<Result<Vec<u32>, _>>()
-        .ok()?;
-    Some((platform, version))
+    let version: Vec<u32> = parts.map_while(|part| part.parse().ok()).collect();
+    (!version.is_empty()).then_some((platform, version))
 }
 
 /// The iPhones in `simctl list devices available -j` output: booted first,
@@ -128,6 +128,7 @@ fn parse_devices(json: &str) -> Result<Vec<Device>, String> {
                             .join(".")
                     ),
                     state: device.state.clone(),
+                    duo: device.device_type_identifier.ends_with(".iPhone-Duo"),
                     version: version.clone(),
                 })
         })
@@ -243,17 +244,6 @@ fn open_panes() -> Vec<String> {
         .collect();
     udids.sort();
     udids
-}
-
-/// A palette row or `leaf sim open` argument: a udid, `duo:<udid>`, or `folded:<udid>`.
-fn open_target(spec: &str, duo: bool, folded: bool) -> (&str, bool, bool) {
-    if let Some(udid) = spec.strip_prefix("folded:") {
-        (udid, true, true)
-    } else if let Some(udid) = spec.strip_prefix("duo:") {
-        (udid, true, folded)
-    } else {
-        (spec, duo, folded)
-    }
 }
 
 /// `--device <udid>` taken out of `args`.
@@ -386,7 +376,19 @@ fn screenshot(udid: &str, path: Option<&str>) -> Result<PathBuf, String> {
         }
     };
     let shown = target.to_string_lossy().into_owned();
-    simctl(&["io", udid, "screenshot", "--type=png", &shown])?;
+    // The iPhone Duo has two built-in screens, and simctl won't pick one;
+    // iOS draws on the cover, the "primary" screen.
+    simctl(&["io", udid, "screenshot", "--type=png", &shown]).or_else(|first| {
+        simctl(&[
+            "io",
+            udid,
+            "screenshot",
+            "--type=png",
+            "--display=primary",
+            &shown,
+        ])
+        .map_err(|_| first)
+    })?;
     Ok(target)
 }
 
@@ -548,22 +550,19 @@ fn helper() -> Result<PathBuf, String> {
                 bytes: DUO_OPEN,
                 mode: 0o644,
             },
-            Part {
-                name: "iphone-duo-folded.usdz",
-                bytes: DUO_FOLDED,
-                mode: 0o644,
-            },
         ],
     )?;
     Ok(dir.join("leaf-sim-host"))
 }
 
 /// `leaf sim open <udid>`: the device in this Rex pane until it closes.
-/// `duo` draws the iPhone Duo; `folded` uses its cover instead of the inner display.
-fn open(udid: &str, duo: bool, folded: bool) -> Result<(), String> {
-    if std::env::var_os("REX_SESSION").is_none() || std::env::var_os("REX_BLOCK").is_none() {
+fn open(udid: &str) -> Result<(), String> {
+    let Some(block) = crate::agent::rex_block() else {
         return Err("open the simulator from a Rex pane, or with Leaf: Open Simulator… in Rex's command palette.".into());
-    }
+    };
+    // Newer Rex sets only REX_BLOCK in a pane; the helper needs the session too.
+    let session = crate::agent::rex_session_api_id()
+        .map_err(|error| format!("couldn't find this pane's Rex session: {error}"))?;
     let developer = developer_dir()?;
     let listed = devices()?;
     if listed.is_empty() {
@@ -590,6 +589,8 @@ fn open(udid: &str, duo: bool, folded: bool) -> Result<(), String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .env("REX_SESSION", session)
+        .env("REX_BLOCK", block)
         .env("LEAF_REX", rex)
         .env(
             "LEAF_AGENT",
@@ -600,21 +601,17 @@ fn open(udid: &str, duo: bool, folded: bool) -> Result<(), String> {
         .env("LEAF_SIM_RUNTIME", &device.runtime)
         .env("LEAF_SIM_SOCKET", &socket)
         .env("LEAF_DEVELOPER_DIR", &developer);
-    // Absent means the helper decides from the simulator's name.
-    if duo {
-        command.env("LEAF_SIM_CHASSIS", "duo");
-        command.env("LEAF_SIM_POSE", if folded { "folded" } else { "open" });
+    if device.duo {
+        command.env("LEAF_SIM_DUO", "1");
     } else {
-        command.env_remove("LEAF_SIM_CHASSIS");
-        command.env_remove("LEAF_SIM_POSE");
+        command.env_remove("LEAF_SIM_DUO");
     }
-    let mut child = command.spawn()
-        .map_err(|e| {
-            format!(
-                "couldn't start the simulator pane at {} ({e}).",
-                executable.display()
-            )
-        })?;
+    let mut child = command.spawn().map_err(|e| {
+        format!(
+            "couldn't start the simulator pane at {} ({e}).",
+            executable.display()
+        )
+    })?;
     if let (Some(mut to_helper), Some(from_helper)) = (child.stdin.take(), child.stdout.take()) {
         for line in BufReader::new(from_helper).lines() {
             let Ok(line) = line else { break };
@@ -679,18 +676,7 @@ fn command(args: &[String]) -> Result<(), SimError> {
             println!("{json}");
             Ok(())
         }
-        ["open", spec] => {
-            let (udid, duo, folded) = open_target(spec, false, false);
-            Ok(open(udid, duo, folded)?)
-        }
-        ["open", spec, "--duo"] | ["open", "--duo", spec] => {
-            let (udid, _, folded) = open_target(spec, true, false);
-            Ok(open(udid, true, folded)?)
-        }
-        ["open", spec, "--folded"] | ["open", "--folded", spec] => {
-            let (udid, _, _) = open_target(spec, true, true);
-            Ok(open(udid, true, true)?)
-        }
+        ["open", udid] => Ok(open(udid)?),
         // Unpack the helper and print where, so a release can prove the
         // pane it ships runs, outside Rex.
         ["--check"] => {
@@ -839,33 +825,42 @@ mod tests {
             runtime("com.apple.CoreSimulator.SimRuntime.iOS-26-1"),
             Some(("iOS", vec![26, 1]))
         );
+        assert_eq!(
+            runtime("com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4"),
+            Some(("iOS", vec![27, 2]))
+        );
         assert_eq!(runtime("com.apple.CoreSimulator.SimRuntime.odd-x"), None);
     }
 
     #[test]
-    fn the_picker_lists_each_phone_then_its_duo_open_and_folded() {
-        let mut phone = device();
-        phone.udid = "C3".into();
-        phone.state = "Shutdown".into();
-        let rows = crate::palette::simulators(&[device(), phone]);
-        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    fn the_iphone_duo_on_its_own_runtime_is_listed_once() {
+        let listing = r#"{"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-2": [
+                {"udid": "A1", "name": "iPhone 18 Pro", "state": "Shutdown", "isAvailable": true,
+                 "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro"}
+            ],
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4": [
+                {"udid": "B2", "name": "iPhone Duo", "state": "Shutdown", "isAvailable": true,
+                 "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo"}
+            ]
+        }}"#;
+        let devices = parse_devices(listing).expect("parses");
+        let rows: Vec<(&str, &str, bool)> = devices
+            .iter()
+            .map(|d| (d.name.as_str(), d.runtime.as_str(), d.duo))
+            .collect();
         assert_eq!(
-            ids,
-            ["B2", "duo:B2", "folded:B2", "C3", "duo:C3", "folded:C3",]
+            rows,
+            vec![
+                ("iPhone 18 Pro", "iOS 27.2", false),
+                ("iPhone Duo", "iOS 27.2", true),
+            ]
         );
-        assert_eq!(rows[1].title, "iPhone Duo");
-        assert_eq!(rows[1].detail, "open · booted");
-        assert_eq!(rows[2].title, "iPhone Duo Folded");
-        assert_eq!(rows[2].subtitle, "iPhone 17 Pro · iOS 26.1");
-        assert_eq!(rows[5].detail, "folded");
-    }
-
-    #[test]
-    fn open_target_names_the_chassis() {
-        assert_eq!(open_target("B2", false, false), ("B2", false, false));
-        assert_eq!(open_target("duo:B2", false, false), ("B2", true, false));
-        assert_eq!(open_target("folded:B2", false, false), ("B2", true, true));
-        assert_eq!(open_target("duo:B2", true, true), ("B2", true, true));
+        let ids: Vec<String> = crate::palette::simulators(&devices)
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(ids, ["A1", "B2"]);
     }
 
     #[test]
@@ -894,6 +889,7 @@ mod tests {
             name: "iPhone 17 Pro".into(),
             runtime: "iOS 26.1".into(),
             state: "Booted".into(),
+            duo: false,
             version: vec![26, 1],
         }
     }

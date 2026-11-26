@@ -328,10 +328,9 @@ function M.setup(opts)
     name = "leaf_simulator",
     title = "Leaf: Open Simulator…",
     description = "Pick an installed iPhone simulator and open it on a 3D iPhone in a pane beside"
-      .. " this one. The same list has each simulator on an iPhone Duo, open and folded."
-      .. " Your agent can tap, swipe and type on it with `leaf sim`.",
+      .. " this one. Your agent can tap, swipe and type on it with `leaf sim`.",
     category = "Leaf",
-    keywords = "leaf simulator ios iphone duo fold folded xcode device app simctl 3d",
+    keywords = "leaf simulator ios iphone xcode device app simctl 3d",
     args = { udid = "string?" },
     run = function(ctx, args)
       if ctx.server ~= nil then
@@ -361,8 +360,7 @@ function M.setup(opts)
         if type(picked) ~= "string" then return end
         udid = picked
       end
-      local duo = udid:find("^duo:") or udid:find("^folded:")
-      open_pane(ctx, duo and "iphone duo" or "simulator", argv("sim", "open", udid), cwd(ctx))
+      open_pane(ctx, "simulator", argv("sim", "open", udid), cwd(ctx))
     end,
   }
 
