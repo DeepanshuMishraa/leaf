@@ -81,7 +81,7 @@ Tabs for summary, timeline, comments, code and checks. Merge, approve, comment, 
 leaf board [file.excalidraw]
 ```
 
-An Excalidraw-compatible board in the terminal. `@` asks your agent, which draws by editing the file; its changes appear live. `E` exports SVG and PNG.
+An Excalidraw-compatible board in the terminal. `@` asks your agent, which draws by editing the file; its changes appear live. `E` exports SVG and PNG. In Rex, **Leaf: Open Whiteboard** in the command palette starts one in the pane's folder.
 
 ## Margin: review your agent's plans and changes
 

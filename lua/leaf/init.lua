@@ -352,6 +352,18 @@ function M.setup(opts)
   }
 
   rex.action{
+    name = "leaf_board",
+    title = "Leaf: Open Whiteboard",
+    description = "Start a new whiteboard in this pane's folder (beside it when busy)."
+      .. " Press @ on the board to ask your agent to draw.",
+    category = "Leaf",
+    keywords = "leaf whiteboard board excalidraw sketch draw diagram canvas",
+    run = function(ctx)
+      place(ctx, "board", "board")
+    end,
+  }
+
+  rex.action{
     name = "leaf_diff",
     title = "Leaf: Review Diff",
     description = "Review the working tree, a revision, a patch, or a GitHub link in this pane."
