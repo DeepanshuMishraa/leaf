@@ -88,7 +88,7 @@ This is text to speech in the reader. leaf has no speech-to-text input. `a` star
 
 `leaf rex install` adds leaf to Rex's command palette (`cmd+shift+p`, type Leaf). Updates keep the plugin current. Actions:
 
-- Always: **Open Document…** (a floating picker), **Open Browser**, **Minimal Address Bar**, **Review Diff**, **Review Staged Changes**, **Review This Branch**, **Pull Requests & Issues**, **Choose Agent…**
+- Always: **Open Document…** (a floating picker), **Open Browser**, **Minimal Address Bar**, **Open Whiteboard**, **Review Diff**, **Review Staged Changes**, **Review This Branch**, **Pull Requests & Issues**, **Choose Agent…**
 - While a document or diff is open: **Ask Agent About Selection** (`⇧⌘A`)
 - While a document is open: **Read Aloud / Pause**, **Stop Reading Aloud**, **Read Faster**, **Read Slower**, **Next Sentence**, **Previous Sentence**, **Change Voice…**
 

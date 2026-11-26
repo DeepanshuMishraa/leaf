@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Rex's command palette has **Leaf: Open Whiteboard**, which starts a new board in the active pane's folder, beside it when the pane is busy.
+- `ctrl+w` deletes the word before the cursor in `leaf plan` comments and in `leaf diff` file notes, like `alt+backspace`.
+
 ## 0.18.2
 
 - `leaf browser` no longer flickers when focus moves between Rex panes, including between two browser panes: the page stays above Rex while Rex or another leaf pane is in front, and drops back to normal stacking when another app comes forward. A browser pane that another app's window overlaps, even a floating one, stays behind that window when another leaf pane is activated.
