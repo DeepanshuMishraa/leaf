@@ -114,6 +114,7 @@ pub fn open(path: &Path) -> Result<Doc, PackageFailed> {
     Ok(Doc {
         title: crate::office::stem(path),
         page_count: Some(count.max(1)),
+        bookmarks: Vec::new(),
         source: Box::new(deck),
     })
 }

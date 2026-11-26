@@ -126,6 +126,7 @@ pub fn open(path: &Path) -> Result<Doc, PictureFailed> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         page_count: None,
+        bookmarks: Vec::new(),
         source: Box::new(Picture {
             text: format!("![]({})", Doc::image_href("0")).into(),
             path: path.to_path_buf(),

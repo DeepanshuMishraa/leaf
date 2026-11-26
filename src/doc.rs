@@ -208,7 +208,19 @@ pub struct Doc {
     pub title: String,
     /// Total pages, when the source has pages; a source without pages is one page.
     pub page_count: Option<usize>,
+    /// The document's own bookmarks: a PDF's outline, an EPUB's table of contents.
+    pub bookmarks: Vec<Bookmark>,
     pub source: Box<dyn Source>,
+}
+
+/// A place the document itself points to, unlike the reader's `progress::Bookmark`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    pub title: String,
+    /// How deep it hangs in the document's outline, from 0 at the root.
+    pub depth: usize,
+    /// The page it goes to, 0-based.
+    pub page: usize,
 }
 
 impl Doc {
@@ -217,6 +229,7 @@ impl Doc {
         Doc {
             title: title.into(),
             page_count: None,
+            bookmarks: Vec::new(),
             source: Box::new(Whole(markdown.into().into())),
         }
     }

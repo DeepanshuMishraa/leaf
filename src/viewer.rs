@@ -41,6 +41,7 @@ use crate::kitty::{self, Kitty};
 use crate::look::Look;
 use crate::mono::{self, Rgb};
 use crate::news::News;
+use crate::outline::{self, Ask, OpenOutline, OutlineForm, Pinned};
 use crate::picture;
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
 use crate::remote::{self, Command};
@@ -55,6 +56,8 @@ const PAGED_MIN_WIDTH: u16 = 100;
 const WIDTH_STEP: u16 = 8;
 /// The narrowest column `<` goes to.
 const MIN_WIDTH: u16 = 20;
+const OUTLINE_COLUMNS: u16 = 32;
+const OUTLINE_MIN_SCREEN: u16 = OUTLINE_COLUMNS + MIN_WIDTH + 4;
 
 /// How wide the reading column is asked to be, before the screen limits it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +199,8 @@ enum Dialog {
         typed: String,
         selected: Option<usize>,
     },
+    /// The tree stays in `outline`; this only holds the keys.
+    Outline,
 }
 
 /// Which way to move through pages or history.
@@ -471,6 +476,12 @@ pub struct App {
     reading_width: ReadingWidth,
     /// Columns the last frame left for the reading column; unbounded before it.
     room: u16,
+    /// How wide the outline's sidebar is asked to be; `<` and `>` change it for the session.
+    outline_columns: u16,
+    /// The columns the last frame gave the sidebar, 0 when it isn't shown.
+    beside: u16,
+    /// The terminal's width, from the last frame or a resize since; unbounded before either.
+    screen_width: u16,
     laid: HashMap<usize, (Rc<Laid>, bool)>,
     mode: Mode,
     /// The page being read: in paged mode the one shown, when scrolling the one at the top.
@@ -503,6 +514,7 @@ pub struct App {
     /// A command from Rex's command palette, being typed in after F12.
     rex_command: Option<String>,
     bookmarks: Vec<Bookmark>,
+    outline: Option<OpenOutline>,
     selection: Option<Selection>,
     tool: Tool,
     drag: Drag,
@@ -640,8 +652,12 @@ impl App {
             open_url: Box::new(crate::prmedia::open),
             rex_command: None,
             bookmarks: options.bookmarks.clone(),
+            outline: None,
             reading_width: ReadingWidth::Columns(options.max_text_width),
             room: u16::MAX,
+            screen_width: u16::MAX,
+            outline_columns: outline::SIDEBAR_COLUMNS,
+            beside: 0,
             doc,
             options,
             picker,
@@ -709,10 +725,7 @@ impl App {
 
     /// Reads the watched file again once a change to it has settled.
     fn reload(&mut self) -> bool {
-        if self.selection.is_some()
-            || !matches!(self.dialog, Dialog::None)
-            || !matches!(self.drag, Drag::Idle)
-        {
+        if self.selection.is_some() || self.overlaying() || !matches!(self.drag, Drag::Idle) {
             return false;
         }
         let Some(doc) = self
@@ -1239,11 +1252,27 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
-        self.room = area.width.saturating_sub(4);
+        self.screen_width = area.width;
+        if self.form() == Some(OutlineForm::Sidebar) && area.width < OUTLINE_MIN_SCREEN {
+            self.outline = None;
+        }
+        let beside = match self.form() {
+            Some(OutlineForm::Sidebar) => {
+                outline::sidebar(self.outline_columns, area.width, MIN_WIDTH + 4)
+            }
+            _ => 0,
+        };
+        self.beside = beside;
+        let text = Rect {
+            x: area.x + beside,
+            width: area.width - beside,
+            ..area
+        };
+        self.room = text.width.saturating_sub(4);
         let width = self.reading_width.within(self.room);
         let mode = if self.doc.page_count.is_some()
-            && area.width >= PAGED_MIN_WIDTH
-            && area.height >= PAGED_MIN_HEIGHT
+            && text.width >= PAGED_MIN_WIDTH
+            && text.height >= PAGED_MIN_HEIGHT
         {
             Mode::Paged
         } else {
@@ -1251,6 +1280,11 @@ impl App {
         };
         if width != self.width || mode != self.mode {
             self.hold_anchor();
+            // Paged and scrolled count rows differently, so a switch, such as the sidebar
+            // opening, keeps the text read at the top rather than the page's start.
+            if mode != self.mode && self.width > 0 && self.anchor.is_none() {
+                self.anchor = Some(self.top_anchor());
+            }
             self.width = width;
             self.laid.clear();
             self.retain_protocols(|_| false);
@@ -1276,7 +1310,7 @@ impl App {
         }
         self.prune();
         self.column = Rect {
-            x: area.x + (area.width - width) / 2,
+            x: text.x + (text.width - width) / 2,
             y: area.y,
             width,
             height: self.view_height,
@@ -1298,9 +1332,11 @@ impl App {
         }
         screen.resize(self.view(), None);
         self.screen = screen;
+        // The text also moves without a key: by a reload, or a followed link.
+        self.sync_outline();
         let ink = self.look.ink();
         if let Some(ink) = ink {
-            art::curtains(f.buffer_mut(), area, self.column, ink);
+            art::curtains(f.buffer_mut(), text, self.column, ink);
         }
 
         let selection = self.selection.map(Selection::range);
@@ -1319,7 +1355,10 @@ impl App {
             self.draw_row(f, page, row, self.column.y + y as u16, marks);
         }
         self.draw_figures(f, &screen);
-        self.draw_strokes(area);
+        self.draw_strokes(text);
+        if beside > 0 {
+            self.draw_outline_side(f, Rect::new(area.x, area.y, beside, self.view_height));
+        }
 
         // The footer sits on a bar that dissolves up into the page.
         if let (true, Some(ink)) = (area.height >= FOOTER_ROWS, ink) {
@@ -1361,6 +1400,7 @@ impl App {
             Dialog::Ask { typed, passage } => Some(self.draw_ask(f, area, &typed, &passage)),
             Dialog::Bookmarks { selected } => Some(self.draw_bookmarks(f, area, selected)),
             Dialog::Voices { typed, selected } => Some(self.draw_voices(f, area, &typed, selected)),
+            Dialog::Outline => self.draw_outline_window(f, area),
         };
         let news = self.news.as_mut().map(|news| news.draw(f, ink));
         // Kitty images sit above the text, so any under a panel would hide it.
@@ -1632,7 +1672,8 @@ impl App {
     /// The redraw after a resize clears the screen, and kitty's placements with
     /// it. Rex and Ghostty drop the uploaded figures too, so placing the old
     /// ids again shows nothing: every figure and stroke is uploaded afresh.
-    fn resized(&mut self) {
+    fn resized(&mut self, width: u16) {
+        self.screen_width = width;
         if let Some(kitty) = &mut self.kitty {
             kitty.reset();
             for (_, image) in self.ink_drawn.drain() {
@@ -1722,11 +1763,19 @@ impl App {
             },
         ));
         if paged {
-            rows.push(("t  :", "go to page"));
+            rows.push((":  t  T", "go to page / outline beside or over the text"));
             rows.extend([
                 ("m", "bookmark this page, or remove it"),
                 ("'", "bookmarks"),
             ]);
+        } else {
+            rows.push(("t  T", "outline beside or over the text"));
+        }
+        if self.outline.is_some() {
+            rows.push((
+                "<  >",
+                "narrow or widen the outline beside the text (or drag its edge)",
+            ));
         }
         rows.extend([("f  F", "find text"), ("n/N", "next / previous match")]);
         rows.extend([
@@ -2501,6 +2550,222 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Outline.
+
+    fn form(&self) -> Option<OutlineForm> {
+        debug_assert!(
+            self.outline.is_some() || !matches!(self.dialog, Dialog::Outline),
+            "the outline window is open with no tree"
+        );
+        self.outline
+            .as_ref()
+            .map(|open| open.form(matches!(self.dialog, Dialog::Outline)))
+    }
+
+    /// Whether a panel holds the keys: a dialog.
+    fn overlaying(&self) -> bool {
+        self.dialog != Dialog::None
+    }
+
+    fn close_outline(&mut self) {
+        self.outline = None;
+        if matches!(self.dialog, Dialog::Outline) {
+            self.dialog = Dialog::None;
+        }
+    }
+
+    /// `t`/`T`: toggle the outline beside the text or over it. The form
+    /// already shown closes; the other form switches to it, tree and all.
+    fn toggle_outline(&mut self, form: OutlineForm) {
+        if self.form() == Some(form) {
+            self.close_outline();
+            return;
+        }
+        // A resize since the last frame counts: keys and resizes are handled before the next draw.
+        if form == OutlineForm::Sidebar && self.screen_width < OUTLINE_MIN_SCREEN {
+            self.notice = Some("the screen is too narrow for the outline".into());
+            return;
+        }
+        if self.outline.is_none() {
+            let nodes = self.outline_nodes();
+            if nodes.is_empty() {
+                self.notice = Some("this page has no headings".into());
+                return;
+            }
+            let mut open = OpenOutline::new(outline::Outline::new(nodes));
+            open.page = self.outline_page();
+            self.outline = Some(open);
+        }
+        // Only the outline's own window can be open here: any other dialog
+        // would have taken the key.
+        self.dialog = match form {
+            OutlineForm::Sidebar => Dialog::None,
+            OutlineForm::Window => Dialog::Outline,
+        };
+    }
+
+    /// The document's own bookmarks when it has them, else the page's headings.
+    fn outline_nodes(&mut self) -> Vec<outline::OutlineNode> {
+        if !self.doc.bookmarks.is_empty() {
+            return outline::from_bookmarks(&self.doc.bookmarks);
+        }
+        outline::from_headings(&self.laid(self.current).headings)
+    }
+
+    fn outline_page(&self) -> Option<usize> {
+        self.doc.bookmarks.is_empty().then_some(self.current)
+    }
+
+    /// From the reader's own place, not the last frame drawn.
+    fn heading_under_top(&mut self) -> Option<usize> {
+        let page = self.current;
+        let row = self.offset.saturating_sub(self.prefix(page));
+        let laid = self.laid(page);
+        outline::heading_at(&laid.headings, row)
+    }
+
+    /// The entry a jump pinned while the text stays where it landed, else the one at the top
+    /// of the page.
+    fn outline_here(&mut self) -> Option<usize> {
+        let pinned = self.outline.as_ref()?.pinned;
+        let still = pinned.filter(|pin| pin.landed == (self.current, self.offset));
+        if let Some(pin) = still {
+            return Some(pin.node);
+        }
+        if let Some(open) = self.outline.as_mut() {
+            open.pinned = None;
+        }
+        if self
+            .outline
+            .as_ref()
+            .is_some_and(|open| open.page.is_none())
+        {
+            return outline::page_at(&self.doc.bookmarks, self.current);
+        }
+        let index = self.heading_under_top()?;
+        self.outline
+            .as_ref()?
+            .tree
+            .at(outline::Locator::Text(index))
+    }
+
+    fn outline_go(&mut self, node: usize) {
+        let Some(locator) = self
+            .outline
+            .as_ref()
+            .and_then(|open| open.tree.nodes[node].locator)
+        else {
+            return;
+        };
+        match locator {
+            // The diff view resolves its own; the rest are the reader's.
+            outline::Locator::Diff(_) => return,
+            outline::Locator::Text(index) => self.show_heading(index),
+            outline::Locator::Page(page) => self.go_to_page(page, false),
+        }
+        let landed = (self.current, self.offset);
+        if let Some(open) = self.outline.as_mut() {
+            open.pinned = Some(Pinned { node, landed });
+        }
+    }
+
+    /// Puts the heading at the top, as far as the end of the page allows.
+    fn show_heading(&mut self, index: usize) {
+        let laid = self.laid(self.current);
+        let Some(heading) = laid.heading(index) else {
+            return;
+        };
+        let row = self.prefix(self.current) + heading.row;
+        match self.mode {
+            Mode::Paged => self.offset = row.min(self.max_offset()),
+            Mode::Scroll => {
+                self.offset = row;
+                self.clamp_end();
+            }
+        }
+    }
+
+    fn outline_key(&mut self, key: &KeyEvent) -> bool {
+        // Before the next draw: a jump earlier in this batch of keys must be seen by the next.
+        self.sync_outline();
+        let Some((taken, ask)) = self.outline.as_mut().map(|open| open.key(key)) else {
+            return false;
+        };
+        match ask {
+            Some(Ask::Close) => self.close_outline(),
+            Some(Ask::Show(form)) => self.toggle_outline(form),
+            Some(Ask::Go(Some(node))) => self.outline_go(node),
+            Some(Ask::Resize { wider }) => {
+                self.outline_columns = outline::resized(self.outline_columns, wider);
+            }
+            Some(Ask::Go(None)) | None => {}
+        }
+        taken
+    }
+
+    /// Headings on another page are another tree even when they read the same.
+    fn sync_outline(&mut self) {
+        if self.outline.is_none() {
+            return;
+        }
+        let nodes = self.outline_nodes();
+        let page = self.outline_page();
+        if let Some(open) = self.outline.as_mut()
+            && open.retarget(nodes, open.page != page)
+        {
+            open.page = page;
+        }
+        let here = self.outline_here();
+        if let Some(open) = self.outline.as_mut() {
+            open.follows(here);
+        }
+    }
+
+    fn draw_outline_side(&mut self, f: &mut Frame, area: Rect) {
+        let here = self.outline_here();
+        let Some(open) = self.outline.as_ref() else {
+            return;
+        };
+        let rows = (area.height as usize).saturating_sub(2);
+        let lines = open.lines(
+            here,
+            rows,
+            "No headings on this page.",
+            |entry, style, _| vec![Span::styled(entry.label.to_owned(), style)],
+        );
+        let body = Rect {
+            x: area.x + 1,
+            width: area.width.saturating_sub(2),
+            ..area
+        };
+        f.render_widget(Paragraph::new(lines), body);
+        let edge = Rect {
+            x: (area.x + area.width).saturating_sub(1),
+            width: 1,
+            ..area
+        };
+        f.render_widget(Paragraph::new(outline::edge(area.height)), edge);
+    }
+
+    fn draw_outline_window(&mut self, f: &mut Frame, area: Rect) -> Option<Rect> {
+        let here = self.outline_here();
+        let open = self.outline.as_ref()?;
+        let rows = (area.height as usize).saturating_sub(8);
+        let lines = open.lines(
+            here,
+            rows,
+            "No headings on this page.",
+            |entry, style, _| vec![Span::styled(entry.label.to_owned(), style)],
+        );
+        let width = lines
+            .iter()
+            .map(|line| line.width() as u16)
+            .max()
+            .unwrap_or(0);
+        Some(Self::panel(f, area, self.tints(), "Outline", lines, width))
+    }
+
+    // -----------------------------------------------------------------------
     // Search.
 
     fn seeking(&self) -> bool {
@@ -2822,6 +3087,11 @@ impl App {
             Dialog::Ask { typed, passage } => return self.ask_key(&key, typed, passage),
             Dialog::Bookmarks { selected } => return self.bookmarks_key(&key, selected),
             Dialog::Voices { typed, selected } => return self.voices_key(&key, typed, selected),
+            // Every key is the window's.
+            Dialog::Outline => {
+                self.outline_key(&key);
+                return;
+            }
             Dialog::Help | Dialog::Guide => {
                 if matches!(
                     key.code,
@@ -2834,6 +3104,10 @@ impl App {
             Dialog::None => {}
         }
         self.notice = None;
+        // The keys the outline doesn't take reach the reader's own bindings.
+        if self.outline.is_some() && self.outline_key(&key) {
+            return;
+        }
         if self.tool == Tool::Move && self.arrange_key(&key) {
             return;
         }
@@ -2844,7 +3118,7 @@ impl App {
         match typed(&key) {
             Some('?') | Some('/') => self.dialog = Dialog::Help,
             Some('!') => self.dialog = Dialog::Guide,
-            Some('t') | Some(':') => {
+            Some(':') => {
                 if let Some(page_count) = self.doc.page_count {
                     self.dialog = Dialog::Goto {
                         digits: String::new(),
@@ -2852,6 +3126,8 @@ impl App {
                     };
                 }
             }
+            Some('t') => self.toggle_outline(OutlineForm::Sidebar),
+            Some('T') => self.toggle_outline(OutlineForm::Window),
             Some('m') if key.kind == KeyEventKind::Press => self.toggle_bookmark(),
             Some('\'') if self.doc.page_count.is_some() => {
                 // Opens on the bookmark at or before the page being read.
@@ -3144,7 +3420,25 @@ impl App {
     }
 
     fn mouse(&mut self, mouse: MouseEvent, history: &mut ReaderHistory) {
-        if News::mouse(&mut self.news, mouse) || self.dialog != Dialog::None {
+        if News::mouse(&mut self.news, mouse) || self.overlaying() {
+            return;
+        }
+        let beside = self.beside;
+        if let Some(open) = self.outline.as_mut() {
+            let (taken, width) = open.edge_mouse(mouse.kind, mouse.column, beside);
+            if let Some(width) = width {
+                self.outline_columns = width;
+            }
+            if taken {
+                return;
+            }
+        }
+        // A release is let through, so a drag begun in the text still ends.
+        if self.form() == Some(OutlineForm::Sidebar)
+            && mouse.column < self.beside
+            && mouse.row < self.view_height
+            && !matches!(mouse.kind, MouseEventKind::Up(_))
+        {
             return;
         }
         let (x, y) = (mouse.column, mouse.row);
@@ -3740,7 +4034,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => self.key(key, history),
                     Event::Mouse(mouse) => self.mouse(mouse, history),
-                    Event::Resize(..) => self.resized(),
+                    Event::Resize(width, _) => self.resized(width),
                     _ => {}
                 }
                 if self.quit || !event::poll(Duration::ZERO)? {
@@ -3922,7 +4216,23 @@ mod tests {
         Doc {
             title: "Book".into(),
             page_count: Some(pages.len()),
+            bookmarks: Vec::new(),
             source: Box::new(Book(pages.iter().map(|p| p.to_string()).collect())),
+        }
+    }
+
+    /// A book with its own bookmarks, as a PDF or EPUB would carry them.
+    fn bookmarked(pages: &[&str], bookmarks: &[(&str, usize, usize)]) -> Doc {
+        Doc {
+            bookmarks: bookmarks
+                .iter()
+                .map(|&(title, depth, page)| crate::doc::Bookmark {
+                    title: title.to_owned(),
+                    depth,
+                    page,
+                })
+                .collect(),
+            ..book(pages)
         }
     }
 
@@ -3961,13 +4271,19 @@ mod tests {
                 .join("\n")
         }
 
-        fn press(&mut self, code: KeyCode) -> String {
+        /// Sends a key without drawing, as two keys can arrive before the next
+        /// frame is.
+        fn tap(&mut self, code: KeyCode) {
             self.key(KeyEvent {
                 code,
                 modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press,
                 state: KeyEventState::NONE,
             });
+        }
+
+        fn press(&mut self, code: KeyCode) -> String {
+            self.tap(code);
             self.draw()
         }
 
@@ -4024,6 +4340,14 @@ mod tests {
                         .map(|x| (line[..x].chars().count() as u16, y as u16))
                 })
                 .expect("text is on screen")
+        }
+
+        /// The rows of the text column, clear of `columns` on its left.
+        fn text(&mut self, columns: u16) -> Vec<String> {
+            self.draw()
+                .lines()
+                .map(|line| line.chars().skip(columns as usize).collect())
+                .collect()
         }
     }
 
@@ -4562,6 +4886,7 @@ mod tests {
             let doc = Doc {
                 title: "Counted book".into(),
                 page_count: Some(1),
+                bookmarks: Vec::new(),
                 source: Box::new(Counted {
                     text: text.into(),
                     reads: reads.clone(),
@@ -4648,6 +4973,7 @@ mod tests {
         let doc = Doc {
             title: "Book".into(),
             page_count: Some(1),
+            bookmarks: Vec::new(),
             source: Box::new(Pictured),
         };
         let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
@@ -4658,7 +4984,7 @@ mod tests {
         let before = figure_ids(&s);
         assert_eq!(before.len(), 1);
         // The column stays 76 wide, so nothing else would make the figure change.
-        s.app.resized();
+        s.app.resized(118);
         s.terminal.backend_mut().resize(118, 30);
         s.draw();
         let after = figure_ids(&s);
@@ -4682,7 +5008,7 @@ mod tests {
         };
         let before = ink(&s);
         assert_eq!(before.len(), 1);
-        s.app.resized();
+        s.app.resized(120);
         s.draw();
         let after = ink(&s);
         assert_eq!(after.len(), 1);
@@ -4755,6 +5081,7 @@ mod tests {
         let doc = Doc {
             title: "Book".into(),
             page_count: Some(1),
+            bookmarks: Vec::new(),
             source: Box::new(Broken(tries.clone())),
         };
         let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
@@ -5191,7 +5518,7 @@ mod tests {
             30,
             ViewerOptions::default(),
         );
-        s.press(KeyCode::Char('t'));
+        s.press(KeyCode::Char(':'));
         s.press(KeyCode::Char('1'));
         s.press(KeyCode::Char('3'));
         let frame = s.press(KeyCode::Char('2'));
@@ -6148,6 +6475,618 @@ mod tests {
         assert_eq!(marked(&mut s), "");
         s.press(KeyCode::Esc);
         assert!(s.app.quit);
+    }
+
+    /// `count` short paragraphs, so a document is taller than the screen.
+    fn filler(count: usize) -> String {
+        (0..count).map(|n| format!("Filler {n}.\n\n")).collect()
+    }
+
+    /// The outline entry the panel marks as the one the text is under.
+    fn picked(frame: &str) -> String {
+        frame
+            .lines()
+            .find_map(|line| {
+                // Up to the sidebar's edge, which is no part of an entry.
+                let beside: String = line.chars().take_while(|&c| c != '│').collect();
+                beside.split_once('›').map(|(_, entry)| {
+                    entry
+                        .trim()
+                        .trim_start_matches(['▾', '▸'])
+                        .trim()
+                        .to_owned()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_outline_beside_the_text_lists_the_page_s_headings() {
+        let doc = Doc::whole("Doc", "# One\n\nShort.\n\n## Two\n\nShort too.");
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&frame), "One");
+        assert!(frame.contains("Two"), "{frame}");
+        // The text keeps its own column to the right of it, and still shows.
+        assert!(s.app.column.x >= OUTLINE_COLUMNS);
+        assert!(frame.contains("Short too."), "{frame}");
+    }
+
+    #[test]
+    fn dragging_the_outline_s_edge_resizes_it() {
+        let text = format!("# One\n\n{}", filler(40));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('t'));
+        let edge = OUTLINE_COLUMNS - 1;
+        // A faint line marks the edge to take hold of.
+        let first = frame.lines().next().unwrap_or_default();
+        assert_eq!(first.chars().nth(edge as usize), Some('│'), "{frame}");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), edge, 5);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), 50, 5);
+        assert_eq!(s.app.beside, 51);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), 5, 6);
+        assert_eq!(s.app.beside, 20, "no narrower than its least");
+        s.mouse(MouseEventKind::Up(MouseButton::Left), 5, 6);
+        // Let go, a drag elsewhere is the text's again and leaves the sidebar alone.
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), 60, 6);
+        assert_eq!(s.app.beside, 20);
+        assert!(s.app.selection.is_none());
+    }
+
+    #[test]
+    fn angle_brackets_resize_the_outline_beside_the_text() {
+        let doc = Doc::whole("Doc", "# One\n\nShort.\n\n## Two\n\nShort too.");
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.beside, OUTLINE_COLUMNS);
+        let width = s.app.width;
+        s.press(KeyCode::Char('>'));
+        assert_eq!(s.app.beside, OUTLINE_COLUMNS + 4);
+        // The keys go to the sidebar, not to the reading column's width.
+        assert_eq!(s.app.width, width);
+        // It narrows no further than its least, and widens no further than the screen allows.
+        for _ in 0..20 {
+            s.press(KeyCode::Char('<'));
+        }
+        assert_eq!(s.app.beside, 20);
+        for _ in 0..40 {
+            s.press(KeyCode::Char('>'));
+        }
+        assert_eq!(s.app.beside, 80);
+        s.terminal.backend_mut().resize(90, 30);
+        s.draw();
+        assert_eq!(s.app.beside, 90 - MIN_WIDTH - 4);
+        // Closed and opened again, it keeps the width it was given.
+        s.terminal.backend_mut().resize(120, 30);
+        s.press(KeyCode::Char('t'));
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.beside, 80);
+    }
+
+    #[test]
+    fn t_and_t_toggle_and_switch_the_outline_form() {
+        let doc = Doc::whole("Doc", "# One\n\nShort.\n\n## Two\n\nShort too.");
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.form(), Some(OutlineForm::Sidebar));
+        // The same key closes it again.
+        s.press(KeyCode::Char('t'));
+        assert!(s.app.outline.is_none());
+        // The other key opens the window; the first switches to the sidebar.
+        s.press(KeyCode::Char('T'));
+        assert_eq!(s.app.form(), Some(OutlineForm::Window));
+        // A fold made in one form is kept in the other.
+        s.press(KeyCode::Char('h'));
+        assert_eq!(shown(&s), ["One"]);
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.form(), Some(OutlineForm::Sidebar));
+        assert_eq!(shown(&s), ["One"]);
+        s.press(KeyCode::Char('T'));
+        assert_eq!(s.app.form(), Some(OutlineForm::Window));
+        assert_eq!(shown(&s), ["One"]);
+        s.press(KeyCode::Char('T'));
+        assert!(s.app.outline.is_none());
+    }
+
+    #[test]
+    fn a_window_over_the_text_takes_every_key() {
+        let text = format!("# One\n\n{}## Two\n\n{}", filler(30), filler(30));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('T'));
+        let before = s.app.offset;
+        // Nothing reaches the text behind the window: it doesn't scroll, and
+        // no other panel opens under it.
+        for code in [KeyCode::PageDown, KeyCode::Char(' '), KeyCode::Char('?')] {
+            s.press(code);
+        }
+        assert_eq!(s.app.offset, before);
+        assert!(!matches!(s.app.dialog, Dialog::Help));
+        assert_eq!(s.app.form(), Some(OutlineForm::Window));
+        // `q` closes the window and leaves the reader open.
+        s.press(KeyCode::Char('q'));
+        assert_eq!(s.app.form(), None);
+        assert!(!s.app.quit);
+    }
+
+    #[test]
+    fn an_outline_move_puts_that_heading_at_the_top_of_the_text() {
+        let text = format!(
+            "# One\n\n{}## Two\n\n{}### Three\n\n{}",
+            filler(14),
+            filler(14),
+            filler(14)
+        );
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&frame), "Two");
+        let row = s.app.laid(0).heading(1).expect("Two is numbered").row;
+        assert_eq!(s.app.offset, row + 1);
+        assert!(s.text(OUTLINE_COLUMNS)[0].contains("Two"), "{frame}");
+        // And back up to the first.
+        let frame = s.press(KeyCode::Char('k'));
+        assert_eq!(picked(&frame), "One");
+        let one = s.app.laid(0).heading(0).expect("One is numbered").row;
+        assert_eq!(s.app.offset, one + 1);
+    }
+
+    /// The entries the outline panel shows, in order.
+    fn shown(s: &Screen) -> Vec<String> {
+        let open = s.app.outline.as_ref().expect("an outline is open");
+        open.tree
+            .visible()
+            .iter()
+            .map(|&node| open.tree.nodes[node].label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_outline_follows_the_text_as_it_scrolls() {
+        let text = format!("# One\n\n{}## Two\n\n{}", filler(14), filler(20));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&s.draw()), "One");
+        // The wheel scrolls the text, and the panel says where it got to.
+        let two = s.app.laid(0).heading(1).expect("Two is numbered").row;
+        for _ in 0..20 {
+            if s.app.offset > two {
+                break;
+            }
+            s.mouse(MouseEventKind::ScrollDown, 100, 5);
+        }
+        assert_eq!(picked(&s.draw()), "Two");
+        // And back up, within the first section again.
+        s.app.scroll_by(-(two as isize));
+        s.draw();
+        assert_eq!(picked(&s.draw()), "One");
+    }
+
+    #[test]
+    fn crossing_a_page_moves_the_outline_to_that_page_s_headings() {
+        // The same headings on both pages: still another tree, its folds not carried over.
+        let page = format!(
+            "# First\n\n## Child\n\n{}\n\n## Third\n\n{}",
+            filler(20),
+            filler(5)
+        );
+        let mut s = Screen::new(
+            book(&[page.as_str(), page.as_str()]),
+            90,
+            20,
+            ViewerOptions::default(),
+        );
+        s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&s.draw()), "Child");
+        assert_eq!(shown(&s), ["First", "Child", "Third"]);
+        s.press(KeyCode::Char('h'));
+        assert_eq!(shown(&s), ["First"]);
+        for _ in 0..20 {
+            if s.app.current > 0 {
+                break;
+            }
+            s.app.scroll_by(10);
+        }
+        // Past the page's first heading, still above its last.
+        s.app.scroll_by(10);
+        assert_eq!(picked(&s.draw()), "Child");
+        assert_eq!(shown(&s), ["First", "Child", "Third"]);
+        // On the blank row just above Child the text is still under First.
+        let child = s.app.laid(1).heading(1).expect("Child is numbered").row;
+        let top = s.app.prefix(1) + child - 1;
+        s.app.scroll_by(top as isize - s.app.offset as isize);
+        assert_eq!(picked(&s.draw()), "First");
+    }
+
+    #[test]
+    fn the_same_title_twice_keeps_its_own_place() {
+        let text = format!("## Notes\n\n{}## Notes\n\n{}", filler(14), filler(20));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        s.press(KeyCode::Char('j'));
+        let second = s.app.laid(0).heading(1).expect("the second Notes").row;
+        assert_eq!(s.app.offset, second + 1);
+        assert_eq!(picked(&s.draw()), "Notes");
+        // The first is still its own entry, above this one.
+        s.press(KeyCode::Char('k'));
+        let first = s.app.laid(0).heading(0).expect("the first Notes").row;
+        assert_eq!(s.app.offset, first + 1);
+    }
+
+    #[test]
+    fn a_short_title_drawn_as_large_letters_is_gone_to() {
+        let text = format!("# Hi\n\n{}# Ho\n\n{}", filler(14), filler(20));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        let frame = s.press(KeyCode::Char('j'));
+        let ho = s.app.laid(0).heading(1).expect("Ho is numbered").row;
+        assert_eq!(s.app.offset, ho + 1);
+        // Large letters are not in the page text, so this is the drawn row.
+        assert!(s.text(OUTLINE_COLUMNS)[0].contains('█'), "{frame}");
+    }
+    #[test]
+    fn a_search_lists_its_matches_and_enter_goes_to_the_picked_one() {
+        let text = format!(
+            "# Alpha\n\n{}## Beta\n\n{}## Trot\n\n{}# Beta again\n\n{}",
+            filler(10),
+            filler(14),
+            filler(10),
+            filler(20)
+        );
+        let mut s = Screen::new(Doc::whole("Doc", text), 150, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        s.press(KeyCode::Char('/'));
+        for c in "bet".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        // The matches, and the entry above the first, which holds it.
+        assert_eq!(shown(&s), ["Alpha", "Beta", "Beta again"]);
+        let frame = s.draw();
+        assert_eq!(picked(&frame), "Beta");
+        assert!(frame.contains("“bet” · 2 of 4"), "{frame}");
+        // Backspace takes a letter off the filter while it is typed.
+        s.press(KeyCode::Backspace);
+        assert_eq!(s.app.outline.as_ref().unwrap().tree.filter, "be");
+        // Tab moves on to the next match; Enter puts the text there and ends the search.
+        s.press(KeyCode::Tab);
+        s.press(KeyCode::Enter);
+        let again = s
+            .app
+            .laid(0)
+            .heading(3)
+            .expect("Beta again is numbered")
+            .row;
+        assert_eq!(s.app.offset, again + 1);
+        assert_eq!(shown(&s), ["Alpha", "Beta", "Trot", "Beta again"]);
+        assert_eq!(picked(&s.draw()), "Beta again");
+        // Escape ends a search and leaves the text where it is.
+        let before = s.app.offset;
+        s.press(KeyCode::Char('/'));
+        for c in "alp".chars() {
+            s.press(KeyCode::Char(c));
+        }
+        assert_eq!(picked(&s.draw()), "Alpha");
+        s.press(KeyCode::Esc);
+        assert_eq!(s.app.offset, before);
+        assert_eq!(s.app.outline.as_ref().unwrap().tree.filter, "");
+        // Escape then closes the outline.
+        s.press(KeyCode::Esc);
+        assert!(s.app.outline.is_none());
+    }
+    #[test]
+    fn a_resize_keeps_the_outline_and_its_jump_follows_the_new_layout() {
+        let text = format!("# One\n\n{}## Two\n\n{}", filler(14), filler(20));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        s.terminal.backend_mut().resize(100, 26);
+        s.draw();
+        let frame = s.press(KeyCode::Char('j'));
+        let two = s.app.laid(0).heading(1).expect("Two is numbered").row;
+        assert_eq!(s.app.offset, two + 1);
+        assert!(s.app.column.width < 76, "the column was relaid out");
+        assert!(s.text(OUTLINE_COLUMNS)[0].contains("Two"), "{frame}");
+    }
+    #[test]
+    fn a_page_without_headings_says_there_is_nothing_to_outline() {
+        let doc = Doc::whole("Doc", "Just words.");
+        let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('t'));
+        assert!(s.app.outline.is_none());
+        assert!(frame.contains("this page has no headings"), "{frame}");
+    }
+
+    #[test]
+    fn the_outline_window_jumps_and_esc_leaves_the_text_where_it_went() {
+        let text = format!("# One\n\n{}## Two\n\n{}", filler(14), filler(20));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        let frame = s.press(KeyCode::Char('T'));
+        assert!(frame.contains("Outline"), "{frame}");
+        assert!(frame.contains("Two"), "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert!(
+            frame.lines().any(|line| line
+                .split_once('›')
+                .is_some_and(|(_, rest)| rest.contains("Two"))),
+            "{frame}"
+        );
+        let two = s.app.laid(0).heading(1).expect("Two is numbered").row;
+        assert_eq!(s.app.offset, two + 1);
+        // The window is shut, and the text stays where the outline left it.
+        let frame = s.press(KeyCode::Esc);
+        assert!(s.app.outline.is_none());
+        assert_eq!(s.app.offset, two + 1);
+        assert!(s.text(0)[0].contains("Two"), "{frame}");
+        assert!(!s.app.overlaying());
+    }
+
+    #[test]
+    fn a_heading_near_the_end_of_a_paged_text_stays_marked_after_the_pull_back() {
+        let text = format!(
+            "# One\n\n{}\n\n## Near the end\n\nmore.\n\n## Last\n\nend.",
+            filler(40)
+        );
+        let mut s = Screen::new(book(&[&text]), 150, 34, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&frame), "Near the end", "{frame}");
+    }
+
+    #[test]
+    fn a_screen_too_narrow_for_both_keeps_the_text() {
+        let doc = Doc::whole("Doc", "# One\n\nwords");
+        let mut s = Screen::new(doc, 40, 20, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert!(s.app.outline.is_none());
+        assert_eq!(
+            s.app.notice.as_deref(),
+            Some("the screen is too narrow for the outline")
+        );
+        s.terminal.backend_mut().resize(60, 20);
+        s.draw();
+        s.press(KeyCode::Char('t'));
+        assert!(s.app.outline.is_some());
+        s.terminal.backend_mut().resize(40, 20);
+        s.draw();
+        assert!(s.app.outline.is_none());
+    }
+
+    #[test]
+    fn a_resize_before_the_next_frame_is_seen_by_the_outline_key() {
+        // The terminal narrows and `t` arrives in the same batch, before a draw.
+        let doc = Doc::whole("Doc", "# One\n\nwords");
+        let mut s = Screen::new(doc, 120, 20, ViewerOptions::default());
+        s.draw();
+        s.terminal.backend_mut().resize(40, 20);
+        s.app.resized(40);
+        s.tap(KeyCode::Char('t'));
+        assert!(s.app.outline.is_none());
+        assert_eq!(
+            s.app.notice.as_deref(),
+            Some("the screen is too narrow for the outline")
+        );
+        // And the other way: widened, then `t` before a draw.
+        s.terminal.backend_mut().resize(120, 20);
+        s.app.resized(120);
+        s.tap(KeyCode::Char('t'));
+        assert!(s.app.outline.is_some());
+    }
+
+    #[test]
+    fn opening_the_sidebar_over_a_paged_text_keeps_the_place_read() {
+        // 120 columns pages the text; the sidebar leaves too few, so it scrolls.
+        let page = filler(60);
+        let mut s = Screen::new(
+            book(&[page.as_str(), page.as_str()]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        s.draw();
+        assert_eq!(s.app.mode, Mode::Paged);
+        s.app.scroll_by(20);
+        let top = |s: &mut Screen, skip: u16| {
+            s.text(skip)
+                .into_iter()
+                .find(|line| line.contains("Filler"))
+                .map(|line| line.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let before = top(&mut s, 0);
+        assert_ne!(
+            before, "Filler 0.",
+            "the text was read past the page's start"
+        );
+        // Filler has no headings, so the book gets a bookmark to outline.
+        s.app.doc.bookmarks = vec![crate::doc::Bookmark {
+            title: "Start".into(),
+            depth: 0,
+            page: 0,
+        }];
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.mode, Mode::Scroll);
+        assert_eq!(top(&mut s, OUTLINE_COLUMNS), before);
+    }
+
+    #[test]
+    fn jumping_to_the_last_heading_highlights_it_despite_clamp_end() {
+        // The end of the document is short, so clamp_end pulls the view back
+        // and the last heading does not land on the top row. It must still be
+        // the highlighted entry, and a further j must not get stuck.
+        let text = format!("# One\n\n{}## Last\n\nend.", filler(15));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        let frame = s.press(KeyCode::Char('G'));
+        assert_eq!(picked(&frame), "Last", "{frame}");
+        assert!(
+            s.text(0).iter().any(|line| line.contains("Last")),
+            "the last heading is on screen: {frame}"
+        );
+    }
+
+    #[test]
+    fn a_second_step_goes_on_from_the_one_the_first_reached() {
+        // Two keys can arrive before a frame is drawn: the second one must move
+        // on from where the first jumped to, not from the screen the first
+        // frame still shows.
+        let text = format!(
+            "## One\n\n{}## Two\n\n{}## Three\n\n{}",
+            filler(14),
+            filler(14),
+            filler(14)
+        );
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        s.tap(KeyCode::Char('j'));
+        s.tap(KeyCode::Char('j'));
+        let frame = s.draw();
+        assert_eq!(picked(&frame), "Three", "{frame}");
+        assert!(
+            s.text(OUTLINE_COLUMNS)
+                .iter()
+                .any(|line| line.contains("Three")),
+            "the third heading is on screen: {frame}"
+        );
+    }
+
+    #[test]
+    fn a_move_past_the_last_heading_leaves_the_text_where_it_is() {
+        let text = format!("## One\n\n{}## Two\n\n{}", filler(14), filler(60));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        s.press(KeyCode::Char('G'));
+        assert_eq!(picked(&s.draw()), "Two");
+        // Read on below the last heading: a step down has nowhere to go, and
+        // must not pull the text back to the heading.
+        let two = s.app.laid(0).heading(1).expect("Two is numbered").row;
+        s.app.scroll_by((two + 5) as isize);
+        let before = s.app.offset;
+        assert!(before > two, "the text is read past the heading");
+        s.press(KeyCode::Char('j'));
+        assert_eq!(s.app.offset, before);
+        assert_eq!(picked(&s.draw()), "Two");
+    }
+
+    #[test]
+    fn folding_a_leaf_heading_folds_the_group_it_hangs_under() {
+        // The cursor is on a child heading with nothing under it. `h` folds the
+        // nearest ancestor that has children, the same as a file in a diff.
+        let text = format!(
+            "# One\n\n{}## Child\n\n{}## Other\n\n{}",
+            filler(14),
+            filler(14),
+            filler(14)
+        );
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        // Move off the root onto the child, which is the highlighted entry.
+        s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&s.draw()), "Child");
+        s.press(KeyCode::Char('h'));
+        assert_eq!(shown(&s), ["One"], "the ancestor folded its children");
+    }
+    #[test]
+    fn a_release_over_the_outline_ends_a_drag_begun_in_the_text() {
+        let text = format!("# One\n\n{}", filler(30));
+        let mut s = Screen::new(Doc::whole("Doc", text), 150, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        let (x, y) = s.find("Filler 3.");
+        assert!(x > OUTLINE_COLUMNS, "the text is beside the outline");
+        s.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        s.mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        s.mouse(MouseEventKind::Up(MouseButton::Left), 10, y);
+        assert!(
+            matches!(s.app.drag, Drag::Idle),
+            "the drag begun in the text never ended"
+        );
+    }
+    /// A page of text taller than the screen, so a jump to it stays on it.
+    fn tall(title: &str) -> String {
+        format!("# {title}\n\n{}", filler(30))
+    }
+
+    #[test]
+    fn a_documents_bookmarks_are_outlined_and_turn_to_their_pages() {
+        let pages = [tall("First"), tall("Second"), tall("Third")];
+        let mut s = Screen::new(
+            bookmarked(
+                &[pages[0].as_str(), pages[1].as_str(), pages[2].as_str()],
+                &[("First", 0, 0), ("Nested", 1, 1), ("Third", 0, 2)],
+            ),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        let frame = s.press(KeyCode::Char('t'));
+        // The tree is the book's own, at its own depths, whatever the page shows.
+        assert_eq!(shown(&s), ["First", "Nested", "Third"]);
+        assert_eq!(picked(&frame), "First");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(s.app.current, 1);
+        assert_eq!(picked(&frame), "Nested");
+        assert!(frame.contains("2 / 3"), "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(s.app.current, 2);
+        assert_eq!(picked(&frame), "Third");
+        // And back up.
+        let frame = s.press(KeyCode::Char('k'));
+        assert_eq!(s.app.current, 1);
+        assert_eq!(picked(&frame), "Nested");
+    }
+
+    #[test]
+    fn a_bookmark_outline_follows_the_page_being_read() {
+        let pages = [tall("First"), tall("Second"), tall("Third")];
+        let mut s = Screen::new(
+            bookmarked(
+                &[pages[0].as_str(), pages[1].as_str(), pages[2].as_str()],
+                &[("First", 0, 0), ("Third", 0, 2)],
+            ),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&s.draw()), "First");
+        s.app.go_to_page(2, false);
+        assert_eq!(picked(&s.draw()), "Third");
+        s.app.go_to_page(0, false);
+        assert_eq!(picked(&s.draw()), "First");
+    }
+
+    #[test]
+    fn bookmarks_sharing_a_page_are_walked_one_by_one() {
+        // Three entries on one page: a second `j` must leave the entry the
+        // first one landed on, not look the page up again and find the same.
+        let pages = [tall("First")];
+        let mut s = Screen::new(
+            bookmarked(
+                &[pages[0].as_str()],
+                &[("Alpha", 0, 0), ("Beta", 0, 0), ("Gamma", 0, 0)],
+            ),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        let frame = s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&frame), "Alpha", "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&frame), "Beta", "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&frame), "Gamma", "{frame}");
+        let frame = s.press(KeyCode::Char('k'));
+        assert_eq!(picked(&frame), "Beta", "{frame}");
+    }
+    #[test]
+    fn a_click_on_the_sidebar_does_not_select_text() {
+        let text = format!("# One\n\n{}", filler(10));
+        let mut s = Screen::new(Doc::whole("Doc", text), 120, 30, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert!(s.app.selection.is_none());
+        s.mouse(MouseEventKind::Down(MouseButton::Left), 5, 2);
+        assert!(
+            s.app.selection.is_none(),
+            "the click was kept out of the text"
+        );
+        assert!(s.app.outline.is_some());
     }
 
     #[test]

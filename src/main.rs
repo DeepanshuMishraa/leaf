@@ -39,6 +39,7 @@ mod mono;
 mod news;
 mod office;
 mod ooxml;
+mod outline;
 mod palette;
 mod pdf;
 mod picker;
@@ -115,7 +116,7 @@ Diff options:
   --patch <file>     a .diff or .patch file
   --inline           one column, removed lines above added ones (i switches)
 
-Diff keys: j/k move, V visual, c comment, m comments, f files, y copy, o other
+Diff keys: j/k move, V visual, c comment, m comments, f files, t/T outline, y copy, o other
 side, i split/inline, r reload, ? keys, q quit
 
 Pull request keys: tab summary/timeline, 3 code, m merge, x close/reopen, r ready/draft,
@@ -127,7 +128,7 @@ Issue keys: tab summary/timeline, x close as completed/not planned or reopen, c 
 Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
 
-Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, t go to page, m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, @ or ctrl+enter send the selection, with the lines around it, to an agent, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit
+Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, : go to page, t outline beside the text (T over it), m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, @ or ctrl+enter send the selection, with the lines around it, to an agent, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit
 
 Board keys: v select, h hand, r box, d diamond, o ellipse, a arrow, l line, p pen, t text,
 F frame, e eraser, drag to draw, move or resize, the knob turns, double-click or enter writes text,

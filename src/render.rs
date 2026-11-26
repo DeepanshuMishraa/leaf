@@ -111,6 +111,14 @@ pub enum Link {
     Note(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    pub index: usize,
+    pub level: u8,
+    pub title: String,
+    pub row: usize,
+}
+
 /// A page laid out at one width.
 #[derive(Debug, Default)]
 pub struct Laid {
@@ -122,6 +130,8 @@ pub struct Laid {
     pub links: Vec<(std::ops::Range<usize>, Link)>,
     /// Hidden URL suffixes, in page text order.
     pub hidden_link_urls: Vec<std::ops::Range<usize>>,
+    /// Numbered in the order they are drawn.
+    pub headings: Vec<Heading>,
 }
 
 impl Laid {
@@ -131,6 +141,10 @@ impl Laid {
             .iter()
             .find(|(span, _)| span.contains(&offset))
             .map(|(_, link)| link)
+    }
+
+    pub fn heading(&self, index: usize) -> Option<&Heading> {
+        self.headings.iter().find(|heading| heading.index == index)
     }
 
     /// The row and column character `offset` of the page text is drawn at.
@@ -830,6 +844,13 @@ impl Ctx<'_> {
     fn heading(&mut self, depth: u8, runs: &[Run], x: u16, width: u16, align: Align) {
         let text: String = runs.iter().map(|r| r.text.as_str()).collect();
         let accent = Style::default().fg(self.colors.headings[usize::from(depth.min(3) - 1)]);
+        // Numbered as they are drawn, here and nowhere else.
+        self.laid.headings.push(Heading {
+            index: self.laid.headings.len(),
+            level: depth,
+            title: text.replace(IMAGE_MARK, "").trim().to_owned(),
+            row: self.laid.rows.len(),
+        });
         // The terminal has one font size, so rank comes from size where it fits
         // (large letters for a short title), then weight and space. Links
         // stay in regular text so their underline and label are readable.
@@ -1975,5 +1996,60 @@ mod tests {
         let text: String = laid.text.iter().collect();
         assert_eq!(text, "see  here\n");
         assert!(laid.figures.is_empty());
+    }
+
+    #[test]
+    fn headings_are_numbered_in_the_order_they_are_drawn() {
+        let laid = layout(
+            "# One\n\n> ## In a quote\n\n- ### In a list\n\n<div align=\"center\">\n#### Centered\n</div>",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        let told: Vec<(usize, u8, &str)> = laid
+            .headings
+            .iter()
+            .map(|heading| (heading.index, heading.level, heading.title.as_str()))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (0, 1, "One"),
+                (1, 2, "In a quote"),
+                (2, 3, "In a list"),
+                (3, 4, "Centered"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heading_with_an_image_in_it_is_named_by_its_words_alone() {
+        let laid = layout(
+            "# ![icon](icon.png) Title\n\nwords",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        assert_eq!(laid.headings[0].title, "Title");
+    }
+
+    #[test]
+    fn a_heading_is_recorded_at_the_row_it_starts_on() {
+        // A short title is drawn as big letters, which the page text leaves out.
+        let laid = layout("# Hi\n\nAfter", 40, (8, 16), &no_images);
+        let hi = laid.heading(0).expect("the heading is numbered");
+        assert_eq!((hi.level, hi.title.as_str(), hi.row), (1, "Hi", 1));
+        assert_eq!(draw("# Hi\n\nAfter", 40)[hi.row], "█ █ █");
+        // A long one is an ordinary row of text.
+        let laid = layout(
+            "## A long enough title to wrap\n\nAfter",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        let sub = laid.heading(0).expect("the heading is numbered");
+        assert_eq!(sub.title, "A long enough title to wrap");
+        assert!(draw("## A long enough title to wrap\n\nAfter", 40)[sub.row].starts_with("A long"));
+        assert_eq!(laid.heading(1), None);
     }
 }
