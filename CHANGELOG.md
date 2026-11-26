@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A review that an agent in tmux opened beside itself delivers its verdict to the agent's pane again when tmux's session environment carries Rex's variables (#85). It used to fail with `block target "%N" not found` and copy the text to the clipboard instead.
+
 ## 0.18.3
 
 - Rex's command palette has **Leaf: Open Whiteboard**, which starts a new board in the active pane's folder, beside it when the pane is busy.

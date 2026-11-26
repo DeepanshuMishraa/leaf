@@ -37,6 +37,23 @@ impl Host {
         }
     }
 
+    /// The multiplexer that owns pane `pane`. Inside tmux, a tmux pane id
+    /// (`%N`) belongs to tmux even when Rex's variables reached this pane
+    /// through tmux's session environment.
+    pub fn for_pane(pane: &str) -> Option<Host> {
+        Host::for_pane_from_env(pane, |name| {
+            std::env::var(name).ok().filter(|v| !v.is_empty())
+        })
+    }
+
+    fn for_pane_from_env(pane: &str, var: impl Fn(&str) -> Option<String>) -> Option<Host> {
+        if pane.starts_with('%') && var("TMUX").is_some() {
+            Some(Host::Tmux)
+        } else {
+            Host::from_env(var)
+        }
+    }
+
     /// This process's own pane.
     pub fn own_pane(&self) -> Option<String> {
         let name = match self {
@@ -385,6 +402,25 @@ mod tests {
             Some(Host::Rex)
         );
         assert_eq!(Host::from_env(env(&[("TMUX", "/tmp/s,1,0")])), None);
+    }
+
+    #[test]
+    fn a_tmux_pane_id_in_tmux_goes_through_tmux() {
+        // tmux's session environment can carry Rex's variables into a pane.
+        let leaked = [
+            ("TMUX", "/tmp/s,1,0"),
+            ("TMUX_PANE", "%23"),
+            ("REX_BLOCK", "b"),
+        ];
+        assert_eq!(
+            Host::for_pane_from_env("%22", env(&leaked)),
+            Some(Host::Tmux)
+        );
+        assert_eq!(Host::for_pane_from_env("b", env(&leaked)), Some(Host::Rex));
+        assert_eq!(
+            Host::for_pane_from_env("%22", env(&[("REX_BLOCK", "b")])),
+            Some(Host::Rex)
+        );
     }
 
     #[test]
