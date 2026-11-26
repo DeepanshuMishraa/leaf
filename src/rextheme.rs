@@ -1,8 +1,16 @@
-//! Rex's theme, read from the Mac app's settings. Rex paints its theme in the
-//! app, while the terminal leaf talks to answers color queries with built-in
-//! defaults, so asking the terminal can't tell which theme is on. The
+//! Rex's theme, read from the Mac app's settings. Until the app showing a pane
+//! claims it, the terminal leaf talks to answers color queries with built-in
+//! defaults, so asking the terminal can't be relied on as leaf starts. The
 //! settings are read through cfprefsd, which has a switch the moment Rex
 //! makes it; the plist on disk catches up only seconds later.
+//!
+//! They're only the theme on screen when the Rex app showing the pane runs on
+//! this machine. A pane on a remote Rex host is shown by the app on the
+//! person's own Mac, whose settings this host can't read, while the host may
+//! have a Rex app of its own with another theme, or in light mode.
+//! [`shown_elsewhere`] tells the two apart. There, the showing app gives the
+//! pane its theme once it claims it, and the terminal answers color queries
+//! with that theme from then on (see `Scheme::Pushed`).
 
 use serde_json::Value;
 
@@ -28,14 +36,14 @@ fn home() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// The theme Rex shows now. `None` outside Rex, on a host without Rex's
-/// settings (a remote pane), or when they can't be read; the caller then
-/// asks the terminal.
+/// The theme Rex shows now. `None` outside Rex, in a pane another machine's
+/// Rex app shows, on a host without Rex's settings, or when they can't be
+/// read; the caller then asks the terminal.
 #[cfg(target_os = "macos")]
 pub fn active() -> Option<Theme> {
     use crate::prefs::{self, Pref};
 
-    if !inside_rex() {
+    if !inside_rex() || !shown_here() {
         return None;
     }
     prefs::sync(DOMAIN);
@@ -68,6 +76,155 @@ pub fn active() -> Option<Theme> {
 #[cfg(not(target_os = "macos"))]
 pub fn active() -> Option<Theme> {
     None
+}
+
+/// Whether this Rex pane follows the terminal instead of this machine's
+/// settings: another machine's Rex app shows it, or one is attached and no
+/// app claimed the pane in time, so which one will is unknown. Either way, the app that claims it
+/// gives it its theme, which the terminal then answers with. Every Rex pane
+/// off macOS does: Rex's app runs only on a Mac.
+#[cfg_attr(test, allow(dead_code))]
+pub fn shown_elsewhere() -> bool {
+    inside_rex() && !shown_here()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shown_here() -> bool {
+    false
+}
+
+/// Whether a Rex app on this machine shows this pane, so the settings here
+/// are its own. Asked once, since it takes `rex` calls and the theme is read
+/// again every quarter second. With no other machine's app attached, it's
+/// this one's. Otherwise a pane no app has claimed yet is asked about again
+/// for up to `CLAIM_WAIT`, since the claim comes about half a second after a
+/// pane opens; still unclaimed then, it follows the terminal
+/// (`Scheme::Pushed`). When Rex itself can't be asked in time, the settings
+/// here are used, as before.
+#[cfg(target_os = "macos")]
+fn shown_here() -> bool {
+    use std::time::{Duration, Instant};
+
+    const CLAIM_WAIT: Duration = Duration::from_secs(1);
+    static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HERE.get_or_init(|| {
+        let (Some(block), Some(session)) =
+            (crate::agent::rex_block(), crate::agent::rex_session_id())
+        else {
+            return true;
+        };
+        let Some(clients) = rex_json(&["api", "call", "client.list"]) else {
+            return true;
+        };
+        if !remote_app_attached(&clients) {
+            return true;
+        }
+        let deadline = Instant::now() + CLAIM_WAIT;
+        loop {
+            let Some(blocks) =
+                rex_json(&["block", "ls", "-s", &session, "--json", "--short=false"])
+            else {
+                return true;
+            };
+            if let Some(local) = shown_by_local_app(&blocks, &clients, &block) {
+                return local;
+            }
+            if Instant::now() >= deadline {
+                // Still unclaimed: follow the terminal until an app claims it.
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    })
+}
+
+/// A `rex` call's JSON output, or `None` when it fails or takes over a
+/// second, so a stuck Rex server can't hold up leaf's start. A call that
+/// overruns is killed, so none is left behind.
+#[cfg(target_os = "macos")]
+fn rex_json(args: &[&str]) -> Option<Value> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(crate::agent::rex_program().ok()?)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Read on another thread so a large reply can't fill the pipe and stall
+    // the child; the read ends once the child exits or is killed.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).ok().map(|_| text)
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let text = reader.join().ok()??;
+    if !status?.success() {
+        return None;
+    }
+    serde_json::from_str(&text).ok()
+}
+
+/// Whether an app reached Rex other than over its local socket, from the
+/// `client.list` API: only then can another machine show a pane.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn remote_app_attached(clients: &Value) -> bool {
+    clients
+        .get("clients")
+        .and_then(Value::as_array)
+        .is_some_and(|clients| {
+            clients.iter().any(|entry| {
+                entry.pointer("/info/kind").and_then(Value::as_str) == Some("app")
+                    && entry
+                        .pointer("/principal/transport")
+                        .and_then(Value::as_str)
+                        != Some("unix")
+            })
+        })
+}
+
+/// Whether the client showing `block` reached Rex over its local socket, from
+/// `rex block ls --json` and the `client.list` API. The client showing a pane
+/// owns it; a pane just opened may not have an owner yet, so the owner of
+/// another pane in its window stands in. `None` when no owner is known.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn shown_by_local_app(blocks: &Value, clients: &Value, block: &str) -> Option<bool> {
+    let blocks = blocks.get("blocks")?.as_array()?;
+    fn owner(entry: &Value) -> Option<&str> {
+        entry.get("owner").and_then(Value::as_str)
+    }
+    let this = blocks
+        .iter()
+        .find(|entry| entry.get("block_id").and_then(Value::as_str) == Some(block))?;
+    let window = this.get("window_id").and_then(Value::as_str);
+    let client = owner(this).or_else(|| {
+        let window = window?;
+        blocks
+            .iter()
+            .filter(|entry| entry.get("window_id").and_then(Value::as_str) == Some(window))
+            .find_map(owner)
+    })?;
+    let entry = clients
+        .get("clients")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("client_id").and_then(Value::as_str) == Some(client))?;
+    Some(entry.pointer("/principal/transport")?.as_str()? == "unix")
 }
 
 /// The built-in themes, read once: they only change when Rex updates.
@@ -237,6 +394,58 @@ mod tests {
                 magenta: [204, 204, 204],
             })
         );
+    }
+
+    #[test]
+    fn the_app_showing_a_pane_is_local_only_over_the_unix_socket() {
+        // A remote host's session: this Mac's app (over Tailscale) shows the
+        // window, while the host's own Rex app is attached too.
+        let clients = json!({ "clients": [
+            { "client_id": "client:host-app",
+              "principal": { "kind": "peer", "transport": "unix" },
+              "info": { "kind": "app" } },
+            { "client_id": "client:mac-app",
+              "principal": { "kind": "tailscale", "transport": "tailscale" },
+              "info": { "kind": "app" } }
+        ] });
+        let blocks = json!({ "blocks": [
+            { "block_id": "block:agent", "window_id": "window:w", "owner": "client:mac-app" },
+            { "block_id": "block:review", "window_id": "window:w", "owner": null },
+            { "block_id": "block:mine", "window_id": "window:x", "owner": "client:host-app" },
+            { "block_id": "block:alone", "window_id": null, "owner": null }
+        ] });
+        assert_eq!(
+            shown_by_local_app(&blocks, &clients, "block:agent"),
+            Some(false)
+        );
+        // Not owned yet: its window's owner shows it.
+        assert_eq!(
+            shown_by_local_app(&blocks, &clients, "block:review"),
+            Some(false)
+        );
+        assert_eq!(
+            shown_by_local_app(&blocks, &clients, "block:mine"),
+            Some(true)
+        );
+        assert_eq!(shown_by_local_app(&blocks, &clients, "block:alone"), None);
+        assert_eq!(shown_by_local_app(&blocks, &clients, "block:missing"), None);
+        assert_eq!(
+            shown_by_local_app(&json!({}), &clients, "block:agent"),
+            None
+        );
+        assert!(remote_app_attached(&clients));
+    }
+
+    #[test]
+    fn only_an_app_off_the_unix_socket_counts_as_remote() {
+        let local = json!({ "clients": [
+            { "client_id": "client:app",
+              "principal": { "transport": "unix" }, "info": { "kind": "app" } },
+            { "client_id": "client:cli",
+              "principal": { "transport": "tailscale" }, "info": { "kind": "cli" } }
+        ] });
+        assert!(!remote_app_attached(&local));
+        assert!(!remote_app_attached(&json!({})));
     }
 
     #[test]
