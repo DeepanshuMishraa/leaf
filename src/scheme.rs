@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
-use crate::mono::Rgb;
 use crate::rextheme;
 use crate::theme::{self, Theme};
 
