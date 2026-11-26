@@ -101,75 +101,97 @@ impl Outline {
     /// The entries a panel shows, top to bottom: what the filter matches and the
     /// entries above them, less what a fold hides.
     pub fn visible(&self) -> Vec<usize> {
-        self.rows(&self.kept())
+        self.listed().0
     }
 
-    fn rows(&self, kept: &[bool]) -> Vec<usize> {
-        let mut rows = Vec::new();
-        // The depth of a folded entry above, while its entries are passed over.
-        let mut hidden_under: Option<usize> = None;
-        for (at, node) in self.nodes.iter().enumerate() {
-            if hidden_under.is_some_and(|folded| node.depth > folded) {
-                continue;
-            }
-            hidden_under = None;
-            if !kept[at] {
-                continue;
-            }
+    /// The entries a panel shows, with how many of them the filter matches.
+    fn listed(&self) -> (Vec<usize>, usize) {
+        let (mut rows, mut matched) = (Vec::new(), 0);
+        self.walk(|at, is| {
             rows.push(at);
-            if self.folded(at) {
-                hidden_under = Some(node.depth);
-            }
-        }
-        rows
+            matched += usize::from(is);
+        });
+        (rows, matched)
     }
 
-    /// How many entries the filter matches.
-    fn matches(&self) -> usize {
-        (0..self.nodes.len()).filter(|&at| self.matched(at)).count()
-    }
-
-    /// A match goes somewhere, and the filter finds it. With nothing typed, every entry
-    /// that goes somewhere is one.
-    fn matched(&self, at: usize) -> bool {
-        let node = &self.nodes[at];
-        node.locator.is_some()
-            && (self.filter.is_empty() || rank(&node.found_by, &self.filter).is_some())
-    }
-
-    /// What a panel lists: the matches, and the entries a match hangs under.
-    fn kept(&self) -> Vec<bool> {
-        let mut shown: Vec<bool> = (0..self.nodes.len()).map(|at| self.matched(at)).collect();
-        // The entries above the one at hand, outermost first.
-        let mut path: Vec<(usize, usize)> = Vec::new();
+    /// Visits the entries a panel shows in order, saying of each whether the filter
+    /// matches it.
+    fn walk(&self, mut visit: impl FnMut(usize, bool)) {
+        let typed = self.typed();
+        // Per entry: whether the filter matches it, and whether a panel lists it.
+        let mut state: Vec<(bool, bool)> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.locator.is_some()
+                        && (typed.is_empty() || rank(&node.found_by, &typed).is_some()),
+                    false,
+                )
+            })
+            .collect();
+        // The entries above the one at hand, outermost first; a match shows them.
+        let mut above: Vec<(usize, usize)> = Vec::new();
         for (at, node) in self.nodes.iter().enumerate() {
-            while path.last().is_some_and(|&(depth, _)| depth >= node.depth) {
-                path.pop();
+            while above.last().is_some_and(|&(depth, _)| depth >= node.depth) {
+                above.pop();
             }
-            if shown[at] {
-                for &(_, above) in &path {
-                    shown[above] = true;
+            for &(_, up) in &above {
+                state[up].1 |= state[at].0;
+            }
+            state[at].1 |= state[at].0;
+            above.push((node.depth, at));
+        }
+        // The depth of a folded entry, while what is under it is passed over.
+        let mut folded: Option<usize> = None;
+        for (at, node) in self.nodes.iter().enumerate() {
+            if folded.is_some_and(|depth| node.depth > depth) {
+                continue;
+            }
+            folded = None;
+            let (matched, listed) = state[at];
+            if listed {
+                visit(at, matched);
+                if self.folded(at) {
+                    folded = Some(node.depth);
                 }
             }
-            path.push((node.depth, at));
         }
-        shown
+    }
+
+    /// The filter as it is matched, lowercased.
+    fn typed(&self) -> Vec<char> {
+        self.filter.chars().flat_map(char::to_lowercase).collect()
     }
 
     /// The matches, top to bottom.
     fn stops(&self) -> Vec<usize> {
-        self.rows(&self.kept())
-            .into_iter()
-            .filter(|&at| self.matched(at))
-            .collect()
+        let mut stops = Vec::new();
+        self.walk(|at, matched| {
+            if matched {
+                stops.push(at);
+            }
+        });
+        stops
     }
 
     /// The match to pick first: the one the typed characters lie closest together in,
     /// then the one where they start a word rather than the middle of one, then the earliest.
     pub fn best(&self) -> Option<usize> {
-        self.stops()
-            .into_iter()
-            .min_by_key(|&at| rank(&self.nodes[at].found_by, &self.filter))
+        let typed = self.typed();
+        let mut best: Option<((usize, bool, usize), usize)> = None;
+        self.walk(|at, matched| {
+            if !matched {
+                return;
+            }
+            let Some(rank) = rank(&self.nodes[at].found_by, &typed) else {
+                return;
+            };
+            if best.is_none_or(|(been, _)| rank < been) {
+                best = Some((rank, at));
+            }
+        });
+        best.map(|(_, at)| at)
     }
 
     /// The entry `delta` places along the stops from `from`, which need not be one
@@ -201,7 +223,10 @@ impl Outline {
     /// The entry a panel marks for the one the text is under: itself while it is shown,
     /// else the nearest shown one above it.
     pub fn shown(&self, at: Option<usize>) -> Option<usize> {
-        let visible = self.visible();
+        self.shown_in(&self.visible(), at)
+    }
+
+    fn shown_in(&self, visible: &[usize], at: Option<usize>) -> Option<usize> {
         let mut at = at?;
         while visible.binary_search(&at).is_err() {
             at = self.parent(at)?;
@@ -240,28 +265,24 @@ impl Outline {
     }
 }
 
-/// How well `typed` names a label by its characters in order, whatever lies between them:
-/// the spread of the match, whether it starts a word, and where it starts. The less of
-/// each the better. None when the characters don't all come.
-fn rank(label: &str, typed: &str) -> Option<(usize, bool, usize)> {
-    let lower = |text: &str| {
-        text.chars()
-            .flat_map(char::to_lowercase)
-            .collect::<Vec<_>>()
-    };
-    let label = lower(label);
-    let typed = lower(typed);
+/// How well `typed`, lowercased, names a label by its characters in order, whatever lies
+/// between them: the spread of the match, whether it starts a word, and where it starts.
+/// The less of each the better. None when the characters don't all come.
+fn rank(label: &str, typed: &[char]) -> Option<(usize, bool, usize)> {
     if typed.is_empty() {
         return Some((0, false, 0));
     }
+    let lower = || label.chars().flat_map(char::to_lowercase);
     let mut best: Option<(usize, bool, usize)> = None;
-    for (start, &lead) in label.iter().enumerate() {
+    for (start, lead) in lower().enumerate() {
         if lead != typed[0] {
             continue;
         }
-        let (mut end, mut rest, mut whole) = (start, start + 1, true);
+        let mut after = lower().skip(start + 1);
+        let (mut end, mut rest) = (start, start + 1);
+        let mut whole = true;
         for &want in &typed[1..] {
-            match label[rest..].iter().position(|&c| c == want) {
+            match after.position(|have| have == want) {
                 Some(found) => {
                     end = rest + found;
                     rest = end + 1;
@@ -272,7 +293,7 @@ fn rank(label: &str, typed: &str) -> Option<(usize, bool, usize)> {
                 }
             }
         }
-        let inside_a_word = start > 0 && label[start - 1].is_alphanumeric();
+        let inside_a_word = start > 0 && lower().nth(start - 1).is_some_and(char::is_alphanumeric);
         if whole && best.is_none_or(|been| (end - start, inside_a_word, start) < been) {
             best = Some((end - start, inside_a_word, start));
         }
@@ -460,12 +481,12 @@ impl OpenOutline {
         let rows = rows.max(1);
         // While a filter is typed, the match picked is marked; with nothing typed yet, the
         // entry under the text still is.
+        let (visible, matched) = self.tree.listed();
         let here = match self.picked {
             Some(picked) if self.typing => Some(picked),
-            _ => self.tree.shown(here),
+            _ => self.tree.shown_in(&visible, here),
         };
-        let visible = self.tree.visible();
-        let mut lines = vec![self.head(visible.len())];
+        let mut lines = vec![self.head(visible.len(), matched)];
         if visible.is_empty() {
             let said = if self.tree.nodes.is_empty() {
                 empty
@@ -500,8 +521,9 @@ impl OpenOutline {
         lines
     }
 
-    /// The query and how many entries it matches; the count of entries when nothing is typed.
-    fn head(&self, shown: usize) -> Line<'static> {
+    /// The query and how many entries it matches, of those listed; the count of entries
+    /// when nothing is typed.
+    fn head(&self, shown: usize, matched: usize) -> Line<'static> {
         let typed = &self.tree.filter;
         if typed.is_empty() {
             return Line::from(Span::styled(format!("{shown} entries"), dim()));
@@ -519,11 +541,7 @@ impl OpenOutline {
         } else {
             format!("“{typed}”")
         };
-        let said = format!(
-            "{quoted} · {} of {}",
-            self.tree.matches(),
-            self.tree.nodes.len()
-        );
+        let said = format!("{quoted} · {matched} of {}", self.tree.nodes.len());
         Line::from(Span::styled(said, dim()))
     }
 }
