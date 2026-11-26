@@ -2605,14 +2605,18 @@ impl App {
     }
 
     fn outline_go(&mut self, node: usize) {
-        let Some(outline::Locator::Text(index)) = self
+        let Some(locator) = self
             .outline
             .as_ref()
-            .map(|open| open.tree.nodes[node].locator)
+            .and_then(|open| open.tree.nodes[node].locator)
         else {
             return;
         };
-        self.show_heading(index);
+        match locator {
+            // The diff view resolves its own; the rest are the reader's.
+            outline::Locator::Diff(_) => return,
+            outline::Locator::Text(index) => self.show_heading(index),
+        }
         let landed = (self.current, self.offset);
         if let Some(open) = self.outline.as_mut() {
             open.pinned = Some(Pinned { node, landed });

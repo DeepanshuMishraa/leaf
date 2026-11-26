@@ -1,6 +1,8 @@
 //! An outline: a tree of the places a document can be gone to, the panel over it, and
 //! the way between its entries.
 
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -12,13 +14,18 @@ use crate::render;
 pub enum Locator {
     /// The heading the renderer numbered `n`, on the page being read.
     Text(usize),
+    /// A file's index in a diff's files.
+    Diff(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineNode {
     pub label: String,
     pub depth: usize,
-    pub locator: Locator,
+    /// `None` for a group, which holds no place of its own.
+    pub locator: Option<Locator>,
+    /// The words a filter finds the entry by: a diff file's path, any other entry's label.
+    pub found_by: String,
 }
 
 /// Which entry the text is under is not kept here: it comes from the text.
@@ -51,7 +58,9 @@ impl Outline {
     }
 
     pub fn at(&self, locator: Locator) -> Option<usize> {
-        self.nodes.iter().position(|node| node.locator == locator)
+        self.nodes
+            .iter()
+            .position(|node| node.locator == Some(locator))
     }
 
     pub fn has_children(&self, at: usize) -> bool {
@@ -118,9 +127,12 @@ impl Outline {
         (0..self.nodes.len()).filter(|&at| self.matched(at)).count()
     }
 
-    /// Whether the filter finds an entry. With nothing typed, it finds them all.
+    /// A match goes somewhere, and the filter finds it. With nothing typed, every entry
+    /// that goes somewhere is one.
     fn matched(&self, at: usize) -> bool {
-        self.filter.is_empty() || rank(&self.nodes[at].label, &self.filter).is_some()
+        let node = &self.nodes[at];
+        node.locator.is_some()
+            && (self.filter.is_empty() || rank(&node.found_by, &self.filter).is_some())
     }
 
     /// What a panel lists: the matches, and the entries a match hangs under.
@@ -155,7 +167,7 @@ impl Outline {
     pub fn best(&self) -> Option<usize> {
         self.stops()
             .into_iter()
-            .min_by_key(|&at| rank(&self.nodes[at].label, &self.filter))
+            .min_by_key(|&at| rank(&self.nodes[at].found_by, &self.filter))
     }
 
     /// The entry `delta` places along the stops from `from`, which need not be one
@@ -530,9 +542,83 @@ pub fn from_headings(headings: &[render::Heading]) -> Vec<OutlineNode> {
         nodes.push(OutlineNode {
             label: heading.title.clone(),
             depth: open.len(),
-            locator: Locator::Text(heading.index),
+            locator: Some(Locator::Text(heading.index)),
+            found_by: heading.title.clone(),
         });
         open.push(heading.level);
+    }
+    nodes
+}
+
+/// The diff's files as a tree of directories. A directory is told by where it
+/// hangs and its name; an absolute path hangs from a root with no name.
+pub fn from_diff_files(files: &[crate::diff::File]) -> Vec<OutlineNode> {
+    struct Branch {
+        label: String,
+        path: String,
+        locator: Option<Locator>,
+        children: Vec<usize>,
+    }
+    let mut branches: Vec<Branch> = Vec::new();
+    let mut roots: Vec<usize> = Vec::new();
+    // Where each directory met so far is, by the entry it hangs under.
+    let mut dirs: HashMap<(Option<usize>, &str), usize> = HashMap::new();
+    for (index, file) in files.iter().enumerate() {
+        let path = file.path();
+        let mut folders: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let name = folders.pop().unwrap_or(path);
+        if path.starts_with('/') {
+            folders.insert(0, "");
+        }
+        let mut above: Option<usize> = None;
+        for part in folders {
+            let at = match dirs.get(&(above, part)) {
+                Some(&at) => at,
+                None => {
+                    let at = branches.len();
+                    branches.push(Branch {
+                        label: part.to_owned(),
+                        path: part.to_owned(),
+                        locator: None,
+                        children: Vec::new(),
+                    });
+                    match above {
+                        Some(above) => branches[above].children.push(at),
+                        None => roots.push(at),
+                    }
+                    dirs.insert((above, part), at);
+                    at
+                }
+            };
+            above = Some(at);
+        }
+        let at = branches.len();
+        branches.push(Branch {
+            label: name.to_owned(),
+            path: path.to_owned(),
+            locator: Some(Locator::Diff(index)),
+            children: Vec::new(),
+        });
+        match above {
+            Some(above) => branches[above].children.push(at),
+            None => roots.push(at),
+        }
+    }
+    fn flatten(branches: &[Branch], at: usize, depth: usize, nodes: &mut Vec<OutlineNode>) {
+        let branch = &branches[at];
+        nodes.push(OutlineNode {
+            label: branch.label.clone(),
+            depth,
+            locator: branch.locator,
+            found_by: branch.path.clone(),
+        });
+        for &child in &branch.children {
+            flatten(branches, child, depth + 1, nodes);
+        }
+    }
+    let mut nodes = Vec::with_capacity(branches.len());
+    for root in roots {
+        flatten(&branches, root, 0, &mut nodes);
     }
     nodes
 }
@@ -551,6 +637,7 @@ pub fn heading_at(headings: &[render::Heading], row: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff;
 
     /// Entries from (depth, label) pairs, numbered in order.
     fn entries(pairs: &[(usize, &str)]) -> Vec<OutlineNode> {
@@ -560,7 +647,8 @@ mod tests {
             .map(|(at, (depth, label))| OutlineNode {
                 label: (*label).to_owned(),
                 depth: *depth,
-                locator: Locator::Text(at),
+                locator: Some(Locator::Text(at)),
+                found_by: (*label).to_owned(),
             })
             .collect()
     }
@@ -689,6 +777,46 @@ mod tests {
         }
         assert_eq!(outline.best(), Some(1));
     }
+
+    #[test]
+    fn a_file_is_found_by_its_path_and_a_directory_only_places_it() {
+        let dir = |label: &str, depth: usize| OutlineNode {
+            label: label.to_owned(),
+            depth,
+            locator: None,
+            found_by: label.to_owned(),
+        };
+        let file = |label: &str, depth: usize, index: usize, path: &str| OutlineNode {
+            label: label.to_owned(),
+            depth,
+            locator: Some(Locator::Diff(index)),
+            found_by: path.to_owned(),
+        };
+        let mut outline = Outline::new(vec![
+            dir("src", 0),
+            dir("core", 1),
+            file("a.rs", 2, 0, "src/core/a.rs"),
+            file("main.rs", 1, 1, "src/main.rs"),
+            dir("docs", 0),
+            file("x.md", 1, 2, "docs/x.md"),
+        ]);
+        let find = |outline: &mut Outline, typed: &str| {
+            outline.filter.clear();
+            for c in typed.chars() {
+                outline.filter.push(c);
+            }
+            labels(outline, &outline.visible())
+        };
+        // The files under a directory are its matches; the directory only places them.
+        assert_eq!(
+            find(&mut outline, "src"),
+            ["src", "core", "a.rs", "main.rs"]
+        );
+        assert_eq!(outline.step(None, 1), Some(2));
+        assert_eq!(outline.step(Some(2), 1), Some(3));
+        assert_eq!(find(&mut outline, "docs/x"), ["docs", "x.md"]);
+        assert_eq!(outline.best(), Some(5));
+    }
     #[test]
     fn a_step_from_an_entry_that_is_no_stop_goes_to_the_nearest_one() {
         let mut outline = tree(&[(0, "Start"), (1, "Zeta"), (1, "Middle"), (0, "Last")]);
@@ -753,6 +881,23 @@ mod tests {
         };
         assert_eq!(shown(Some(1)), ["  Zero", "› One", "  Two"]);
         assert_eq!(shown(Some(8)), ["  Six", "  Seven", "› Eight"]);
+    }
+
+    #[test]
+    fn a_path_is_typed_with_its_slashes_and_finds_its_file() {
+        let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+        let files = from_diff_files(&changed(&["a/main.rs", "b/main.rs"]));
+        let mut open = OpenOutline::new(Outline::new(files));
+        open.key(&key(KeyCode::Char('/')));
+        for c in "b/main".chars() {
+            open.key(&key(KeyCode::Char(c)));
+        }
+        assert_eq!(open.tree.filter, "b/main");
+        assert_eq!(open.picked, Some(3));
+        assert_eq!(
+            open.key(&key(KeyCode::Enter)),
+            (true, Some(Ask::Go(Some(3))))
+        );
     }
     #[test]
     fn the_entry_the_text_is_under_is_shown_in_reverse() {
@@ -981,19 +1126,19 @@ mod tests {
             heading(4, 1, "Five", 13),
         ];
         let nodes = from_headings(&told);
-        let got: Vec<(&str, usize, Locator)> = nodes
+        let got: Vec<(&str, usize, Option<Locator>)> = nodes
             .iter()
             .map(|node| (node.label.as_str(), node.depth, node.locator))
             .collect();
         assert_eq!(
             got,
             [
-                ("One", 0, Locator::Text(0)),
-                ("Two", 1, Locator::Text(1)),
-                ("Three", 2, Locator::Text(2)),
+                ("One", 0, Some(Locator::Text(0))),
+                ("Two", 1, Some(Locator::Text(1))),
+                ("Three", 2, Some(Locator::Text(2))),
                 // Back up to the shallower heading, not the one just above.
-                ("Four", 1, Locator::Text(3)),
-                ("Five", 0, Locator::Text(4)),
+                ("Four", 1, Some(Locator::Text(3))),
+                ("Five", 0, Some(Locator::Text(4))),
             ]
         );
     }
@@ -1022,11 +1167,76 @@ mod tests {
         ];
         let nodes = from_headings(&told);
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].locator, Locator::Text(1));
+        assert_eq!(nodes[0].locator, Some(Locator::Text(1)));
         // The text under an untitled heading belongs to the titled one before.
         assert_eq!(heading_at(&told, 0), Some(1));
         assert_eq!(heading_at(&told, 4), Some(1));
         assert_eq!(heading_at(&told, 9), Some(1));
         assert_eq!(heading_at(&told, 20), Some(1));
+    }
+
+    fn file(old: Option<&str>, new: Option<&str>) -> diff::File {
+        diff::File {
+            old_path: old.map(str::to_owned),
+            new_path: new.map(str::to_owned),
+            header_row: 0,
+            hunks: Vec::new(),
+            added: 0,
+            removed: 0,
+            binary: false,
+            note: None,
+            identity: String::new(),
+        }
+    }
+
+    fn changed(pairs: &[&str]) -> Vec<diff::File> {
+        pairs
+            .iter()
+            .map(|path| file(Some(path), Some(path)))
+            .collect()
+    }
+    /// (label, depth, locator), as the panel lists them.
+    fn shape(files: &[diff::File]) -> Vec<(String, usize, Option<Locator>)> {
+        from_diff_files(files)
+            .into_iter()
+            .map(|node| (node.label, node.depth, node.locator))
+            .collect()
+    }
+
+    #[test]
+    fn diff_files_hang_under_the_directories_their_paths_lead_through() {
+        let files = changed(&["src/core/a.rs", "src/core/b.rs", "src/main.rs"]);
+        assert_eq!(
+            shape(&files),
+            [
+                ("src".to_owned(), 0, None),
+                ("core".to_owned(), 1, None),
+                ("a.rs".to_owned(), 2, Some(Locator::Diff(0))),
+                ("b.rs".to_owned(), 2, Some(Locator::Diff(1))),
+                // The next file goes back up to the shallower directory.
+                ("main.rs".to_owned(), 1, Some(Locator::Diff(2))),
+            ]
+        );
+        // A directory met again is the entry it was, and an absolute path hangs from
+        // a root with no name.
+        let files = changed(&["src/a.rs", "docs/b.rs", "src/c.rs", "/src/d.rs"]);
+        let nodes = from_diff_files(&files);
+        let got: Vec<(&str, usize)> = nodes
+            .iter()
+            .map(|node| (node.label.as_str(), node.depth))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("src", 0),
+                ("a.rs", 1),
+                ("c.rs", 1),
+                ("docs", 0),
+                ("b.rs", 1),
+                ("", 0),
+                ("src", 1),
+                ("d.rs", 2),
+            ]
+        );
     }
 }
