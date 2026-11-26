@@ -2,7 +2,7 @@
 //! sending them to an agent or a pull request.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
@@ -363,12 +363,14 @@ type Deliver = Box<dyn FnMut(&str) -> Result<agent::Agent, agent::AgentFailed>>;
 
 /// One line on screen. In the split layout changed blocks are paired
 /// left-to-right; inline, each line holds one changed row, or a context row on
-/// both sides. Headings and notes span the width.
+/// both sides. Headings and notes span the width. A folded file is its
+/// heading alone, with `folded` set.
 #[derive(Debug, Clone, Copy)]
 struct SplitRow {
     left: Option<usize>,
     right: Option<usize>,
     band: Option<usize>,
+    folded: bool,
 }
 
 /// What a split line is going through this frame.
@@ -379,8 +381,14 @@ struct SideState {
 }
 
 impl SplitRow {
+    /// A line of code, on either side.
     fn is_content(self) -> bool {
         self.left.is_some() || self.right.is_some()
+    }
+
+    /// A line the cursor can rest on: code, or a folded file's heading.
+    fn is_stop(self) -> bool {
+        self.is_content() || self.folded
     }
 
     /// The side the cursor and a new comment prefer: the new side.
@@ -498,7 +506,9 @@ impl Split {
         }
     }
 
-    fn new(diff: &Diff, layout: Layout) -> Self {
+    /// The lines for `diff`, with the files in `folded` shown as their
+    /// heading alone.
+    fn new(diff: &Diff, layout: Layout, folded: &HashSet<usize>) -> Self {
         let rows = diff.rows();
         let shifts = block_shifts(diff);
         let mut lines = Vec::new();
@@ -515,12 +525,31 @@ impl Split {
         let mut at = 0;
         while at < rows.len() {
             match rows[at].kind {
+                RowKind::File if folded.contains(&(rows[at].file as usize)) => {
+                    push(
+                        SplitRow {
+                            left: None,
+                            right: None,
+                            band: Some(at),
+                            folded: true,
+                        },
+                        &mut line_of_row,
+                    );
+                    // The file's rows all land on its heading.
+                    let line = line_of_row[at];
+                    at += 1;
+                    while at < rows.len() && rows[at].kind != RowKind::File {
+                        line_of_row[at] = line;
+                        at += 1;
+                    }
+                }
                 RowKind::Context => {
                     push(
                         SplitRow {
                             left: Some(at),
                             right: Some(at),
                             band: None,
+                            folded: false,
                         },
                         &mut line_of_row,
                     );
@@ -532,6 +561,7 @@ impl Split {
                             left: Some(at),
                             right: None,
                             band: None,
+                            folded: false,
                         },
                         &mut line_of_row,
                     );
@@ -561,6 +591,7 @@ impl Split {
                                 left: side(left_shift, old, old_start),
                                 right: side(right_shift, new, new_start),
                                 band: None,
+                                folded: false,
                             },
                             &mut line_of_row,
                         );
@@ -577,6 +608,7 @@ impl Split {
                                 left: None,
                                 right: Some(row),
                                 band: None,
+                                folded: false,
                             },
                             &mut line_of_row,
                         );
@@ -588,6 +620,7 @@ impl Split {
                             left: None,
                             right: None,
                             band: Some(at),
+                            folded: false,
                         },
                         &mut line_of_row,
                     );
@@ -652,25 +685,25 @@ impl Split {
     }
 
     fn first_content(&self) -> Option<usize> {
-        self.lines.iter().position(|line| line.is_content())
+        self.lines.iter().position(|line| line.is_stop())
     }
 
     fn last_content(&self) -> Option<usize> {
-        self.lines.iter().rposition(|line| line.is_content())
+        self.lines.iter().rposition(|line| line.is_stop())
     }
 
     fn next_content(&self, line: usize, forward: bool) -> Option<usize> {
         if forward {
-            (line + 1..self.lines.len()).find(|&i| self.lines[i].is_content())
+            (line + 1..self.lines.len()).find(|&i| self.lines[i].is_stop())
         } else {
             (0..line.min(self.lines.len()))
                 .rev()
-                .find(|&i| self.lines[i].is_content())
+                .find(|&i| self.lines[i].is_stop())
         }
     }
 
     fn snap(&self, line: usize) -> usize {
-        if self.lines.get(line).is_some_and(|line| line.is_content()) {
+        if self.lines.get(line).is_some_and(|line| line.is_stop()) {
             return line;
         }
         self.next_content(line, true)
@@ -727,6 +760,11 @@ struct App {
     tabs: bool,
     layout: Layout,
     split: Split,
+    /// The paths of the files shown as their heading alone.
+    folded: HashSet<String>,
+    /// The files marked viewed, kept so headings don't fingerprint a file
+    /// every frame.
+    viewed: HashSet<usize>,
     /// The diff's lines on screen.
     view: Rect,
     /// Rows inside the comment box, for moving the cursor.
@@ -764,7 +802,7 @@ struct NoteEditor {
 
 impl App {
     fn new(loaded: Loaded, options: Options) -> Self {
-        let split = Split::new(&loaded.diff, options.layout);
+        let split = Split::new(&loaded.diff, options.layout, &HashSet::new());
         let cursor = split.first_content().unwrap_or(0);
         let key = loaded.key.clone();
         let look = Look::detect();
@@ -802,6 +840,8 @@ impl App {
             tabs: options.tabs,
             layout: options.layout,
             split,
+            folded: HashSet::new(),
+            viewed: HashSet::new(),
             view: Rect::default(),
             composer_view: 0,
             highlight: HashMap::new(),
@@ -826,6 +866,12 @@ impl App {
         }
         app.rebuild_marks();
         app.follow_renames();
+        app.refresh_viewed();
+        app.fold_viewed();
+        if !app.folded.is_empty() {
+            app.rebuild_split();
+            app.cursor = app.split.first_content().unwrap_or(0);
+        }
         app
     }
 
@@ -1037,15 +1083,41 @@ impl App {
                         .filter(|at| *at > 0)
                         .and_then(|at| self.loaded.diff.file(at - 1))
                         .map(|file| file.path().to_owned());
+                    // A folded file that changed opens again, so the change
+                    // isn't hidden under its heading.
+                    let changed: Vec<String> = if same_key {
+                        self.folded
+                            .iter()
+                            .filter(|path| {
+                                let print = |diff: &Diff| {
+                                    diff.files()
+                                        .iter()
+                                        .position(|file| file.path() == path.as_str())
+                                        .map(|file| diffreview::fingerprint(diff, file))
+                                };
+                                print(&self.loaded.diff) != print(&loaded.diff)
+                            })
+                            .cloned()
+                            .collect()
+                    } else {
+                        self.folded.iter().cloned().collect()
+                    };
+                    for path in changed {
+                        self.folded.remove(&path);
+                    }
                     self.loaded = loaded;
                     self.content_widths = None;
                     self.key = self.loaded.key.clone();
-                    self.split = Split::new(&self.loaded.diff, self.layout);
                     if !same_key {
                         self.load_comments();
                         self.load_notes();
                     }
                     self.follow_renames();
+                    self.refresh_viewed();
+                    if !same_key {
+                        self.fold_viewed();
+                    }
+                    self.split = Split::new(&self.loaded.diff, self.layout, &self.folded_files());
                     self.cursor = if background {
                         remember
                             .and_then(|(file, side, line)| {
@@ -1587,8 +1659,10 @@ impl App {
                 self.leave = Leave::Checks;
                 self.quit = true;
             }
-            KeyCode::Char('h') | KeyCode::Left => self.scroll_sideways(false),
-            KeyCode::Char('l') | KeyCode::Right => self.scroll_sideways(true),
+            KeyCode::Char('h') => self.fold_current(true),
+            KeyCode::Char('l') => self.fold_current(false),
+            KeyCode::Char('H') | KeyCode::Left => self.scroll_sideways(false),
+            KeyCode::Char('L') | KeyCode::Right => self.scroll_sideways(true),
             KeyCode::Char('0') => self.left = 0,
             KeyCode::Char('?') => self.dialog = Dialog::Help,
             _ => {}
@@ -1945,6 +2019,12 @@ impl App {
         }
     }
 
+    /// Jumps to file `index`, opening it when it's folded.
+    fn open_file(&mut self, index: usize) {
+        self.set_folded(index, false);
+        self.jump_file(index);
+    }
+
     fn show_files(&mut self) {
         if self.loaded.diff.files().is_empty() {
             self.toast("This diff has no files");
@@ -2006,7 +2086,7 @@ impl App {
                 let files = self.picker_files();
                 if let Some(&index) = files.get(self.pick_selected()) {
                     self.dialog = Dialog::None;
-                    self.jump_file(index);
+                    self.open_file(index);
                 }
             }
             KeyCode::Char(c) if !control => {
@@ -2096,7 +2176,7 @@ impl App {
                 .split
                 .lines()
                 .get(top - 1)
-                .is_some_and(|line| line.band.is_some())
+                .is_some_and(|line| line.band.is_some() && !line.folded)
         {
             top -= 1;
         }
@@ -2120,13 +2200,6 @@ impl App {
     /// Switches between split and inline, keeping the cursor, selection and
     /// focused comment on the same diff rows.
     fn toggle_layout(&mut self) {
-        let row_of =
-            |split: &Split, line: usize| split.lines().get(line).and_then(|l| l.focus_row());
-        let cursor = row_of(&self.split, self.cursor);
-        let selection = self.selection.and_then(|line| row_of(&self.split, line));
-        let focus = self
-            .focus
-            .and_then(|(first, last)| self.split.rows_between(first, last));
         self.layout = self.layout.toggled();
         // Remembered, so the next diff opens the same way.
         match self
@@ -2147,9 +2220,54 @@ impl App {
                 ));
             }
         }
-        self.split = Split::new(&self.loaded.diff, self.layout);
+        self.rebuild_split();
+    }
+
+    /// The indices of the folded files in this diff.
+    fn folded_files(&self) -> HashSet<usize> {
+        if self.folded.is_empty() {
+            return HashSet::new();
+        }
+        self.loaded
+            .diff
+            .files()
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| self.folded.contains(file.path()))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Works out again which files are marked viewed.
+    fn refresh_viewed(&mut self) {
+        let diff = &self.loaded.diff;
+        self.viewed = (0..diff.files().len())
+            .filter(|&index| self.notes.is_viewed(diff, index))
+            .collect();
+    }
+
+    /// Folds every file marked viewed.
+    fn fold_viewed(&mut self) {
+        let files = self.loaded.diff.files();
+        for &index in &self.viewed {
+            self.folded.insert(files[index].path().to_owned());
+        }
+    }
+
+    /// Lays the lines out again after a layout switch or a fold, keeping the
+    /// cursor, selection and focused comment on the same diff rows.
+    fn rebuild_split(&mut self) {
+        let row_of =
+            |split: &Split, line: usize| split.lines().get(line).and_then(|l| l.focus_row());
+        let cursor = row_of(&self.split, self.cursor);
+        let selection = self.selection.and_then(|line| row_of(&self.split, line));
+        let focus = self
+            .focus
+            .and_then(|(first, last)| self.split.rows_between(first, last));
+        self.split = Split::new(&self.loaded.diff, self.layout, &self.folded_files());
         self.cursor = cursor
             .and_then(|row| self.split.line_for_row(row))
+            .map(|line| self.split.snap(line))
             .or_else(|| self.split.first_content())
             .unwrap_or(0);
         self.selection = selection.and_then(|row| self.split.line_for_row(row));
@@ -2157,6 +2275,42 @@ impl App {
         match self.focus {
             Some((first, last)) => self.follow_focus(first, last),
             None => self.follow_cursor(),
+        }
+    }
+
+    /// Folds file `file` to its heading, or opens it, leaving the cursor on
+    /// its heading or its first line. Returns whether anything changed.
+    fn set_folded(&mut self, file: usize, fold: bool) -> bool {
+        let Some(info) = self.loaded.diff.file(file) else {
+            return false;
+        };
+        let path = info.path().to_owned();
+        let header = info.header_row;
+        let changed = if fold {
+            self.folded.insert(path)
+        } else {
+            self.folded.remove(&path)
+        };
+        if !changed {
+            return false;
+        }
+        self.visual = false;
+        self.selection = None;
+        self.focus = None;
+        self.rebuild_split();
+        if let Some(line) = self.split.line_for_row(header) {
+            self.cursor = self.split.snap(line);
+            // Keep the heading on screen.
+            self.scroll = self.scroll.min(line);
+        }
+        self.follow_cursor();
+        true
+    }
+
+    /// `h` folds the file under the cursor, `l` opens it.
+    fn fold_current(&mut self, fold: bool) {
+        if let Some(file) = self.current_file() {
+            self.set_folded(file, fold);
         }
     }
 
@@ -2427,6 +2581,9 @@ impl App {
             .row_for(&anchor.file, anchor.side, anchor.end_line)
             .unwrap_or(first)
             .max(first);
+        if let Some(file) = diff.file_index(first) {
+            self.set_folded(file, false);
+        }
         let lines = self.split.lines_for_rows(first, last);
         let Some((first, last)) = lines else {
             self.fail(format!(
@@ -2751,20 +2908,36 @@ impl App {
         if let Some(index) = pinned
             && let Some(row) = self.split.lines()[index].band
         {
-            let drawn = self.row_line(row);
+            let mut drawn = self.row_line(row);
+            if self.split.lines()[index].folded {
+                fold_heading(&mut drawn);
+            }
             headers.push((0, drawn.width() as u16));
             lines.push(drawn);
         }
         for index in self.scroll..end {
             let line = self.split.lines()[index];
-            let drawn = match line.band {
+            let mut drawn = match line.band {
                 Some(row) => self.row_line(row),
                 None => self.split_content(index, area.width),
             };
             if let Some(row) = line.band
                 && self.loaded.diff.rows()[row].kind == RowKind::File
             {
-                headers.push((lines.len() as u16, drawn.width() as u16));
+                if line.folded {
+                    fold_heading(&mut drawn);
+                }
+                if index == self.cursor {
+                    // The cursor on a folded heading: a full-width bar, drawn
+                    // over the ink so it shows.
+                    let width = drawn.width();
+                    drawn.spans.push(Span::raw(
+                        " ".repeat((area.width as usize).saturating_sub(width)),
+                    ));
+                    drawn = drawn.patch_style(Style::default().bg(self.palette.cursor));
+                } else {
+                    headers.push((lines.len() as u16, drawn.width() as u16));
+                }
             }
             lines.push(drawn);
         }
@@ -2801,21 +2974,33 @@ impl App {
                 let (added, removed) = file.map_or((0, 0), |file| (file.added, file.removed));
                 let path = file.map(|file| file.display()).unwrap_or_default();
                 let note = file.and_then(|file| file.note.clone());
+                // A viewed file's heading is muted, folded or not.
+                let viewed = self.viewed.contains(&(row.file as usize));
+                let (path_style, added_style, removed_style) = if viewed {
+                    let muted = Style::default().fg(DIM);
+                    (muted, muted, muted)
+                } else {
+                    (
+                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default().fg(ADDED_FG),
+                        Style::default().fg(REMOVED_FG),
+                    )
+                };
                 let mut spans = vec![
-                    Span::styled(" ▎ ", Style::default().fg(ACCENT)),
-                    Span::styled(path, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " ▎ ",
+                        Style::default().fg(if viewed { DIM } else { ACCENT }),
+                    ),
+                    Span::styled(path, path_style),
                 ];
                 if added > 0 {
-                    spans.push(Span::styled(
-                        format!(" +{added}"),
-                        Style::default().fg(ADDED_FG),
-                    ));
+                    spans.push(Span::styled(format!(" +{added}"), added_style));
                 }
                 if removed > 0 {
-                    spans.push(Span::styled(
-                        format!(" −{removed}"),
-                        Style::default().fg(REMOVED_FG),
-                    ));
+                    spans.push(Span::styled(format!(" −{removed}"), removed_style));
+                }
+                if viewed {
+                    spans.push(Span::styled("  ✓ viewed", Style::default().fg(DIM)));
                 }
                 if let Some(note) = note {
                     spans.push(Span::styled(format!("  {note}"), Style::default().fg(DIM)));
@@ -3520,6 +3705,13 @@ fn push_text(spans: &mut Vec<Span<'static>>, style: Style, text: &str) {
     spans.push(Span::styled(text.to_owned(), style));
 }
 
+/// Marks a file heading as folded: its bar turns into a closed arrow.
+fn fold_heading(line: &mut Line<'static>) {
+    if let Some(bar) = line.spans.first_mut() {
+        bar.content = " ▸ ".into();
+    }
+}
+
 /// Pads a band row to the full width with its background still drawn.
 fn clip(text: &str, width: usize) -> String {
     let mut out = String::new();
@@ -3562,6 +3754,7 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ("space b", "page down or up"),
         ("g G  Home End", "first or last line"),
         ("[ ]  N n", "previous or next file"),
+        ("h l", "fold this file to its heading, or open it"),
         ("f", "files: filter by path, open one"),
         ("V v", "visual mode; move to select, esc clears"),
         ("c C", "comment on the line or selection"),
@@ -3576,13 +3769,13 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>) {
         ),
         ("F", "note on this whole file"),
         ("M", "global note on the whole change"),
-        ("w", "mark this file viewed (again: not viewed)"),
+        ("w", "mark this file viewed and fold it (again: not viewed)"),
         ("S", "send drafts and notes as one review, with a verdict"),
         ("y Y", "copy this range or every comment"),
         ("o r", "other side of the diff, or reload"),
         ("i", "split or inline layout"),
         (
-            "h l  ← →",
+            "H L  ← →",
             "scroll sideways with keys, wheel or trackpad; 0 resets",
         ),
         ("? q", "this help, quit"),
@@ -3743,7 +3936,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => match self.overview_file() {
                 Some(file) => {
                     self.overview = None;
-                    self.jump_file(file);
+                    self.open_file(file);
                 }
                 None => self.edit_global_note(),
             },
@@ -3866,10 +4059,11 @@ impl App {
         };
         let viewed = self.notes.toggle_viewed(&self.loaded.diff, file);
         self.persist_notes();
+        self.refresh_viewed();
+        // A viewed file folds out of the way; unmarked, it opens again.
+        self.set_folded(file, viewed);
         let count = self.loaded.diff.files().len();
-        let seen = (0..count)
-            .filter(|f| self.notes.is_viewed(&self.loaded.diff, *f))
-            .count();
+        let seen = self.viewed.len();
         self.toast(if viewed {
             format!("Viewed · {seen} of {count} files")
         } else {
@@ -4017,7 +4211,7 @@ impl App {
             .min(files.len().saturating_sub(room));
         for (index, file) in files.iter().enumerate().skip(first).take(room) {
             let row = index + 1;
-            let viewed = self.notes.is_viewed(diff, index);
+            let viewed = self.viewed.contains(&index);
             let old = file.old_path.as_deref().filter(|old| *old != file.path());
             let has_note = self.notes.files.contains_key(file.path());
             let comments = self.draft_comments_in(file.path())
@@ -4237,7 +4431,7 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn a_line_inserted_above_an_edit_pairs_the_edit_with_its_old_line() {
         let diff = Diff::parse(SHIFTED.to_owned());
-        let split = Split::new(&diff, Layout::Split);
+        let split = Split::new(&diff, Layout::Split, &HashSet::new());
         let rows: Vec<(Option<&str>, Option<&str>)> = split
             .lines()
             .iter()
@@ -5167,7 +5361,7 @@ diff --git a/a.rs b/a.rs
             assert_eq!(app.left, limit - 4);
             draw(&mut app, 80, 12);
             assert_eq!(app.left, 0, "all lines fit after resize");
-            press(&mut app, KeyCode::Char('l'));
+            press(&mut app, KeyCode::Char('L'));
             assert_eq!(app.left, 0, "keys share the wheel limit");
         }
     }
@@ -5662,6 +5856,110 @@ rename to new.rs
         assert!(app.notes.is_viewed(&app.loaded.diff, 0));
         let screen = draw(&mut app, 100, 12);
         assert!(screen.contains(" ✓ M a.rs"), "{screen}");
+    }
+
+    fn on_file(app: &App) -> Option<String> {
+        app.current_file()
+            .map(|file| app.loaded.diff.files()[file].path().to_owned())
+    }
+
+    #[test]
+    fn h_folds_the_file_to_its_heading_and_l_opens_it() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        draw(&mut app, 80, 12);
+        let open = app.split.lines().len();
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.folded.contains("a.rs"));
+        assert!(app.split.lines().len() < open);
+        assert!(
+            app.split.lines()[app.cursor].folded,
+            "cursor rests on the heading"
+        );
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("▸ a.rs"), "{screen}");
+        assert!(
+            !screen.contains("✓ viewed"),
+            "folded isn't viewed: {screen}"
+        );
+        assert!(!screen.contains("old"), "{screen}");
+        assert!(screen.contains("two"), "{screen}");
+        // j moves from the folded heading into the next file.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(on_file(&app).as_deref(), Some("b.rs"));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+        press(&mut app, KeyCode::Char('l'));
+        assert!(app.folded.is_empty());
+        assert_eq!(app.split.lines().len(), open);
+        assert!(
+            app.split.lines()[app.cursor].is_content(),
+            "cursor on its first line"
+        );
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+        assert!(draw(&mut app, 80, 12).contains("old"));
+    }
+
+    #[test]
+    fn marking_a_file_viewed_folds_it_and_unmarking_opens_it() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.notes.is_viewed(&app.loaded.diff, 0));
+        assert!(app.folded.contains("a.rs"));
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("▸ a.rs +1 −1  ✓ viewed"), "{screen}");
+        // Opened again, it still says viewed.
+        press(&mut app, KeyCode::Char('l'));
+        let screen = draw(&mut app, 80, 12);
+        assert!(screen.contains("▎ a.rs +1 −1  ✓ viewed"), "{screen}");
+        assert!(screen.contains("old"), "{screen}");
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!app.notes.is_viewed(&app.loaded.diff, 0));
+        assert!(app.folded.is_empty());
+        assert!(!draw(&mut app, 80, 12).contains("✓ viewed"));
+        // From the overview too.
+        let mut app = reviewing(TWO_FILES);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.folded.contains("b.rs"));
+    }
+
+    #[test]
+    fn viewed_files_open_folded_and_opening_one_from_the_overview_unfolds_it() {
+        let mut first = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut first, KeyCode::Char('w'));
+        let draft = first.notes.to_json();
+        let options = Options {
+            margin: Margin {
+                draft,
+                overview_first: true,
+                ..Margin::default()
+            },
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(TWO_FILES), options);
+        assert!(app.folded.contains("a.rs"));
+        assert!(app.split.lines()[app.cursor].folded);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.folded.is_empty());
+        assert_eq!(on_file(&app).as_deref(), Some("a.rs"));
+    }
+
+    #[test]
+    fn a_folded_file_that_changes_on_reload_opens_again() {
+        let mut app = App::new(loaded(TWO_FILES), Options::default());
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.folded.len(), 2);
+        let changed = TWO_FILES.replace("+two", "+three");
+        app.finish(Done::Load {
+            result: Box::new(Ok(loaded(&changed))),
+            remember: None,
+            background: true,
+        });
+        assert!(app.folded.contains("a.rs"));
+        assert!(!app.folded.contains("b.rs"));
     }
 
     #[test]

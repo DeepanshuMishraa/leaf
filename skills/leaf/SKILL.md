@@ -98,7 +98,7 @@ Documents open in the pane the palette was called from. If that pane is busy (an
 
 **Reader:** `j/k` scroll, `space/b` screen, `ctrl+d/u` half, `←/→` page, `g/G` ends, `t` go to page, `f` find (`n/N`), `m` bookmark, `'` bookmarks, `i` original/painted images, `<`/`>` column width, `=` fit. Drag to select and copy, `@` ask the agent, `y` highlight, `1`–`6` color, `d` pen, `e` eraser, `v` move ink, `a` read aloud, `s` voice, `?` all keys, `q` quit.
 
-**Diff:** `j/k` move, `[`/`]` files, `f` file picker, `tab` overview, `V` select lines, `c` comment, `F` file note, `M` global note, `m` list comments, `w` viewed, `S` send review, `@` ask the agent, `ctrl+enter` send one comment now, `ctrl+g` post to GitHub, `i` split/inline, `o` other side, `r` reload, `?` keys.
+**Diff:** `j/k` move, `[`/`]` files, `h`/`l` fold/open a file, `f` file picker, `tab` overview, `V` select lines, `c` comment, `F` file note, `M` global note, `m` list comments, `w` viewed (and folded), `S` send review, `@` ask the agent, `ctrl+enter` send one comment now, `ctrl+g` post to GitHub, `i` split/inline, `o` other side, `r` reload, `?` keys.
 
 **Pull request:** `tab` or `1`–`5` for Summary, Timeline, Comments, Code, Checks. `m` merge, `a` approve, `c` comment, `]`/`[` pick a comment and `enter` to reply, `x` close/reopen, `r` ready/draft. On Checks, `enter` opens a job's log and `r` re-runs. `o` opens on GitHub, `q` returns to the list. In the list, `←/→` switch PRs and issues, `tab` switches open and done, `@` shows only assigned, `R` reloads. Needs `gh` signed in.
 
