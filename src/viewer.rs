@@ -4403,7 +4403,7 @@ mod tests {
         let md = "# Top heading that wraps in a narrow column\n\
                   ## Second\n### Third\n###### Sixth\n\n\
                   Body [**docs**](guide.md) and [[notes|Wiki]].\n\n\
-                  > [Quoted](#anchor)";
+                  > [Quoted](#anchor) and `snippet`";
         for enabled in [false, true] {
             let mut screen = Screen::new(
                 book(&[md]),
@@ -4415,15 +4415,16 @@ mod tests {
                 },
             );
             for (text, default, colorful) in [
-                ("Top", Color::LightBlue, Color::Yellow),
+                ("Top", Color::LightBlue, Color::LightMagenta),
                 ("Second", Color::LightBlue, Color::LightBlue),
-                ("Third", Color::LightBlue, Color::Magenta),
-                ("Sixth", Color::LightBlue, Color::Magenta),
+                ("Third", Color::LightBlue, Color::LightGreen),
+                ("Sixth", Color::LightBlue, Color::LightGreen),
                 ("Body", Color::Reset, Color::Reset),
                 ("docs", Color::Reset, Color::LightCyan),
                 ("Wiki", Color::Reset, Color::LightCyan),
                 ("guide.md", render::DIM, render::DIM),
                 ("Quoted", render::DIM, Color::LightCyan),
+                ("snippet", render::DIM, render::DIM),
             ] {
                 let position = screen.find(text);
                 let cell = &screen.terminal.backend().buffer()[position];

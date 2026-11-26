@@ -41,7 +41,11 @@ impl MarkdownColors {
 
     pub fn colorful(colors: Colors) -> Self {
         Self {
-            headings: [Color::Yellow, colors.heading_color(), Color::Magenta],
+            headings: [
+                colors.readable(|t| t.magenta, Color::Magenta, Color::LightMagenta),
+                colors.heading_color(),
+                colors.readable(|t| t.green, Color::Green, Color::LightGreen),
+            ],
             link: Some(if colors.light {
                 Color::Cyan
             } else {
@@ -1004,7 +1008,12 @@ impl Ctx<'_> {
         if kind.is_none() {
             for row in &mut self.laid.rows[body..] {
                 for seg in &mut row.segs {
-                    if self.colors.link.is_none() || seg.style.fg.is_none() {
+                    // Colored link labels stay colored; everything else is muted.
+                    if self
+                        .colors
+                        .link
+                        .is_none_or(|link| seg.style.fg != Some(link))
+                    {
                         seg.style = seg.style.fg(DIM);
                     }
                     seg.style = seg.style.add_modifier(Modifier::ITALIC);
@@ -1512,6 +1521,58 @@ mod tests {
                 assert_eq!(title.style.fg, Some(expected));
                 assert!(title.style.add_modifier.contains(Modifier::BOLD));
             }
+        }
+    }
+
+    #[test]
+    fn colorful_headings_take_readable_palette_colors() {
+        let theme = crate::theme::Theme {
+            background: [250; 3],
+            blue: [24, 62, 133],
+            red: [160, 35, 55],
+            green: [35, 146, 77],
+            accent: [100, 70, 140],
+            magenta: [120, 40, 140],
+        };
+        for (colors, expected) in [
+            (
+                Colors::DARK,
+                [Color::LightMagenta, Color::LightBlue, Color::LightGreen],
+            ),
+            (
+                Colors {
+                    theme: None,
+                    light: true,
+                },
+                [Color::Magenta, Color::Blue, Color::Green],
+            ),
+            (
+                Colors {
+                    theme: Some(theme),
+                    light: true,
+                },
+                [
+                    Color::Rgb(120, 40, 140),
+                    Color::Rgb(24, 62, 133),
+                    Color::Rgb(35, 146, 77),
+                ],
+            ),
+        ] {
+            let laid = layout_with_colors(
+                "## One\n\n### Two\n\n#### Three",
+                40,
+                (8, 16),
+                &no_images,
+                MarkdownColors::colorful(colors),
+            );
+            let fg: Vec<_> = laid
+                .rows
+                .iter()
+                .flat_map(|row| &row.segs)
+                .map(|seg| seg.style.fg)
+                .collect();
+            assert_eq!(fg, [expected[1], expected[2], expected[2]].map(Some));
+            assert_eq!(MarkdownColors::colorful(colors).headings, expected);
         }
     }
 

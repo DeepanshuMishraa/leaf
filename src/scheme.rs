@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
+use crate::mono::Rgb;
 use crate::rextheme;
 use crate::theme::{self, Theme};
 
@@ -37,19 +38,27 @@ impl Colors {
 
     /// Blue from the active palette, with ANSI colors when it is unknown.
     pub fn heading_color(self) -> Color {
+        self.readable(|theme| theme.blue, Color::Blue, Color::LightBlue)
+    }
+
+    /// A palette slot made readable on the background: mixed toward the text
+    /// color when it is as light (or dark) as the background. Without the
+    /// palette, the ANSI color for a light or a dark background.
+    pub fn readable(self, slot: fn(Theme) -> Rgb, on_light: Color, on_dark: Color) -> Color {
         match self.theme {
             Some(theme) => {
-                // The standard ANSI blue can be faint on a dark background.
-                let [r, g, b] = if theme::is_light(theme.blue) == self.light {
+                // A standard ANSI color can be faint on a background of its own lightness.
+                let color = slot(theme);
+                let [r, g, b] = if theme::is_light(color) == self.light {
                     let ink = if self.light { [0; 3] } else { [255; 3] };
-                    theme::mix(theme.blue, ink, 0.4)
+                    theme::mix(color, ink, 0.4)
                 } else {
-                    theme.blue
+                    color
                 };
                 Color::Rgb(r, g, b)
             }
-            None if self.light => Color::Blue,
-            None => Color::LightBlue,
+            None if self.light => on_light,
+            None => on_dark,
         }
     }
 }
