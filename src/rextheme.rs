@@ -140,18 +140,43 @@ fn shown_here() -> bool {
 
 /// A `rex` call's JSON output, or `None` when it fails or takes over a
 /// second, so a stuck Rex server can't hold up leaf's start. A call that
-/// overruns is left to finish on its own thread.
+/// overruns is killed, so none is left behind.
 #[cfg(target_os = "macos")]
 fn rex_json(args: &[&str]) -> Option<Value> {
-    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = send.send(crate::agent::rex_output(&args));
-    });
-    let text = receive
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .ok()?
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(crate::agent::rex_program().ok()?)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    // Read on another thread so a large reply can't fill the pipe and stall
+    // the child; the read ends once the child exits or is killed.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).ok().map(|_| text)
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let text = reader.join().ok()??;
+    if !status?.success() {
+        return None;
+    }
     serde_json::from_str(&text).ok()
 }
 
