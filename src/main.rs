@@ -4,6 +4,7 @@ mod aloud;
 mod art;
 mod article;
 mod board;
+mod boardkeys;
 mod boardsvg;
 mod boardview;
 mod browser;
@@ -48,12 +49,14 @@ mod picker;
 mod picture;
 mod place;
 mod planblocks;
+mod plankeys;
 mod planview;
 mod plugin;
 mod popover;
 mod pr;
 #[cfg(target_os = "macos")]
 mod prefs;
+mod prkeys;
 mod prmedia;
 mod progress;
 mod prview;
@@ -107,6 +110,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf voices              pick a voice from every voice there is
        leaf agents              pick the installed agent questions go to
        leaf ui [dither | classic | toggle]   show or switch the dithered look (classic: as before)
+       leaf config [path | check | keys]   where settings live, whether they read, every key and its action
        leaf version             print the installed version
        leaf upgrade [--check]   install the newest release (--check: only say if there is one)
        leaf sponsor             open leaf's sponsor page in the browser
@@ -366,11 +370,64 @@ fn export_board(path: &Path, to: &Path) -> ExitCode {
     }
 }
 
+/// `leaf config path` names the settings file, `check` reads it as leaf
+/// would, and `keys` prints every key table at its defaults, ready to copy.
+fn config_command(args: &[String]) -> ExitCode {
+    let path = config::default_path();
+    let shown = || {
+        path.as_ref().map_or_else(
+            || "no settings file: neither XDG_CONFIG_HOME nor HOME is set".to_owned(),
+            |path| path.display().to_string(),
+        )
+    };
+    match args {
+        [what] if what == "path" => {
+            println!("{}", shown());
+            ExitCode::SUCCESS
+        }
+        [what] if what == "check" => match config::load() {
+            Ok(_) if path.as_ref().is_some_and(|path| path.exists()) => {
+                println!("{} reads cleanly.", shown());
+                ExitCode::SUCCESS
+            }
+            Ok(_) => {
+                println!("{} doesn't exist, so leaf uses its defaults.", shown());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("leaf: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        [what] if what == "keys" => {
+            println!(
+                "# Every key table leaf reads from {}, with each action at its\n\
+                 # default keys. Copy the lines you want to change; actions left out\n\
+                 # keep these keys, and `action = []` unbinds one.\n",
+                shown()
+            );
+            print!("{}", config::KeysConfig::defaults_toml());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("Usage: leaf config path | check | keys");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn board_command(path: &Path) -> ExitCode {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!("leaf: the board needs a terminal to draw in. Run leaf board in one.");
         return ExitCode::from(2);
     }
+    let keys = match config::load() {
+        Ok(config) => config.keys.board,
+        Err(error) => {
+            eprintln!("leaf: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let board = match board::Board::load(path) {
         Ok(board) => board,
         Err(e) => {
@@ -386,7 +443,7 @@ fn board_command(path: &Path) -> ExitCode {
         eprintln!("leaf: {e}");
         return ExitCode::FAILURE;
     }
-    match boardview::run(path.to_owned(), board) {
+    match boardview::run(path.to_owned(), board, keys) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!(
@@ -467,6 +524,7 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
         "ui" => ui_command(rest),
+        "config" => config_command(rest),
         "board" | "whiteboard" => match rest {
             [] => match board::fresh_path(Path::new(".")) {
                 Ok(path) => board_command(&path),
@@ -863,7 +921,8 @@ fn open(first: &str) -> ExitCode {
         options.max_text_width = config.reader.max_width;
         options.colorful_markdown = config.reader.colorful_markdown;
         options.hide_link_urls = config.reader.hide_link_urls;
-        options.keys = config.keys.reader.clone();
+        options.keys = config.keys.clone();
+        options.outline_width = config.outline.width;
         options.picture_path = watch.as_ref().map(|_| source_path);
         options.watch = watch;
         options.start_viewport = viewport;
@@ -990,7 +1049,14 @@ fn pr_command(args: &[String]) -> ExitCode {
         }
     };
     std::thread::spawn(syntax::warm);
-    match prview::run(start, here, pr::current_branch()) {
+    let keys = match config::load() {
+        Ok(config) => config.keys,
+        Err(error) => {
+            eprintln!("leaf: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match prview::run(start, here, pr::current_branch(), keys) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("leaf: the terminal failed ({e}). Nothing was changed on GitHub after that.");
@@ -1258,7 +1324,8 @@ fn diff_options(
         failure: failure.clone(),
         tabs: false,
         layout: diffview::Layout::Split,
-        keys: config.keys.diff,
+        keys: config.keys,
+        outline_width: config.outline.width,
         margin: margin::diff_margin(key, failure.clone()),
     };
     match Store::open(&progress::default_path()) {
@@ -1274,6 +1341,10 @@ fn diff_options(
             options.store = Some(store);
         }
         Err(e) => *failure.borrow_mut() = Some(e.to_string()),
+    }
+    // `[diff] layout` wins over the layout last used.
+    if let Some(layout) = config.diff.layout {
+        options.layout = layout;
     }
     Ok(options)
 }

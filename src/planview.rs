@@ -16,10 +16,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Frame_, BorderType, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::KeysConfig;
+use crate::diffkeys::VerdictAction;
 use crate::doc::{WATCH_TICK, Watch};
 use crate::hue::Hue;
+use crate::keymap::Keymap;
 use crate::look::Look;
 use crate::planblocks::{self, Block};
+use crate::plankeys::{PlanAction, PlanNotesAction, PlanQuitAction};
 use crate::render::{self, DIM, Laid};
 use crate::review::{Notes, Outcome, PlanEdit, PlanNote, PlanTarget, Review, Verdict};
 
@@ -191,6 +195,8 @@ struct App {
     text_x: u16,
     save: SaveDraft,
     watch: Option<Watch>,
+    /// The keys it answers to, as `[keys.plan]` and its neighbours set them.
+    keys: KeysConfig,
 }
 
 impl App {
@@ -231,6 +237,7 @@ impl App {
             text_x: 0,
             save: plan.save,
             watch: plan.watch,
+            keys: KeysConfig::default(),
         };
         if let Some(previous) = plan.previous.as_deref() {
             let mut before: std::collections::HashMap<String, usize> =
@@ -958,7 +965,10 @@ impl App {
                 with.clone(),
             ),
             PlanEdit::Remove => {
-                self.toast = Some("a removal has no text to edit; x deletes it".into());
+                self.toast = Some(format!(
+                    "a removal has no text to edit; {} deletes it",
+                    self.keys.plan_notes.first(PlanNotesAction::Delete)
+                ));
                 return;
             }
         };
@@ -1173,18 +1183,21 @@ impl App {
     fn notes_key(&mut self, key: KeyEvent, selected: usize) {
         let listed = self.listed();
         let picked = listed.get(selected).copied();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => self.dialog = Dialog::None,
-            KeyCode::Char('j') | KeyCode::Down => {
+        let Some(action) = self.keys.plan_notes.actions(&key).first().copied() else {
+            return;
+        };
+        match action {
+            PlanNotesAction::Close => self.dialog = Dialog::None,
+            PlanNotesAction::Down => {
                 let selected = (selected + 1).min(listed.len().saturating_sub(1));
                 self.dialog = Dialog::Notes { selected };
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            PlanNotesAction::Up => {
                 self.dialog = Dialog::Notes {
                     selected: selected.saturating_sub(1),
                 };
             }
-            KeyCode::Enter => match picked {
+            PlanNotesAction::Open => match picked {
                 Some(Listed::Note(at)) => {
                     let block = block_of(&self.notes[at].target);
                     self.dialog = Dialog::None;
@@ -1196,7 +1209,7 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Char('e') => match picked {
+            PlanNotesAction::Edit => match picked {
                 Some(Listed::Note(at)) => self.edit_note(at),
                 Some(Listed::Global) => {
                     self.dialog = Dialog::None;
@@ -1204,7 +1217,7 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Char('x') | KeyCode::Char('d') => {
+            PlanNotesAction::Delete => {
                 if let Some(picked) = picked {
                     match picked {
                         Listed::Note(at) => self.delete_note(at),
@@ -1224,7 +1237,6 @@ impl App {
                     };
                 }
             }
-            _ => {}
         }
     }
 
@@ -1241,20 +1253,20 @@ impl App {
                 return;
             }
             Dialog::Verdict => {
-                match key.code {
-                    KeyCode::Char('a') => self.send(Verdict::Approve),
-                    KeyCode::Char('n') => self.send(Verdict::ApproveWithNotes),
-                    KeyCode::Char('c') | KeyCode::Char('r') => self.send(Verdict::RequestChanges),
-                    KeyCode::Esc | KeyCode::Char('q') => self.dialog = Dialog::None,
-                    _ => {}
+                match self.keys.verdict.actions(&key).first() {
+                    Some(VerdictAction::Approve) => self.send(Verdict::Approve),
+                    Some(VerdictAction::ApproveWithNotes) => self.send(Verdict::ApproveWithNotes),
+                    Some(VerdictAction::RequestChanges) => self.send(Verdict::RequestChanges),
+                    Some(VerdictAction::Cancel) => self.dialog = Dialog::None,
+                    None => {}
                 }
                 return;
             }
             Dialog::Quit => {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('q') => self.outcome = Some(Outcome::Closed),
-                    KeyCode::Char('S') => self.dialog = Dialog::Verdict,
-                    _ => self.dialog = Dialog::None,
+                match self.keys.plan_quit.actions(&key).first() {
+                    Some(PlanQuitAction::Quit) => self.outcome = Some(Outcome::Closed),
+                    Some(PlanQuitAction::SendReview) => self.dialog = Dialog::Verdict,
+                    None => self.dialog = Dialog::None,
                 }
                 return;
             }
@@ -1262,55 +1274,58 @@ impl App {
             Dialog::None => {}
         }
         self.toast = None;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(action) = self.keys.plan.actions(&key).first().copied() else {
+            return;
+        };
         let block = match self.focus {
             Focus::Block(block) => Some(block),
             Focus::Global => None,
         };
         // Moving by lines extends a visual selection and lets go of any other;
         // jumping lets go of both.
+        use PlanAction as A;
         let moves_line = matches!(
-            key.code,
-            KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
-        ) || (ctrl && matches!(key.code, KeyCode::Char('d' | 'u')));
+            action,
+            A::Down | A::Up | A::HalfScreenDown | A::HalfScreenUp
+        );
         let jumps = matches!(
-            key.code,
-            KeyCode::Char('J' | 'K' | 'g' | 'G' | '[' | ']' | '{' | '}' | 'D')
-                | KeyCode::Home
-                | KeyCode::End
+            action,
+            A::NextNoted
+                | A::PreviousNoted
+                | A::First
+                | A::Last
+                | A::NextBlock
+                | A::PreviousBlock
+                | A::NextChange
         );
         if jumps || (moves_line && self.visual.is_none()) {
             self.clear_selection();
         }
         let half = (self.view_height / 2).max(1) as isize;
-        match key.code {
-            KeyCode::Esc if self.selection.is_some() || self.visual.is_some() => {
+        match action {
+            A::Escape if self.selection.is_some() || self.visual.is_some() => {
                 self.clear_selection()
             }
-            KeyCode::Char('c') if ctrl => self.outcome = Some(Outcome::Closed),
-            KeyCode::Char('j') | KeyCode::Down => self.move_line(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_line(-1),
-            KeyCode::Char(']' | '}') => self.step(1),
-            KeyCode::Char('[' | '{') => self.step(-1),
-            KeyCode::Char('J') => self.step_noted(true),
-            KeyCode::Char('K') => self.step_noted(false),
-            KeyCode::Char('d') if ctrl => self.move_line(half),
-            KeyCode::Char('u') if ctrl => self.move_line(-half),
-            KeyCode::Char('V' | 'v') => self.toggle_visual(),
-            KeyCode::Char('B') => self.compose_block_comment(),
-            KeyCode::Char(' ') | KeyCode::PageDown => {
-                self.scroll_by(self.view_height.saturating_sub(2) as isize)
-            }
-            KeyCode::Char('b') | KeyCode::PageUp => {
-                self.scroll_by(-(self.view_height.saturating_sub(2) as isize))
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.set_focus_index(-1),
-            KeyCode::Char('G') | KeyCode::End => self.set_focus_index(self.blocks.len() as isize),
-            KeyCode::Char('c') | KeyCode::Enter => self.compose_comment(),
-            KeyCode::Char('C') => self.compose_global(),
-            KeyCode::Char('x') => self.remove_here(),
-            KeyCode::Char('r') => self.compose_replace(),
-            KeyCode::Char('X') => match block {
+            A::QuitNow => self.outcome = Some(Outcome::Closed),
+            A::Down => self.move_line(1),
+            A::Up => self.move_line(-1),
+            A::NextBlock => self.step(1),
+            A::PreviousBlock => self.step(-1),
+            A::NextNoted => self.step_noted(true),
+            A::PreviousNoted => self.step_noted(false),
+            A::HalfScreenDown => self.move_line(half),
+            A::HalfScreenUp => self.move_line(-half),
+            A::Select => self.toggle_visual(),
+            A::BlockComment => self.compose_block_comment(),
+            A::ScreenDown => self.scroll_by(self.view_height.saturating_sub(2) as isize),
+            A::ScreenUp => self.scroll_by(-(self.view_height.saturating_sub(2) as isize)),
+            A::First => self.set_focus_index(-1),
+            A::Last => self.set_focus_index(self.blocks.len() as isize),
+            A::Comment => self.compose_comment(),
+            A::GlobalNote => self.compose_global(),
+            A::Remove => self.remove_here(),
+            A::Replace => self.compose_replace(),
+            A::Clear => match block {
                 Some(block) => self.clear_block(block),
                 None => {
                     self.global = None;
@@ -1318,27 +1333,26 @@ impl App {
                     self.persist();
                 }
             },
-            KeyCode::Char('D') => {
+            A::NextChange => {
                 self.selection = None;
                 self.next_change()
             }
-            KeyCode::Char('L') => {
+            A::Notes => {
                 if self.note_count() == 0 {
                     self.toast = Some("no notes yet".into());
                 } else {
                     self.dialog = Dialog::Notes { selected: 0 };
                 }
             }
-            KeyCode::Char('S') => self.dialog = Dialog::Verdict,
-            KeyCode::Char('?') => self.dialog = Dialog::Help,
-            KeyCode::Char('q') | KeyCode::Esc => {
+            A::SendReview => self.dialog = Dialog::Verdict,
+            A::Help => self.dialog = Dialog::Help,
+            A::Quit | A::Escape => {
                 if self.note_count() > 0 {
                     self.dialog = Dialog::Quit;
                 } else {
                     self.outcome = Some(Outcome::Closed);
                 }
             }
-            _ => {}
         }
     }
 
@@ -1430,7 +1444,13 @@ impl App {
                     self.selection = None;
                 }
                 if self.selection.is_some() {
-                    self.toast = Some("selected · c comment · x remove · r replace".into());
+                    let keys = &self.keys.plan;
+                    self.toast = Some(format!(
+                        "selected · {} comment · {} remove · {} replace",
+                        keys.first(PlanAction::Comment),
+                        keys.first(PlanAction::Remove),
+                        keys.first(PlanAction::Replace),
+                    ));
                 }
             }
             _ => {}
@@ -1522,7 +1542,7 @@ impl App {
         self.draw_footer(f, footer);
         match self.dialog {
             Dialog::None => {}
-            Dialog::Help => draw_help(f, area),
+            Dialog::Help => draw_help(f, area, &self.keys.plan),
             Dialog::Verdict => self.draw_verdict(f, area),
             Dialog::Quit => self.draw_quit(f, area),
             Dialog::Notes { selected } => self.draw_notes(f, area, selected),
@@ -1567,8 +1587,15 @@ impl App {
             lines.push(Line::from(Span::styled(clip(&text, width), style)));
         }
         lines.push(Line::from(""));
+        let keys = &self.keys.plan_notes;
         lines.push(Line::from(Span::styled(
-            "enter go to · e edit · x delete · esc close",
+            format!(
+                "{} go to · {} edit · {} delete · {} close",
+                keys.first(PlanNotesAction::Open),
+                keys.first(PlanNotesAction::Edit),
+                keys.first(PlanNotesAction::Delete),
+                keys.first(PlanNotesAction::Close),
+            ),
             Style::default().fg(DIM),
         )));
         popup(f, area, lines, width as u16 + 4);
@@ -1587,7 +1614,10 @@ impl App {
                 0 => String::new(),
                 n => format!(" · {n} gone"),
             };
-            format!("{changed} changed{gone} · D next change ")
+            format!(
+                "{changed} changed{gone} · {} next change ",
+                self.keys.plan.first(PlanAction::NextChange)
+            )
         } else {
             format!("{} blocks ", self.blocks.len())
         };
@@ -1672,7 +1702,10 @@ impl App {
                         buf.set_string(
                             text_x + 11,
                             y,
-                            "· c adds a note on all of it",
+                            format!(
+                                "· {} adds a note on all of it",
+                                self.keys.plan.first(PlanAction::Comment)
+                            ),
                             Style::default().fg(DIM),
                         );
                     }
@@ -1867,17 +1900,29 @@ impl App {
             0 => "Send review".to_owned(),
             n => format!("Send review · {}", plural(n, "note")),
         };
-        let key = |k: &'static str| Span::styled(format!("  {k}  "), Style::default().fg(ACCENT));
+        let keys = &self.keys.verdict;
+        let key = |action| {
+            Span::styled(
+                format!("  {}  ", keys.first(action)),
+                Style::default().fg(ACCENT),
+            )
+        };
         let changes = if count == 0 {
             Line::from(vec![
-                Span::styled("  c  ", Style::default().fg(DIM)),
+                Span::styled(
+                    format!("  {}  ", keys.first(VerdictAction::RequestChanges)),
+                    Style::default().fg(DIM),
+                ),
                 Span::styled(
                     "Request changes (add a note first)",
                     Style::default().fg(DIM),
                 ),
             ])
         } else {
-            Line::from(vec![key("c"), Span::raw("Request changes")])
+            Line::from(vec![
+                key(VerdictAction::RequestChanges),
+                Span::raw("Request changes"),
+            ])
         };
         let approve = if count == 0 {
             "Approve"
@@ -1890,11 +1935,11 @@ impl App {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(vec![key("a"), Span::raw(approve)]),
+            Line::from(vec![key(VerdictAction::Approve), Span::raw(approve)]),
             changes,
             Line::from(""),
             Line::from(Span::styled(
-                "  esc  keep reviewing",
+                format!("  {}  keep reviewing", keys.first(VerdictAction::Cancel)),
                 Style::default().fg(DIM),
             )),
         ];
@@ -1902,16 +1947,25 @@ impl App {
     }
 
     fn draw_quit(&self, f: &mut Frame, area: Rect) {
-        let key = |k: &'static str| Span::styled(format!("  {k}  "), Style::default().fg(ACCENT));
+        let keys = &self.keys.plan_quit;
+        let key = |action| {
+            Span::styled(
+                format!("  {}  ", keys.first(action)),
+                Style::default().fg(ACCENT),
+            )
+        };
         let lines = vec![
             Line::from(Span::styled(
                 format!("{} not sent", plural(self.note_count(), "note")),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(vec![key("S"), Span::raw("Send the review")]),
             Line::from(vec![
-                key("q"),
+                key(PlanQuitAction::SendReview),
+                Span::raw("Send the review"),
+            ]),
+            Line::from(vec![
+                key(PlanQuitAction::Quit),
                 Span::raw("Quit; they're kept for next time"),
             ]),
             Line::from(""),
@@ -2099,37 +2153,98 @@ fn popup(f: &mut Frame, area: Rect, lines: Vec<Line>, width: u16) {
     );
 }
 
-const KEYS: &[(&str, &str)] = &[
-    ("j/k ↓/↑", "next or previous line"),
-    ("] [  } {", "next or previous block"),
-    ("J/K", "next or previous block with notes"),
-    ("g/G", "global note, last block"),
-    ("ctrl+d/u", "half a screen down or up"),
-    ("space/b", "a screen down or up"),
-    ("V, v", "select lines; j/k extend, esc clears"),
-    ("c, enter", "comment on the line or the selection"),
-    ("B", "comment on the whole block"),
-    (
-        "x",
-        "remove the selection, or mark the block (again: keep it)",
-    ),
-    ("r", "replace the selection or the block with your text"),
-    ("C", "global note on the whole plan"),
-    ("X", "clear the block's notes"),
-    ("L", "notes on blocks: go to, edit or delete one"),
-    ("D", "next block that changed since the last round (+)"),
-    ("drag", "select a passage; c, x and r then act on it"),
-    ("S", "send the review with a verdict"),
-    ("q", "quit"),
-];
-
-fn draw_help(f: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = KEYS
+/// The keys as `[keys.plan]` binds them, so a rebound key shows here too.
+fn draw_help(f: &mut Frame, area: Rect, keymap: &Keymap<PlanAction>) {
+    use PlanAction as A;
+    let keys = |actions: &[PlanAction]| keymap.labels(actions);
+    let rows = [
+        (keys(&[A::Down, A::Up]), "next or previous line".to_owned()),
+        (
+            keys(&[A::NextBlock, A::PreviousBlock]),
+            "next or previous block".to_owned(),
+        ),
+        (
+            keys(&[A::NextNoted, A::PreviousNoted]),
+            "next or previous block with notes".to_owned(),
+        ),
+        (
+            keys(&[A::First, A::Last]),
+            "global note, last block".to_owned(),
+        ),
+        (
+            keys(&[A::HalfScreenDown, A::HalfScreenUp]),
+            "half a screen down or up".to_owned(),
+        ),
+        (
+            keys(&[A::ScreenDown, A::ScreenUp]),
+            "a screen down or up".to_owned(),
+        ),
+        (
+            keys(&[A::Select]),
+            format!(
+                "select lines; {} extend, {} clears",
+                keymap.pair(A::Down, A::Up),
+                keymap.first(A::Escape)
+            ),
+        ),
+        (
+            keys(&[A::Comment]),
+            "comment on the line or the selection".to_owned(),
+        ),
+        (
+            keys(&[A::BlockComment]),
+            "comment on the whole block".to_owned(),
+        ),
+        (
+            keys(&[A::Remove]),
+            "remove the selection, or mark the block (again: keep it)".to_owned(),
+        ),
+        (
+            keys(&[A::Replace]),
+            "replace the selection or the block with your text".to_owned(),
+        ),
+        (
+            keys(&[A::GlobalNote]),
+            "global note on the whole plan".to_owned(),
+        ),
+        (keys(&[A::Clear]), "clear the block's notes".to_owned()),
+        (
+            keys(&[A::Notes]),
+            "notes on blocks: go to, edit or delete one".to_owned(),
+        ),
+        (
+            keys(&[A::NextChange]),
+            "next block that changed since the last round (+)".to_owned(),
+        ),
+        (
+            "drag".to_owned(),
+            format!(
+                "select a passage; {}, {} and {} then act on it",
+                keymap.first(A::Comment),
+                keymap.first(A::Remove),
+                keymap.first(A::Replace)
+            ),
+        ),
+        (
+            keys(&[A::SendReview]),
+            "send the review with a verdict".to_owned(),
+        ),
+        (keys(&[A::Quit, A::QuitNow]), "quit".to_owned()),
+    ];
+    let column = rows
         .iter()
+        .map(|(keys, _)| keys.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10);
+    let lines: Vec<Line> = rows
+        .into_iter()
+        // An action left with no key has nothing to show.
+        .filter(|(keys, _)| !keys.is_empty())
         .map(|(keys, what)| {
             Line::from(vec![
-                Span::styled(format!("{keys:>10}  "), Style::default().fg(ACCENT)),
-                Span::raw(*what),
+                Span::styled(format!("{keys:>column$}  "), Style::default().fg(ACCENT)),
+                Span::raw(what),
             ])
         })
         .collect();
@@ -2137,7 +2252,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 }
 
 /// Opens the plan for review and says how it was left.
-pub fn run(plan: Plan) -> io::Result<(Outcome, String)> {
+pub fn run(plan: Plan, keys: KeysConfig) -> io::Result<(Outcome, String)> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -2152,6 +2267,7 @@ pub fn run(plan: Plan) -> io::Result<(Outcome, String)> {
         SetTitle(&title)
     );
     let mut app = App::new(plan);
+    app.keys = keys;
     let result = setup.and_then(|_| event_loop(&mut app, &mut terminal));
     let _ = execute!(
         io::stdout(),
@@ -2526,6 +2642,17 @@ create table tokens (id int);
 
     fn press(app: &mut App, code: KeyCode) {
         app.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_rebound_key_acts_and_the_old_one_lets_go() {
+        let mut app = app();
+        let config: crate::config::Config = toml::from_str("[keys.plan]\nhelp = \"f1\"").unwrap();
+        app.keys = config.keys;
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.dialog, Dialog::None);
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.dialog, Dialog::Help);
     }
 
     fn type_text(app: &mut App, text: &str) {

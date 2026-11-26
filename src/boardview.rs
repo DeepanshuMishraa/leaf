@@ -36,9 +36,11 @@ use serde_json::{Value, json};
 use crate::board::{
     Board, Dash, Element, End, Fill, FillStyle, Frame, INK, Order, Pt, Shape, text_size,
 };
+use crate::boardkeys::BoardAction;
 use crate::boardsvg::{self, Overlay, Paint};
 use crate::doc::{LIVE_TICK, Watch};
 use crate::hue::Hue;
+use crate::keymap::Keymap;
 use crate::kitty::{self, Kitty};
 use crate::mono::Rgb;
 
@@ -96,19 +98,20 @@ impl Tool {
         Tool::Eraser,
     ];
 
-    fn key(self) -> char {
+    /// The action that takes this tool, whose keys `[keys.board]` sets.
+    fn action(self) -> BoardAction {
         match self {
-            Tool::Select => 'v',
-            Tool::Hand => 'h',
-            Tool::Rectangle => 'r',
-            Tool::Diamond => 'd',
-            Tool::Ellipse => 'o',
-            Tool::Arrow => 'a',
-            Tool::Line => 'l',
-            Tool::Pen => 'p',
-            Tool::Text => 't',
-            Tool::Frame => 'F',
-            Tool::Eraser => 'e',
+            Tool::Select => BoardAction::ToolSelect,
+            Tool::Hand => BoardAction::ToolHand,
+            Tool::Rectangle => BoardAction::ToolBox,
+            Tool::Diamond => BoardAction::ToolDiamond,
+            Tool::Ellipse => BoardAction::ToolEllipse,
+            Tool::Arrow => BoardAction::ToolArrow,
+            Tool::Line => BoardAction::ToolLine,
+            Tool::Pen => BoardAction::ToolPen,
+            Tool::Text => BoardAction::ToolText,
+            Tool::Frame => BoardAction::ToolFrame,
+            Tool::Eraser => BoardAction::ToolEraser,
         }
     }
 
@@ -128,8 +131,8 @@ impl Tool {
         }
     }
 
-    fn of_key(c: char) -> Option<Tool> {
-        Tool::ALL.into_iter().find(|tool| tool.key() == c)
+    fn of_action(action: BoardAction) -> Option<Tool> {
+        Tool::ALL.into_iter().find(|tool| tool.action() == action)
     }
 
     /// The shape a drag with this tool starts, if it draws one.
@@ -374,6 +377,8 @@ struct App {
     path: PathBuf,
     board: Board,
     watch: Watch,
+    /// The keys it answers to, as `[keys.board]` sets them.
+    keys: Keymap<BoardAction>,
     view: View,
     /// Whether the view has been fitted to the board yet; needs the screen size.
     placed: bool,
@@ -472,6 +477,7 @@ impl App {
         });
         App {
             watch: Watch::live(path.clone()),
+            keys: Keymap::default(),
             path,
             board,
             view: View {
@@ -1158,78 +1164,82 @@ impl App {
                 _ => {}
             },
             Mode::Help => self.mode = Mode::Board,
-            Mode::Board => self.board_key(key, ctrl),
+            Mode::Board => self.board_key(key),
         }
     }
 
-    fn board_key(&mut self, key: KeyEvent, ctrl: bool) {
+    fn board_key(&mut self, key: KeyEvent) {
         self.message = None;
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let step = if shift { 4.0 } else { 1.0 };
-        match key.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('y') if !ctrl => self.copy_selection(false),
-            KeyCode::Char('L') => self.toggle_lock(),
-            KeyCode::Char('x') if ctrl => self.copy_selection(true),
-            KeyCode::Char('v') if ctrl => self.paste_elements(self.clipboard.clone()),
-            KeyCode::Char('z') if ctrl => self.step(!shift),
-            KeyCode::Char('r' | 'y') if ctrl => self.step(false),
-            KeyCode::Char('a') if ctrl => self.select_all(),
-            KeyCode::Char('d') if ctrl => self.duplicate(),
-            KeyCode::Char('e') if ctrl => self.export(),
-            KeyCode::Char('g') if ctrl => self.group(shift),
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc => {
+        let Some(action) = self.keys.actions(&key).first().copied() else {
+            return;
+        };
+        if let Some(tool) = Tool::of_action(action) {
+            return self.pick(tool);
+        }
+        use BoardAction as A;
+        match action {
+            A::QuitNow | A::Quit => self.quit = true,
+            A::Copy => self.copy_selection(false),
+            A::Lock => self.toggle_lock(),
+            A::Cut => self.copy_selection(true),
+            A::Paste => self.paste_elements(self.clipboard.clone()),
+            A::Undo => self.step(true),
+            A::Redo => self.step(false),
+            A::SelectAll => self.select_all(),
+            A::Duplicate => self.duplicate(),
+            A::Export => self.export(),
+            A::Group => self.group(false),
+            A::Ungroup => self.group(true),
+            A::Escape => {
                 self.selected.clear();
                 self.tool = Tool::Select;
             }
-            KeyCode::Char('u') => self.step(true),
-            KeyCode::Char('U') => self.step(false),
-            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => self.delete_selected(),
-            KeyCode::Char('0') => self.recolor(None),
-            KeyCode::Char(c @ '1'..='6') => self.recolor(Hue::of_key(c)),
-            KeyCode::Char('@' | 'c') => self.mode = Mode::Asking(String::new()),
-            KeyCode::Char('f') => {
+            A::Delete => self.delete_selected(),
+            A::NoColor => self.recolor(None),
+            A::Color1 | A::Color2 | A::Color3 | A::Color4 | A::Color5 | A::Color6 => {
+                self.recolor(action.hue())
+            }
+            A::Ask => self.mode = Mode::Asking(String::new()),
+            A::Fit => {
                 if self.movable() {
                     self.fit();
                 }
             }
-            KeyCode::Char('z') => {
+            A::ScrollMode => {
                 self.scroll = match self.scroll {
                     Scroll::Pan => Scroll::Zoom,
                     Scroll::Zoom => Scroll::Pan,
                 };
+                let key = self.keys.first(A::ScrollMode);
                 self.message = Some(match self.scroll {
-                    Scroll::Zoom => "Scrolling zooms; shift+scroll pans · z to pan again".into(),
-                    Scroll::Pan => "Scrolling pans · z to zoom by scrolling".into(),
+                    Scroll::Zoom => {
+                        format!("Scrolling zooms; shift+scroll pans · {key} to pan again")
+                    }
+                    Scroll::Pan => format!("Scrolling pans · {key} to zoom by scrolling"),
                 });
             }
-            KeyCode::Char('+' | '=') => self.zoom_middle(1.25),
-            KeyCode::Char('-') => self.zoom_middle(0.8),
-            KeyCode::Char('b') => self.cycle_fill(),
-            KeyCode::Char('B') => self.cycle_background(),
-            KeyCode::Tab | KeyCode::BackTab => {
-                let back = key.code == KeyCode::BackTab || shift;
-                let n = Tool::ALL.len();
-                let at = Tool::ALL.iter().position(|t| *t == self.tool).unwrap_or(0);
-                self.pick(Tool::ALL[if back { (at + n - 1) % n } else { (at + 1) % n }]);
-            }
-            KeyCode::Char('s') => self.cycle_dash(),
-            KeyCode::Char('w') => self.cycle_stroke(),
-            KeyCode::Char('k') => self.cycle_roughness(),
-            KeyCode::Char('n') => self.cycle_font(),
-            KeyCode::Char('>') => self.resize_text(1.25),
-            KeyCode::Char('<') => self.resize_text(0.8),
-            KeyCode::Char('m') => self.cycle_heads(),
-            KeyCode::Char(']') => self.reorder(Order::Forward),
-            KeyCode::Char('[') => self.reorder(Order::Backward),
-            KeyCode::Char('}') => self.reorder(Order::Front),
-            KeyCode::Char('{') => self.reorder(Order::Back),
-            KeyCode::Char('D') => self.duplicate(),
-            KeyCode::Char('g') => self.group(false),
-            KeyCode::Char('G') => self.group(true),
-            KeyCode::Char('E') => self.export(),
-            KeyCode::Char('i') => {
+            A::ZoomIn => self.zoom_middle(1.25),
+            A::ZoomOut => self.zoom_middle(0.8),
+            A::ZoomInStep => self.zoom_middle(1.1),
+            A::ZoomOutStep => self.zoom_middle(1.0 / 1.1),
+            A::Fill => self.cycle_fill(),
+            A::Background => self.cycle_background(),
+            A::NextTool => self.step_tool(false),
+            A::PreviousTool => self.step_tool(true),
+            A::Dash => self.cycle_dash(),
+            A::StrokeWidth => self.cycle_stroke(),
+            A::Roughness => self.cycle_roughness(),
+            A::Font => self.cycle_font(),
+            A::TextBigger => self.resize_text(1.25),
+            A::TextSmaller => self.resize_text(0.8),
+            A::Arrowheads => self.cycle_heads(),
+            A::Forward => self.reorder(Order::Forward),
+            A::Backward => self.reorder(Order::Backward),
+            A::Front => self.reorder(Order::Front),
+            A::Back => self.reorder(Order::Back),
+            A::Dots => {
                 if self.pixels.is_some() {
                     self.dots = !self.dots;
                     self.reset_pixels();
@@ -1239,8 +1249,8 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Enter => {
+            A::Help => self.mode = Mode::Help,
+            A::Edit => {
                 if let [id] = self.selected.as_slice()
                     && let Some(index) = self.board.find(id)
                 {
@@ -1251,15 +1261,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.zoom_middle(1.1),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.zoom_middle(1.0 / 1.1);
-            }
-            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
-                let (dx, dy) = match key.code {
-                    KeyCode::Left => (-1.0, 0.0),
-                    KeyCode::Right => (1.0, 0.0),
-                    KeyCode::Up => (0.0, -1.0),
+            A::MoveLeft | A::MoveRight | A::MoveUp | A::MoveDown => {
+                let (dx, dy) = match action {
+                    A::MoveLeft => (-1.0, 0.0),
+                    A::MoveRight => (1.0, 0.0),
+                    A::MoveUp => (0.0, -1.0),
                     _ => (0.0, 1.0),
                 };
                 if self.selected.is_empty() {
@@ -1268,12 +1274,18 @@ impl App {
                     self.nudge(dx * self.view.scale * step, dy * self.view.row() * step);
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(tool) = Tool::of_key(c) {
-                    self.pick(tool);
-                }
-            }
-            _ => {}
+            // Picked above.
+            A::ToolSelect
+            | A::ToolHand
+            | A::ToolBox
+            | A::ToolDiamond
+            | A::ToolEllipse
+            | A::ToolArrow
+            | A::ToolLine
+            | A::ToolPen
+            | A::ToolText
+            | A::ToolFrame
+            | A::ToolEraser => {}
         }
     }
 
@@ -1498,7 +1510,18 @@ impl App {
 
     fn pick(&mut self, tool: Tool) {
         self.tool = tool;
-        self.message = Some(format!("{} ({})", tool.name(), tool.key()));
+        self.message = Some(format!(
+            "{} ({})",
+            tool.name(),
+            self.keys.first(tool.action())
+        ));
+    }
+
+    /// The next tool along, or the one before.
+    fn step_tool(&mut self, back: bool) {
+        let n = Tool::ALL.len();
+        let at = Tool::ALL.iter().position(|t| *t == self.tool).unwrap_or(0);
+        self.pick(Tool::ALL[if back { (at + n - 1) % n } else { (at + 1) % n }]);
     }
 
     /// A double click edits text, writes inside a shape, or starts new text.
@@ -1939,7 +1962,7 @@ impl App {
         }
         self.draw_status(f, status);
         if matches!(self.mode, Mode::Help) {
-            draw_help(f, self.canvas);
+            draw_help(f, self.canvas, &self.keys);
         }
     }
 
@@ -1952,13 +1975,14 @@ impl App {
         let mut at = area.x;
         self.buttons.clear();
         for tool in Tool::ALL {
+            let key = self.keys.first(tool.action());
             let (label, style) = if tool == self.tool {
                 (
-                    format!(" {} {} ", tool.key(), tool.name()),
+                    format!(" {key} {} ", tool.name()),
                     Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
                 )
             } else {
-                (format!(" {}", tool.key()), dim)
+                (format!(" {key}"), dim)
             };
             let width = label.chars().count() as u16;
             self.buttons.push((tool, at, at + width));
@@ -1989,15 +2013,33 @@ impl App {
             spans.push(Span::styled(text, dim));
             spans.push(Span::styled(format!(" {key}"), bold));
         };
-        style(Some(("●", ink_color)), ink.to_owned(), "1-6");
-        style(Some((swatch, bg_color)), format!("bg {bg}"), "B");
-        style(None, format!("fill {}", fill_name(self.fill_style)), "b");
-        style(None, self.dash.name().to_owned(), "s");
-        style(None, format!("{}px", self.stroke), "w");
+        let keys = &self.keys;
+        let colors = colors_label(keys);
+        style(Some(("●", ink_color)), ink.to_owned(), &colors);
+        style(
+            Some((swatch, bg_color)),
+            format!("bg {bg}"),
+            &keys.first(BoardAction::Background),
+        );
+        style(
+            None,
+            format!("fill {}", fill_name(self.fill_style)),
+            &keys.first(BoardAction::Fill),
+        );
+        style(
+            None,
+            self.dash.name().to_owned(),
+            &keys.first(BoardAction::Dash),
+        );
+        style(
+            None,
+            format!("{}px", self.stroke),
+            &keys.first(BoardAction::StrokeWidth),
+        );
         style(
             None,
             if self.locked { "locked" } else { "lock" }.to_owned(),
-            "L",
+            &keys.first(BoardAction::Lock),
         );
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -2347,14 +2389,22 @@ impl App {
             Mode::Help => Line::styled("Any key closes the keys.", dim),
             Mode::Board => match &self.message {
                 Some(message) => Line::raw(message.clone()),
-                None => Line::styled(
-                    format!(
-                        "drag to draw · double-click to write · 1-6 ink · B background · @ ask agent · ? keys · q quit   {} elements · {:.0}%",
-                        self.board.elements.len(),
-                        SCALE / self.view.scale * 100.0
-                    ),
-                    dim,
-                ),
+                None => {
+                    let keys = &self.keys;
+                    Line::styled(
+                        format!(
+                            "drag to draw · double-click to write · {} ink · {} background · {} ask agent · {} keys · {} quit   {} elements · {:.0}%",
+                            colors_label(keys),
+                            keys.first(BoardAction::Background),
+                            keys.first(BoardAction::Ask),
+                            keys.first(BoardAction::Help),
+                            keys.first(BoardAction::Quit),
+                            self.board.elements.len(),
+                            SCALE / self.view.scale * 100.0
+                        ),
+                        dim,
+                    )
+                }
             },
         };
         f.render_widget(Paragraph::new(line), area);
@@ -2581,59 +2631,140 @@ fn dashed(ctx: &mut Context, from: Pt, to: Pt, dash: f64, color: Color) {
     }
 }
 
-const KEYS: &[(&str, &str)] = &[
-    ("tab shift+tab", "next, previous tool"),
-    ("v h", "select, hand (pan)"),
-    ("r d o", "box, diamond, ellipse"),
-    ("a l p", "arrow, line, pen"),
-    ("t F e", "text, frame, eraser"),
-    ("drag", "draw; shift keeps it square or at 15°"),
-    ("double-click", "write text, or inside a shape"),
-    ("enter", "edit the selected text or shape's text"),
-    ("handles", "drag to resize (shift keeps shape), knob turns"),
-    ("1-6 0", "ink color, back to ink"),
-    ("B", "next background color: none, gray, 1-6 colors"),
-    ("b s w k", "fill, dashes, width, hand-drawn"),
-    ("m", "arrowhead"),
-    ("n < >", "font, smaller, bigger text"),
-    ("[ ] { }", "back, forward, to back, to front"),
-    ("g G", "group, ungroup"),
-    ("D ctrl+d", "duplicate"),
-    ("y ctrl+x v", "copy, cut, paste (also from excalidraw.com)"),
-    ("x del", "delete"),
-    ("u U", "undo, redo"),
-    ("arrows", "nudge the selection, or pan"),
-    (
-        "scroll",
-        "pan; ctrl/option+scroll, option+↑↓ or + - zoom; f fits",
-    ),
-    ("z", "scroll zooms instead of panning (for trackpads)"),
-    ("i", "pictures or dots"),
-    ("E", "export SVG and PNG beside the board"),
-    ("@ c", "ask the agent"),
-    ("paste a path", "drop a picture on the board"),
-    ("L", "lock the canvas: no panning or zooming"),
-    ("q ctrl+c", "quit"),
-];
+/// The color keys for a hint: `1-6` while they run in order, else each one.
+fn colors_label(keys: &Keymap<BoardAction>) -> String {
+    use BoardAction as A;
+    let colors = [
+        A::Color1,
+        A::Color2,
+        A::Color3,
+        A::Color4,
+        A::Color5,
+        A::Color6,
+    ];
+    let firsts: Vec<String> = colors.iter().map(|action| keys.first(*action)).collect();
+    if firsts
+        .iter()
+        .zip('1'..='6')
+        .all(|(key, n)| *key == n.to_string())
+    {
+        "1-6".to_owned()
+    } else {
+        keys.labels(&colors)
+    }
+}
 
-fn draw_help(f: &mut Screen, area: Rect) {
-    let width = 64.min(area.width);
-    let height = (KEYS.len() as u16 + 2).min(area.height);
+/// The keys as `[keys.board]` binds them, so a rebound key shows here too.
+fn help_rows(keys: &Keymap<BoardAction>) -> Vec<(String, String)> {
+    use BoardAction as A;
+    let k = |actions: &[BoardAction]| keys.labels(actions);
+    let row = |keys: String, what: &str| (keys, what.to_owned());
+    let rows = vec![
+        row(k(&[A::NextTool, A::PreviousTool]), "next, previous tool"),
+        row(k(&[A::ToolSelect, A::ToolHand]), "select, hand (pan)"),
+        row(
+            k(&[A::ToolBox, A::ToolDiamond, A::ToolEllipse]),
+            "box, diamond, ellipse",
+        ),
+        row(
+            k(&[A::ToolArrow, A::ToolLine, A::ToolPen]),
+            "arrow, line, pen",
+        ),
+        row(
+            k(&[A::ToolText, A::ToolFrame, A::ToolEraser]),
+            "text, frame, eraser",
+        ),
+        row("drag".to_owned(), "draw; shift keeps it square or at 15°"),
+        row("double-click".to_owned(), "write text, or inside a shape"),
+        row(k(&[A::Edit]), "edit the selected text or shape's text"),
+        row(
+            "handles".to_owned(),
+            "drag to resize (shift keeps shape), knob turns",
+        ),
+        row(
+            format!("{} {}", colors_label(keys), keys.label(A::NoColor)),
+            "ink color, back to ink",
+        ),
+        row(
+            k(&[A::Background]),
+            "next background color: none, gray, 1-6 colors",
+        ),
+        row(
+            k(&[A::Fill, A::Dash, A::StrokeWidth, A::Roughness]),
+            "fill, dashes, width, hand-drawn",
+        ),
+        row(k(&[A::Arrowheads]), "arrowhead"),
+        row(
+            k(&[A::Font, A::TextSmaller, A::TextBigger]),
+            "font, smaller, bigger text",
+        ),
+        row(
+            k(&[A::Backward, A::Forward, A::Back, A::Front]),
+            "back, forward, to back, to front",
+        ),
+        row(k(&[A::Group, A::Ungroup]), "group, ungroup"),
+        row(k(&[A::Duplicate, A::SelectAll]), "duplicate, select all"),
+        row(
+            k(&[A::Copy, A::Cut, A::Paste]),
+            "copy, cut, paste (also from excalidraw.com)",
+        ),
+        row(k(&[A::Delete]), "delete"),
+        row(k(&[A::Undo, A::Redo]), "undo, redo"),
+        row(
+            k(&[A::MoveLeft, A::MoveRight, A::MoveUp, A::MoveDown]),
+            "nudge the selection, or pan",
+        ),
+        (
+            "scroll".to_owned(),
+            format!(
+                "pan; ctrl/option+scroll, {} or {} zoom; {} fits",
+                k(&[A::ZoomInStep, A::ZoomOutStep]),
+                k(&[A::ZoomIn, A::ZoomOut]),
+                keys.first(A::Fit)
+            ),
+        ),
+        row(
+            k(&[A::ScrollMode]),
+            "scroll zooms instead of panning (for trackpads)",
+        ),
+        row(k(&[A::Dots]), "pictures or dots"),
+        row(k(&[A::Export]), "export SVG and PNG beside the board"),
+        row(k(&[A::Ask]), "ask the agent"),
+        row("paste a path".to_owned(), "drop a picture on the board"),
+        row(k(&[A::Lock]), "lock the canvas: no panning or zooming"),
+        row(k(&[A::Quit, A::QuitNow]), "quit"),
+    ];
+    // An action left with no key has nothing to show.
+    rows.into_iter()
+        .filter(|(keys, _)| !keys.trim().is_empty())
+        .collect()
+}
+
+fn draw_help(f: &mut Screen, area: Rect, keys: &Keymap<BoardAction>) {
+    let rows = help_rows(keys);
+    let column = rows
+        .iter()
+        .map(|(keys, _)| keys.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(13);
+    let width = (column as u16 + 51).min(area.width);
+    let height = (rows.len() as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
         width,
         height,
     };
-    let lines: Vec<Line> = KEYS
-        .iter()
+    let lines: Vec<Line> = rows
+        .into_iter()
         .map(|(keys, what)| {
             Line::from(vec![
                 Span::styled(
-                    format!("{keys:>13}  "),
+                    format!("{keys:>column$}  "),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(*what),
+                Span::raw(what),
             ])
         })
         .collect();
@@ -2744,7 +2875,7 @@ fn query_paint() -> Paint {
 }
 
 /// Opens the board at `path` until it's closed. Changes are already saved.
-pub fn run(path: PathBuf, board: Board) -> io::Result<()> {
+pub fn run(path: PathBuf, board: Board, keys: Keymap<BoardAction>) -> io::Result<()> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
@@ -2785,6 +2916,7 @@ pub fn run(path: PathBuf, board: Board) -> io::Result<()> {
             .map_err(|e| e.to_string())
     });
     let mut app = App::new(path, board, paint, pixels, send);
+    app.keys = keys;
     let result = setup.and_then(|()| event_loop(&mut app, &mut terminal));
     if let Some(Pixels {
         kitty: Some(kitty), ..
@@ -2961,6 +3093,22 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_rebound_tool_key_picks_the_tool_and_shows_in_the_toolbar() {
+        let path =
+            std::env::temp_dir().join(format!("leaf-keys-{}.excalidraw", std::process::id()));
+        let (mut app, _) = app(&path);
+        let config: crate::config::Config =
+            toml::from_str("[keys.board]\ntool_box = \"R\"").unwrap();
+        app.keys = config.keys.board;
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.tool, Tool::Select, "r no longer takes the box");
+        press(&mut app, KeyCode::Char('R'));
+        assert_eq!(app.tool, Tool::Rectangle);
+        assert_eq!(app.message.as_deref(), Some("box (R)"));
+        let _ = std::fs::remove_file(&path);
     }
 
     fn ctrl(app: &mut App, c: char) {

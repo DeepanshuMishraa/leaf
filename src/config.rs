@@ -3,29 +3,99 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::diffkeys::DiffAction;
-use crate::keymap::Keymap;
-use crate::readerkeys::ReaderAction;
+use crate::boardkeys::BoardAction;
+use crate::diffkeys::{CommentsAction, ConfirmAction, DiffAction, OverviewAction, VerdictAction};
+use crate::diffview::Layout;
+use crate::keymap::{self, Keymap};
+use crate::outline::{self, OutlineAction};
+use crate::plankeys::{PlanAction, PlanNotesAction, PlanQuitAction};
+use crate::prkeys::{PrAction, PrListAction};
+use crate::readerkeys::{BookmarksAction, InkAction, ReaderAction};
 
 pub const DEFAULT_MAX_WIDTH: u16 = 76;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub reader: ReaderConfig,
+    pub diff: DiffConfig,
+    pub outline: OutlineConfig,
     pub keys: KeysConfig,
 }
 
-/// `[keys.reader]` and `[keys.diff]`: each names an action and the key, or
-/// list of keys, that does it. Actions left out keep their default keys.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct KeysConfig {
-    pub reader: Keymap<ReaderAction>,
-    pub diff: Keymap<DiffAction>,
+pub struct DiffConfig {
+    /// The layout a diff opens in. Left out, it opens in the one last used;
+    /// `--inline` on the command line wins over either.
+    pub layout: Option<Layout>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutlineConfig {
+    /// The sidebar's width when it first opens, in columns.
+    pub width: u16,
+}
+
+impl Default for OutlineConfig {
+    fn default() -> Self {
+        Self {
+            width: outline::SIDEBAR_COLUMNS,
+        }
+    }
+}
+
+/// Declares `KeysConfig`: one `[keys.<view>]` table for each view's actions.
+macro_rules! keys_config {
+    ($($field:ident: $action:ty),+ $(,)?) => {
+        /// `[keys.<view>]`: each names an action and the key, or list of keys,
+        /// that does it. Actions left out keep their default keys.
+        #[derive(Debug, Default, Clone, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct KeysConfig {
+            $(pub $field: Keymap<$action>,)+
+        }
+
+        impl KeysConfig {
+            /// Every table with every action at its default keys: `leaf keys`.
+            pub fn defaults_toml() -> String {
+                [$(keymap::defaults_toml::<$action>()),+].join("\n")
+            }
+
+            /// The `[keys.<view>]` names, each with the field it fills.
+            #[cfg(test)]
+            fn views() -> Vec<(&'static str, &'static str)> {
+                vec![$((stringify!($field), <$action as keymap::Action>::VIEW)),+]
+            }
+
+            #[cfg(test)]
+            fn check_tables() {
+                $(keymap::check::<$action>();)+
+            }
+        }
+    };
+}
+
+keys_config! {
+    reader: ReaderAction,
+    ink: InkAction,
+    bookmarks: BookmarksAction,
+    outline: OutlineAction,
+    diff: DiffAction,
+    diff_comments: CommentsAction,
+    diff_overview: OverviewAction,
+    confirm_post: ConfirmAction,
+    verdict: VerdictAction,
+    plan: PlanAction,
+    plan_notes: PlanNotesAction,
+    plan_quit: PlanQuitAction,
+    board: BoardAction,
+    pr_list: PrListAction,
+    pr: PrAction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReaderConfig {
     pub max_width: u16,
@@ -50,7 +120,8 @@ pub struct ConfigFailed {
     pub cause: String,
 }
 
-fn default_path() -> Option<PathBuf> {
+/// Where `config.toml` is read from: `$XDG_CONFIG_HOME/leaf`, else `~/.config/leaf`.
+pub fn default_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
@@ -81,6 +152,14 @@ pub fn load() -> Result<Config, ConfigFailed> {
             "reader.max_width must be an integer from 1 through 65535".into(),
         ));
     }
+    if !(outline::SIDEBAR_MIN..=outline::SIDEBAR_MAX).contains(&config.outline.width) {
+        return Err(failed(format!(
+            "outline.width must be from {} through {} columns; it is {}",
+            outline::SIDEBAR_MIN,
+            outline::SIDEBAR_MAX,
+            config.outline.width
+        )));
+    }
     Ok(config)
 }
 
@@ -89,6 +168,32 @@ mod tests {
     use super::Config;
     use crate::diffkeys::DiffAction;
     use crate::readerkeys::ReaderAction;
+
+    #[test]
+    fn every_keys_table_is_named_for_its_field_and_sound() {
+        super::KeysConfig::check_tables();
+        for (field, view) in super::KeysConfig::views() {
+            assert_eq!(field, view);
+        }
+    }
+
+    #[test]
+    fn the_printed_defaults_read_back_as_the_defaults() {
+        let printed = super::KeysConfig::defaults_toml();
+        let config: Config = toml::from_str(&printed).unwrap();
+        assert_eq!(config.keys.reader, Default::default());
+        assert_eq!(config.keys.board, Default::default());
+        assert_eq!(config.keys.pr, Default::default());
+    }
+
+    #[test]
+    fn minor_settings_read() {
+        let config: Config =
+            toml::from_str("[diff]\nlayout = \"inline\"\n\n[outline]\nwidth = 40").unwrap();
+        assert_eq!(config.diff.layout, Some(crate::diffview::Layout::Inline));
+        assert_eq!(config.outline.width, 40);
+        assert!(toml::from_str::<Config>("[diff]\nlayout = \"sideways\"").is_err());
+    }
 
     #[test]
     fn keys_rebind_per_view() {
@@ -107,10 +212,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("keys.reader.quit"), "{error}");
-        let error = toml::from_str::<Config>("[keys.board]\nquit = \"q\"")
+        let error = toml::from_str::<Config>("[keys.browser]\nquit = \"q\"")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("board"), "{error}");
+        assert!(error.contains("browser"), "{error}");
     }
 
     #[test]

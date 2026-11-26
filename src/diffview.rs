@@ -29,15 +29,15 @@ use unicode_width::UnicodeWidthChar;
 use crate::agent;
 use crate::art;
 use crate::comment::{Anchor, Comment, Side, State};
+use crate::config::KeysConfig;
 use crate::diff::{self, Diff, File, Kind as RowKind, Loaded, Request};
-use crate::diffkeys::DiffAction;
+use crate::diffkeys::{CommentsAction, ConfirmAction, DiffAction, OverviewAction, VerdictAction};
 use crate::diffreview::{self, FileNotes, Margin, Reopen, SaveNotes, Sends};
 use crate::github;
-use crate::keymap::Keymap;
 use crate::linediff;
 use crate::look::Look;
 use crate::news::News;
-use crate::outline::{self, Ask, OpenOutline, OutlineForm};
+use crate::outline::{self, Ask, OpenOutline, OutlineAction, OutlineForm};
 use crate::progress::{SavedComment, Store, StoreFailed};
 use crate::remote;
 use crate::render::DIM;
@@ -160,13 +160,16 @@ pub struct Options {
     pub tabs: bool,
     pub layout: Layout,
     /// The keys the diff answers to, as `[keys.diff]` sets them.
-    pub keys: Keymap<DiffAction>,
+    pub keys: KeysConfig,
+    /// The outline sidebar's width when it first opens, as `[outline] width` sets it.
+    pub outline_width: u16,
     /// File and global notes, and where `S` sends the review.
     pub margin: Margin,
 }
 
 /// How changed lines are laid out; `i` switches between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// Old code on the left, new code on the right.
     #[default]
@@ -224,7 +227,8 @@ impl Default for Options {
             failure: Rc::new(RefCell::new(None)),
             tabs: false,
             layout: Layout::Split,
-            keys: Keymap::default(),
+            keys: KeysConfig::default(),
+            outline_width: outline::SIDEBAR_COLUMNS,
             margin: Margin::default(),
         }
     }
@@ -770,7 +774,7 @@ struct App {
     /// Where `quit` goes, for a pull request's Code tab.
     leave: Leave,
     tabs: bool,
-    keys: Keymap<DiffAction>,
+    keys: KeysConfig,
     layout: Layout,
     split: Split,
     /// The paths of the files shown as their heading alone.
@@ -875,7 +879,7 @@ impl App {
             sends: options.margin.sends,
             overview: None,
             outline: None,
-            outline_columns: outline::SIDEBAR_COLUMNS,
+            outline_columns: options.outline_width,
             note_editor: None,
             outcome: None,
             quit_armed: false,
@@ -1619,25 +1623,28 @@ impl App {
         if self.outline.is_some() && self.outline_key(key) {
             return;
         }
-        let actions = self.keys.actions(&key);
+        let done = self
+            .keys
+            .diff
+            .actions(&key)
+            .into_iter()
+            .find(|action| self.perform(*action));
         // `q` quits on the second press; any other key between starts over.
-        if !actions.contains(&DiffAction::Quit) {
+        if done != Some(DiffAction::Quit) {
             self.quit_armed = false;
         }
-        if actions.into_iter().any(|action| self.perform(action)) {
-            return;
-        }
-        if key.code == KeyCode::Esc {
-            // Escape drops whatever is highlighted before it quits.
-            if self.visual {
-                self.visual = false;
-                self.selection = None;
-            } else if self.selection.is_some() || self.focus.is_some() {
-                self.selection = None;
-                self.focus = None;
-            } else {
-                self.quit = true;
-            }
+    }
+
+    /// Drops whatever is highlighted before it quits.
+    fn escape(&mut self) {
+        if self.visual {
+            self.visual = false;
+            self.selection = None;
+        } else if self.selection.is_some() || self.focus.is_some() {
+            self.selection = None;
+            self.focus = None;
+        } else {
+            self.quit = true;
         }
     }
 
@@ -1664,6 +1671,7 @@ impl App {
             | DiffAction::TabChecks => return false,
             DiffAction::Quit => self.ask_quit(),
             DiffAction::QuitNow => self.quit = true,
+            DiffAction::Escape => self.escape(),
             DiffAction::FileNote => self.edit_file_note(None),
             DiffAction::GlobalNote => self.edit_global_note(),
             DiffAction::Viewed => self.toggle_viewed(None),
@@ -1728,9 +1736,13 @@ impl App {
             Some(DialogKind::Loading) => {}
             Some(DialogKind::Verdict) => self.verdict_key(key),
             Some(DialogKind::Help | DialogKind::Error) | None => {
-                let closes =
-                    self.keys.is(&key, DiffAction::Quit) || self.keys.is(&key, DiffAction::Help);
-                if closes || matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                let closes = self.keys.diff.actions(&key).into_iter().any(|action| {
+                    matches!(
+                        action,
+                        DiffAction::Quit | DiffAction::Help | DiffAction::Escape
+                    )
+                });
+                if closes || key.code == KeyCode::Enter {
                     self.dialog = Dialog::None;
                 }
             }
@@ -1748,27 +1760,30 @@ impl App {
     }
 
     fn comments_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => self.dialog = Dialog::None,
-            KeyCode::Down | KeyCode::Char('j') => {
+        let Some(action) = self.keys.diff_comments.actions(&key).first().copied() else {
+            return;
+        };
+        match action {
+            CommentsAction::Close => self.dialog = Dialog::None,
+            CommentsAction::Down => {
                 let last = self.comments.len().saturating_sub(1);
                 if let Dialog::Comments { selected } = &mut self.dialog {
                     *selected = (*selected + 1).min(last);
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            CommentsAction::Up => {
                 if let Dialog::Comments { selected } = &mut self.dialog {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            KeyCode::Enter => {
+            CommentsAction::Jump => {
                 if let Some((_, comment)) = self.selected_comment() {
                     let anchor = comment.anchor;
                     self.dialog = Dialog::None;
                     self.jump_to(&anchor);
                 }
             }
-            KeyCode::Char('d') => {
+            CommentsAction::Delete => {
                 if let Some((index, _)) = self.selected_comment() {
                     self.remove(index);
                     self.toast("Comment deleted");
@@ -1779,33 +1794,32 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('g') => {
+            CommentsAction::Github => {
                 if let Some((index, comment)) = self.selected_comment() {
                     self.dialog = Dialog::None;
                     self.comment_to_github(&comment, Some(index));
                 }
             }
-            KeyCode::Char('a') => {
+            CommentsAction::Agent => {
                 if let Some((index, comment)) = self.selected_comment() {
                     self.dialog = Dialog::None;
                     self.comment_to_agent(&comment, Some(index));
                 }
             }
-            KeyCode::Char('y') => {
+            CommentsAction::Copy => {
                 if let Some((_, comment)) = self.selected_comment() {
                     let text = self.anchor_payload(&comment.anchor, &comment.body);
                     self.copy = Some(text);
                     self.toast("Comment copied");
                 }
             }
-            _ => {}
         }
     }
 
     fn confirm_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.start_post(),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        match self.keys.confirm_post.actions(&key).first() {
+            Some(ConfirmAction::Yes) => self.start_post(),
+            Some(ConfirmAction::No) => {
                 if let Dialog::Confirm(confirm) = std::mem::replace(&mut self.dialog, Dialog::None)
                 {
                     self.composer = Some(confirm.composer);
@@ -2441,9 +2455,12 @@ impl App {
                 }
                 self.composer = Some(Composer::new(anchor, first, last, purpose));
             }
-            None => self.fail(
-                "That range has no code line to comment on. Move to a line that changed, then press C.",
-            ),
+            None => {
+                let key = self.keys.diff.first(DiffAction::Comment);
+                self.fail(format!(
+                    "That range has no code line to comment on. Move to a line that changed, then press {key}."
+                ))
+            }
         }
     }
 
@@ -2718,7 +2735,10 @@ impl App {
             self.copy = Some(payload(&self.loaded.diff, &anchor, first, last, ""));
             self.toast(format!("Copied {} {}", anchor.file, anchor.range_label()));
         } else {
-            self.fail("That range has no code line to copy. Move to a changed line, then press y.");
+            let key = self.keys.diff.first(DiffAction::Copy);
+            self.fail(format!(
+                "That range has no code line to copy. Move to a changed line, then press {key}."
+            ));
         }
     }
 
@@ -2949,19 +2969,31 @@ impl App {
                 "selected · "
             };
             let unit = if lines == 1 { "line" } else { "lines" };
-            left.push_str(&format!("  {mode}{lines} {unit} · c comment"));
+            let comment = self.keys.diff.first(DiffAction::Comment);
+            left.push_str(&format!("  {mode}{lines} {unit} · {comment} comment"));
         }
         let (added, removed) = totals(diff);
         let unsent = self.unsent();
+        let keys = &self.keys.diff;
+        let send = keys.first(DiffAction::SendReview);
         let review = if unsent > 0 {
-            format!("{unsent} unsent · S send   ")
+            format!("{unsent} unsent · {send} send   ")
         } else if self.sends == Sends::Return {
-            "tab files · S send   ".to_owned()
+            format!(
+                "{} files · {send} send   ",
+                keys.first(DiffAction::Overview)
+            )
         } else {
             String::new()
         };
         let stats = if self.tabs {
-            format!("{review}1 summary · 2 timeline · 3 comments · 5 checks   +{added} −{removed} ")
+            format!(
+                "{review}{} summary · {} timeline · {} comments · {} checks   +{added} −{removed} ",
+                keys.first(DiffAction::TabSummary),
+                keys.first(DiffAction::TabTimeline),
+                keys.first(DiffAction::TabComments),
+                keys.first(DiffAction::TabChecks),
+            )
         } else {
             format!("{review}+{added} −{removed} ")
         };
@@ -3603,8 +3635,17 @@ impl App {
             lines.truncate(max_rows);
         }
         lines.push(Line::from(""));
+        let keys = &self.keys.diff_comments;
         lines.push(Line::from(Span::styled(
-            "enter jump · a agent · g github · d delete · y copy · esc close",
+            format!(
+                "{} jump · {} agent · {} github · {} delete · {} copy · {} close",
+                keys.first(CommentsAction::Jump),
+                keys.first(CommentsAction::Agent),
+                keys.first(CommentsAction::Github),
+                keys.first(CommentsAction::Delete),
+                keys.first(CommentsAction::Copy),
+                keys.first(CommentsAction::Close),
+            ),
             Style::default().fg(DIM),
         )));
         panel(f, area, self.look.ink(), "comments", lines, width);
@@ -3644,9 +3685,15 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("y", Style::default().fg(ADDED_FG)),
+            Span::styled(
+                self.keys.confirm_post.first(ConfirmAction::Yes),
+                Style::default().fg(ADDED_FG),
+            ),
             Span::styled(" post    ", Style::default().fg(DIM)),
-            Span::styled("n", Style::default().fg(REMOVED_FG)),
+            Span::styled(
+                self.keys.confirm_post.first(ConfirmAction::No),
+                Style::default().fg(REMOVED_FG),
+            ),
             Span::styled(" back to editing", Style::default().fg(DIM)),
         ]));
         panel(f, area, self.look.ink(), "post to github", lines, width);
@@ -3843,7 +3890,8 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 /// The keys as `[keys.diff]` binds them, so a rebound key shows here too.
-fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, keymap: &Keymap<DiffAction>) {
+fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, all: &KeysConfig) {
+    let keymap = &all.diff;
     use DiffAction as A;
     let keys = |actions: &[DiffAction]| keymap.labels(actions);
     let rows = [
@@ -3868,7 +3916,8 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, keymap: &Keymap<D
             "outline of every file beside the diff, or over it",
         ),
         (
-            "< >".to_owned(),
+            all.outline
+                .labels(&[OutlineAction::Narrower, OutlineAction::Wider]),
             "outline open: narrow or widen its sidebar (or drag its edge)",
         ),
         (
@@ -3909,7 +3958,10 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, keymap: &Keymap<D
             "scroll sideways with keys, wheel or trackpad",
         ),
         (keys(&[A::ScrollReset]), "scroll back to the left edge"),
-        (keys(&[A::Help, A::Quit]), "this help, quit"),
+        (
+            keys(&[A::Help, A::Quit, A::QuitNow]),
+            "this help, quit, quit at once",
+        ),
     ];
     let column = rows
         .iter()
@@ -3930,7 +3982,10 @@ fn draw_help(f: &mut Frame, area: Rect, ink: Option<art::Ink>, keymap: &Keymap<D
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Comment, write, Enter saves the comment on that line.",
+        format!(
+            " {}, write, Enter saves the comment on that line.",
+            keymap.first(A::Comment)
+        ),
         Style::default().fg(DIM),
     )));
     lines.push(Line::from(Span::styled(
@@ -4020,7 +4075,9 @@ impl App {
                 self.toast("This diff has no files");
                 return;
             }
-            self.outline = Some(OpenOutline::new(outline::Outline::new(nodes)));
+            self.outline = Some(
+                OpenOutline::new(outline::Outline::new(nodes)).with_keys(self.keys.outline.clone()),
+            );
         }
         // Only the outline's own window can be open here: any other dialog
         // would have taken the key.
@@ -4236,7 +4293,9 @@ impl App {
             self.quit_armed = true;
             let notes = if unsent == 1 { "1 note" } else { "notes" };
             self.toast(format!(
-                "{notes} not sent yet: S sends the review, q again quits and keeps them"
+                "{notes} not sent yet: {} sends the review, {} again quits and keeps them",
+                self.keys.diff.first(DiffAction::SendReview),
+                self.keys.diff.first(DiffAction::Quit),
             ));
         } else {
             self.quit = true;
@@ -4266,33 +4325,37 @@ impl App {
             return;
         };
         let last = self.overview_rows() - 1;
-        if !matches!(key.code, KeyCode::Char('q')) {
+        let action = self.keys.diff_overview.actions(&key).first().copied();
+        if action != Some(OverviewAction::Quit) {
             self.quit_armed = false;
         }
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Char('j') | KeyCode::Down => self.overview = Some((selected + 1).min(last)),
-            KeyCode::Char('k') | KeyCode::Up => self.overview = Some(selected.saturating_sub(1)),
-            KeyCode::Char('g') | KeyCode::Home => self.overview = Some(0),
-            KeyCode::Char('G') | KeyCode::End => self.overview = Some(last),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => match self.overview_file() {
+        let Some(action) = action else {
+            return;
+        };
+        match action {
+            OverviewAction::QuitNow => self.quit = true,
+            OverviewAction::Down => self.overview = Some((selected + 1).min(last)),
+            OverviewAction::Up => self.overview = Some(selected.saturating_sub(1)),
+            OverviewAction::First => self.overview = Some(0),
+            OverviewAction::Last => self.overview = Some(last),
+            OverviewAction::Open => match self.overview_file() {
                 Some(file) => {
                     self.overview = None;
                     self.open_file(file);
                 }
                 None => self.edit_global_note(),
             },
-            KeyCode::Char('c') => match self.overview_file() {
+            OverviewAction::FileNote => match self.overview_file() {
                 Some(file) => self.edit_file_note(Some(file)),
                 None => self.edit_global_note(),
             },
-            KeyCode::Char('C') | KeyCode::Char('M') => self.edit_global_note(),
-            KeyCode::Char('w' | 'V') => {
+            OverviewAction::GlobalNote => self.edit_global_note(),
+            OverviewAction::Viewed => {
                 if let Some(file) = self.overview_file() {
                     self.toggle_viewed(Some(file));
                 }
             }
-            KeyCode::Char('x') => match self.overview_file() {
+            OverviewAction::DeleteNote => match self.overview_file() {
                 Some(file) => {
                     let path = self.loaded.diff.files()[file].path().to_owned();
                     if self.notes.files.remove(&path).is_some() {
@@ -4307,18 +4370,19 @@ impl App {
                     }
                 }
             },
-            KeyCode::Char('S') => self.open_verdict(),
-            KeyCode::Char('m') => self.show_comments(),
-            KeyCode::Char('?') => self.dialog = Dialog::Help,
-            KeyCode::Tab | KeyCode::Char('O') | KeyCode::Esc => {
+            OverviewAction::SendReview => self.open_verdict(),
+            OverviewAction::Comments => self.show_comments(),
+            OverviewAction::Help => self.dialog = Dialog::Help,
+            // A review opened from `leaf review` starts on the overview, so
+            // escape there asks to quit rather than show the diff.
+            OverviewAction::Close => {
                 if self.sends == Sends::Return && key.code == KeyCode::Esc {
                     self.ask_quit();
                 } else {
                     self.overview = None;
                 }
             }
-            KeyCode::Char('q') => self.ask_quit(),
-            _ => {}
+            OverviewAction::Quit => self.ask_quit(),
         }
     }
 
@@ -4418,12 +4482,12 @@ impl App {
     }
 
     fn verdict_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('a') => self.send_review(Verdict::Approve),
-            KeyCode::Char('n') => self.send_review(Verdict::ApproveWithNotes),
-            KeyCode::Char('c') | KeyCode::Char('r') => self.send_review(Verdict::RequestChanges),
-            KeyCode::Esc | KeyCode::Char('q') => self.dialog = Dialog::None,
-            _ => {}
+        match self.keys.verdict.actions(&key).first() {
+            Some(VerdictAction::Approve) => self.send_review(Verdict::Approve),
+            Some(VerdictAction::ApproveWithNotes) => self.send_review(Verdict::ApproveWithNotes),
+            Some(VerdictAction::RequestChanges) => self.send_review(Verdict::RequestChanges),
+            Some(VerdictAction::Cancel) => self.dialog = Dialog::None,
+            None => {}
         }
     }
 
@@ -4440,7 +4504,13 @@ impl App {
             &self.comments,
         );
         if asked == Verdict::RequestChanges && !review.has_notes() {
-            self.fail("Add a note first (C on lines, F on a file, M for the whole change), so the agent knows what to change.");
+            let keys = &self.keys.diff;
+            self.fail(format!(
+                "Add a note first ({} on lines, {} on a file, {} for the whole change), so the agent knows what to change.",
+                keys.first(DiffAction::Comment),
+                keys.first(DiffAction::FileNote),
+                keys.first(DiffAction::GlobalNote),
+            ));
             return;
         }
         let verdict = review.verdict(asked);
@@ -4526,7 +4596,10 @@ impl App {
                 "   Whole change  {}",
                 note.lines().next().unwrap_or_default()
             ),
-            None if selected == 0 => "   Whole change · c adds a note on all of it".to_owned(),
+            None if selected == 0 => format!(
+                "   Whole change · {} adds a note on all of it",
+                self.keys.diff_overview.first(OverviewAction::FileNote)
+            ),
             None => "   Whole change".to_owned(),
         };
         let global_style = if self.notes.global.is_some() {
@@ -4641,6 +4714,13 @@ impl App {
             Sends::Return => "the agent that asked",
             Sends::Agent => "the agent pane",
         };
+        let keys = &self.keys.verdict;
+        let key = |action| {
+            Span::styled(
+                format!(" {} ", keys.first(action)),
+                Style::default().fg(ACCENT),
+            )
+        };
         let lines = vec![
             Line::from(Span::styled(
                 format!("Send {notes} to {to}"),
@@ -4648,7 +4728,7 @@ impl App {
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled(" a ", Style::default().fg(ACCENT)),
+                key(VerdictAction::Approve),
                 Span::raw(if unsent > 0 {
                     "approve, with these notes"
                 } else {
@@ -4656,16 +4736,16 @@ impl App {
                 }),
             ]),
             Line::from(vec![
-                Span::styled(" n ", Style::default().fg(ACCENT)),
+                key(VerdictAction::ApproveWithNotes),
                 Span::raw("approve with notes"),
             ]),
             Line::from(vec![
-                Span::styled(" c ", Style::default().fg(ACCENT)),
+                key(VerdictAction::RequestChanges),
                 Span::raw("request changes"),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "esc keeps reviewing",
+                format!("{} keeps reviewing", keys.first(VerdictAction::Cancel)),
                 Style::default().fg(DIM),
             )),
         ];
@@ -4861,6 +4941,40 @@ diff --git a/a.rs b/a.rs
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         });
+    }
+
+    #[test]
+    fn rebound_keys_act_and_the_old_ones_let_go() {
+        let config: crate::config::Config =
+            toml::from_str("[keys.diff]\nlayout = \"x\"\nescape = \"e\"").unwrap();
+        let options = Options {
+            keys: config.keys,
+            ..Options::default()
+        };
+        let mut app = App::new(loaded(PATCH), options);
+        app.view = Rect::new(0, 1, 120, 20);
+        let before = app.layout;
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.layout, before, "i no longer switches the layout");
+        press(&mut app, KeyCode::Char('x'));
+        assert_ne!(app.layout, before);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.quit, "esc was given away");
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_key_between_two_qs_starts_the_quit_over() {
+        let mut app = app();
+        app.sends = Sends::Return;
+        app.notes.set_global("look again");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit_armed && !app.quit);
+        press(&mut app, KeyCode::Char('0'));
+        assert!(!app.quit_armed);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "the first q after another key only asks");
     }
 
     #[test]

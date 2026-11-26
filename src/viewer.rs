@@ -31,21 +31,21 @@ use crate::agent::{self, Agent, AgentFailed};
 use crate::aloud::{self, Backend, Cut, Narrator, Said, Spot, Status};
 use crate::art;
 use crate::article;
+use crate::config::KeysConfig;
 use crate::doc::{Doc, ImageRef, WATCH_TICK, Watch};
 use crate::edge;
 use crate::find::Query;
 use crate::follow::{self, Follow};
 use crate::highlight::{self, Highlight};
 use crate::hue::Hue;
-use crate::keymap::Keymap;
 use crate::kitty::{self, Kitty};
 use crate::look::Look;
 use crate::mono::{self, Rgb};
 use crate::news::News;
-use crate::outline::{self, Ask, OpenOutline, OutlineForm, Pinned};
+use crate::outline::{self, Ask, OpenOutline, OutlineAction, OutlineForm, Pinned};
 use crate::picture;
 use crate::progress::{Bookmark, ImageMode, Progress, Scroll};
-use crate::readerkeys::ReaderAction;
+use crate::readerkeys::{BookmarksAction, InkAction, ReaderAction};
 use crate::remote::{self, Command};
 use crate::render::{self, DIM, Laid};
 use crate::stroke::{self, Cells, Corner, FRAME_PAD, Point, Stroke, Trace};
@@ -398,7 +398,9 @@ pub struct ViewerOptions {
     pub colorful_markdown: bool,
     pub hide_link_urls: bool,
     /// The keys the reader answers to, as `[keys.reader]` sets them.
-    pub keys: Keymap<ReaderAction>,
+    pub keys: KeysConfig,
+    /// The outline sidebar's width when it first opens, as `[outline] width` sets it.
+    pub outline_width: u16,
     /// For paged documents, where reading resumes (1-based).
     pub start_page: Option<usize>,
     pub image_mode: ImageMode,
@@ -444,7 +446,8 @@ impl Default for ViewerOptions {
             max_text_width: crate::config::DEFAULT_MAX_WIDTH,
             colorful_markdown: false,
             hide_link_urls: false,
-            keys: Keymap::default(),
+            keys: KeysConfig::default(),
+            outline_width: outline::SIDEBAR_COLUMNS,
             start_page: None,
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
@@ -578,14 +581,6 @@ fn picked_voice(
         .min(ranked.len().saturating_sub(1))
 }
 
-/// The character a key types.
-fn typed(key: &KeyEvent) -> Option<char> {
-    match key.code {
-        KeyCode::Char(c) => Some(c),
-        _ => None,
-    }
-}
-
 fn char_width(c: char) -> u16 {
     c.width().unwrap_or(0) as u16
 }
@@ -661,7 +656,7 @@ impl App {
             reading_width: ReadingWidth::Columns(options.max_text_width),
             room: u16::MAX,
             screen_width: u16::MAX,
-            outline_columns: outline::SIDEBAR_COLUMNS,
+            outline_columns: options.outline_width,
             beside: 0,
             doc,
             options,
@@ -929,18 +924,31 @@ impl App {
 
     fn footer(&mut self) -> String {
         let mut footer = self.searched();
+        let keys = &self.options.keys;
+        let escape = keys.reader.first(ReaderAction::Escape);
         match self.tool {
             Tool::Select => {}
             Tool::Pen => {
-                footer = format!("{footer} · pen {} · e eraser · esc stop", self.hue.name())
-            }
-            Tool::Eraser => footer = format!("{footer} · eraser · d pen · esc stop"),
-            Tool::Move if self.picked.is_some() => {
                 footer = format!(
-                    "{footer} · drag or arrows move · corners or +/- resize · x delete · esc done"
+                    "{footer} · pen {} · {} eraser · {escape} stop",
+                    self.hue.name(),
+                    keys.reader.first(ReaderAction::Eraser)
                 )
             }
-            Tool::Move => footer = format!("{footer} · move: click ink to pick it · esc stop"),
+            Tool::Eraser => {
+                footer = format!(
+                    "{footer} · eraser · {} pen · {escape} stop",
+                    keys.reader.first(ReaderAction::Pen)
+                )
+            }
+            Tool::Move if self.picked.is_some() => {
+                footer = format!(
+                    "{footer} · drag or arrows move · corners or {} resize · {} delete · {escape} done",
+                    keys.ink.pair(InkAction::Grow, InkAction::Shrink),
+                    keys.ink.first(InkAction::Delete)
+                )
+            }
+            Tool::Move => footer = format!("{footer} · move: click ink to pick it · {escape} stop"),
         }
         let mark = match self.narrator.status() {
             Status::Idle => None,
@@ -1749,7 +1757,7 @@ impl App {
     fn help_rows(&self) -> Vec<(String, &'static str)> {
         use ReaderAction as A;
         let paged = self.doc.page_count.is_some();
-        let keys = |actions: &[ReaderAction]| self.options.keys.labels(actions);
+        let keys = |actions: &[ReaderAction]| self.options.keys.reader.labels(actions);
         let mut rows = Vec::new();
         if paged {
             rows.push((
@@ -1802,7 +1810,10 @@ impl App {
         }
         if self.outline.is_some() {
             rows.push((
-                "<  >".to_owned(),
+                self.options
+                    .keys
+                    .outline
+                    .labels(&[OutlineAction::Narrower, OutlineAction::Wider]),
                 "narrow or widen the outline beside the text (or drag its edge)",
             ));
         }
@@ -2025,11 +2036,21 @@ impl App {
     }
 
     fn draw_bookmarks(&self, f: &mut Frame, area: Rect, selected: usize) -> Rect {
-        let hint = "enter go · x remove · esc close";
+        let keys = &self.options.keys.bookmarks;
+        let hint = format!(
+            "{} go · {} remove · {} close",
+            keys.first(BookmarksAction::Open),
+            keys.first(BookmarksAction::Delete),
+            keys.first(BookmarksAction::Close)
+        );
+        let hint = hint.as_str();
         if self.bookmarks.is_empty() {
             let lines = vec![
                 Line::from(Span::styled(
-                    "No bookmarks yet. Press m to mark a page.",
+                    format!(
+                        "No bookmarks yet. Press {} to mark a page.",
+                        self.options.keys.reader.first(ReaderAction::Bookmark)
+                    ),
                     Style::default().fg(DIM),
                 ))
                 .centered(),
@@ -2571,26 +2592,26 @@ impl App {
     /// Moving through the bookmark list; enter turns to the picked page.
     fn bookmarks_key(&mut self, key: &KeyEvent, selected: usize) {
         let last = self.bookmarks.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('\'') => self.dialog = Dialog::None,
-            KeyCode::Down | KeyCode::Char('j') => {
+        match self.options.keys.bookmarks.actions(key).first() {
+            Some(BookmarksAction::Close) => self.dialog = Dialog::None,
+            Some(BookmarksAction::Down) => {
                 self.dialog = Dialog::Bookmarks {
                     selected: (selected + 1).min(last),
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(BookmarksAction::Up) => {
                 self.dialog = Dialog::Bookmarks {
                     selected: selected.saturating_sub(1),
                 }
             }
-            KeyCode::Enter => {
+            Some(BookmarksAction::Open) => {
                 self.dialog = Dialog::None;
                 if let Some(page) = self.bookmarks.get(selected).map(|b| b.page) {
                     self.go_to_page(page, false);
                 }
             }
             // A held key would remove one bookmark after another.
-            KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace
+            Some(BookmarksAction::Delete)
                 if key.kind == KeyEventKind::Press
                     && selected <= last
                     && !self.bookmarks.is_empty() =>
@@ -2648,7 +2669,8 @@ impl App {
                 self.notice = Some("this page has no headings".into());
                 return;
             }
-            let mut open = OpenOutline::new(outline::Outline::new(nodes));
+            let mut open = OpenOutline::new(outline::Outline::new(nodes))
+                .with_keys(self.options.keys.outline.clone());
             open.page = self.outline_page();
             self.outline = Some(open);
         }
@@ -3149,13 +3171,22 @@ impl App {
                 return;
             }
             Dialog::Help | Dialog::Guide => {
-                let closes = self.options.keys.actions(&key).into_iter().any(|action| {
-                    matches!(
-                        action,
-                        ReaderAction::Quit | ReaderAction::Help | ReaderAction::Guide
-                    )
-                });
-                if closes || key.code == KeyCode::Esc {
+                let closes = self
+                    .options
+                    .keys
+                    .reader
+                    .actions(&key)
+                    .into_iter()
+                    .any(|action| {
+                        matches!(
+                            action,
+                            ReaderAction::Quit
+                                | ReaderAction::Help
+                                | ReaderAction::Guide
+                                | ReaderAction::Escape
+                        )
+                    });
+                if closes {
                     self.dialog = Dialog::None;
                 }
                 return;
@@ -3170,26 +3201,24 @@ impl App {
         if self.tool == Tool::Move && self.arrange_key(&key) {
             return;
         }
-        for action in self.options.keys.actions(&key) {
+        for action in self.options.keys.reader.actions(&key) {
             if self.perform(action, &key, history) {
                 return;
             }
         }
-        if let Some(hue) = typed(&key).and_then(Hue::of_key) {
-            return self.pick_hue(hue);
-        }
-        // Esc lets go of a picked stroke, puts the pen down, then lets
-        // go of a selection, then a search, then quits.
-        if key.code == KeyCode::Esc {
-            if self.picked.take().is_some() {
-            } else if self.tool != Tool::Select {
-                self.tool = Tool::Select;
-            } else if self.selection.take().is_none() && self.search.take().is_none() {
-                if self.narrator.active() {
-                    self.narrator.stop();
-                } else {
-                    self.quit = true;
-                }
+    }
+
+    /// Lets go of a picked stroke, puts the pen down, then lets go of a
+    /// selection, then a search, then stops reading aloud, then quits.
+    fn escape(&mut self) {
+        if self.picked.take().is_some() {
+        } else if self.tool != Tool::Select {
+            self.tool = Tool::Select;
+        } else if self.selection.take().is_none() && self.search.take().is_none() {
+            if self.narrator.active() {
+                self.narrator.stop();
+            } else {
+                self.quit = true;
             }
         }
     }
@@ -3280,6 +3309,16 @@ impl App {
             }
             ReaderAction::PreviousSentence => self.skip_sentence(Direction::Backward),
             ReaderAction::NextSentence => self.skip_sentence(Direction::Forward),
+            ReaderAction::Escape => self.escape(),
+            ReaderAction::Color1
+            | ReaderAction::Color2
+            | ReaderAction::Color3
+            | ReaderAction::Color4
+            | ReaderAction::Color5
+            | ReaderAction::Color6 => match action.hue() {
+                Some(hue) => self.pick_hue(hue),
+                None => return false,
+            },
             ReaderAction::Bookmark
             | ReaderAction::Bookmarks
             | ReaderAction::NextMatch
@@ -3772,35 +3811,39 @@ impl App {
         let Some(stroke) = self.picked_stroke().cloned() else {
             return false;
         };
-        let nudge = match (key.code, typed(key)) {
-            (KeyCode::Left, _) | (_, Some('h')) => Some((-1.0, 0.0)),
-            (KeyCode::Right, _) | (_, Some('l')) => Some((1.0, 0.0)),
-            (KeyCode::Up, _) | (_, Some('k')) => Some((0.0, -1.0)),
-            (KeyCode::Down, _) | (_, Some('j')) => Some((0.0, 1.0)),
-            _ => None,
-        };
-        let changed = if let Some((dx, dy)) = nudge {
-            let mut moved = stroke;
+        let ink = self.options.keys.ink.actions(key).first().copied();
+        let hue = self
+            .options
+            .keys
+            .reader
+            .actions(key)
+            .into_iter()
+            .find_map(ReaderAction::hue);
+        let nudge = |dx: f32, dy: f32| {
+            let mut moved = stroke.clone();
             moved.shift(dx, dy);
             moved
-        } else if matches!(typed(key), Some('+') | Some('=')) {
-            stroke.fitted(stroke.extent().scaled(GROW))
-        } else if typed(key) == Some('-') {
-            stroke.fitted(stroke.extent().scaled(1.0 / GROW))
-        } else if let Some(hue) = typed(key).and_then(Hue::of_key) {
-            self.hue = hue;
-            Stroke { hue, ..stroke }
-        } else if matches!(key.code, KeyCode::Delete | KeyCode::Backspace)
-            || typed(key) == Some('x')
-        {
-            if let Some(i) = self.picked_index() {
-                self.strokes.remove(i);
+        };
+        let changed = match (ink, hue) {
+            (Some(InkAction::Left), _) => nudge(-1.0, 0.0),
+            (Some(InkAction::Right), _) => nudge(1.0, 0.0),
+            (Some(InkAction::Up), _) => nudge(0.0, -1.0),
+            (Some(InkAction::Down), _) => nudge(0.0, 1.0),
+            (Some(InkAction::Grow), _) => stroke.fitted(stroke.extent().scaled(GROW)),
+            (Some(InkAction::Shrink), _) => stroke.fitted(stroke.extent().scaled(1.0 / GROW)),
+            (Some(InkAction::Delete), _) => {
+                if let Some(i) = self.picked_index() {
+                    self.strokes.remove(i);
+                }
+                self.picked = None;
+                self.report_strokes();
+                return true;
             }
-            self.picked = None;
-            self.report_strokes();
-            return true;
-        } else {
-            return false;
+            (None, Some(hue)) => {
+                self.hue = hue;
+                Stroke { hue, ..stroke }
+            }
+            (None, None) => return false,
         };
         self.replace_picked(changed);
         self.reanchor_picked();
@@ -5578,7 +5621,7 @@ mod tests {
         let config: crate::config::Config =
             toml::from_str("[keys.reader]\nquit = \"x\"\nhelp = \"f1\"").unwrap();
         let options = ViewerOptions {
-            keys: config.keys.reader,
+            keys: config.keys,
             ..ViewerOptions::default()
         };
         let mut s = Screen::new(book(&["Alpha", "Bravo"]), 120, 30, options);

@@ -38,8 +38,10 @@ use ratatui::{DefaultTerminal, Frame};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::art;
+use crate::config::KeysConfig;
 use crate::diff;
 use crate::diffview::Leave;
+use crate::keymap::Keymap;
 use crate::look::Look;
 use crate::news::News;
 use crate::popover::{self, Edit};
@@ -47,6 +49,7 @@ use crate::pr::{
     self, Action, CheckStatus, CloseReason, Detail, Ended, Ending, Entry, EventKind, Kind,
     Mergeability, PrRef, Relation, Source, State, Status, Verdict,
 };
+use crate::prkeys::{PrAction, PrListAction};
 use crate::prmedia::{self, Gallery, Shown};
 use crate::render::{self, DIM, Figure};
 use crate::usage;
@@ -78,45 +81,112 @@ const POLL: Duration = Duration::from_secs(10);
 /// How often a running job's steps are read again while they're shown.
 const JOB_POLL: Duration = Duration::from_secs(5);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-/// The keys an issue's footer offers, in the order they're dropped to fit.
-const ISSUE_KEYS: [(&str, &str); 7] = [
-    ("←→", "tabs"),
-    ("c", "comment"),
-    ("]", "reply"),
-    ("x", "close"),
-    ("o", "browser"),
-    ("?", "keys"),
-    ("q", "back"),
-];
-/// The keys the page's footer offers, in the order they're dropped to fit.
-const KEYS: [(&str, &str); 8] = [
-    ("←→", "tabs"),
-    ("m", "merge"),
-    ("c", "comment"),
-    ("a", "approve"),
-    ("x", "close"),
-    ("o", "browser"),
-    ("?", "keys"),
-    ("q", "back"),
-];
-/// The footer's keys on the Checks tab.
-const CHECK_KEYS: [(&str, &str); 7] = [
-    ("←→", "tabs"),
-    ("↑↓", "pick"),
-    ("enter", "steps and log"),
-    ("r", "re-run"),
-    ("o", "open"),
-    ("?", "keys"),
-    ("q", "back"),
-];
-/// The footer's keys over a job's log.
-const LOG_KEYS: [(&str, &str); 5] = [
-    ("↑↓", "pick"),
-    ("e", "open all groups"),
-    ("r", "re-run"),
-    ("o", "on GitHub"),
-    ("esc", "back"),
-];
+/// What a footer offers: the keys, as `[keys.pr]` binds them, and what they do.
+type Offer = (String, &'static str);
+
+/// The footers' keys, each in the order they're dropped to fit.
+struct Footers<'a>(&'a Keymap<PrAction>);
+
+impl Footers<'_> {
+    fn of(&self, action: PrAction) -> String {
+        self.0.first(action)
+    }
+
+    fn tabs(&self) -> String {
+        format!(
+            "{}{}",
+            self.0.arrow(PrAction::LeftTab),
+            self.0.arrow(PrAction::RightTab)
+        )
+    }
+
+    fn pick(&self) -> String {
+        format!(
+            "{}{}",
+            self.0.arrow(PrAction::Up),
+            self.0.arrow(PrAction::Down)
+        )
+    }
+
+    fn issue(&self) -> Vec<Offer> {
+        vec![
+            (self.tabs(), "tabs"),
+            (self.of(PrAction::Comment), "comment"),
+            (self.of(PrAction::NextComment), "reply"),
+            (self.of(PrAction::Close), "close"),
+            (self.of(PrAction::Open), "browser"),
+            (self.of(PrAction::Help), "keys"),
+            (self.of(PrAction::Quit), "back"),
+        ]
+    }
+
+    fn pull(&self) -> Vec<Offer> {
+        vec![
+            (self.tabs(), "tabs"),
+            (self.of(PrAction::Merge), "merge"),
+            (self.of(PrAction::Comment), "comment"),
+            (self.of(PrAction::Approve), "approve"),
+            (self.of(PrAction::Close), "close"),
+            (self.of(PrAction::Open), "browser"),
+            (self.of(PrAction::Help), "keys"),
+            (self.of(PrAction::Quit), "back"),
+        ]
+    }
+
+    fn checks(&self) -> Vec<Offer> {
+        vec![
+            (self.tabs(), "tabs"),
+            (self.pick(), "pick"),
+            (self.of(PrAction::OpenLog), "steps and log"),
+            (self.of(PrAction::Rerun), "re-run"),
+            (self.of(PrAction::OpenCheck), "open"),
+            (self.of(PrAction::Help), "keys"),
+            (self.of(PrAction::Quit), "back"),
+        ]
+    }
+
+    fn log(&self, expanded: bool) -> Vec<Offer> {
+        vec![
+            (self.pick(), "pick"),
+            (
+                self.of(PrAction::Expand),
+                if expanded {
+                    "close all groups"
+                } else {
+                    "open all groups"
+                },
+            ),
+            (self.of(PrAction::Rerun), "re-run"),
+            (self.of(PrAction::OpenCheck), "on GitHub"),
+            (self.of(PrAction::Escape), "back"),
+        ]
+    }
+
+    fn comments(&self) -> Vec<Offer> {
+        vec![
+            (self.0.pair(PrAction::Down, PrAction::Up), "pick"),
+            (self.of(PrAction::Reply), "reply"),
+            (self.of(PrAction::Comment), "comment"),
+            (self.tabs(), "tabs"),
+            (self.of(PrAction::Quit), "back"),
+        ]
+    }
+
+    fn focused(&self) -> Vec<Offer> {
+        vec![
+            (self.of(PrAction::Reply), "reply"),
+            (
+                format!(
+                    "{} {}",
+                    self.of(PrAction::PreviousComment),
+                    self.of(PrAction::NextComment)
+                ),
+                "pick",
+            ),
+            (self.of(PrAction::Escape), "done"),
+        ]
+    }
+}
 
 /// The spinner's frame now.
 fn spinner() -> char {
@@ -916,10 +986,17 @@ struct App {
     logs: Logs,
     gallery: Gallery,
     now: i64,
+    /// The keys it answers to, as `[keys.pr_list]` and `[keys.pr]` set them.
+    keys: KeysConfig,
 }
 
 /// Runs the pull request viewer until it's closed.
-pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Result<()> {
+pub fn run(
+    start: Start,
+    here: Option<String>,
+    branch: Option<String>,
+    keys: KeysConfig,
+) -> io::Result<()> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -948,6 +1025,7 @@ pub fn run(start: Start, here: Option<String>, branch: Option<String>) -> io::Re
         logs: Logs::default(),
         gallery,
         now: pr::now(),
+        keys,
     };
     match start {
         Start::List => app.open_list(),
@@ -1754,9 +1832,16 @@ impl App {
         let picked = list.picked();
         list.note = None;
         list.selection = None;
-        match key.code {
+        // A plain letter or digit bound here acts only while nothing is
+        // typed, so a filter can still hold it; the list's own keys are
+        // arrows, tab, `@`, `R` and ctrl.
+        let typing = !list.typed.is_empty()
+            && matches!(key.code, KeyCode::Char(c) if c.is_alphanumeric())
+            && !key.modifiers.contains(KeyModifiers::CONTROL);
+        let action = self.keys.pr_list.actions(&key).first().copied();
+        match action.filter(|_| !typing) {
             // Two tabs, so either arrow flips between them.
-            KeyCode::Left | KeyCode::Right => {
+            Some(PrListAction::SwitchKind) => {
                 list.show(match list.kind {
                     Kind::Pull => Kind::Issue,
                     Kind::Issue => Kind::Pull,
@@ -1764,28 +1849,26 @@ impl App {
                 return Ok(true);
             }
             // Tab flips open rows and done ones: merged or closed.
-            KeyCode::Tab | KeyCode::BackTab => {
+            Some(PrListAction::SwitchStatus) => {
                 self.flip_status();
                 return Ok(true);
             }
             // `@` for "@me": everything, or only what's assigned to you.
-            KeyCode::Char('@') => {
+            Some(PrListAction::Scope) => {
                 list.show_scope(list.scope.other());
                 return Ok(true);
             }
             // Asks every search again now rather than waiting. `R` only while
             // nothing's typed, so a filter can still hold an R (it ignores
             // case, so `r` starts one); ctrl+r works either way.
-            KeyCode::Char('R') if list.typed.is_empty() => {
-                self.reload_list();
-                return Ok(true);
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(PrListAction::Reload)
+                if list.typed.is_empty() || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.reload_list();
                 return Ok(true);
             }
             // Letters filter the list, so copying the number takes ctrl.
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(PrListAction::CopyNumber) => {
                 if let Some(pr) = &picked {
                     let number = format!("#{}", pr.number);
                     copy(&number);
@@ -1793,15 +1876,15 @@ impl App {
                 }
                 return Ok(true);
             }
-            KeyCode::PageDown => {
+            Some(PrListAction::PageDown) => {
                 list.selected = (list.selected + 8).min(rows.saturating_sub(1));
                 return Ok(true);
             }
-            KeyCode::PageUp => {
+            Some(PrListAction::PageUp) => {
                 list.selected = list.selected.saturating_sub(8);
                 return Ok(true);
             }
-            _ => {}
+            Some(PrListAction::Reload) | None => {}
         }
         match popover::edit(
             key.code,
@@ -1830,7 +1913,7 @@ impl App {
             return Ok(true);
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
+        if self.keys.pr.actions(&key).first() == Some(&PrAction::QuitNow) {
             return Ok(false);
         }
         page.toast = None;
@@ -1933,147 +2016,146 @@ impl App {
         }
 
         let half = terminal.size().map(|s| s.height as usize / 2).unwrap_or(10);
-        if page.tab == Tab::Checks {
-            let count = detail.map_or(0, |d| d.checks.len());
-            let at = page.fold_rows.iter().position(|(_, f)| *f == page.pick);
-            let fold = |index: usize| page.fold_rows.get(index).map(|(_, f)| *f);
-            match key.code {
-                // Escape lets go of a selection first; q and backspace go back at once.
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace
-                    if page.log.is_some()
-                        && (key.code != KeyCode::Esc || page.selection.is_none()) =>
-                {
-                    page.selection = None;
-                    page.log = None;
-                    page.scroll = 0;
-                    page.follow = true;
-                    return Ok(true);
-                }
-                KeyCode::Char('j') | KeyCode::Down if page.log.is_some() => {
-                    let next = at.map_or(0, |at| at + 1);
-                    page.pick = fold(next).unwrap_or(page.pick);
-                    page.follow = true;
-                    return Ok(true);
-                }
-                KeyCode::Char('k') | KeyCode::Up if page.log.is_some() => {
-                    let next = at.map_or(0, |at| at.saturating_sub(1));
-                    page.pick = fold(next).unwrap_or(page.pick);
-                    page.follow = true;
-                    return Ok(true);
-                }
-                KeyCode::Enter | KeyCode::Char(' ') if page.log.is_some() => {
-                    page.toggle(page.pick);
-                    page.follow = true;
-                    return Ok(true);
-                }
-                KeyCode::Char('j') | KeyCode::Down if page.log.is_none() => {
-                    page.check = (page.check + 1).min(count.saturating_sub(1));
-                    page.follow = true;
-                    return Ok(true);
-                }
-                KeyCode::Char('k') | KeyCode::Up if page.log.is_none() => {
-                    page.check = page.check.saturating_sub(1);
-                    page.follow = true;
-                    return Ok(true);
-                }
-                KeyCode::Enter if page.log.is_none() => {
-                    self.open_log();
-                    return Ok(true);
-                }
-                KeyCode::Char('R') if page.log.is_some() => {
-                    if let Some(job) = page.log {
-                        self.read_job(job);
-                    }
-                    return Ok(true);
-                }
-                KeyCode::Char('o') => {
-                    if let Some(url) = page.picked_check().and_then(|c| c.url.clone()) {
-                        page.toast = Some(match prmedia::open(&url) {
-                            Ok(()) => "Opened it in the browser".to_owned(),
-                            Err(e) => format!("Couldn't open {url} ({e})"),
-                        });
-                        return Ok(true);
-                    }
-                }
-                // On this tab, r re-runs jobs rather than marking the pull request ready.
-                KeyCode::Char('r') => {
-                    page.toast = Some(match (page.busy.is_some(), detail) {
-                        (true, _) => "Wait for the last action to finish".to_owned(),
-                        (false, None) => "Still loading".to_owned(),
-                        (false, Some(detail)) => match reruns(detail, page.picked_check()) {
-                            Ok(choices) => {
-                                page.mode = Mode::Rerun(choices);
-                                return Ok(true);
-                            }
-                            Err(why) => why,
-                        },
-                    });
-                    return Ok(true);
-                }
-                _ => {}
+        for action in self.keys.pr.actions(&key) {
+            if let Some(stay) = self.page_action(action, half, terminal)? {
+                return Ok(stay);
             }
         }
-        match key.code {
-            // Escape lets go of a selection before it leaves.
-            KeyCode::Esc if self.gallery.any_playing() => self.gallery.stop(),
-            KeyCode::Esc if page.selection.is_some() => page.selection = None,
-            KeyCode::Esc if page.focus.is_some() => {
+        Ok(true)
+    }
+
+    /// Does what `action` asks on the page: `Some` with whether leaf stays
+    /// open when it did, `None` when it can't act now, so the next action
+    /// bound to the same key can.
+    fn page_action(
+        &mut self,
+        action: PrAction,
+        half: usize,
+        terminal: &mut DefaultTerminal,
+    ) -> io::Result<Option<bool>> {
+        let Some(page) = &mut self.page else {
+            return Ok(Some(true));
+        };
+        let detail = match &page.detail {
+            Load::Ready(detail) => Some(detail),
+            _ => None,
+        };
+        let checks = page.tab == Tab::Checks;
+        let log = page.log.is_some();
+        let count = detail.map_or(0, |d| d.checks.len());
+        let at = page.fold_rows.iter().position(|(_, f)| *f == page.pick);
+        let fold = |index: usize| page.fold_rows.get(index).map(|(_, f)| *f);
+        // Leaves a job's log for the list of checks.
+        let close_log = |page: &mut Page| {
+            page.selection = None;
+            page.log = None;
+            page.scroll = 0;
+            page.follow = true;
+        };
+        use PrAction as A;
+        match action {
+            A::QuitNow => return Ok(Some(false)),
+            // Escape lets go of a selection before it closes the log, and
+            // before it leaves.
+            A::Escape if checks && log && page.selection.is_none() => close_log(page),
+            A::Escape if self.gallery.any_playing() => self.gallery.stop(),
+            A::Escape if page.selection.is_some() => page.selection = None,
+            A::Escape if page.focus.is_some() => {
                 page.focus = None;
                 page.cache = None;
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
+            A::Back | A::Quit if checks && log => close_log(page),
+            A::Back => return Ok(None),
+            A::Quit | A::Escape => {
                 self.page = None;
                 if self.list.is_none() {
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
             }
-            // On Comments, j and k move between comments rather than lines.
-            KeyCode::Char('j') | KeyCode::Down if page.tab == Tab::Comments => page.pick(1),
-            KeyCode::Char('k') | KeyCode::Up if page.tab == Tab::Comments => page.pick(-1),
-            KeyCode::Char('j') | KeyCode::Down => page.scroll += 1,
-            KeyCode::Char('k') | KeyCode::Up => page.scroll = page.scroll.saturating_sub(1),
-            KeyCode::Char('d') if ctrl => page.scroll += half,
-            KeyCode::Char('u') if ctrl => page.scroll = page.scroll.saturating_sub(half),
-            KeyCode::Char(' ') | KeyCode::PageDown => page.scroll += half * 2,
-            KeyCode::Char('b') | KeyCode::PageUp => {
-                page.scroll = page.scroll.saturating_sub(half * 2)
+            A::Down | A::Up if checks && log => {
+                let next = match action {
+                    A::Down => at.map_or(0, |at| at + 1),
+                    _ => at.map_or(0, |at| at.saturating_sub(1)),
+                };
+                page.pick = fold(next).unwrap_or(page.pick);
+                page.follow = true;
             }
-            KeyCode::Char('g') | KeyCode::Home => page.scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => page.scroll = usize::MAX,
-            KeyCode::Char(']') => page.pick(1),
-            KeyCode::Char('[') => page.pick(-1),
-            KeyCode::Enter if page.busy.is_none() && page.focus.is_some() => page.reply(),
+            A::Down if checks => {
+                page.check = (page.check + 1).min(count.saturating_sub(1));
+                page.follow = true;
+            }
+            A::Up if checks => {
+                page.check = page.check.saturating_sub(1);
+                page.follow = true;
+            }
+            // On Comments, moving goes between comments rather than lines.
+            A::Down if page.tab == Tab::Comments => page.pick(1),
+            A::Up if page.tab == Tab::Comments => page.pick(-1),
+            A::Down => page.scroll += 1,
+            A::Up => page.scroll = page.scroll.saturating_sub(1),
+            A::Toggle if checks && log => {
+                page.toggle(page.pick);
+                page.follow = true;
+            }
+            A::Toggle => return Ok(None),
+            A::OpenLog if checks && !log => self.open_log(),
+            A::OpenLog => return Ok(None),
+            A::Reply if page.busy.is_none() && page.focus.is_some() => page.reply(),
+            A::Reply => return Ok(None),
+            A::HalfScreenDown => page.scroll += half,
+            A::HalfScreenUp => page.scroll = page.scroll.saturating_sub(half),
+            A::ScreenDown => page.scroll += half * 2,
+            A::ScreenUp => page.scroll = page.scroll.saturating_sub(half * 2),
+            A::Top => page.scroll = 0,
+            A::Bottom => page.scroll = usize::MAX,
+            A::NextComment => page.pick(1),
+            A::PreviousComment => page.pick(-1),
             // Tab cycles Summary → Timeline → Comments → Code → Checks and
             // round; shift-tab goes the other way. The arrows stop at the ends.
-            KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Char('h' | 'l') => {
-                let forward =
-                    matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Char('l'));
-                let wrap = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+            A::NextTab | A::PreviousTab | A::RightTab | A::LeftTab => {
+                let forward = matches!(action, A::NextTab | A::RightTab);
+                let wrap = matches!(action, A::NextTab | A::PreviousTab);
                 match page.step(if forward { 1 } else { -1 }, wrap) {
                     Step::Tab(tab) => page.show(tab),
                     Step::Code => self.open_code(terminal)?,
                     Step::Stay => {}
                 }
             }
-            KeyCode::Char('1') => page.show(Tab::Summary),
-            KeyCode::Char('2') => page.show(Tab::Timeline),
-            KeyCode::Char('3') => page.show(Tab::Comments),
-            KeyCode::Char('4') if page.kind == Kind::Pull => self.open_code(terminal)?,
-            KeyCode::Char('5') if page.kind == Kind::Pull => page.show(Tab::Checks),
-            KeyCode::Char('e') => {
+            A::Summary => page.show(Tab::Summary),
+            A::Timeline => page.show(Tab::Timeline),
+            A::Comments => page.show(Tab::Comments),
+            A::Code if page.kind == Kind::Pull => self.open_code(terminal)?,
+            A::Checks if page.kind == Kind::Pull => page.show(Tab::Checks),
+            A::Code | A::Checks => return Ok(None),
+            A::Expand => {
                 page.expanded = !page.expanded;
                 page.cache = None;
             }
-            KeyCode::Char('?') => page.mode = Mode::Help,
-            KeyCode::Char('R') => {
+            A::Help => page.mode = Mode::Help,
+            A::ReloadLog if checks && log => {
+                if let Some(job) = page.log {
+                    self.read_job(job);
+                }
+            }
+            A::ReloadLog => return Ok(None),
+            A::Reload => {
                 let (pr, kind) = (page.pr.clone(), page.kind);
                 self.fetch(pr, kind, true);
             }
-            KeyCode::Char('o') => {
+            A::OpenCheck => {
+                let Some(url) = page
+                    .picked_check()
+                    .and_then(|c| c.url.clone())
+                    .filter(|_| checks)
+                else {
+                    return Ok(None);
+                };
+                page.toast = Some(match prmedia::open(&url) {
+                    Ok(()) => "Opened it in the browser".to_owned(),
+                    Err(e) => format!("Couldn't open {url} ({e})"),
+                });
+            }
+            A::Open => {
                 let opened = match page.kind {
                     Kind::Pull => pr::open_in_browser(&page.pr),
                     Kind::Issue => pr::open_issue(&page.pr),
@@ -2083,21 +2165,21 @@ impl App {
                     Err(e) => e.to_string(),
                 });
             }
-            KeyCode::Char('y') if page.kind == Kind::Pull => {
+            A::Copy if page.kind == Kind::Pull => {
                 copy(&page.pr.checkout());
                 page.toast = Some(format!("Copied {}", page.pr.checkout()));
             }
-            KeyCode::Char('y' | 'Y') => {
+            A::Copy | A::CopyLink => {
                 let url = page.url();
                 copy(&url);
                 page.toast = Some(format!("Copied {url}"));
             }
-            KeyCode::Char('n') => {
+            A::CopyNumber => {
                 let number = format!("#{}", page.pr.number);
                 copy(&number);
                 page.toast = Some(format!("Copied {number}"));
             }
-            KeyCode::Char('c') if page.busy.is_none() => {
+            A::Comment if page.busy.is_none() => {
                 page.mode = Mode::Compose {
                     text: Vec::new(),
                     cursor: 0,
@@ -2105,14 +2187,37 @@ impl App {
                     refused: None,
                 };
             }
-            KeyCode::Char(c @ ('m' | 'x' | 'r' | 'a')) => {
+            A::Comment => return Ok(None),
+            // On Checks, re-running takes the place of marking it ready.
+            A::Rerun if checks => {
+                page.toast = Some(match (page.busy.is_some(), detail) {
+                    (true, _) => "Wait for the last action to finish".to_owned(),
+                    (false, None) => "Still loading".to_owned(),
+                    (false, Some(detail)) => match reruns(detail, page.picked_check()) {
+                        Ok(choices) => {
+                            page.mode = Mode::Rerun(choices);
+                            return Ok(Some(true));
+                        }
+                        Err(why) => why,
+                    },
+                });
+            }
+            A::Rerun => return Ok(None),
+            A::Merge | A::Close | A::Ready | A::Approve => {
                 if page.busy.is_some() {
                     page.toast = Some("Wait for the last action to finish".to_owned());
-                    return Ok(true);
+                    return Ok(Some(true));
                 }
                 let Some(detail) = detail else {
                     page.toast = Some("Still loading".to_owned());
-                    return Ok(true);
+                    return Ok(Some(true));
+                };
+                // What `available` names each of these by.
+                let c = match action {
+                    A::Merge => 'm',
+                    A::Close => 'x',
+                    A::Ready => 'r',
+                    _ => 'a',
                 };
                 match available(detail, c) {
                     Ok(Next::Merge) => page.mode = Mode::Merge,
@@ -2122,9 +2227,8 @@ impl App {
                     Err(why) => page.toast = Some(why),
                 }
             }
-            _ => {}
         }
-        Ok(true)
+        Ok(Some(true))
     }
 
     fn draw(&mut self, f: &mut Frame) {
@@ -2139,9 +2243,10 @@ impl App {
                 now,
                 refreshing,
                 &self.look,
+                &self.keys.pr,
             );
         } else if let Some(list) = &mut self.list {
-            draw_list(f, list, now, self.look.ink());
+            draw_list(f, list, now, self.look.ink(), &self.keys.pr_list);
         }
         if let Some(news) = &mut self.news {
             let panel = news.draw(f, self.look.ink());
@@ -2341,7 +2446,13 @@ fn relation_color(relation: Relation) -> Color {
 /// The list: the tabs and a legend, a filter, then the shown tab's rows
 /// newest first on two lines, title above and who and when below, in one
 /// centered column.
-fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
+fn draw_list(
+    f: &mut Frame,
+    list: &mut List,
+    now: i64,
+    ink: Option<art::Ink>,
+    keys: &Keymap<PrListAction>,
+) {
     let area = f.area();
     let (x, width) = column(area);
     let w = width as usize;
@@ -2637,15 +2748,18 @@ fn draw_list(f: &mut Frame, list: &mut List, now: i64, ink: Option<art::Ink>) {
         (Some(e), None) if total > 0 => Line::from(Span::styled(clip(&e, w), dim)),
         _ => keys_line(
             &[
-                ("↑↓", "move"),
-                ("enter", "open"),
-                ("tab", &flip),
-                ("@", &scope),
-                ("←→", "pulls · issues"),
-                ("type", "filter"),
-                ("^y", "copy #"),
-                ("R", "reload"),
-                ("esc", "quit"),
+                ("↑↓".to_owned(), "move"),
+                ("enter".to_owned(), "open"),
+                (keys.first(PrListAction::SwitchStatus), &flip),
+                (keys.first(PrListAction::Scope), &scope),
+                (
+                    keys.label(PrListAction::SwitchKind).replace('/', ""),
+                    "pulls · issues",
+                ),
+                ("type".to_owned(), "filter"),
+                (keys.first(PrListAction::CopyNumber), "copy #"),
+                (keys.first(PrListAction::Reload), "reload"),
+                ("esc".to_owned(), "quit"),
             ],
             w,
         ),
@@ -2748,7 +2862,7 @@ fn ending_glyph(how: Ending) -> (&'static str, Color) {
 }
 
 /// Key hints, as many as fit: the key, then what it does, quieter.
-fn keys_line(keys: &[(&str, &str)], width: usize) -> Line<'static> {
+fn keys_line(keys: &[(String, &str)], width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     let mut used = 0;
     for (key, what) in keys {
@@ -2760,7 +2874,7 @@ fn keys_line(keys: &[(&str, &str)], width: usize) -> Line<'static> {
         if gap > 0 {
             spans.push(Span::raw("   "));
         }
-        spans.push(Span::raw((*key).to_owned()));
+        spans.push(Span::raw(key.clone()));
         spans.push(Span::styled(format!(" {what}"), Style::default().fg(DIM)));
         used += needed;
     }
@@ -2875,6 +2989,7 @@ fn column(area: Rect) -> (u16, u16) {
     (area.x + (area.width - width) / 2, width)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_page(
     f: &mut Frame,
     page: &mut Page,
@@ -2883,6 +2998,7 @@ fn draw_page(
     now: i64,
     refreshing: bool,
     look: &Look,
+    keys: &Keymap<PrAction>,
 ) {
     let ink = look.ink();
     let area = f.area();
@@ -2932,7 +3048,7 @@ fn draw_page(
                 Paragraph::new(lines),
                 Rect::new(indent, top, width, height.min(area.height)),
             );
-            footer(f, page, area, x, width);
+            footer(f, page, area, x, width, keys);
             return;
         }
     };
@@ -3270,9 +3386,9 @@ fn draw_page(
             ink,
         );
     }
-    footer(f, page, area, x, width);
+    footer(f, page, area, x, width, keys);
     if let Mode::Help = page.mode {
-        draw_help(f, area, page.kind, ink);
+        draw_help(f, area, page.kind, ink, keys);
     }
 }
 
@@ -3286,7 +3402,8 @@ fn footer_height(page: &Page, width: u16) -> u16 {
     }
 }
 
-fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
+fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16, keys: &Keymap<PrAction>) {
+    let offers = Footers(keys);
     let dim = Style::default().fg(DIM);
     let accent = Style::default().add_modifier(Modifier::BOLD);
     let y = area.y + area.height.saturating_sub(1);
@@ -3402,81 +3519,149 @@ fn footer(f: &mut Frame, page: &Page, area: Rect, x: u16, width: u16) {
                 format!("{} Loading the diff…", spinner()),
                 dim,
             )),
-            _ if page.tab == Tab::Comments => keys_line(
-                &[
-                    ("j/k", "pick"),
-                    ("enter", "reply"),
-                    ("c", "comment"),
-                    ("←→", "tabs"),
-                    ("q", "back"),
-                ],
-                width as usize,
-            ),
+            _ if page.tab == Tab::Comments => keys_line(&offers.comments(), width as usize),
             _ if page.tab == Tab::Checks && page.log.is_some() => {
-                let mut keys = LOG_KEYS;
-                if page.expanded {
-                    keys[1].1 = "close all groups";
-                }
-                keys_line(&keys, width as usize)
+                keys_line(&offers.log(page.expanded), width as usize)
             }
-            _ if page.tab == Tab::Checks => keys_line(&CHECK_KEYS, width as usize),
-            _ if page.focus.is_some() => keys_line(
-                &[("enter", "reply"), ("[ ]", "pick"), ("esc", "done")],
-                width as usize,
-            ),
+            _ if page.tab == Tab::Checks => keys_line(&offers.checks(), width as usize),
+            _ if page.focus.is_some() => keys_line(&offers.focused(), width as usize),
             _ => match page.kind {
-                Kind::Pull => keys_line(&KEYS, width as usize),
-                Kind::Issue => keys_line(&ISSUE_KEYS, width as usize),
+                Kind::Pull => keys_line(&offers.pull(), width as usize),
+                Kind::Issue => keys_line(&offers.issue(), width as usize),
             },
         },
     };
     f.render_widget(Paragraph::new(line), Rect::new(x, y, width, 1));
 }
 
-fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
-    let keys: &[(&str, &str)] = match kind {
-        Kind::Pull => &[
-            ("←→, tab", "Summary, Timeline, Comments, Code, Checks"),
-            ("1, 2, 3, 4, 5", "the same tabs"),
-            ("↑↓, enter", "Checks: a job's steps and log"),
-            ("j/k, ctrl+d/u", "scroll a line, half a screen"),
-            ("space/b, g/G", "a screen, top and bottom"),
-            ("drag", "select text; it's copied"),
-            ("click", "a picture opens it, a video plays"),
-            ("e", "long comments and quotes, or a job's groups"),
-            ("m", "merge: squash, merge commit or rebase"),
-            ("x", "close, or reopen a closed one"),
-            ("r", "ready or draft; on Checks, re-run"),
-            ("a", "approve"),
-            ("c", "comment"),
-            ("] [, enter", "pick a comment, reply quoting it"),
-            ("j/k on Comments", "pick the next or previous comment"),
-            ("o", "open on GitHub, or the picked check"),
-            ("y, Y, n", "copy the checkout command, link, number"),
-            ("click #", "the number in the header copies it"),
-            ("R", "reload"),
-            ("q, esc", "back to the list, or quit"),
+/// The keys as `[keys.pr]` binds them, so a rebound key shows here too.
+fn help_rows(kind: Kind, keys: &Keymap<PrAction>) -> Vec<(String, &'static str)> {
+    use PrAction as A;
+    let first = |action| keys.first(action);
+    let join = |actions: &[PrAction]| {
+        actions
+            .iter()
+            .map(|action| keys.first(*action))
+            .filter(|key| !key.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let tabs = format!(
+        "{}{}, {}",
+        keys.arrow(A::LeftTab),
+        keys.arrow(A::RightTab),
+        first(A::NextTab)
+    );
+    let scroll = format!(
+        "{}, {}",
+        keys.pair(A::Down, A::Up),
+        keys.pair(A::HalfScreenDown, A::HalfScreenUp)
+    );
+    let screens = format!(
+        "{}, {}",
+        keys.pair(A::ScreenDown, A::ScreenUp),
+        keys.pair(A::Top, A::Bottom)
+    );
+    let pick = format!(
+        "{} {}, {}",
+        first(A::NextComment),
+        first(A::PreviousComment),
+        first(A::Reply)
+    );
+    let on_comments = format!("{} on Comments", keys.pair(A::Down, A::Up));
+    let quit = join(&[A::Quit, A::Escape]);
+    let rows = match kind {
+        Kind::Pull => vec![
+            (tabs, "Summary, Timeline, Comments, Code, Checks"),
+            (
+                join(&[A::Summary, A::Timeline, A::Comments, A::Code, A::Checks]),
+                "the same tabs",
+            ),
+            (
+                format!(
+                    "{}{}, {}",
+                    keys.arrow(A::Up),
+                    keys.arrow(A::Down),
+                    first(A::OpenLog)
+                ),
+                "Checks: a job's steps and log",
+            ),
+            (scroll, "scroll a line, half a screen"),
+            (screens, "a screen, top and bottom"),
+            ("drag".to_owned(), "select text; it's copied"),
+            ("click".to_owned(), "a picture opens it, a video plays"),
+            (
+                first(A::Expand),
+                "long comments and quotes, or a job's groups",
+            ),
+            (first(A::Merge), "merge: squash, merge commit or rebase"),
+            (first(A::Close), "close, or reopen a closed one"),
+            (
+                join(&[A::Ready, A::Rerun]),
+                "ready or draft; on Checks, re-run",
+            ),
+            (first(A::Approve), "approve"),
+            (first(A::Comment), "comment"),
+            (pick, "pick a comment, reply quoting it"),
+            (on_comments, "pick the next or previous comment"),
+            (
+                join(&[A::Open, A::OpenCheck]),
+                "open on GitHub, or the picked check",
+            ),
+            (
+                join(&[A::Copy, A::CopyLink, A::CopyNumber]),
+                "copy the checkout command, link, number",
+            ),
+            ("click #".to_owned(), "the number in the header copies it"),
+            (first(A::Reload), "reload"),
+            (quit, "back to the list, or quit"),
         ],
-        Kind::Issue => &[
-            ("←→, tab", "Summary, Timeline, Comments"),
-            ("1, 2, 3", "the same tabs"),
-            ("j/k, ctrl+d/u", "scroll a line, half a screen"),
-            ("space/b, g/G", "a screen, top and bottom"),
-            ("drag", "select text; it's copied"),
-            ("click", "a picture opens it, a video plays"),
-            ("e", "expand or cut short long comments and quotes"),
-            ("x", "close as done or not planned, reopen"),
-            ("c", "comment"),
-            ("] [, enter", "pick a comment, reply quoting it"),
-            ("j/k on Comments", "pick the next or previous comment"),
-            ("o", "open on GitHub"),
-            ("y, n", "copy the link, number"),
-            ("click #", "the number in the header copies it"),
-            ("R", "reload"),
-            ("q, esc", "back to the list, or quit"),
+        Kind::Issue => vec![
+            (tabs, "Summary, Timeline, Comments"),
+            (
+                join(&[A::Summary, A::Timeline, A::Comments]),
+                "the same tabs",
+            ),
+            (scroll, "scroll a line, half a screen"),
+            (screens, "a screen, top and bottom"),
+            ("drag".to_owned(), "select text; it's copied"),
+            ("click".to_owned(), "a picture opens it, a video plays"),
+            (
+                first(A::Expand),
+                "expand or cut short long comments and quotes",
+            ),
+            (first(A::Close), "close as done or not planned, reopen"),
+            (first(A::Comment), "comment"),
+            (pick, "pick a comment, reply quoting it"),
+            (on_comments, "pick the next or previous comment"),
+            (first(A::Open), "open on GitHub"),
+            (join(&[A::Copy, A::CopyNumber]), "copy the link, number"),
+            ("click #".to_owned(), "the number in the header copies it"),
+            (first(A::Reload), "reload"),
+            (quit, "back to the list, or quit"),
         ],
     };
-    let width = 54.min(area.width.saturating_sub(4));
+    // An action left with no key has nothing to show.
+    rows.into_iter()
+        .filter(|(keys, _)| !keys.trim_matches([',', ' ']).is_empty())
+        .collect()
+}
+
+fn draw_help(
+    f: &mut Frame,
+    area: Rect,
+    kind: Kind,
+    ink: Option<art::Ink>,
+    keymap: &Keymap<PrAction>,
+) {
+    let keys = help_rows(kind, keymap);
+    let column = keys
+        .iter()
+        .map(|(key, _)| key.width())
+        .max()
+        .unwrap_or(0)
+        .max(15);
+    let width = (column as u16 + 39).min(area.width.saturating_sub(4));
     let height = (keys.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
@@ -3489,7 +3674,7 @@ fn draw_help(f: &mut Frame, area: Rect, kind: Kind, ink: Option<art::Ink>) {
         .map(|(key, what)| {
             Line::from(vec![
                 Span::styled(
-                    format!(" {key:<15}"),
+                    format!(" {key:<column$}"),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled((*what).to_owned(), Style::default().fg(DIM)),
@@ -4951,6 +5136,7 @@ mod tests {
             logs: Logs::default(),
             gallery: Gallery::plain(),
             now: 0,
+            keys: KeysConfig::default(),
         }
     }
 
@@ -5252,7 +5438,7 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10))
                 .expect("test terminal");
             terminal
-                .draw(|f| footer(f, page, f.area(), 0, 100))
+                .draw(|f| footer(f, page, f.area(), 0, 100, &Keymap::default()))
                 .expect("draws");
             let buffer = terminal.backend().buffer();
             (0..buffer.area.height)
@@ -5849,7 +6035,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
             .expect("test terminal");
         terminal
-            .draw(|f| draw_list(f, &mut list, now, None))
+            .draw(|f| draw_list(f, &mut list, now, None, &Keymap::default()))
             .expect("draws");
         let buffer = terminal.backend().buffer();
         let screen: Vec<String> = (0..buffer.area.height)
@@ -5914,7 +6100,7 @@ mod tests {
             .expect("test terminal");
         list.kind = Kind::Issue;
         terminal
-            .draw(|f| draw_list(f, &mut list, 0, None))
+            .draw(|f| draw_list(f, &mut list, 0, None, &Keymap::default()))
             .expect("draws");
         let buffer = terminal.backend().buffer();
         let text: String = (0..buffer.area.height)
@@ -6080,12 +6266,21 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_shows_rebound_keys() {
+        let config: crate::config::Config = toml::from_str("[keys.pr]\nmerge = \"M\"").unwrap();
+        let pull = Footers(&config.keys.pr).pull();
+        assert_eq!(plain(&keys_line(&pull, 20)), "←→ tabs   M merge");
+    }
+
+    #[test]
     fn footer_keys_drop_from_the_end_to_fit() {
+        let keys = Keymap::default();
+        let pull = Footers(&keys).pull();
         assert_eq!(
-            plain(&keys_line(&KEYS, 200)).matches("   ").count(),
-            KEYS.len() - 1
+            plain(&keys_line(&pull, 200)).matches("   ").count(),
+            pull.len() - 1
         );
-        assert_eq!(plain(&keys_line(&KEYS, 20)), "←→ tabs   m merge");
+        assert_eq!(plain(&keys_line(&pull, 20)), "←→ tabs   m merge");
     }
 
     #[test]

@@ -1,132 +1,116 @@
 //! What the reader does from a key, and the keys it does it from until
-//! `[keys.reader]` in `config.toml` says otherwise.
+//! `[keys.reader]`, `[keys.ink]` and `[keys.bookmarks]` in `config.toml` say
+//! otherwise.
 
-use crate::keymap::Action;
+use crate::hue::Hue;
+use crate::keymap::actions;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReaderAction {
-    Help,
-    Guide,
-    GoToPage,
-    Outline,
-    OutlineWindow,
-    Bookmark,
-    Bookmarks,
-    Find,
-    NextMatch,
-    PreviousMatch,
-    Quit,
-    Highlight,
-    Ask,
-    ScrollDown,
-    ScrollUp,
-    HalfScreenDown,
-    HalfScreenUp,
-    ScreenDown,
-    ScreenUp,
-    NextPage,
-    PreviousPage,
-    LinkBack,
-    LinkForward,
-    First,
-    Last,
-    Images,
-    Look,
-    Pen,
-    Eraser,
-    MoveInk,
-    ReadAloud,
-    StopReading,
-    Voices,
-    Slower,
-    Faster,
-    Narrower,
-    Wider,
-    FitWidth,
-    PreviousSentence,
-    NextSentence,
-}
-
-impl Action for ReaderAction {
-    const VIEW: &'static str = "reader";
+actions! {
     /// `next_match` comes before `next_page`: `n` finds the next match while
     /// a search has one on the page, and turns the page otherwise.
-    const TABLE: &'static [(&'static str, Self, &'static [&'static str])] = &[
-        ("help", ReaderAction::Help, &["?", "/"]),
-        ("guide", ReaderAction::Guide, &["!"]),
-        ("go_to_page", ReaderAction::GoToPage, &[":"]),
-        ("outline", ReaderAction::Outline, &["t"]),
-        ("outline_window", ReaderAction::OutlineWindow, &["T"]),
-        ("bookmark", ReaderAction::Bookmark, &["m"]),
-        ("bookmarks", ReaderAction::Bookmarks, &["'"]),
-        ("find", ReaderAction::Find, &["f", "F"]),
-        ("next_match", ReaderAction::NextMatch, &["n"]),
-        ("previous_match", ReaderAction::PreviousMatch, &["N"]),
-        ("quit", ReaderAction::Quit, &["q"]),
-        ("highlight", ReaderAction::Highlight, &["y"]),
-        ("ask", ReaderAction::Ask, &["@", "ctrl+enter"]),
-        ("scroll_down", ReaderAction::ScrollDown, &["j", "down"]),
-        ("scroll_up", ReaderAction::ScrollUp, &["k", "up"]),
-        (
-            "half_screen_down",
-            ReaderAction::HalfScreenDown,
-            &["ctrl+d"],
-        ),
-        (
-            "half_screen_up",
-            ReaderAction::HalfScreenUp,
-            &["u", "ctrl+u"],
-        ),
-        (
-            "screen_down",
-            ReaderAction::ScreenDown,
-            &["space", "pagedown"],
-        ),
-        ("screen_up", ReaderAction::ScreenUp, &["b", "pageup"]),
-        ("next_page", ReaderAction::NextPage, &["l", "n", "right"]),
-        (
-            "previous_page",
-            ReaderAction::PreviousPage,
-            &["h", "p", "left"],
-        ),
-        ("link_back", ReaderAction::LinkBack, &["H"]),
-        ("link_forward", ReaderAction::LinkForward, &["L"]),
-        ("first", ReaderAction::First, &["g", "home"]),
-        ("last", ReaderAction::Last, &["G", "end"]),
-        ("images", ReaderAction::Images, &["i"]),
-        ("look", ReaderAction::Look, &["o"]),
-        ("pen", ReaderAction::Pen, &["d", "D"]),
-        ("eraser", ReaderAction::Eraser, &["e", "E"]),
-        ("move_ink", ReaderAction::MoveInk, &["v", "V"]),
-        ("read_aloud", ReaderAction::ReadAloud, &["a"]),
-        ("stop_reading", ReaderAction::StopReading, &["A"]),
-        ("voices", ReaderAction::Voices, &["s", "S"]),
-        ("slower", ReaderAction::Slower, &["["]),
-        ("faster", ReaderAction::Faster, &["]"]),
-        ("narrower", ReaderAction::Narrower, &["<", "-"]),
-        ("wider", ReaderAction::Wider, &[">", "+"]),
-        ("fit_width", ReaderAction::FitWidth, &["="]),
-        ("previous_sentence", ReaderAction::PreviousSentence, &[","]),
-        ("next_sentence", ReaderAction::NextSentence, &["."]),
-    ];
+    pub enum ReaderAction in "reader", "Reading a document" {
+        Help = "help" ["?", "/"] "list the keys",
+        Guide = "guide" ["!"] "how to highlight and draw",
+        GoToPage = "go_to_page" [":"] "go to a page by number",
+        Outline = "outline" ["t"] "outline beside the text",
+        OutlineWindow = "outline_window" ["T"] "outline over the text",
+        Bookmark = "bookmark" ["m"] "bookmark this page, or remove it",
+        Bookmarks = "bookmarks" ["'"] "list the bookmarks",
+        Find = "find" ["f", "F"] "find text",
+        NextMatch = "next_match" ["n"] "next match, while a search has one on the page",
+        PreviousMatch = "previous_match" ["N"] "previous match",
+        Quit = "quit" ["q"] "quit",
+        Highlight = "highlight" ["y"] "highlight the selection, or clear one",
+        Ask = "ask" ["@", "ctrl+enter"] "ask an agent about the selection",
+        ScrollDown = "scroll_down" ["j", "down"] "scroll down a line",
+        ScrollUp = "scroll_up" ["k", "up"] "scroll up a line",
+        HalfScreenDown = "half_screen_down" ["ctrl+d"] "half a screen down",
+        HalfScreenUp = "half_screen_up" ["u", "ctrl+u"] "half a screen up",
+        ScreenDown = "screen_down" ["space", "pagedown"] "a screen down",
+        ScreenUp = "screen_up" ["b", "pageup"] "a screen up",
+        NextPage = "next_page" ["l", "n", "right"] "next page, or picture in the folder",
+        PreviousPage = "previous_page" ["h", "p", "left"] "previous page, or picture",
+        LinkBack = "link_back" ["H"] "back through followed links",
+        LinkForward = "link_forward" ["L"] "forward through followed links",
+        First = "first" ["g", "home"] "first page, or the top",
+        Last = "last" ["G", "end"] "last page, or the bottom",
+        Images = "images" ["i"] "original or painted images",
+        Look = "look" ["o"] "office documents: as designed or in the terminal's font",
+        Pen = "pen" ["d", "D"] "take the pen",
+        Eraser = "eraser" ["e", "E"] "take the eraser",
+        MoveInk = "move_ink" ["v", "V"] "take the move tool, to pick and move ink",
+        Escape = "escape" ["esc"] "drop the tool, selection or search; quit when there is none",
+        Color1 = "color_1" ["1"] "yellow; paints the selection",
+        Color2 = "color_2" ["2"] "green",
+        Color3 = "color_3" ["3"] "blue",
+        Color4 = "color_4" ["4"] "pink",
+        Color5 = "color_5" ["5"] "purple",
+        Color6 = "color_6" ["6"] "red",
+        ReadAloud = "read_aloud" ["a"] "read aloud from here; pause and go on",
+        StopReading = "stop_reading" ["A"] "stop reading aloud",
+        Voices = "voices" ["s", "S"] "pick a voice",
+        Slower = "slower" ["["] "read slower",
+        Faster = "faster" ["]"] "read faster",
+        Narrower = "narrower" ["<", "-"] "narrower column",
+        Wider = "wider" [">", "+"] "wider column",
+        FitWidth = "fit_width" ["="] "fit the column to the screen, or back",
+        PreviousSentence = "previous_sentence" [","] "previous sentence aloud",
+        NextSentence = "next_sentence" ["."] "next sentence aloud",
+    }
+}
+
+impl ReaderAction {
+    /// The color a `color_N` action picks.
+    pub fn hue(self) -> Option<Hue> {
+        let n = match self {
+            ReaderAction::Color1 => 0,
+            ReaderAction::Color2 => 1,
+            ReaderAction::Color3 => 2,
+            ReaderAction::Color4 => 3,
+            ReaderAction::Color5 => 4,
+            ReaderAction::Color6 => 5,
+            _ => return None,
+        };
+        Hue::ALL.get(n).copied()
+    }
+}
+
+actions! {
+    /// With the move tool, while a stroke is picked.
+    pub enum InkAction in "ink", "The move tool, with a stroke picked" {
+        Left = "left" ["h", "left"] "move it left",
+        Right = "right" ["l", "right"] "move it right",
+        Up = "up" ["k", "up"] "move it up",
+        Down = "down" ["j", "down"] "move it down",
+        Grow = "grow" ["+", "="] "make it bigger",
+        Shrink = "shrink" ["-"] "make it smaller",
+        Delete = "delete" ["x", "delete", "backspace"] "delete it",
+    }
+}
+
+actions! {
+    pub enum BookmarksAction in "bookmarks", "The reader's list of bookmarks" {
+        Close = "close" ["esc", "q", "'"] "close the list",
+        Down = "down" ["j", "down"] "next bookmark",
+        Up = "up" ["k", "up"] "previous bookmark",
+        Open = "open" ["enter"] "go to the bookmark",
+        Delete = "delete" ["x", "d", "delete", "backspace"] "remove the bookmark",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ReaderAction;
-    use crate::keymap::{Action, Keymap};
+    use crate::hue::Hue;
+    use crate::keymap::Keymap;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
-    fn every_action_is_listed_once_and_its_defaults_parse() {
+    fn the_number_keys_pick_the_colors_they_always_did() {
         let keys = Keymap::<ReaderAction>::default();
-        for (i, (name, action, _)) in ReaderAction::TABLE.iter().enumerate() {
-            assert!(
-                ReaderAction::TABLE[i + 1..]
-                    .iter()
-                    .all(|(other, theirs, _)| other != name && theirs != action),
-                "{name}"
-            );
-            assert!(!keys.label(*action).is_empty(), "{name}");
+        for c in '1'..='6' {
+            let action = keys.actions(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            assert_eq!(action.first().and_then(|a| a.hue()), Hue::of_key(c), "{c}");
         }
     }
 }

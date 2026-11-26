@@ -14,7 +14,53 @@ use serde::Deserialize;
 pub trait Action: Copy + Eq + 'static {
     /// The `[keys.<VIEW>]` table that rebinds these actions.
     const VIEW: &'static str;
+    /// Where these keys work, for `leaf keys`.
+    const WHERE: &'static str = "";
     const TABLE: &'static [(&'static str, Self, &'static [&'static str])];
+    /// What each action in `TABLE` does, in the same order, for `leaf keys`.
+    const ABOUT: &'static [&'static str] = &[];
+}
+
+/// Declares a view's actions: the enum, and its `Action` table with each
+/// action's name in `config.toml`, its default keys and what it does.
+macro_rules! actions {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident in $view:literal, $where:literal {
+            $($variant:ident = $key:literal [$($chord:literal),* $(,)?] $about:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $crate::keymap::Action for $name {
+            const VIEW: &'static str = $view;
+            const WHERE: &'static str = $where;
+            const TABLE: &'static [(&'static str, Self, &'static [&'static str])] =
+                &[$(($key, $name::$variant, &[$($chord),*])),+];
+            const ABOUT: &'static [&'static str] = &[$($about),+];
+        }
+    };
+}
+
+pub(crate) use actions;
+
+/// `[keys.<view>]` with every action and its default keys, commented with
+/// what it does: what `leaf keys` prints.
+pub fn defaults_toml<A: Action>() -> String {
+    let mut out = format!("# {}\n[keys.{}]\n", A::WHERE, A::VIEW);
+    for (i, (name, _, keys)) in A::TABLE.iter().enumerate() {
+        let keys: Vec<String> = keys.iter().map(|key| format!("{key:?}")).collect();
+        let line = format!("{name} = [{}]", keys.join(", "));
+        match A::ABOUT.get(i) {
+            Some(about) => out.push_str(&format!("{line:<44} # {about}\n")),
+            None => out.push_str(&format!("{line}\n")),
+        }
+    }
+    out
 }
 
 /// One key with the modifiers held for it, such as `ctrl+d` or `G`.
@@ -36,15 +82,19 @@ impl Chord {
             return Err(bad("it is empty"));
         }
         // The key comes last, and may itself be `+`.
+        // `None` when no modifiers are named; `Some("")` when a `+` names none.
         let (mods_text, key) = match text.strip_suffix('+') {
-            Some(rest) if rest.is_empty() || rest.ends_with('+') => {
-                (rest.strip_suffix('+').unwrap_or(rest), "+")
-            }
-            _ => text.rsplit_once('+').unwrap_or(("", text)),
+            Some("") => (None, "+"),
+            Some(rest) if rest.ends_with('+') => (rest.strip_suffix('+'), "+"),
+            _ => match text.rsplit_once('+') {
+                Some((mods, key)) => (Some(mods), key),
+                None => (None, text),
+            },
         };
         let mut mods = KeyModifiers::NONE;
-        for name in mods_text.split('+').filter(|name| !name.is_empty()) {
+        for name in mods_text.into_iter().flat_map(|mods| mods.split('+')) {
             mods |= match name.to_ascii_lowercase().as_str() {
+                "" => return Err(bad("a `+` stands between two names, as in ctrl+d")),
                 "ctrl" | "control" => KeyModifiers::CONTROL,
                 "alt" | "option" | "opt" | "meta" => KeyModifiers::ALT,
                 "shift" => KeyModifiers::SHIFT,
@@ -97,8 +147,12 @@ impl Chord {
             KeyCode::Tab if shift => KeyCode::BackTab,
             code => code,
         };
+        // A letter's case already says shift. Symbols keep it, so `shift+space`
+        // is its own key; a terminal that reports `?` with shift still finds
+        // `?`, as a binding asking for fewer modifiers.
         let mods = match code {
-            KeyCode::Char(_) | KeyCode::BackTab => mods & HELD,
+            KeyCode::Char(c) if c.is_alphabetic() => mods & HELD,
+            KeyCode::BackTab => mods & HELD,
             _ => mods & (HELD | KeyModifiers::SHIFT),
         };
         Chord { code, mods }
@@ -193,9 +247,22 @@ impl<A: Action> Keymap<A> {
                 .collect::<Result<Vec<_>, _>>()?;
             chosen.push((*action, name, chords));
         }
-        for (i, (_, name, chords)) in chosen.iter().enumerate() {
-            for (_, other, theirs) in &chosen[i + 1..] {
-                if let Some(chord) = chords.iter().find(|chord| theirs.contains(chord)) {
+        let defaults = Keymap::<A>::default();
+        let default_of = |action: A, chord: &Chord| {
+            defaults
+                .bindings
+                .iter()
+                .any(|(mine, chords)| *mine == action && chords.contains(chord))
+        };
+        // A key both actions have by default is shared on purpose, as `n`
+        // finds the next match or turns the page; any other is a clash.
+        for (i, (action, name, chords)) in chosen.iter().enumerate() {
+            for (theirs_action, other, theirs) in &chosen[i + 1..] {
+                let clash = chords.iter().find(|chord| {
+                    theirs.contains(chord)
+                        && !(default_of(*action, chord) && default_of(*theirs_action, chord))
+                });
+                if let Some(chord) = clash {
                     return Err(format!(
                         "keys.{view}: `{}` is bound to both `{name}` and `{other}`. Give it to one of them.",
                         chord.label()
@@ -203,13 +270,23 @@ impl<A: Action> Keymap<A> {
                 }
             }
         }
-        let mut keymap = Keymap::default();
+        // Only a key an action didn't have before is taken from the others,
+        // so restating an action's defaults changes nothing.
+        let taken: Vec<Chord> = chosen
+            .iter()
+            .flat_map(|(action, _, chords)| {
+                chords
+                    .iter()
+                    .filter(|chord| !default_of(*action, chord))
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut keymap = defaults.clone();
         for (action, chords) in &mut keymap.bindings {
             match chosen.iter().find(|(mine, _, _)| mine == action) {
                 Some((_, _, mine)) => *chords = mine.clone(),
-                None => chosen
-                    .iter()
-                    .for_each(|(_, _, taken)| chords.retain(|chord| !taken.contains(chord))),
+                None => chords.retain(|chord| !taken.contains(chord)),
             }
         }
         Ok(keymap)
@@ -239,11 +316,6 @@ impl<A: Action> Keymap<A> {
         held(true).chain(held(false)).collect()
     }
 
-    /// Whether `key` is bound to `action`.
-    pub fn is(&self, key: &KeyEvent, action: A) -> bool {
-        self.actions(key).contains(&action)
-    }
-
     /// The keys of `action` for a help screen, such as `j/↓`; empty when unbound.
     pub fn label(&self, action: A) -> String {
         self.bindings
@@ -257,6 +329,42 @@ impl<A: Action> Keymap<A> {
                     .join("/")
             })
             .unwrap_or_default()
+    }
+
+    /// The first key of `action`, for a hint that shows one; empty when unbound.
+    pub fn first(&self, action: A) -> String {
+        self.bindings
+            .iter()
+            .find(|(mine, _)| *mine == action)
+            .and_then(|(_, chords)| chords.first())
+            .map(|chord| chord.label())
+            .unwrap_or_default()
+    }
+
+    /// The arrow key of `action` when it has one, else its first key: what a
+    /// footer shows for moving, such as `↑` rather than `k`.
+    pub fn arrow(&self, action: A) -> String {
+        let arrows = [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right];
+        self.bindings
+            .iter()
+            .find(|(mine, _)| *mine == action)
+            .and_then(|(_, chords)| {
+                chords
+                    .iter()
+                    .find(|chord| arrows.contains(&chord.code) && chord.mods.is_empty())
+                    .or(chords.first())
+            })
+            .map(|chord| chord.label())
+            .unwrap_or_default()
+    }
+
+    /// The first keys of two actions that go together, such as `j/k`.
+    pub fn pair(&self, one: A, other: A) -> String {
+        let (one, other) = (self.first(one), self.first(other));
+        match (one.is_empty(), other.is_empty()) {
+            (false, false) => format!("{one}/{other}"),
+            _ => format!("{one}{other}"),
+        }
     }
 
     /// The keys of several actions, such as `h/←  l/→`, skipping unbound ones.
@@ -292,6 +400,27 @@ impl<'de, A: Action> Deserialize<'de> for Keymap<A> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let overrides = BTreeMap::<String, Keys>::deserialize(deserializer)?;
         Keymap::with(&overrides).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Fails when `A`'s table names an action twice, lists an action twice, has
+/// a default key that doesn't parse, or describes a different number of actions.
+#[cfg(test)]
+pub fn check<A: Action + std::fmt::Debug>() {
+    let view = A::VIEW;
+    assert_eq!(
+        A::ABOUT.len(),
+        A::TABLE.len(),
+        "keys.{view}: one description per action"
+    );
+    for (i, (name, action, keys)) in A::TABLE.iter().enumerate() {
+        for (other, theirs, _) in &A::TABLE[i + 1..] {
+            assert_ne!(name, other, "keys.{view}");
+            assert_ne!(action, theirs, "keys.{view}.{name}");
+        }
+        for key in *keys {
+            assert!(Chord::parse(key).is_ok(), "keys.{view}.{name}: {key}");
+        }
     }
 }
 
@@ -365,6 +494,9 @@ mod tests {
         assert!(Chord::parse("f13").is_err());
         assert!(Chord::parse("").is_err());
         assert!(Chord::parse("ctrl+").is_err());
+        assert!(Chord::parse("ctrl++q").is_err());
+        assert!(Chord::parse("+q").is_err());
+        assert_ne!(parse("shift+space"), parse("space"));
     }
 
     #[test]
@@ -422,6 +554,13 @@ mod tests {
         assert_eq!(keys.actions(&char('n')), vec![Test::Quit]);
         assert!(keys.actions(&char('q')).is_empty());
         assert_eq!(keys.label(Test::Turn), "d");
+    }
+
+    #[test]
+    fn restating_defaults_changes_nothing() {
+        let keys = overrides("next = \"n\"\nturn = [\"n\", \"d\"]").unwrap();
+        assert_eq!(keys, Keymap::default());
+        assert_eq!(keys.actions(&char('n')), vec![Test::Next, Test::Turn]);
     }
 
     #[test]

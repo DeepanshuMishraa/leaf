@@ -53,6 +53,12 @@ max_width = 100   # reading column width, default 76
 colorful_markdown = true   # terminal palette colors for heading levels and links, default false
 hide_link_urls = true   # hide URLs printed after clickable link labels, default false
 
+[diff]
+layout = "inline"   # "split" or "inline"; left out, a diff opens in the layout last used
+
+[outline]
+width = 40   # the outline sidebar's width when it opens, 20 through 80, default 32
+
 # Rebind keys. Each line names an action and one key or a list of them.
 # Actions you leave out keep their keys; an empty list unbinds one.
 [keys.reader]
@@ -62,14 +68,16 @@ pen = []
 
 [keys.diff]
 next_file = ["]", "n", "tab"]
-comment = "c"
+
+[keys.board]
+tool_box = "R"
 ```
 
-Keys are written as `q`, `G`, `ctrl+d`, `alt+enter`, `shift+tab`, `space`, `enter`, `esc`, `tab`, `up`, `pagedown`, `home`, `f1` and so on. A key you give to one action is taken from the others, and `?` lists the keys as you set them. A misspelled action or key stops leaf with a message naming it and listing the actions there are.
+Every view has its own key table: `reader`, `ink`, `bookmarks`, `outline`, `diff`, `diff_comments`, `diff_overview`, `confirm_post`, `verdict`, `plan`, `plan_notes`, `plan_quit`, `board`, `pr_list` and `pr`. `leaf config keys` prints them all with every action, its default keys and what it does, ready to copy. Text you type, such as comments, find and filters, keeps its own keys.
 
-Reader actions: `help`, `guide`, `go_to_page`, `outline`, `outline_window`, `bookmark`, `bookmarks`, `find`, `next_match`, `previous_match`, `quit`, `highlight`, `ask`, `scroll_down`, `scroll_up`, `half_screen_down`, `half_screen_up`, `screen_down`, `screen_up`, `next_page`, `previous_page`, `link_back`, `link_forward`, `first`, `last`, `images`, `look`, `pen`, `eraser`, `move_ink`, `read_aloud`, `stop_reading`, `voices`, `slower`, `faster`, `narrower`, `wider`, `fit_width`, `previous_sentence`, `next_sentence`.
+Keys are written as `q`, `G`, `ctrl+d`, `alt+enter`, `shift+tab`, `space`, `enter`, `esc`, `tab`, `up`, `pagedown`, `home`, `f1` and so on. A key you give to one action is taken from the others, and `?` lists the keys as you set them.
 
-Diff actions: `tab_summary`, `tab_timeline`, `tab_comments`, `tab_checks` (in a pull request's Code tab), `quit`, `quit_now`, `file_note`, `global_note`, `viewed`, `send_review`, `overview`, `down`, `up`, `half_page_down`, `half_page_up`, `page_down`, `page_up`, `first`, `last`, `next_file`, `previous_file`, `files`, `outline`, `outline_window`, `select`, `comment`, `ask`, `comments`, `copy`, `copy_all`, `other_side`, `layout`, `reload`, `fold`, `unfold`, `scroll_left`, `scroll_right`, `scroll_reset`, `help`.
+`leaf config check` reads the file as leaf would. A file that doesn't read stops the reader, `leaf diff`, `leaf review`, `leaf plan`, `leaf board` and `leaf pr` with a message naming the line; in `leaf pr`'s Code tab it shows as a toast instead. A misspelled action lists the actions its table has, and a misspelled key says how to write one. `leaf config path` prints where the file is.
 
 ## Diffs
 
