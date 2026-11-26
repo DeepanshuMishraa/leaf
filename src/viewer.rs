@@ -2563,7 +2563,7 @@ impl App {
                 return;
             }
             let mut open = OpenOutline::new(outline::Outline::new(nodes));
-            open.page = self.current;
+            open.page = self.outline_page();
             self.outline = Some(open);
         }
         // Only the outline's own window can be open here: any other dialog
@@ -2574,8 +2574,16 @@ impl App {
         };
     }
 
+    /// The document's own bookmarks when it has them, else the page's headings.
     fn outline_nodes(&mut self) -> Vec<outline::OutlineNode> {
+        if !self.doc.bookmarks.is_empty() {
+            return outline::from_bookmarks(&self.doc.bookmarks);
+        }
         outline::from_headings(&self.laid(self.current).headings)
+    }
+
+    fn outline_page(&self) -> Option<usize> {
+        self.doc.bookmarks.is_empty().then_some(self.current)
     }
 
     /// From the reader's own place, not the last frame drawn.
@@ -2597,6 +2605,13 @@ impl App {
         if let Some(open) = self.outline.as_mut() {
             open.pinned = None;
         }
+        if self
+            .outline
+            .as_ref()
+            .is_some_and(|open| open.page.is_none())
+        {
+            return outline::page_at(&self.doc.bookmarks, self.current);
+        }
         let index = self.heading_under_top()?;
         self.outline
             .as_ref()?
@@ -2616,6 +2631,7 @@ impl App {
             // The diff view resolves its own; the rest are the reader's.
             outline::Locator::Diff(_) => return,
             outline::Locator::Text(index) => self.show_heading(index),
+            outline::Locator::Page(page) => self.go_to_page(page, false),
         }
         let landed = (self.current, self.offset);
         if let Some(open) = self.outline.as_mut() {
@@ -2660,10 +2676,11 @@ impl App {
             return;
         }
         let nodes = self.outline_nodes();
+        let page = self.outline_page();
         if let Some(open) = self.outline.as_mut()
-            && open.retarget(nodes, open.page != self.current)
+            && open.retarget(nodes, open.page != page)
         {
-            open.page = self.current;
+            open.page = page;
         }
         let here = self.outline_here();
         if let Some(open) = self.outline.as_mut() {
@@ -4150,7 +4167,23 @@ mod tests {
         Doc {
             title: "Book".into(),
             page_count: Some(pages.len()),
+            bookmarks: Vec::new(),
             source: Box::new(Book(pages.iter().map(|p| p.to_string()).collect())),
+        }
+    }
+
+    /// A book with its own bookmarks, as a PDF or EPUB would carry them.
+    fn bookmarked(pages: &[&str], bookmarks: &[(&str, usize, usize)]) -> Doc {
+        Doc {
+            bookmarks: bookmarks
+                .iter()
+                .map(|&(title, depth, page)| crate::doc::Bookmark {
+                    title: title.to_owned(),
+                    depth,
+                    page,
+                })
+                .collect(),
+            ..book(pages)
         }
     }
 
@@ -4804,6 +4837,7 @@ mod tests {
             let doc = Doc {
                 title: "Counted book".into(),
                 page_count: Some(1),
+                bookmarks: Vec::new(),
                 source: Box::new(Counted {
                     text: text.into(),
                     reads: reads.clone(),
@@ -4890,6 +4924,7 @@ mod tests {
         let doc = Doc {
             title: "Book".into(),
             page_count: Some(1),
+            bookmarks: Vec::new(),
             source: Box::new(Pictured),
         };
         let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
@@ -4997,6 +5032,7 @@ mod tests {
         let doc = Doc {
             title: "Book".into(),
             page_count: Some(1),
+            bookmarks: Vec::new(),
             source: Box::new(Broken(tries.clone())),
         };
         let mut s = Screen::new(doc, 120, 30, ViewerOptions::default());
@@ -6799,6 +6835,79 @@ mod tests {
     /// A page of text taller than the screen, so a jump to it stays on it.
     fn tall(title: &str) -> String {
         format!("# {title}\n\n{}", filler(30))
+    }
+
+    #[test]
+    fn a_documents_bookmarks_are_outlined_and_turn_to_their_pages() {
+        let pages = [tall("First"), tall("Second"), tall("Third")];
+        let mut s = Screen::new(
+            bookmarked(
+                &[pages[0].as_str(), pages[1].as_str(), pages[2].as_str()],
+                &[("First", 0, 0), ("Nested", 1, 1), ("Third", 0, 2)],
+            ),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        let frame = s.press(KeyCode::Char('t'));
+        // The tree is the book's own, at its own depths, whatever the page shows.
+        assert_eq!(shown(&s), ["First", "Nested", "Third"]);
+        assert_eq!(picked(&frame), "First");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(s.app.current, 1);
+        assert_eq!(picked(&frame), "Nested");
+        assert!(frame.contains("2 / 3"), "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(s.app.current, 2);
+        assert_eq!(picked(&frame), "Third");
+        // And back up.
+        let frame = s.press(KeyCode::Char('k'));
+        assert_eq!(s.app.current, 1);
+        assert_eq!(picked(&frame), "Nested");
+    }
+
+    #[test]
+    fn a_bookmark_outline_follows_the_page_being_read() {
+        let pages = [tall("First"), tall("Second"), tall("Third")];
+        let mut s = Screen::new(
+            bookmarked(
+                &[pages[0].as_str(), pages[1].as_str(), pages[2].as_str()],
+                &[("First", 0, 0), ("Third", 0, 2)],
+            ),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&s.draw()), "First");
+        s.app.go_to_page(2, false);
+        assert_eq!(picked(&s.draw()), "Third");
+        s.app.go_to_page(0, false);
+        assert_eq!(picked(&s.draw()), "First");
+    }
+
+    #[test]
+    fn bookmarks_sharing_a_page_are_walked_one_by_one() {
+        // Three entries on one page: a second `j` must leave the entry the
+        // first one landed on, not look the page up again and find the same.
+        let pages = [tall("First")];
+        let mut s = Screen::new(
+            bookmarked(
+                &[pages[0].as_str()],
+                &[("Alpha", 0, 0), ("Beta", 0, 0), ("Gamma", 0, 0)],
+            ),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        let frame = s.press(KeyCode::Char('t'));
+        assert_eq!(picked(&frame), "Alpha", "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&frame), "Beta", "{frame}");
+        let frame = s.press(KeyCode::Char('j'));
+        assert_eq!(picked(&frame), "Gamma", "{frame}");
+        let frame = s.press(KeyCode::Char('k'));
+        assert_eq!(picked(&frame), "Beta", "{frame}");
     }
     #[test]
     fn a_click_on_the_sidebar_does_not_select_text() {

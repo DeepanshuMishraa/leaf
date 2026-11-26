@@ -1746,6 +1746,7 @@ pub fn open(path: &Path) -> Result<Doc, PackageFailed> {
     Ok(Doc {
         title: crate::office::stem(path),
         page_count: Some(pages.len()),
+        bookmarks: Vec::new(),
         source: Box::new(Words {
             package,
             pages,

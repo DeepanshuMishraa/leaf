@@ -16,6 +16,8 @@ pub enum Locator {
     Text(usize),
     /// A file's index in a diff's files.
     Diff(usize),
+    /// The page a document's own bookmark goes to, 0-based.
+    Page(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,8 +301,9 @@ pub struct OpenOutline {
     /// The end of the document can pull a jump back mid-screen, so the highlight follows
     /// this until the text moves.
     pub pinned: Option<Pinned>,
-    /// The reader's alone: the page whose headings the tree holds.
-    pub page: usize,
+    /// The reader's alone: the page whose headings the tree holds, `None` for the document's
+    /// own bookmarks.
+    pub page: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -326,7 +329,7 @@ impl OpenOutline {
             typing: false,
             picked: None,
             pinned: None,
-            page: 0,
+            page: None,
         }
     }
 
@@ -550,6 +553,19 @@ pub fn from_headings(headings: &[render::Heading]) -> Vec<OutlineNode> {
     nodes
 }
 
+/// One entry per bookmark, in order: the index `page_at` answers with.
+pub fn from_bookmarks(bookmarks: &[crate::doc::Bookmark]) -> Vec<OutlineNode> {
+    bookmarks
+        .iter()
+        .map(|bookmark| OutlineNode {
+            label: bookmark.title.clone(),
+            depth: bookmark.depth,
+            locator: Some(Locator::Page(bookmark.page)),
+            found_by: bookmark.title.clone(),
+        })
+        .collect()
+}
+
 /// The diff's files as a tree of directories. A directory is told by where it
 /// hangs and its name; an absolute path hangs from a root with no name.
 pub fn from_diff_files(files: &[crate::diff::File]) -> Vec<OutlineNode> {
@@ -632,6 +648,18 @@ pub fn heading_at(headings: &[render::Heading], row: usize) -> Option<usize> {
         .rposition(reached)
         .or_else(|| headings.iter().position(titled))
         .map(|at| headings[at].index)
+}
+
+/// The bookmark at or before `page` that goes furthest; a page two share belongs to the
+/// earlier one.
+pub fn page_at(bookmarks: &[crate::doc::Bookmark], page: usize) -> Option<usize> {
+    bookmarks
+        .iter()
+        .enumerate()
+        .filter(|(_, bookmark)| bookmark.page <= page)
+        .max_by_key(|&(at, bookmark)| (bookmark.page, std::cmp::Reverse(at)))
+        .map(|(at, _)| at)
+        .or_else(|| (!bookmarks.is_empty()).then_some(0))
 }
 
 #[cfg(test)]
@@ -1156,6 +1184,49 @@ mod tests {
             .map(|node| (node.label.as_str(), node.depth))
             .collect();
         assert_eq!(got, [("Deep", 0), ("Deeper", 1), ("Up", 0)]);
+    }
+
+    fn bookmark(title: &str, depth: usize, page: usize) -> crate::doc::Bookmark {
+        crate::doc::Bookmark {
+            title: title.to_owned(),
+            depth,
+            page,
+        }
+    }
+
+    #[test]
+    fn bookmarks_keep_the_depth_they_came_with() {
+        let nodes = from_bookmarks(&[bookmark("One", 0, 0), bookmark("Nested", 1, 2)]);
+        assert_eq!(nodes[0].depth, 0);
+        assert_eq!(nodes[1].depth, 1);
+    }
+
+    #[test]
+    fn a_page_belongs_to_the_last_bookmark_at_or_before_it() {
+        let bookmarks = [bookmark("One", 0, 2), bookmark("Two", 0, 5)];
+        // Pages before the first bookmark belong to it.
+        assert_eq!(page_at(&bookmarks, 0), Some(0));
+        assert_eq!(page_at(&bookmarks, 2), Some(0));
+        assert_eq!(page_at(&bookmarks, 4), Some(0));
+        assert_eq!(page_at(&bookmarks, 5), Some(1));
+        assert_eq!(page_at(&bookmarks, 40), Some(1));
+        assert_eq!(page_at(&[], 0), None);
+    }
+
+    #[test]
+    fn a_page_belongs_to_the_bookmark_at_or_before_it_that_goes_furthest() {
+        // Bookmarks need not come in page order, so the nearest one is not the
+        // last one listed.
+        let bookmarks = [bookmark("Late", 0, 5), bookmark("Early", 0, 2)];
+        // A page before them all belongs to the first entry, as ever.
+        assert_eq!(page_at(&bookmarks, 1), Some(0));
+        assert_eq!(page_at(&bookmarks, 2), Some(1));
+        assert_eq!(page_at(&bookmarks, 4), Some(1));
+        assert_eq!(page_at(&bookmarks, 5), Some(0));
+        assert_eq!(page_at(&bookmarks, 9), Some(0));
+        // Two on one page: the earlier of them holds it.
+        let shared = [bookmark("One", 0, 3), bookmark("Two", 0, 3)];
+        assert_eq!(page_at(&shared, 3), Some(0));
     }
 
     #[test]

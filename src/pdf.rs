@@ -15,7 +15,7 @@ use mupdf::{
 };
 use regex::Regex;
 
-use crate::doc::{Doc, Source};
+use crate::doc::{Bookmark, Doc, Source};
 use crate::memory;
 
 #[derive(Debug, thiserror::Error)]
@@ -1521,8 +1521,13 @@ impl Source for Worker {
     }
 }
 
+/// What a background loader reads of the document itself and sends back to the
+/// reader: its title, page count and bookmarks. Its source stays on the
+/// loader's own thread.
+type Loaded = (String, Option<usize>, Vec<Bookmark>);
+
 pub struct Loading {
-    ready: Receiver<Result<(String, Option<usize>), PdfOpenFailed>>,
+    ready: Receiver<Result<Loaded, PdfOpenFailed>>,
     worker: Worker,
 }
 
@@ -1544,7 +1549,14 @@ impl Loading {
                     return;
                 }
             };
-            if ready.send(Ok((doc.title.clone(), doc.page_count))).is_err() {
+            if ready
+                .send(Ok((
+                    doc.title.clone(),
+                    doc.page_count,
+                    doc.bookmarks.clone(),
+                )))
+                .is_err()
+            {
                 return;
             }
             while let Ok(query) = queries.recv() {
@@ -1559,9 +1571,10 @@ impl Loading {
 
     pub fn poll(&self) -> Option<Result<Doc, PdfOpenFailed>> {
         match self.ready.try_recv() {
-            Ok(result) => Some(result.map(|(title, page_count)| Doc {
+            Ok(result) => Some(result.map(|(title, page_count, bookmarks)| Doc {
                 title,
                 page_count,
+                bookmarks,
                 source: Box::new(self.worker.clone()),
             })),
             Err(TryRecvError::Empty) => None,
@@ -1640,12 +1653,20 @@ fn from_document(
         .ok()
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty());
+    // A PDF's outline and an EPUB's table of contents both come back here, as
+    // plain data: a damaged one costs the document its bookmarks, not its pages.
+    let bookmarks = document
+        .outlines()
+        .as_deref()
+        .map(bookmarks_in)
+        .unwrap_or_default();
     // A reflowable book (EPUB) lays itself out again on every open, which takes
     // seconds for a long one, so it is never opened afresh.
     let path = path.filter(|_| !document.is_reflowable().unwrap_or(false));
     Ok(Doc {
         title: title.unwrap_or_else(|| fallback_title.to_owned()),
         page_count: Some(page_count),
+        bookmarks,
         source: Box::new(PdfSource {
             path,
             document: RefCell::new((document, 0)),
@@ -1654,6 +1675,33 @@ fn from_document(
             images,
         }),
     })
+}
+
+/// The document's own outline as a flat list in reading order: each entry that
+/// goes to a page, and the entries under it one level deeper.
+///
+/// An entry with nowhere to go (a part heading, say) is passed over, and what
+/// hangs under it keeps that entry's depth rather than indent under a parent
+/// the outline doesn't show.
+fn bookmarks_in(outlines: &[mupdf::Outline]) -> Vec<Bookmark> {
+    fn walk(outlines: &[mupdf::Outline], depth: usize, out: &mut Vec<Bookmark>) {
+        for outline in outlines {
+            match &outline.dest {
+                Some(dest) => {
+                    out.push(Bookmark {
+                        title: outline.title.clone(),
+                        depth,
+                        page: dest.loc.page_number as usize,
+                    });
+                    walk(&outline.down, depth + 1, out);
+                }
+                None => walk(&outline.down, depth, out),
+            }
+        }
+    }
+    let mut bookmarks = Vec::new();
+    walk(outlines, 0, &mut bookmarks);
+    bookmarks
 }
 
 #[cfg(test)]
@@ -2151,6 +2199,77 @@ mod tests {
             "{out}"
         );
     }
+
+    #[test]
+    fn a_pdfs_own_outline_becomes_its_bookmarks() {
+        use mupdf::DestinationKind;
+        use mupdf::Outline;
+        use mupdf::document::Location;
+        use mupdf::link::LinkDestination;
+        use mupdf::pdf::PdfDocument;
+
+        let path =
+            std::env::temp_dir().join(format!("leaf-test-outline-{}.pdf", std::process::id()));
+        let mut pdf = PdfDocument::new();
+        for _ in 0..3 {
+            pdf.new_page((200.0, 200.0)).expect("a page is added");
+        }
+        let at = |page: u32| {
+            Some(LinkDestination {
+                loc: Location {
+                    chapter: 0,
+                    page_in_chapter: page,
+                    page_number: page,
+                },
+                kind: DestinationKind::Fit,
+            })
+        };
+        let entry = |title: &str, dest: Option<LinkDestination>, down: Vec<Outline>| Outline {
+            title: title.to_owned(),
+            uri: None,
+            dest,
+            down,
+        };
+        pdf.set_outlines(&[
+            entry("One", at(0), vec![entry("Nested", at(2), Vec::new())]),
+            // An entry with nowhere to go is passed over; what hangs under it
+            // keeps its depth rather than indent under a parent nobody sees.
+            entry("Part", None, vec![entry("Under a part", at(1), Vec::new())]),
+        ])
+        .expect("the outline is set");
+        pdf.save(path.to_str().unwrap())
+            .expect("the pdf is written");
+        drop(pdf);
+
+        let doc = from_document(
+            Document::open(path.as_path()),
+            Some(path.clone()),
+            "test.pdf",
+            "test",
+        )
+        .expect("the pdf opens");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            doc.bookmarks,
+            vec![
+                Bookmark {
+                    title: "One".into(),
+                    depth: 0,
+                    page: 0,
+                },
+                Bookmark {
+                    title: "Nested".into(),
+                    depth: 1,
+                    page: 2,
+                },
+                Bookmark {
+                    title: "Under a part".into(),
+                    depth: 0,
+                    page: 1,
+                },
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2193,6 +2312,7 @@ mod epub_tests {
             Ok(Doc {
                 title: "Worker book".into(),
                 page_count: Some(1),
+                bookmarks: Vec::new(),
                 source: Box::new(Owned {
                     thread,
                     text: "Worker page".into(),
@@ -2224,6 +2344,33 @@ mod epub_tests {
         assert_eq!(doc.source.decode("0", 7).unwrap().dimensions(), (7, 2));
         drop(doc);
         assert_eq!(finished.recv_timeout(timeout).unwrap(), owner);
+    }
+
+    #[test]
+    fn an_epubs_table_of_contents_becomes_its_bookmarks() {
+        let path = std::env::temp_dir().join(format!("leaf-test-toc-{}.epub", std::process::id()));
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sample-toc.epub"),
+            &path,
+        )
+        .expect("the sample copies");
+        let doc = open(&path).expect("the epub opens");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            doc.bookmarks,
+            vec![
+                Bookmark {
+                    title: "One".into(),
+                    depth: 0,
+                    page: 0,
+                },
+                Bookmark {
+                    title: "Two".into(),
+                    depth: 0,
+                    page: 1,
+                },
+            ]
+        );
     }
 
     #[test]
