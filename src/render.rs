@@ -14,6 +14,7 @@ use regex::Regex;
 use unicode_width::UnicodeWidthChar;
 
 use crate::font;
+use crate::scheme::Colors;
 use crate::syntax;
 
 /// Tallest an image gets, in rows, so one figure never fills several screens.
@@ -23,6 +24,36 @@ const REMOTE_IMAGE_ROWS: u16 = 12;
 
 pub const DIM: Color = Color::Indexed(8);
 pub const CODE: Color = Color::Indexed(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownColors {
+    headings: [Color; 3],
+    link: Option<Color>,
+}
+
+impl MarkdownColors {
+    pub fn uniform(heading: Color) -> Self {
+        Self {
+            headings: [heading; 3],
+            link: None,
+        }
+    }
+
+    pub fn colorful(colors: Colors) -> Self {
+        Self {
+            headings: [
+                colors.readable(|t| t.magenta, Color::Magenta, Color::LightMagenta),
+                colors.heading_color(),
+                colors.readable(|t| t.green, Color::Green, Color::LightGreen),
+            ],
+            link: Some(if colors.light {
+                Color::Cyan
+            } else {
+                Color::LightCyan
+            }),
+        }
+    }
+}
 
 /// A block of centered lines, as PDF pages mark title pages and captions.
 static CENTERED: LazyLock<Regex> = LazyLock::new(|| {
@@ -692,7 +723,7 @@ enum Wrap {
 struct Ctx<'a> {
     laid: Laid,
     image_sizes: ImageSizes<'a>,
-    heading_color: Color,
+    colors: MarkdownColors,
     /// A terminal cell's size in pixels.
     cell: (u16, u16),
 }
@@ -721,8 +752,15 @@ impl Ctx<'_> {
         self.laid.text.reserve(bytes + 1);
         for run in runs {
             let start = self.laid.text.len();
+            let mut style = run.style;
+            if let Some(color) = self.colors.link
+                && run.link.is_some()
+                && style.add_modifier.contains(Modifier::UNDERLINED)
+            {
+                style = style.fg(color);
+            }
             for c in run.text.chars() {
-                cells.push((c, run.style, Some(self.laid.text.len())));
+                cells.push((c, style, Some(self.laid.text.len())));
                 self.laid.text.push(c);
             }
             let end = self.laid.text.len();
@@ -758,7 +796,7 @@ impl Ctx<'_> {
 
     fn heading(&mut self, depth: u8, runs: &[Run], x: u16, width: u16, align: Align) {
         let text: String = runs.iter().map(|r| r.text.as_str()).collect();
-        let accent = Style::default().fg(self.heading_color);
+        let accent = Style::default().fg(self.colors.headings[usize::from(depth.min(3) - 1)]);
         // The terminal has one font size, so rank comes from size where it fits
         // (large letters for a short title), then weight and space. Links
         // stay in regular text so their underline and label are readable.
@@ -943,7 +981,7 @@ impl Ctx<'_> {
         self.laid.rows[first].segs.insert(0, marker);
     }
 
-    /// A quote is dim and italic beside a dim bar. An alert keeps its text
+    /// A quote is muted and italic beside a dim bar. An alert keeps its text
     /// plain under its kind, beside a bar in the text color.
     fn quote(&mut self, kind: Option<BlockQuoteKind>, blocks: &[Node], x: u16, width: u16) {
         let first = self.laid.rows.len();
@@ -970,7 +1008,15 @@ impl Ctx<'_> {
         if kind.is_none() {
             for row in &mut self.laid.rows[body..] {
                 for seg in &mut row.segs {
-                    seg.style = seg.style.fg(DIM).add_modifier(Modifier::ITALIC);
+                    // Colored link labels stay colored; everything else is muted.
+                    if self
+                        .colors
+                        .link
+                        .is_none_or(|link| seg.style.fg != Some(link))
+                    {
+                        seg.style = seg.style.fg(DIM);
+                    }
+                    seg.style = seg.style.add_modifier(Modifier::ITALIC);
                 }
             }
         }
@@ -1321,10 +1367,27 @@ pub fn layout_with_heading_color(
     image_sizes: ImageSizes,
     heading_color: Color,
 ) -> Laid {
+    layout_with_colors(
+        markdown,
+        width,
+        cell,
+        image_sizes,
+        MarkdownColors::uniform(heading_color),
+    )
+}
+
+/// Lays a page out with the reader's colors for headings and links.
+pub fn layout_with_colors(
+    markdown: &str,
+    width: u16,
+    cell: (u16, u16),
+    image_sizes: ImageSizes,
+    colors: MarkdownColors,
+) -> Laid {
     let mut ctx = Ctx {
         laid: Laid::default(),
         image_sizes,
-        heading_color,
+        colors,
         cell,
     };
     for node in parse(markdown, true) {
@@ -1340,7 +1403,6 @@ pub fn layout_with_heading_color(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheme::Colors;
 
     fn layout(markdown: &str, width: u16, cell: (u16, u16), image_sizes: ImageSizes) -> Laid {
         layout_with_heading_color(
@@ -1459,6 +1521,58 @@ mod tests {
                 assert_eq!(title.style.fg, Some(expected));
                 assert!(title.style.add_modifier.contains(Modifier::BOLD));
             }
+        }
+    }
+
+    #[test]
+    fn colorful_headings_take_readable_palette_colors() {
+        let theme = crate::theme::Theme {
+            background: [250; 3],
+            blue: [24, 62, 133],
+            red: [160, 35, 55],
+            green: [35, 146, 77],
+            accent: [100, 70, 140],
+            magenta: [120, 40, 140],
+        };
+        for (colors, expected) in [
+            (
+                Colors::DARK,
+                [Color::LightMagenta, Color::LightBlue, Color::LightGreen],
+            ),
+            (
+                Colors {
+                    theme: None,
+                    light: true,
+                },
+                [Color::Magenta, Color::Blue, Color::Green],
+            ),
+            (
+                Colors {
+                    theme: Some(theme),
+                    light: true,
+                },
+                [
+                    Color::Rgb(120, 40, 140),
+                    Color::Rgb(24, 62, 133),
+                    Color::Rgb(35, 146, 77),
+                ],
+            ),
+        ] {
+            let laid = layout_with_colors(
+                "## One\n\n### Two\n\n#### Three",
+                40,
+                (8, 16),
+                &no_images,
+                MarkdownColors::colorful(colors),
+            );
+            let fg: Vec<_> = laid
+                .rows
+                .iter()
+                .flat_map(|row| &row.segs)
+                .map(|seg| seg.style.fg)
+                .collect();
+            assert_eq!(fg, [expected[1], expected[2], expected[2]].map(Some));
+            assert_eq!(MarkdownColors::colorful(colors).headings, expected);
         }
     }
 

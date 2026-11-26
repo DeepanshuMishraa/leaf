@@ -367,6 +367,7 @@ pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 
 pub struct ViewerOptions {
     pub max_text_width: u16,
+    pub colorful_markdown: bool,
     /// For paged documents, where reading resumes (1-based).
     pub start_page: Option<usize>,
     pub image_mode: ImageMode,
@@ -410,6 +411,7 @@ impl Default for ViewerOptions {
     fn default() -> Self {
         ViewerOptions {
             max_text_width: crate::config::DEFAULT_MAX_WIDTH,
+            colorful_markdown: false,
             start_page: None,
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
@@ -743,6 +745,15 @@ impl App {
         }
     }
 
+    fn markdown_colors(&self) -> render::MarkdownColors {
+        let colors = self.look.colors();
+        if self.options.colorful_markdown {
+            render::MarkdownColors::colorful(colors)
+        } else {
+            render::MarkdownColors::uniform(colors.heading_color())
+        }
+    }
+
     fn laid(&mut self, page: usize) -> Rc<Laid> {
         if let Some((laid, _)) = self.laid.get(&page) {
             return laid.clone();
@@ -750,12 +761,12 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
-        let laid = Rc::new(render::layout_with_heading_color(
+        let laid = Rc::new(render::layout_with_colors(
             &markdown,
             self.width,
             (font.width, font.height),
             &sizes,
-            self.look.colors().heading_color(),
+            self.markdown_colors(),
         ));
         self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
@@ -3642,9 +3653,9 @@ impl App {
             }
             // Following the terminal's theme reads its reply from stdin, so it's
             // asked only after a wait that no key broke.
-            let heading_color = self.look.colors().heading_color();
+            let markdown_colors = self.markdown_colors();
             if self.look.refresh(quiet && !event::poll(Duration::ZERO)?) {
-                if self.look.colors().heading_color() != heading_color {
+                if self.markdown_colors() != markdown_colors {
                     self.laid.clear();
                 }
                 quiet = false;
@@ -4384,6 +4395,44 @@ mod tests {
             };
             let position = screen.find("Heading");
             assert_eq!(screen.terminal.backend().buffer()[position].fg, expected);
+        }
+    }
+
+    #[test]
+    fn reader_can_color_heading_levels_and_link_labels() {
+        let md = "# Top heading that wraps in a narrow column\n\
+                  ## Second\n### Third\n###### Sixth\n\n\
+                  Body [**docs**](guide.md) and [[notes|Wiki]].\n\n\
+                  > [Quoted](#anchor) and `snippet`";
+        for enabled in [false, true] {
+            let mut screen = Screen::new(
+                book(&[md]),
+                40,
+                30,
+                ViewerOptions {
+                    colorful_markdown: enabled,
+                    ..ViewerOptions::default()
+                },
+            );
+            for (text, default, colorful) in [
+                ("Top", Color::LightBlue, Color::LightMagenta),
+                ("Second", Color::LightBlue, Color::LightBlue),
+                ("Third", Color::LightBlue, Color::LightGreen),
+                ("Sixth", Color::LightBlue, Color::LightGreen),
+                ("Body", Color::Reset, Color::Reset),
+                ("docs", Color::Reset, Color::LightCyan),
+                ("Wiki", Color::Reset, Color::LightCyan),
+                ("guide.md", render::DIM, render::DIM),
+                ("Quoted", render::DIM, Color::LightCyan),
+                ("snippet", render::DIM, render::DIM),
+            ] {
+                let position = screen.find(text);
+                let cell = &screen.terminal.backend().buffer()[position];
+                assert_eq!(cell.fg, if enabled { colorful } else { default }, "{text}");
+                if matches!(text, "docs" | "Wiki" | "Quoted") {
+                    assert!(cell.modifier.contains(Modifier::UNDERLINED), "{text}");
+                }
+            }
         }
     }
 
