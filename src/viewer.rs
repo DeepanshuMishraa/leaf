@@ -243,6 +243,27 @@ struct Search {
     seek: Seek,
 }
 
+/// Finds visible text and reports matches in the original page offsets.
+fn page_matches(query: &Query, laid: &Laid) -> Vec<(usize, usize)> {
+    if laid.hidden_link_urls.is_empty() {
+        return query.matches(&laid.text);
+    }
+
+    let mut offsets = Vec::with_capacity(laid.text.len());
+    let mut start = 0;
+    for hidden in &laid.hidden_link_urls {
+        offsets.extend(start..hidden.start);
+        start = hidden.end;
+    }
+    offsets.extend(start..laid.text.len());
+    let text: Vec<_> = offsets.iter().map(|&offset| laid.text[offset]).collect();
+    query
+        .matches(&text)
+        .into_iter()
+        .map(|(start, end)| (offsets[start], offsets[end - 1] + 1))
+        .collect()
+}
+
 /// A place in a page's text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TextPos {
@@ -368,6 +389,7 @@ pub type StrokesListener = Box<dyn FnMut(&[Stroke])>;
 pub struct ViewerOptions {
     pub max_text_width: u16,
     pub colorful_markdown: bool,
+    pub hide_link_urls: bool,
     /// For paged documents, where reading resumes (1-based).
     pub start_page: Option<usize>,
     pub image_mode: ImageMode,
@@ -412,6 +434,7 @@ impl Default for ViewerOptions {
         ViewerOptions {
             max_text_width: crate::config::DEFAULT_MAX_WIDTH,
             colorful_markdown: false,
+            hide_link_urls: false,
             start_page: None,
             image_mode: ImageMode::Color,
             highlights: Vec::new(),
@@ -761,12 +784,18 @@ impl App {
         let markdown = self.doc.source.page(page);
         let font = self.picker.font_size();
         let sizes = |href: &str| self.image_size(href);
+        let link_urls = if self.options.hide_link_urls {
+            render::LinkUrls::Hide
+        } else {
+            render::LinkUrls::Show
+        };
         let laid = Rc::new(render::layout_with_colors(
             &markdown,
             self.width,
             (font.width, font.height),
             &sizes,
             self.markdown_colors(),
+            link_urls,
         ));
         self.laid.insert(page, (laid.clone(), markdown.is_empty()));
         laid
@@ -1355,7 +1384,7 @@ impl App {
         for page in screen.iter().flatten().map(|s| s.page) {
             found
                 .entry(page)
-                .or_insert_with(|| query.matches(&self.laid(page).text));
+                .or_insert_with(|| page_matches(&query, &self.laid(page)));
         }
         found
     }
@@ -2522,9 +2551,7 @@ impl App {
                 Direction::Backward if step == pages => start >= from.offset,
                 _ => true,
             };
-            let mut ranges = search
-                .query
-                .matches(&self.laid(page).text)
+            let mut ranges = page_matches(&search.query, &self.laid(page))
                 .into_iter()
                 .filter(|&(start, _)| keep(start));
             let hit = match direction {
@@ -4053,6 +4080,32 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_label_works_with_the_url_hidden() {
+        let options = ViewerOptions {
+            hide_link_urls: true,
+            ..ViewerOptions::default()
+        };
+        let url = "https://x.dev/a";
+        let mut s = Screen::new(
+            Doc::whole("Notes", format!("Read [the docs]({url}) now.")),
+            80,
+            20,
+            options,
+        );
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let log = opened.clone();
+        s.app.open_url = Box::new(move |url| {
+            log.borrow_mut().push(url.to_owned());
+            Ok(())
+        });
+        let frame = s.draw();
+        assert!(frame.contains("Read the docs now."));
+        assert!(!frame.contains(url));
+        click_text(&mut s, "docs");
+        assert_eq!(*opened.borrow(), [url]);
+    }
+
+    #[test]
     fn clicking_a_wikilink_opens_its_note_in_leaf() {
         let (mut s, dir, opened) = linked_note("wiki", "Next: [[plan|the plan]] and [[nowhere]].");
         let (x, y) = s.find("nowhere");
@@ -5542,6 +5595,33 @@ mod tests {
         let buffer = s.terminal.backend().buffer();
         assert_eq!(buffer[(x, y)].bg, FOUND_HERE);
         assert_eq!(buffer[(x + 7, y)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn find_searches_the_label_and_visible_text_when_the_link_url_is_hidden() {
+        let url = "https://x.dev/guide";
+        let first = format!("Read [the guide]({url}) now.");
+        let second = format!("The address is <{url}>.");
+        let options = ViewerOptions {
+            hide_link_urls: true,
+            ..ViewerOptions::default()
+        };
+        let mut s = Screen::new(book(&[&first, &second]), 120, 30, options);
+
+        assert!(search(&mut s, "guide now").contains("\"guide now\" n/N"));
+        let (x, y) = s.find("guide now");
+        let buffer = s.terminal.backend().buffer();
+        assert_eq!(buffer[(x, y)].bg, FOUND_HERE);
+        assert_eq!(buffer[(x + 8, y)].bg, FOUND_HERE);
+
+        search(&mut s, url);
+        assert_eq!(s.app.found_here().map(|m| m.page), Some(1));
+        s.press(KeyCode::Char('N'));
+        assert_eq!(s.app.found_here().map(|m| m.page), Some(1));
+
+        let mut s = Screen::new(book(&[&first]), 120, 30, ViewerOptions::default());
+        search(&mut s, url);
+        assert_eq!(s.app.found_here().map(|m| m.page), Some(0));
     }
 
     #[test]

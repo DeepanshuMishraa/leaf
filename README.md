@@ -51,6 +51,7 @@ Optional, at `$XDG_CONFIG_HOME/leaf/config.toml` (default `~/.config/leaf/config
 [reader]
 max_width = 100   # reading column width, default 76
 colorful_markdown = true   # terminal palette colors for heading levels and links, default false
+hide_link_urls = true   # hide URLs printed after clickable link labels, default false
 ```
 
 ## Diffs

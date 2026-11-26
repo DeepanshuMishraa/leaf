@@ -16,6 +16,7 @@ pub struct Config {
 pub struct ReaderConfig {
     pub max_width: u16,
     pub colorful_markdown: bool,
+    pub hide_link_urls: bool,
 }
 
 impl Default for ReaderConfig {
@@ -23,6 +24,7 @@ impl Default for ReaderConfig {
         Self {
             max_width: DEFAULT_MAX_WIDTH,
             colorful_markdown: false,
+            hide_link_urls: false,
         }
     }
 }
@@ -83,5 +85,15 @@ mod tests {
             let config: Config = toml::from_str(text).unwrap();
             assert_eq!(config.reader.colorful_markdown, expected, "{text:?}");
         }
+    }
+
+    #[test]
+    fn hiding_link_urls_is_opt_in() {
+        let default: Config = toml::from_str("[reader]\nmax_width = 92").unwrap();
+        let hidden: Config =
+            toml::from_str("[reader]\ncolorful_markdown = true\nhide_link_urls = true").unwrap();
+        assert!(!default.reader.hide_link_urls);
+        assert!(hidden.reader.hide_link_urls);
+        assert!(hidden.reader.colorful_markdown);
     }
 }
