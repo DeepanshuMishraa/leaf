@@ -3926,6 +3926,10 @@ impl App {
             self.close_outline();
             return;
         }
+        if form == OutlineForm::Sidebar && self.view.width < OUTLINE_MIN_SCREEN {
+            self.toast("The screen is too narrow for the outline");
+            return;
+        }
         if self.outline.is_none() {
             let nodes = outline::from_diff_files(self.loaded.diff.files());
             if nodes.is_empty() {
@@ -6579,6 +6583,7 @@ diff --git a/src/d.rs b/src/d.rs
     #[test]
     fn a_diff_without_files_says_there_is_nothing_to_outline() {
         let mut app = App::new(loaded(""), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
         press(&mut app, KeyCode::Char('t'));
         assert!(app.outline.is_none());
         assert_eq!(
@@ -6617,6 +6622,7 @@ diff --git a/src/d.rs b/src/d.rs
     #[test]
     fn the_outline_follows_the_diff_as_the_wheel_moves_it() {
         let mut app = App::new(loaded(&tall_tree(30)), Options::default());
+        app.view = Rect::new(0, 1, 120, 20);
         press(&mut app, KeyCode::Char('t'));
         assert!(picked(&draw(&mut app, 120, 20)).contains("a.rs"));
         // The cursor is the authority: a wheel over the panel scrolls the
@@ -6648,7 +6654,16 @@ diff --git a/src/d.rs b/src/d.rs
     #[test]
     fn a_screen_too_narrow_for_both_keeps_the_diff_alone() {
         let mut app = tree_app();
+        app.view.width = OUTLINE_MIN_SCREEN - 1;
         press(&mut app, KeyCode::Char('t'));
+        assert!(app.outline.is_none());
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("The screen is too narrow for the outline")
+        );
+        app.view.width = OUTLINE_MIN_SCREEN;
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.outline.is_some());
         draw(&mut app, OUTLINE_MIN_SCREEN - 1, 20);
         assert!(app.outline.is_none());
     }

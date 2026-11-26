@@ -848,7 +848,7 @@ impl Ctx<'_> {
         self.laid.headings.push(Heading {
             index: self.laid.headings.len(),
             level: depth,
-            title: text.trim().to_owned(),
+            title: text.replace(IMAGE_MARK, "").trim().to_owned(),
             row: self.laid.rows.len(),
         });
         // The terminal has one font size, so rank comes from size where it fits
@@ -2020,6 +2020,17 @@ mod tests {
                 (3, 4, "Centered"),
             ]
         );
+    }
+
+    #[test]
+    fn a_heading_with_an_image_in_it_is_named_by_its_words_alone() {
+        let laid = layout(
+            "# ![icon](icon.png) Title\n\nwords",
+            40,
+            (8, 16),
+            &no_images,
+        );
+        assert_eq!(laid.headings[0].title, "Title");
     }
 
     #[test]

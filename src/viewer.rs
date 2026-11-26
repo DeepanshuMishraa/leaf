@@ -2556,6 +2556,12 @@ impl App {
             self.close_outline();
             return;
         }
+        // `room` is the screen less its margins while no sidebar takes its columns,
+        // which is the case whenever the sidebar is about to open.
+        if form == OutlineForm::Sidebar && self.room < OUTLINE_MIN_SCREEN - 4 {
+            self.notice = Some("the screen is too narrow for the outline".into());
+            return;
+        }
         if self.outline.is_none() {
             let nodes = self.outline_nodes();
             if nodes.is_empty() {
@@ -6732,7 +6738,15 @@ mod tests {
     #[test]
     fn a_screen_too_narrow_for_both_keeps_the_text() {
         let doc = Doc::whole("Doc", "# One\n\nwords");
-        let mut s = Screen::new(doc, 60, 20, ViewerOptions::default());
+        let mut s = Screen::new(doc, 40, 20, ViewerOptions::default());
+        s.press(KeyCode::Char('t'));
+        assert!(s.app.outline.is_none());
+        assert_eq!(
+            s.app.notice.as_deref(),
+            Some("the screen is too narrow for the outline")
+        );
+        s.terminal.backend_mut().resize(60, 20);
+        s.draw();
         s.press(KeyCode::Char('t'));
         assert!(s.app.outline.is_some());
         s.terminal.backend_mut().resize(40, 20);

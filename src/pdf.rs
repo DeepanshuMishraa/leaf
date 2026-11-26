@@ -1542,7 +1542,7 @@ impl Loading {
         let (ready, rx) = mpsc::channel();
         let (tx, queries) = mpsc::channel::<Query>();
         std::thread::spawn(move || {
-            let doc = match load() {
+            let mut doc = match load() {
                 Ok(doc) => doc,
                 Err(error) => {
                     let _ = ready.send(Err(error));
@@ -1553,7 +1553,7 @@ impl Loading {
                 .send(Ok((
                     doc.title.clone(),
                     doc.page_count,
-                    doc.bookmarks.clone(),
+                    std::mem::take(&mut doc.bookmarks),
                 )))
                 .is_err()
             {
@@ -1684,23 +1684,24 @@ fn from_document(
 /// hangs under it keeps that entry's depth rather than indent under a parent
 /// the outline doesn't show.
 fn bookmarks_in(outlines: &[mupdf::Outline]) -> Vec<Bookmark> {
-    fn walk(outlines: &[mupdf::Outline], depth: usize, out: &mut Vec<Bookmark>) {
-        for outline in outlines {
-            match &outline.dest {
-                Some(dest) => {
-                    out.push(Bookmark {
-                        title: outline.title.clone(),
-                        depth,
-                        page: dest.loc.page_number as usize,
-                    });
-                    walk(&outline.down, depth + 1, out);
-                }
-                None => walk(&outline.down, depth, out),
-            }
-        }
-    }
+    // Read by a loop, not by recursion: an outline may nest deeper than the loader's stack.
+    let mut pending: Vec<(&mupdf::Outline, usize)> =
+        outlines.iter().rev().map(|outline| (outline, 0)).collect();
     let mut bookmarks = Vec::new();
-    walk(outlines, 0, &mut bookmarks);
+    while let Some((outline, depth)) = pending.pop() {
+        let under = match &outline.dest {
+            Some(dest) => {
+                bookmarks.push(Bookmark {
+                    title: outline.title.clone(),
+                    depth,
+                    page: dest.loc.page_number as usize,
+                });
+                depth + 1
+            }
+            None => depth,
+        };
+        pending.extend(outline.down.iter().rev().map(|child| (child, under)));
+    }
     bookmarks
 }
 
@@ -2231,7 +2232,14 @@ mod tests {
             down,
         };
         pdf.set_outlines(&[
-            entry("One", at(0), vec![entry("Nested", at(2), Vec::new())]),
+            entry(
+                "One",
+                at(0),
+                vec![
+                    entry("Earlier", at(1), Vec::new()),
+                    entry("Nested", at(2), Vec::new()),
+                ],
+            ),
             // An entry with nowhere to go is passed over; what hangs under it
             // keeps its depth rather than indent under a parent nobody sees.
             entry("Part", None, vec![entry("Under a part", at(1), Vec::new())]),
@@ -2256,6 +2264,11 @@ mod tests {
                     title: "One".into(),
                     depth: 0,
                     page: 0,
+                },
+                Bookmark {
+                    title: "Earlier".into(),
+                    depth: 1,
+                    page: 1,
                 },
                 Bookmark {
                     title: "Nested".into(),

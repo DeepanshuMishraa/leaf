@@ -273,16 +273,21 @@ fn rank(label: &str, typed: &[char]) -> Option<(usize, bool, usize)> {
         return Some((0, false, 0));
     }
     let lower = || label.chars().flat_map(char::to_lowercase);
+    // Each candidate start reads on from where the last one was, not the label over.
+    let mut chars = lower().enumerate();
     let mut best: Option<(usize, bool, usize)> = None;
-    for (start, lead) in lower().enumerate() {
+    let mut previous = None;
+    while let Some((start, lead)) = chars.next() {
+        let inside_a_word = previous.is_some_and(char::is_alphanumeric);
+        previous = Some(lead);
         if lead != typed[0] {
             continue;
         }
-        let mut after = lower().skip(start + 1);
+        let mut after = chars.clone();
         let (mut end, mut rest) = (start, start + 1);
         let mut whole = true;
         for &want in &typed[1..] {
-            match after.position(|have| have == want) {
+            match after.position(|(_, have)| have == want) {
                 Some(found) => {
                     end = rest + found;
                     rest = end + 1;
@@ -293,13 +298,13 @@ fn rank(label: &str, typed: &[char]) -> Option<(usize, bool, usize)> {
                 }
             }
         }
-        let inside_a_word = start > 0 && lower().nth(start - 1).is_some_and(char::is_alphanumeric);
         if whole && best.is_none_or(|been| (end - start, inside_a_word, start) < been) {
             best = Some((end - start, inside_a_word, start));
         }
     }
     best
 }
+
 fn dim() -> Style {
     Style::default().fg(render::DIM)
 }
@@ -813,6 +818,15 @@ mod tests {
             find(&mut outline, "CFg"),
             (vec!["Configuration".to_owned()], Some(4))
         );
+    }
+
+    #[test]
+    fn a_match_whose_characters_lie_together_outranks_a_scattered_one() {
+        let mut outline = tree(&[(0, "c-art art"), (0, "recat")]);
+        for c in "cat".chars() {
+            outline.filter.push(c);
+        }
+        assert_eq!(outline.best(), Some(1));
     }
 
     #[test]
