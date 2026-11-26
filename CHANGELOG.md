@@ -3,6 +3,13 @@
 ## Unreleased
 
 - A review that an agent in tmux opened beside itself delivers its verdict to the agent's pane again when tmux's session environment carries Rex's variables (#85). It used to fail with `block target "%N" not found` and copy the text to the clipboard instead.
+- `t` opens an outline beside the text and `T` opens it over the text, in the reader and the diff viewer (#78). Either key closes what it opened or switches to the other form. Go to page moves from `t` to `:`.
+- In the reader, the outline lists a PDF's bookmarks or an EPUB's table of contents, and the headings on the page when the document has none (#59). The marked entry follows the text as it scrolls, and moving in the outline scrolls the text to that entry.
+- In a diff, the outline lists the files as a tree of folders. Each file shows its status, lines added and removed, and whether it's viewed (`✓`) or has a note (`●`). Moving to a file opens it with its name and first hunk at the top of the screen.
+- In the outline, `j`/`k` and `g`/`G` move, `h`/`l` fold and open groups, and `/` filters by the typed characters in order, ignoring case. `tab` and `shift+tab` step between matches, `enter` goes to one, and `esc` cancels. `q` or `esc` closes the outline.
+- `<` and `>` narrow or widen the outline sidebar by 4 columns, from 20 to 80, and dragging its right edge resizes it too. The width lasts the session.
+- Opening the outline beside a paged document switches it to scroll mode and keeps the text you were reading at the top. When the terminal is too narrow for the sidebar, `t` says so instead of opening and closing it.
+- Filtering the outline of a very large diff is fast: on 40,000 files a frame takes about 2.7 ms with a filter typed, in a release build.
 
 ## 0.18.3
 
