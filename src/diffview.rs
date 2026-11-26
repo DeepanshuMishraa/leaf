@@ -3975,6 +3975,8 @@ impl App {
             .and_then(|open| open.tree.nodes[node].locator);
         if let Some(outline::Locator::Diff(index)) = locator {
             self.open_file(index);
+            // The file starts at the top of the diff, its name and first hunk above the cursor.
+            self.scroll = self.heading_start(self.cursor).min(self.max_scroll());
         }
     }
 
@@ -6407,6 +6409,37 @@ diff --git a/docs/links.md b/docs/links.md
         assert!(draw(&mut app, 120, 20).contains("new link"));
         press(&mut app, KeyCode::Char('g'));
         assert_eq!(app.current_file(), Some(0));
+    }
+
+    #[test]
+    fn an_outline_move_brings_that_file_to_the_top_of_the_diff() {
+        // Three files, each taller than the screen, so a jump down lands the
+        // next file's first line at the bottom unless the view is moved to it.
+        let patch: String = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| {
+                let added: String = (0..40).map(|n| format!("+{name} line {n}\n")).collect();
+                format!(
+                    "diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -0,0 +1,40 @@\n{added}"
+                )
+            })
+            .collect();
+        let mut app = App::new(loaded(&patch), Options::default());
+        draw(&mut app, 120, 20);
+        press(&mut app, KeyCode::Char('t'));
+        draw(&mut app, 120, 20);
+        for (key, name) in [('j', "b.rs"), ('j', "c.rs"), ('k', "b.rs")] {
+            press(&mut app, KeyCode::Char(key));
+            let screen = draw(&mut app, 120, 20);
+            let top: String = screen
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .skip(OUTLINE_COLUMNS as usize)
+                .collect();
+            assert!(top.contains(name), "{name} is not at the top:\n{screen}");
+        }
     }
 
     #[test]

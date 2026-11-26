@@ -476,6 +476,8 @@ pub struct App {
     reading_width: ReadingWidth,
     /// Columns the last frame left for the reading column; unbounded before it.
     room: u16,
+    /// The terminal's width, from the last frame or a resize since; unbounded before either.
+    screen_width: u16,
     laid: HashMap<usize, (Rc<Laid>, bool)>,
     mode: Mode,
     /// The page being read: in paged mode the one shown, when scrolling the one at the top.
@@ -649,6 +651,7 @@ impl App {
             outline: None,
             reading_width: ReadingWidth::Columns(options.max_text_width),
             room: u16::MAX,
+            screen_width: u16::MAX,
             doc,
             options,
             picker,
@@ -1243,6 +1246,7 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
+        self.screen_width = area.width;
         if self.form() == Some(OutlineForm::Sidebar) && area.width < OUTLINE_MIN_SCREEN {
             self.outline = None;
         }
@@ -1267,6 +1271,11 @@ impl App {
         };
         if width != self.width || mode != self.mode {
             self.hold_anchor();
+            // Paged and scrolled count rows differently, so a switch, such as the sidebar
+            // opening, keeps the text read at the top rather than the page's start.
+            if mode != self.mode && self.width > 0 && self.anchor.is_none() {
+                self.anchor = Some(self.top_anchor());
+            }
             self.width = width;
             self.laid.clear();
             self.retain_protocols(|_| false);
@@ -1654,7 +1663,8 @@ impl App {
     /// The redraw after a resize clears the screen, and kitty's placements with
     /// it. Rex and Ghostty drop the uploaded figures too, so placing the old
     /// ids again shows nothing: every figure and stroke is uploaded afresh.
-    fn resized(&mut self) {
+    fn resized(&mut self, width: u16) {
+        self.screen_width = width;
         if let Some(kitty) = &mut self.kitty {
             kitty.reset();
             for (_, image) in self.ink_drawn.drain() {
@@ -2556,9 +2566,8 @@ impl App {
             self.close_outline();
             return;
         }
-        // `room` is the screen less its margins while no sidebar takes its columns,
-        // which is the case whenever the sidebar is about to open.
-        if form == OutlineForm::Sidebar && self.room < OUTLINE_MIN_SCREEN - 4 {
+        // A resize since the last frame counts: keys and resizes are handled before the next draw.
+        if form == OutlineForm::Sidebar && self.screen_width < OUTLINE_MIN_SCREEN {
             self.notice = Some("the screen is too narrow for the outline".into());
             return;
         }
@@ -3991,7 +4000,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => self.key(key, history),
                     Event::Mouse(mouse) => self.mouse(mouse, history),
-                    Event::Resize(..) => self.resized(),
+                    Event::Resize(width, _) => self.resized(width),
                     _ => {}
                 }
                 if self.quit || !event::poll(Duration::ZERO)? {
@@ -4941,7 +4950,7 @@ mod tests {
         let before = figure_ids(&s);
         assert_eq!(before.len(), 1);
         // The column stays 76 wide, so nothing else would make the figure change.
-        s.app.resized();
+        s.app.resized(118);
         s.terminal.backend_mut().resize(118, 30);
         s.draw();
         let after = figure_ids(&s);
@@ -4965,7 +4974,7 @@ mod tests {
         };
         let before = ink(&s);
         assert_eq!(before.len(), 1);
-        s.app.resized();
+        s.app.resized(120);
         s.draw();
         let after = ink(&s);
         assert_eq!(after.len(), 1);
@@ -6752,6 +6761,63 @@ mod tests {
         s.terminal.backend_mut().resize(40, 20);
         s.draw();
         assert!(s.app.outline.is_none());
+    }
+
+    #[test]
+    fn a_resize_before_the_next_frame_is_seen_by_the_outline_key() {
+        // The terminal narrows and `t` arrives in the same batch, before a draw.
+        let doc = Doc::whole("Doc", "# One\n\nwords");
+        let mut s = Screen::new(doc, 120, 20, ViewerOptions::default());
+        s.draw();
+        s.terminal.backend_mut().resize(40, 20);
+        s.app.resized(40);
+        s.tap(KeyCode::Char('t'));
+        assert!(s.app.outline.is_none());
+        assert_eq!(
+            s.app.notice.as_deref(),
+            Some("the screen is too narrow for the outline")
+        );
+        // And the other way: widened, then `t` before a draw.
+        s.terminal.backend_mut().resize(120, 20);
+        s.app.resized(120);
+        s.tap(KeyCode::Char('t'));
+        assert!(s.app.outline.is_some());
+    }
+
+    #[test]
+    fn opening_the_sidebar_over_a_paged_text_keeps_the_place_read() {
+        // 120 columns pages the text; the sidebar leaves too few, so it scrolls.
+        let page = filler(60);
+        let mut s = Screen::new(
+            book(&[page.as_str(), page.as_str()]),
+            120,
+            30,
+            ViewerOptions::default(),
+        );
+        s.draw();
+        assert_eq!(s.app.mode, Mode::Paged);
+        s.app.scroll_by(20);
+        let top = |s: &mut Screen, skip: u16| {
+            s.text(skip)
+                .into_iter()
+                .find(|line| line.contains("Filler"))
+                .map(|line| line.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let before = top(&mut s, 0);
+        assert_ne!(
+            before, "Filler 0.",
+            "the text was read past the page's start"
+        );
+        // Filler has no headings, so the book gets a bookmark to outline.
+        s.app.doc.bookmarks = vec![crate::doc::Bookmark {
+            title: "Start".into(),
+            depth: 0,
+            page: 0,
+        }];
+        s.press(KeyCode::Char('t'));
+        assert_eq!(s.app.mode, Mode::Scroll);
+        assert_eq!(top(&mut s, OUTLINE_COLUMNS), before);
     }
 
     #[test]
