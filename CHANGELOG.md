@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.4
 
 - Rebind any view's keys in `config.toml`: the reader, its ink and bookmarks, the outline, the diff and its comments, overview and verdict, `leaf plan`, `leaf board` and `leaf pr`, each under its own `[keys.<view>]` table. Each line names an action and a key or a list of keys, such as `quit = ["q", "ctrl+q"]`. Actions left out keep their keys, an empty list unbinds one, and a new key given to one action is taken from the others. `?` and the hints at the bottom of each view show the keys as you set them. Text you type, such as comments, find and filters, keeps its own keys. The defaults are the keys leaf had before.
 - `leaf config keys` prints every key table with each action, its default keys and what it does. `leaf config check` reads `config.toml` as leaf would, and `leaf config path` says where it is.
