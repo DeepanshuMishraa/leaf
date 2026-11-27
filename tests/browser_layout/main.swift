@@ -33,16 +33,23 @@ for compact in [false, true] {
     let bottom = configured(["tabBarEdge": "bottom"])
     precondition(configured() == top)
     precondition(top.top == toolbar && top.bottom == edge && top.floatTop == toolbar)
-    precondition(bottom.top == edge && bottom.bottom == toolbar && bottom.floatTop == edge,
-                 "bottom tabs must reserve space below the tiled and floating canvases")
+    precondition(bottom.top == edge && bottom.bottom == toolbar && bottom.floatTop == edge + 34,
+                 "bottom tabs must retain the title area above the floating canvas")
     let window = CGRect(x: 100, y: 50, width: 1000, height: 700)
     for floating in [false, true] {
         let pane = Placement(rect: CGRect(x: 0, y: 0, width: 1, height: 1), focused: true,
                              floating: floating, gapOffset: .zero, layerBounds: nil)
         let a = top.body(pane, in: window)!, b = bottom.body(pane, in: window)!
-        precondition(a.size == b.size && a.minY - b.minY == toolbar - edge)
+        let title: CGFloat = floating ? 34 : 0
+        precondition(a.width == b.width && a.height - b.height == title)
+        precondition(a.minY - b.minY == toolbar - edge - title)
         precondition(b.maxY == window.maxY - toolbar - (floating || !compact ? 1 : 0))
     }
+    let partial = CGRect(x: 0.125, y: 0.25, width: 0.5, height: 0.5)
+    let outer = bottom.floatingFrame(partial, in: window)
+    let canvasHeight = window.height - edge - 34 - toolbar
+    precondition(outer.minY == window.minY + edge + 34 + partial.minY * canvasHeight)
+    precondition(outer.height == partial.height * canvasHeight)
     let hidden = configured(["tabBarEdge": "bottom", "toolbarBehavior": "autoHide"])
     precondition(hidden.top == edge && hidden.bottom == edge && hidden.floatTop == edge)
     for side in ["left", "right"] {
