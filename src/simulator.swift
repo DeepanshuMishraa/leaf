@@ -2354,15 +2354,22 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         // The check, the record's removal and the shutdown happen under the
         // device's lock (BootOwner.lock), so a pane adopting the device
         // either goes first, and this stands down, or waits for it to be off.
-        // A lock whose holder has exited is taken over; without the lock
-        // after a minute, the guardian leaves everything as it is.
+        // A lock whose holder has exited is taken over, as is one with no
+        // pid made over 10 s ago (its holder died before writing it), as
+        // BootOwner.stale decides; without the lock after a minute, the
+        // guardian leaves everything as it is.
         let script = """
         while kill -0 "$1" 2>/dev/null; do sleep 0.5; done
         lock="$3.lock"
         i=0
         until mkdir "$lock" 2>/dev/null; do
           held=$(cat "$lock/pid" 2>/dev/null)
-          if [ -n "$held" ] && ! kill -0 "$held" 2>/dev/null; then rm -rf "$lock"; continue; fi
+          if [ -n "$held" ]; then
+            ! kill -0 "$held" 2>/dev/null && { rm -rf "$lock"; continue; }
+          else
+            made=$(stat -f %m "$lock" 2>/dev/null)
+            [ -n "$made" ] && [ $(( $(date +%s) - made )) -gt 10 ] && { rm -rf "$lock"; continue; }
+          fi
           i=$((i + 1)); [ "$i" -ge 600 ] && exit 0
           sleep 0.1
         done
