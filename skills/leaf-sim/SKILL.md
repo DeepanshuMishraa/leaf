@@ -74,6 +74,7 @@ leaf sim open-url myapp://item/42 # deep links and web pages
 - **Games, maps, canvases, web views without labels**: elements may be missing or unlabeled. Take `leaf sim screenshot`, read the PNG, and tap by pixel. Snapshot sizes and screenshot pixels are the same coordinates.
 - **System alerts** (permission prompts) belong to iOS, not the app, and may not be in the snapshot. If the screen seems stuck, take a screenshot. You can grant permissions up front with `xcrun simctl privacy <udid> grant <service> <bundle id>`.
 - **An app you just terminated** sometimes launches in the background. `launch` says so; tap its icon on the home screen instead.
+- **A simulator that's still booting**: don't snapshot it yet. Reading the screen while iOS starts up can leave its accessibility stuck, and every `leaf sim` read then fails with "didn't say which app is in front" until the simulator restarts. After `xcrun simctl boot <udid>`, wait for `xcrun simctl bootstatus <udid> -b` to finish, then give it about 30 seconds before the first snapshot (a screenshot is safe meanwhile). If reads keep failing on a screen you can see in a screenshot, run `xcrun simctl shutdown <udid>` and `xcrun simctl boot <udid>`, wait the same way, and try again.
 - **The iPhone Duo** has two screens, and only its Leaf pane knows which one faces front, so taps and swipes need it open in a pane. Everything else works without one.
 - `leaf sim info` prints the device, its udid and its screen size.
 
