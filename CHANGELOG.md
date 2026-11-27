@@ -4,6 +4,8 @@
 
 - `[plan] jump = "top"` makes `]`, `[` and the other block jumps in `leaf plan` scroll the block they land on to the top of the screen. The default, `"nearest"`, keeps scrolling only as far as it takes to show the block's first line.
 - `[plan] scrolloff = 3` keeps that many rows below the cursor as it moves down in `leaf plan`, so the lines ahead stay in view. Like Vim's `scrolloff`, but only at the bottom edge, so a block a jump put at the top stays there. At most half the screen is kept; the default is 0.
+- `leaf sponsors` shows everyone who sponsors leaf, biggest backers first: the newest sponsor in a spotlight and everyone else in a grid of round faces, drawn with Kitty graphics where the terminal supports them and half-block pixels elsewhere. Piped, it prints a plain list.
+- `leaf browser` lines up with its pane when Rex puts the tab bar at the bottom (#87, #88). Tiled and floating panes used to sit a tab bar's height too high, and floating panes now keep the title area Rex leaves above them.
 
 ## 0.18.4
 
