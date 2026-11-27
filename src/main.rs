@@ -71,6 +71,7 @@ mod sheet;
 mod skills;
 mod slides;
 mod spinner;
+mod sponsors;
 mod stroke;
 mod syntax;
 mod tempo;
@@ -114,6 +115,7 @@ const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.h
        leaf version             print the installed version
        leaf upgrade [--check]   install the newest release (--check: only say if there is one)
        leaf sponsor             open leaf's sponsor page in the browser
+       leaf sponsors            everyone who sponsors leaf
 
 Diff options:
   --staged           staged changes
@@ -161,6 +163,21 @@ fn sponsor_command(rest: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("leaf: couldn't open a browser ({e}). Visit {SPONSOR_URL} to sponsor leaf.");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `leaf sponsors`: shows everyone who sponsors leaf.
+fn sponsors_command(rest: &[String]) -> ExitCode {
+    if !rest.is_empty() {
+        eprintln!("Usage: leaf sponsors");
+        return ExitCode::from(2);
+    }
+    match sponsors::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("leaf: {e}");
             ExitCode::FAILURE
         }
     }
@@ -601,6 +618,7 @@ fn main() -> ExitCode {
         }
         "voice" => voice_command(rest),
         "sponsor" => sponsor_command(rest),
+        "sponsors" => sponsors_command(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS

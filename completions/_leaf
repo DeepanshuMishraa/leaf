@@ -39,6 +39,7 @@ _leaf() {
     'version:Print the installed version'
     'upgrade:Install the newest release'
     'sponsor:Open the sponsor page in the browser'
+    'sponsors:Show everyone who sponsors leaf'
   )
 
   if (( CURRENT == 2 )); then
