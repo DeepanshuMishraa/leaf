@@ -2343,8 +2343,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         "shift+cmd+c",
     ].compactMap(Chord.init))
 
-    /// When `handleRexKey` last looked for a Rex app to perform bindings.
-    var bindingsRetriedAt: Date?
+    /// When `handleRexKey` last looked for a Rex app to perform bindings, in
+    /// seconds of system uptime (which a clock change doesn't move).
+    var bindingsRetriedAt: TimeInterval?
 
     func loadBindings() {
         let session = session
@@ -2384,8 +2385,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         guard appClient != nil else {
             pendingPrefix = nil
             // At most every few seconds: each look runs rex twice.
-            if bindingsRetriedAt.map({ Date().timeIntervalSince($0) > 3 }) ?? true {
-                bindingsRetriedAt = Date()
+            let now = ProcessInfo.processInfo.systemUptime
+            if bindingsRetriedAt.map({ now - $0 > 3 }) ?? true {
+                bindingsRetriedAt = now
                 loadBindings()
             }
             return false

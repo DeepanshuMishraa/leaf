@@ -635,8 +635,9 @@ class PaneController: NSObject {
 
     // MARK: Rex shortcuts
 
-    /// When `handleRexKey` last looked for a Rex app to perform bindings.
-    var bindingsRetriedAt: Date?
+    /// When `handleRexKey` last looked for a Rex app to perform bindings, in
+    /// seconds of system uptime (which a clock change doesn't move).
+    var bindingsRetriedAt: TimeInterval?
 
     func loadBindings() {
         let session = session, reserved = reservedKeys
@@ -673,8 +674,9 @@ class PaneController: NSObject {
         guard appClient != nil else {
             pendingPrefix = []
             // At most every few seconds: each look runs rex twice.
-            if bindingsRetriedAt.map({ Date().timeIntervalSince($0) > 3 }) ?? true {
-                bindingsRetriedAt = Date()
+            let now = ProcessInfo.processInfo.systemUptime
+            if bindingsRetriedAt.map({ now - $0 > 3 }) ?? true {
+                bindingsRetriedAt = now
                 loadBindings()
             }
             return false

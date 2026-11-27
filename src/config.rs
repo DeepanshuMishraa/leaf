@@ -203,7 +203,9 @@ fn with_simulator_enabled(text: &str) -> String {
         .position(|line| header(line))
         .map_or(lines.len(), |offset| start + 1 + offset);
     let mut out: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
-    let key = |line: &str| line.split('=').next().map(str::trim) == Some("enabled");
+    // The key however it's written: `enabled`, `"enabled"` or `'enabled'`.
+    let key =
+        |line: &str| line.split('=').next().map(|key| unquoted(key.trim())) == Some("enabled");
     match (start + 1..end).find(|&index| key(lines[index])) {
         Some(index) => out[index] = "enabled = true".into(),
         None => out.insert(start + 1, "enabled = true".into()),
@@ -222,16 +224,18 @@ fn table_name(line: &str) -> Option<String> {
     if inner.starts_with('[') {
         return None;
     }
-    let name = inner.trim();
-    let unquoted = name
-        .strip_prefix('"')
+    Some(unquoted(inner.trim()).to_owned())
+}
+
+/// A TOML key or table name without its quotes, if it has them.
+fn unquoted(name: &str) -> &str {
+    name.strip_prefix('"')
         .and_then(|name| name.strip_suffix('"'))
         .or_else(|| {
             name.strip_prefix('\'')
                 .and_then(|name| name.strip_suffix('\''))
         })
-        .unwrap_or(name);
-    Some(unquoted.to_owned())
+        .unwrap_or(name)
 }
 
 pub fn load() -> Result<Config, ConfigFailed> {
@@ -321,6 +325,11 @@ mod tests {
             with_simulator_enabled("[simulator]\n[keys.reader]\n"),
             "[simulator]\nenabled = true\n[keys.reader]\n"
         );
+        // However the key is written, it's replaced, not duplicated.
+        for key in ["\"enabled\"", "'enabled'", "enabled"] {
+            let updated = with_simulator_enabled(&format!("[simulator]\n{key} = false\n"));
+            assert_eq!(updated, "[simulator]\nenabled = true\n", "{key}");
+        }
         // However the header is written, the one table is edited.
         for header in [
             "[ simulator ]",

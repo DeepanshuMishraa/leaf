@@ -168,12 +168,16 @@ impl Model {
     /// or half-replaced file counts as missing, so `leaf sim install`
     /// fetches it again.
     fn installed(&self) -> Result<bool, ModelsFailed> {
-        let path = dir()?.join(self.file);
-        if !fs::metadata(&path).is_ok_and(|meta| meta.len() == self.bytes) {
-            return Ok(false);
+        Ok(self.is_whole(&dir()?.join(self.file)))
+    }
+
+    /// True when `path` holds exactly this model.
+    fn is_whole(&self, path: &std::path::Path) -> bool {
+        if !fs::metadata(path).is_ok_and(|meta| meta.len() == self.bytes) {
+            return false;
         }
-        let Ok(mut file) = fs::File::open(&path) else {
-            return Ok(false);
+        let Ok(mut file) = fs::File::open(path) else {
+            return false;
         };
         let mut hash = Sha256::new();
         let mut chunk = [0; 64 * 1024];
@@ -181,10 +185,10 @@ impl Model {
             match file.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(read) => hash.update(&chunk[..read]),
-                Err(_) => return Ok(false),
+                Err(_) => return false,
             }
         }
-        Ok(hex(&hash.finalize()) == self.sha256)
+        hex(&hash.finalize()) == self.sha256
     }
 }
 
@@ -417,6 +421,33 @@ mod tests {
                 model.file
             );
         }
+    }
+
+    #[test]
+    fn a_damaged_model_of_the_right_size_is_missing() {
+        let dir = std::env::temp_dir().join(format!("leaf-simmodels-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("model.usdz");
+        let bytes = b"leaf model bytes";
+        let right = Model {
+            file: "model.usdz",
+            phones: "test",
+            bytes: bytes.len() as u64,
+            // `printf 'leaf model bytes' | shasum -a 256`
+            sha256: "263bcf23644ae362f22c13b0a08b0f27087d056a2ac5b82c6a72378bc47fc79f",
+        };
+        fs::write(&path, bytes).expect("write");
+        assert!(right.is_whole(&path));
+        // Same size, one byte changed.
+        let mut damaged = bytes.to_vec();
+        damaged[3] ^= 1;
+        fs::write(&path, &damaged).expect("write");
+        assert!(!right.is_whole(&path));
+        // Wrong size.
+        fs::write(&path, b"short").expect("write");
+        assert!(!right.is_whole(&path));
+        assert!(!right.is_whole(&dir.join("absent.usdz")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
