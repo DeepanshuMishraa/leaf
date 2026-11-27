@@ -1,8 +1,10 @@
 // Leaf's iOS Simulator pane: a simulator's live screen on a 3D iPhone, in a
 // window kept over one Rex block (see src/pane.swift). The iPhone Duo
-// (LEAF_SIM_DUO=1) is drawn on a foldable model that swings open and shut;
-// its iOS draws on the cover display, which shows on whichever glass faces
-// front.
+// (LEAF_SIM_DUO=1) is drawn on a foldable model that swings open and shut.
+// A helper inside the device (src/duo-hinge.m) turns iOS's hinge with it, the
+// way Xcode's Device Hub does, so iOS moves between the cover screen (folded)
+// and the inner one (open); the phone shows whichever faces front, and touches
+// go to a digitizer leaf registers for that screen.
 //
 // The screen is the simulator's own framebuffer: CoreSimulator hands out the
 // IOSurface it draws into, and a Metal texture over that surface is the
@@ -190,9 +192,24 @@ final class HID {
     /// Set from the send callback when the device refuses a message.
     private(set) var lastError: String?
 
-    /// Indigo's target for the touch screen and for hardware buttons.
+    /// Indigo's target for the built-in touch screen and for hardware buttons.
     private static let touchTarget: UInt32 = 0x32
     private static let buttonTarget: UInt32 = 0x33
+    /// Set on a target to name a screen by its ID instead.
+    private static let screenTargetBit: UInt32 = 0x4000_0000
+
+    /// Where touches land.
+    enum TouchScreen {
+        /// The built-in digitizer: the screen on every iPhone but the Duo.
+        case builtIn
+        /// A digitizer leaf registers for one screen, by its simctl screen
+        /// ID and unique ID. The Duo's built-in digitizer is bound to its
+        /// inner screen, which iOS leaves dark; its iOS runs on the cover.
+        case screen(id: UInt32, uniqueID: String)
+    }
+
+    /// Read and written on `queue`.
+    private var screen = TouchScreen.builtIn
 
     private init(client: AnyObject, sendFn: SendFn, sendSelector: Selector, mouse: MouseFn, button: ButtonFn, keyboard: KeyFn) {
         self.client = client
@@ -247,6 +264,55 @@ final class HID {
         sendFn(client, sendSelector, message, true, queue, done as AnyObject)
     }
 
+    /// Sends later touches to `screen`.
+    func route(to screen: TouchScreen) {
+        queue.async {
+            self.screen = screen
+            self.registerDigitizer()
+        }
+    }
+
+    /// Indigo's digitizer service commands.
+    private enum DigitizerCommand: UInt32 {
+        case create = 1, remove = 2
+    }
+
+    /// Gives the routed screen a fresh digitizer, as Xcode's display view
+    /// does for screens without the built-in one. backboardd aborts on a
+    /// touch for a screen with no digitizer, or for one whose digitizer was
+    /// disconnected (as it is when that panel powers off, say when the Duo
+    /// folds shut and locks), and a backboardd restart forgets them all. So
+    /// before every touch the old one is removed and a new one made.
+    private func registerDigitizer() {
+        guard case .screen(let id, let uniqueID) = screen else { return }
+        send(digitizerCommand(.remove, screenID: id, uniqueID: nil))
+        send(digitizerCommand(.create, screenID: id, uniqueID: uniqueID))
+    }
+
+    /// Indigo's service command: one 0xa0-byte payload, the command, the
+    /// target, built in, then the screen's unique ID as a C string of at
+    /// most 63 bytes.
+    private func digitizerCommand(_ command: DigitizerCommand, screenID: UInt32, uniqueID: String?) -> UnsafeMutableRawPointer? {
+        guard let message = calloc(1, 0xc0) else { return nil }
+        message.storeBytes(of: UInt32(0xa0), toByteOffset: 0x18, as: UInt32.self)
+        message.storeBytes(of: UInt8(1), toByteOffset: 0x1c, as: UInt8.self)
+        message.storeBytes(of: UInt32(0x7fff_0001), toByteOffset: 0x20, as: UInt32.self)
+        message.storeBytes(of: command.rawValue, toByteOffset: 0x30, as: UInt32.self)
+        message.storeBytes(of: HID.screenTargetBit | screenID, toByteOffset: 0x40, as: UInt32.self)
+        message.storeBytes(of: UInt8(1), toByteOffset: 0x44, as: UInt8.self)
+        for (offset, byte) in (uniqueID ?? "").utf8.prefix(63).enumerated() {
+            message.storeBytes(of: byte, toByteOffset: 0x45 + offset, as: UInt8.self)
+        }
+        return message
+    }
+
+    private var touchTarget: UInt32 {
+        switch screen {
+        case .builtIn: return HID.touchTarget
+        case .screen(let id, _): return HID.screenTargetBit | id
+        }
+    }
+
     /// One touch event at `point`, as fractions of the screen from its top left.
     func touch(_ phase: Phase, at point: CGPoint) {
         queue.async { self.touchNow(phase, at: point) }
@@ -256,12 +322,14 @@ final class HID {
         var location = CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1))
         let type: NSEvent.EventType
         switch phase {
-        case .down: type = .leftMouseDown
+        case .down:
+            registerDigitizer()
+            type = .leftMouseDown
         case .moved: type = .leftMouseDragged
         case .up: type = .leftMouseUp
         }
         // A move within 16 ms of the last comes back nil: Indigo drops it.
-        send(mouse(&location, nil, HID.touchTarget, UInt(type.rawValue), CGSize(width: 1, height: 1), 0))
+        send(mouse(&location, nil, touchTarget, UInt(type.rawValue), CGSize(width: 1, height: 1), 0))
     }
 
     /// A tap at `point` (fractions of the screen); returns once it's sent.
@@ -875,6 +943,11 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     var orbit = Orbit()
     var device: NSObject?
     var display: NSObject?
+    /// The Duo's two screens, once both are up.
+    var duoDisplays: (cover: NSObject, inner: NSObject)?
+    /// The Duo's hinge helper's stdin, while it runs.
+    var hingeInput: FileHandle?
+    var lastHingeAngle: Double?
     var surface: IOSurface?
     var hid: HID?
     var bootedHere = false
@@ -914,7 +987,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         home = ToolButton(symbol: "house", label: "Home (⇧⌘H)", target: nil, action: #selector(Simulator.pressHome))
         lock = ToolButton(symbol: "lock", label: "Lock (⌘L)", target: nil, action: #selector(Simulator.pressLock))
         turn = ToolButton(symbol: "rotate.3d", label: "Face Front (⌘0)", target: nil, action: #selector(Simulator.toggleFront))
-        fold = ToolButton(symbol: "book", label: "Open (⌘F)", target: nil, action: #selector(Simulator.toggleFold))
+        fold = ToolButton(symbol: "book", label: "Expand iPhone Duo (⌘F)", target: nil, action: #selector(Simulator.toggleFold))
         ask = ToolButton(symbol: "text.bubble", label: "Ask", target: nil, action: #selector(Simulator.toggleAsk))
         close = ToolButton(symbol: "xmark", label: "Close Pane (⌘W)", target: nil, action: #selector(Simulator.closePane))
         chassis = ProcessInfo.processInfo.environment["LEAF_SIM_DUO"] == "1" ? .duo(.folded) : .phone
@@ -1043,7 +1116,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         ask.isEnabled = true
         turn.setSymbol(orbit.front ? "rotate.3d" : "iphone", label: orbit.front ? "Turn in 3D (⌘0)" : "Face Front (⌘0)")
         let open = pose == .open
-        fold.setSymbol(open ? "book.closed" : "book", label: open ? "Fold (⌘F)" : "Open (⌘F)")
+        fold.setSymbol(open ? "book.closed" : "book",
+                       label: open ? "Fold iPhone Duo (⌘F)" : "Expand iPhone Duo (⌘F)")
         ask.contentTintColor = askShown ? .controlAccentColor : (ask.isEnabled ? .secondaryLabelColor : .tertiaryLabelColor)
     }
 
@@ -1083,13 +1157,21 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         return pose == .folded ? fold.foldedSize : fold.openSize
     }
 
-    /// Where the picture sits on the glass, as fractions of it. The Duo's
-    /// iOS draws on its cover even when the phone is open, so on the wider
-    /// inner glass the picture is fitted in the middle with black beside it.
+    /// True when the picture lies a quarter turn from the glass: the Duo's
+    /// inner screen is portrait in its framebuffer but held landscape.
+    var quarterTurned: Bool {
+        guard let glass, let surface else { return false }
+        return (surface.width < surface.height) != (glass.size.width < glass.size.height)
+    }
+
+    /// Where the picture sits on the glass, as fractions of it, after any
+    /// quarter turn. A picture of another shape than the glass is fitted in
+    /// the middle with black beside it.
     var picture: CGRect {
         let whole = CGRect(x: 0, y: 0, width: 1, height: 1)
         guard let glass, let surface, surface.width > 0, surface.height > 0 else { return whole }
-        let ratio = (CGFloat(surface.width) / CGFloat(surface.height)) / (glass.size.width / glass.size.height)
+        let (across, down) = quarterTurned ? (surface.height, surface.width) : (surface.width, surface.height)
+        let ratio = (CGFloat(across) / CGFloat(down)) / (glass.size.width / glass.size.height)
         if abs(ratio - 1) < 0.1 { return whole }
         if ratio < 1 { return CGRect(x: (1 - ratio) / 2, y: 0, width: ratio, height: 1) }
         return CGRect(x: 0, y: (1 - 1 / ratio) / 2, width: 1, height: 1 / ratio)
@@ -1103,8 +1185,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             for node in glass.nodes { node.geometry?.materials = [lit ? phone.material : phone.dark] }
         }
         let fit = picture
-        phone.material.diffuse.contentsTransform = SCNMatrix4Mult(
+        let fitted = SCNMatrix4Mult(
             SCNMatrix4MakeTranslation(-fit.minX, -fit.minY, 0), SCNMatrix4MakeScale(1 / fit.width, 1 / fit.height, 1))
+        phone.material.diffuse.contentsTransform = quarterTurned ? SCNMatrix4Mult(fitted, Simulator.quarterTurn) : fitted
         guard fit != CGRect(x: 0, y: 0, width: 1, height: 1) else {
             phone.material.multiply.contents = NSColor.white
             return
@@ -1118,6 +1201,19 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             return true
         }
     }
+
+    /// Takes a point on a landscape picture, (x, y) from its top left, to the
+    /// portrait framebuffer under it: (y, 1 - x). iOS holds the open Duo's
+    /// inner screen with the framebuffer's top along the picture's right.
+    static let quarterTurn: SCNMatrix4 = {
+        var turn = SCNMatrix4Identity
+        turn.m11 = 0
+        turn.m12 = -1
+        turn.m21 = 1
+        turn.m22 = 0
+        turn.m42 = 1
+        return turn
+    }()
 
     /// Which body to draw, beside the helper.
     func modelURL() -> URL? {
@@ -1157,8 +1253,10 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         }
     }
 
-    /// Folds or opens the Duo: its left half swings about the hinge. Folded,
-    /// the cover faces front; open, the inner screen does.
+    /// Folds or opens the Duo: its left half swings about the hinge, and
+    /// iOS's hinge follows. Folded, the cover faces front; open, the inner
+    /// screen does. Folding shut locks the phone, as on the device; a tap on
+    /// the cover wakes it.
     @objc func toggleFold() {
         guard let pose, let phone, let fold = phone.fold, !folding else { return }
         let opening = pose == .folded
@@ -1178,16 +1276,26 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             let eased = t < 0.5 ? 4 * t * t * t : 1 - pow(2 - 2 * t, 3) / 2
             for hinge in fold.hinges { hinge.simdEulerAngles.y = from + (to - from) * eased }
             fold.holder.simdPosition = start + (end - start) * eased
+            // iOS's hinge follows the model's, so its own fold transition
+            // plays in step.
+            let degrees = Double(opening ? eased : 1 - eased) * 180
+            DispatchQueue.main.async { self?.moveHinge(to: degrees, settled: false) }
             // Halfway, the glass that ends up in front takes the picture.
             if !swapped, eased >= 0.5 {
                 swapped = true
-                DispatchQueue.main.async { self?.dressGlass() }
+                DispatchQueue.main.async {
+                    self?.showDuoScreen()
+                    self?.dressGlass()
+                }
             }
         }
         phone.pivot.runAction(swing, forKey: "fold") { [weak self] in
             DispatchQueue.main.async {
-                self?.folding = false
-                self?.dressGlass()
+                guard let self else { return }
+                self.moveHinge(to: opening ? 180 : 0, settled: true)
+                self.folding = false
+                self.dressGlass()
+                if let surface = self.surface { self.routeTouches(to: surface) }
             }
         }
         SCNTransaction.begin()
@@ -1271,7 +1379,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     @objc func validateMenuItem(_ item: NSMenuItem) -> Bool {
         guard item.action == #selector(toggleFold) else { return true }
-        item.title = pose == .open ? "Fold" : "Open"
+        item.title = pose == .open ? "Fold iPhone Duo" : "Expand iPhone Duo"
         return pose != nil && !folding
     }
 
@@ -1291,7 +1399,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         // SceneKit reports V from the bottom; the glass's UVs start at the top.
         let uv = hit.textureCoordinates(withMappingChannel: 0)
         let fit = picture
-        let x = (uv.x - fit.minX) / fit.width, y = (1 - uv.y - fit.minY) / fit.height
+        let across = (uv.x - fit.minX) / fit.width, down = (1 - uv.y - fit.minY) / fit.height
+        let (x, y) = quarterTurned ? (down, 1 - across) : (across, down)
         if slide { return CGPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1)) }
         return (0...1).contains(x) && (0...1).contains(y) ? CGPoint(x: x, y: y) : nil
     }
@@ -1453,7 +1562,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         let state = device.responds(to: NSSelectorFromString("stateString")) ? device.value(forKey: "stateString") as? String : nil
         let booted = state == "Booted"
         // Booted, but by a leaf pane that's gone: still leaf's to shut down.
-        bootedHere = !booted || BootOwner.orphaned(ownerFile)
+        // The Duo is shut down with its pane however it was booted: it's
+        // heavy, and nothing but leaf drives its cover.
+        bootedHere = !booted || BootOwner.orphaned(ownerFile) || pose != nil
         if bootedHere { guardShutdown() }
         if !booted {
             showStatus("Booting \(name)…", busy: true)
@@ -1546,9 +1657,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     }
 
     /// Waits for the display to appear (it does early in the boot, so the
-    /// boot animation shows), then puts it on the phone. The Duo's iOS draws
-    /// on its cover, the smaller of its two screens, so that one is wanted
-    /// once both are up (or after a few seconds, whichever came).
+    /// boot animation shows), then puts it on the phone. The Duo has two:
+    /// its cover, the smaller, and its inner screen; both are wanted (or
+    /// after a few seconds, whichever came), and its hinge starts folded.
     func attachDisplay(tries: Int) {
         guard let device else { return }
         let screens = CoreSim.builtInDisplays(of: device).compactMap { display in
@@ -1566,15 +1677,28 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         }
         self.display = display
         show(surface)
-        let watched = CoreSim.watchSurfaces(of: display) { [weak self] in
-            DispatchQueue.main.async { self?.surfaceChanged() }
+        if pose != nil, screens.count >= 2,
+           let inner = screens.max(by: { $0.surface.width * $0.surface.height < $1.surface.width * $1.surface.height }) {
+            duoDisplays = (cover: display, inner: inner.display)
+        }
+        var watched = true
+        for watchedDisplay in duoDisplays.map({ [$0.cover, $0.inner] }) ?? [display] {
+            watched = CoreSim.watchSurfaces(of: watchedDisplay) { [weak self] in
+                DispatchQueue.main.async { self?.surfaceChanged() }
+            } && watched
         }
         if !watched {
             Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.surfaceChanged() }
         }
+        if pose != nil {
+            startHinge()
+            // Opened before the screens were up: catch up.
+            showDuoScreen()
+        }
         switch HID.connect(to: device) {
         case .success(let hid):
             self.hid = hid
+            if let shown = self.surface { routeTouches(to: shown) }
             startServer()
         case .failure(let failure):
             fail(failure)
@@ -1586,6 +1710,109 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     func surfaceChanged() {
         guard let display, let latest = CoreSim.surface(of: display), latest !== surface else { return }
         show(latest)
+        // A swapped surface can mean a restarted display server, with new IDs.
+        routeTouches(to: latest)
+    }
+
+    /// Shows the Duo's screen that faces front: the inner one open, the
+    /// cover folded.
+    func showDuoScreen() {
+        guard let duoDisplays, let pose else { return }
+        let wanted = pose == .open ? duoDisplays.inner : duoDisplays.cover
+        guard wanted !== display else { return }
+        display = wanted
+        if let latest = CoreSim.surface(of: wanted) { show(latest) }
+    }
+
+    /// Starts the hinge helper inside the Duo (src/duo-hinge.m), which tells
+    /// iOS where the hinge is, and folds it to match the phone.
+    func startHinge() {
+        guard hingeInput == nil, let pose else { return }
+        guard let helper = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("leaf-duo-hinge"),
+              let size = (try? FileManager.default.attributesOfItem(atPath: helper.path))?[.size] as? Int, size > 0 else {
+            fail(SimFailure(message: "This leaf was built without the iPhone Duo's hinge helper (the iOS Simulator SDK wasn't available), so \(name)'s iOS stays on its cover screen. Install Xcode's iOS platform, then reinstall leaf."))
+            return
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        task.arguments = ["simctl", "spawn", udid, helper.path]
+        task.environment = simctlEnvironment()
+        let input = Pipe(), errors = Pipe()
+        task.standardInput = input
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = errors
+        errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let text = String(decoding: handle.availableData, as: UTF8.self)
+            guard let line = Simulator.lastLine(text) else { return }
+            DispatchQueue.main.async { self?.fail(SimFailure(message: "\(line) Fold and open the phone again to retry.")) }
+        }
+        task.terminationHandler = { [weak self] _ in
+            errors.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async { self?.hingeInput = nil }
+        }
+        do { try task.run() } catch {
+            fail(SimFailure(message: "Couldn't start the iPhone Duo's hinge helper (\(error.localizedDescription)), so \(name)'s iOS stays on its cover screen. Close the pane and open it again."))
+            return
+        }
+        // Writing to a helper that has exited must fail the write, not kill the pane.
+        signal(SIGPIPE, SIG_IGN)
+        hingeInput = input.fileHandleForWriting
+        moveHinge(to: pose == .open ? 180 : 0, settled: true)
+    }
+
+    /// Tells iOS the hinge is at `degrees` (0 shut, 180 flat). Mid-swing
+    /// steps smaller than a few degrees are skipped; a settled angle is
+    /// always sent.
+    func moveHinge(to degrees: Double, settled: Bool) {
+        if hingeInput == nil, !settled { return }
+        if hingeInput == nil { startHinge() }
+        guard let hingeInput else { return }
+        if !settled, let last = lastHingeAngle, abs(degrees - last) < 4 { return }
+        lastHingeAngle = degrees
+        // A helper that has exited fails the write; its termination handler
+        // clears `hingeInput`, and the next settled angle starts it again.
+        try? hingeInput.write(contentsOf: Data(String(format: "%.1f\n", degrees).utf8))
+    }
+
+    /// Points the Duo's touches at the screen leaf shows, found in `simctl io
+    /// enumerate` by its pixel size. Other iPhones keep the built-in
+    /// digitizer. Until this resolves, Duo touches go nowhere.
+    func routeTouches(to surface: IOSurface) {
+        guard pose != nil else { return }
+        let size = (surface.width, surface.height)
+        simctl(["io", udid, "enumerate"]) { [weak self] status, output in
+            guard let self, let hid = self.hid else { return }
+            // The phone folded or opened meanwhile; that change routes again.
+            guard let shown = self.surface, (shown.width, shown.height) == size else { return }
+            guard status == 0, let screen = Simulator.screen(in: output, width: size.0, height: size.1) else {
+                self.fail(SimFailure(message: "\(self.name)'s screen shows, but touches can't reach it: leaf couldn't find its \(size.0)×\(size.1) screen in `xcrun simctl io \(self.udid) enumerate`\(status == 0 ? "" : " (simctl exited with \(status))"). Close the pane and open it again."))
+                return
+            }
+            hid.route(to: screen)
+        }
+    }
+
+    /// The connected screen `width`×`height` pixels in `simctl io enumerate`
+    /// output, whose entries read "Screen ID: 1", "Unique ID: <uuid>",
+    /// "Pixel Size: {1398, 2034}".
+    static func screen(in enumeration: String, width: Int, height: Int) -> HID.TouchScreen? {
+        var id: UInt32?, uniqueID: String?
+        for line in enumeration.split(whereSeparator: \.isNewline) {
+            let field = line.trimmingCharacters(in: .whitespaces)
+            func labeled(_ label: String) -> String? {
+                field.hasPrefix(label) ? String(field.dropFirst(label.count)) : nil
+            }
+            if let value = labeled("Screen ID: ") {
+                id = UInt32(value)
+                uniqueID = nil
+            } else if let value = labeled("Unique ID: ") {
+                uniqueID = value
+            } else if let value = labeled("Pixel Size: "), let id, let uniqueID {
+                let numbers = value.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+                if numbers == [width, height] { return .screen(id: id, uniqueID: uniqueID) }
+            }
+        }
+        return nil
     }
 
     /// Puts `surface` on the phone's screen as a texture over the same memory.

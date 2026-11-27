@@ -27,6 +27,8 @@ use crate::helper::{Part, macos_version};
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
 const PHONE: &[u8] = include_bytes!("../vendor/devices/iphone.usdz");
 const DUO_OPEN: &[u8] = include_bytes!("../vendor/devices/iphone-duo-open.usdz");
+/// Runs inside the iPhone Duo's simulator to move its hinge (src/duo-hinge.m).
+const DUO_HINGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-duo-hinge"));
 
 const USAGE: &str = "Usage: leaf sim list [--json]          installed iPhone simulators
        leaf sim open <udid>              show one in this Rex pane, on a 3D iPhone
@@ -549,6 +551,11 @@ fn helper() -> Result<PathBuf, String> {
                 name: "iphone-duo-open.usdz",
                 bytes: DUO_OPEN,
                 mode: 0o644,
+            },
+            Part {
+                name: "leaf-duo-hinge",
+                bytes: DUO_HINGE,
+                mode: 0o755,
             },
         ],
     )?;
