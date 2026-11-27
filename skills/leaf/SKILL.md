@@ -72,13 +72,17 @@ Keys to tell the person: `cmd+l` address bar (takes a URL, `localhost:3000`, or 
 
 ## iOS Simulator (Rex, macOS 13+, Xcode)
 
-`leaf sim open <udid>` boots an installed iPhone simulator and shows its live screen on a 3D iPhone in the current Rex pane until it closes. The iPhone Duo simulator shows on the foldable Duo; `cmd+f` folds and opens it. Its iOS draws on the cover display either way, and screenshots and coordinates are that display's. `leaf sim list` prints the installed iPhones (`--json` for tools). Open one beside you:
+**Install it first.** The 3D iPhones the pane draws on (about 11 MB) aren't part of leaf, and the `sim` command exists only on macOS. `leaf sim install` lists the models, asks, downloads them, checks each one's checksum, sets `[simulator] enabled = true` in `~/.config/leaf/config.toml` and has Rex reload, so **Leaf: Open Simulator…** appears in the palette (before that the palette offers **Leaf: Install Simulator…**). It asks on a terminal; from a tool with no terminal it refuses unless given `--yes`, so ask the person before you run `leaf sim install --yes`. Running it again only fetches what's missing. If `leaf sim open` says the 3D iPhones aren't installed, that's the fix.
+
+`leaf sim open <udid>` boots an installed iPhone simulator and shows its live screen on a 3D iPhone in the current Rex pane until it closes. The iPhone Air, 17 Pro and Pro Max, 16 and 16 Plus get their own models; other iPhones share one. `leaf sim list` prints the installed iPhones (`--json` for tools). Open one beside you:
 
 ```bash
 rex split -s "$REX_SESSION" -b "$REX_BLOCK" --split=right --focus=false -- leaf sim open <udid>
 ```
 
-The person can also use **Leaf: Open Simulator…** in Rex's command palette. With no iOS runtime installed it says so; tell them to add one in Xcode → Settings → Components. A device leaf booted shuts down when its pane closes.
+The person can also use **Leaf: Open Simulator…** in Rex's command palette. With no iOS runtime installed it says so; tell them to add one in Xcode → Settings → Components. A device leaf booted shuts down when its pane closes; the iPhone Duo always does.
+
+**iPhone Duo.** It starts folded, with iOS on its cover screen. `cmd+f` (or the book button) opens it: iOS's hinge moves with the model, the same way Xcode's Device Hub folds it, and iOS moves to the wide inner screen in landscape. Folding it shut locks the phone, as on the device; a tap on the cover wakes it. You can't fold it from the command line. Screenshots and coordinates follow whichever screen faces front, so take a new screenshot after the person folds or opens it. While it's moving, touches fail with a message to wait.
 
 **Driving it.** Coordinates are pixels of the screenshot, with 0,0 at the top left. Take a screenshot first and read it, then act, then take another to check:
 
@@ -117,7 +121,7 @@ This is text to speech in the reader. leaf has no speech-to-text input. `a` star
 
 `leaf rex install` adds leaf to Rex's command palette (`cmd+shift+p`, type Leaf). Updates keep the plugin current. Actions:
 
-- Always: **Open Document…** (a floating picker), **Open Browser**, **Minimal Address Bar**, **Open Simulator…**, **Open Whiteboard**, **Review Diff**, **Review Staged Changes**, **Review This Branch**, **Pull Requests & Issues**, **Choose Agent…**
+- Always: **Open Document…** (a floating picker), **Open Browser**, **Minimal Address Bar**, **Open Simulator…** (on a Mac once `leaf sim install` has run; **Install Simulator…** before), **Open Whiteboard**, **Review Diff**, **Review Staged Changes**, **Review This Branch**, **Pull Requests & Issues**, **Choose Agent…**
 - While a document or diff is open: **Ask Agent About Selection** (`⇧⌘A`)
 - While a document is open: **Read Aloud / Pause**, **Stop Reading Aloud**, **Read Faster**, **Read Slower**, **Next Sentence**, **Previous Sentence**, **Change Voice…**
 

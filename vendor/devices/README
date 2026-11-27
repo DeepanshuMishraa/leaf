@@ -1,3 +1,7 @@
+These models are not built into leaf. `leaf sim install` downloads them from leaf's model store, the Cloudflare R2 bucket leaf-sim-models (https://pub-451fde5e332d42679206eb1aee0e9528.r2.dev/v1/<file>), and checks each against the size and SHA-256 in src/simmodels.rs. A changed model goes up under a new version (v2/…) with wrangler, and src/simmodels.rs moves to it:
+
+  wrangler r2 object put leaf-sim-models/v2/<file> --file <file> --content-type model/vnd.usdz+zip --cache-control "public, max-age=31536000, immutable" --remote
+
 iphone.usdz: the iPhone model leaf's simulator pane draws the simulator's screen on (src/simulator.swift), made for leaf by its author. The screen is the mesh with material COLOUR_Cherry_Screen.
 
 iphone-duo-open.usdz: the iPhone Duo, open. The pane folds it by turning the left half half a turn about the hinge (x = 0, z = 0.002584); the cover display is the mesh with material C_NS_Screen_Outer. Baked for leaf from "Apple iPhone Duo Fold Night Sky 2026" by extraakash (https://sketchfab.com/AakashMansukhani), Sketchfab Standard. The live screen is the mesh with material COLOUR_Cherry_Screen.

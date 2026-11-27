@@ -25,15 +25,11 @@ use serde::{Deserialize, Serialize};
 use crate::helper::{Part, macos_version};
 
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
-const PHONE: &[u8] = include_bytes!("../vendor/devices/iphone.usdz");
-const DUO_OPEN: &[u8] = include_bytes!("../vendor/devices/iphone-duo-open.usdz");
-const AIR: &[u8] = include_bytes!("../vendor/devices/iphone-air.usdz");
-const PRO_17: &[u8] = include_bytes!("../vendor/devices/iphone-17-pro.usdz");
-const IPHONE_16: &[u8] = include_bytes!("../vendor/devices/iphone-16.usdz");
 /// Runs inside the iPhone Duo's simulator to move its hinge (src/duo-hinge.m).
 const DUO_HINGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-duo-hinge"));
 
-const USAGE: &str = "Usage: leaf sim list [--json]          installed iPhone simulators
+const USAGE: &str = "Usage: leaf sim install [--yes]          download the 3D iPhones and turn the simulator on (asks first)
+       leaf sim list [--json]            installed iPhone simulators
        leaf sim open <udid>              show one in this Rex pane, on a 3D iPhone
        leaf sim info                     the device and its screen size in pixels
        leaf sim screenshot [file.png]    save the screen; prints the file's path
@@ -418,9 +414,25 @@ fn screenshot(udid: &str, path: Option<&str>) -> Result<PathBuf, String> {
         }
     };
     let shown = target.to_string_lossy().into_owned();
-    // The iPhone Duo has two built-in screens, and simctl won't pick one;
-    // iOS draws on the cover, the "primary" screen.
-    simctl(&["io", udid, "screenshot", "--type=png", &shown]).or_else(|first| {
+    // The iPhone Duo has two built-in screens, and simctl won't pick one. A
+    // Leaf pane showing it knows which faces front: the cover ("primary")
+    // folded, the inner screen ("primary-1") open. Without one, iOS is on
+    // the cover unless something else unfolded it.
+    let display = ask_pane(udid, &serde_json::json!({ "info": {} }))
+        .ok()
+        .and_then(|info| info.get("display")?.as_str().map(str::to_owned));
+    let first = match &display {
+        Some(display) => simctl(&[
+            "io",
+            udid,
+            "screenshot",
+            "--type=png",
+            &format!("--display={display}"),
+            &shown,
+        ]),
+        None => simctl(&["io", udid, "screenshot", "--type=png", &shown]),
+    };
+    first.or_else(|first| {
         simctl(&[
             "io",
             udid,
@@ -568,7 +580,8 @@ fn answer(device: &Device, line: &str) -> Reply {
     }
 }
 
-/// The helper on disk, with the phone models beside it.
+/// The helper on disk, with the Duo's hinge helper beside it. The phone
+/// models are downloaded apart, by `leaf sim install` (see simmodels.rs).
 fn helper() -> Result<PathBuf, String> {
     if SIM_HOST.is_empty() {
         return Err("this leaf was built without the simulator pane (Apple's Swift toolchain wasn't available). Install Xcode, then reinstall leaf.".into());
@@ -581,31 +594,6 @@ fn helper() -> Result<PathBuf, String> {
                 name: "leaf-sim-host",
                 bytes: SIM_HOST,
                 mode: 0o755,
-            },
-            Part {
-                name: "iphone.usdz",
-                bytes: PHONE,
-                mode: 0o644,
-            },
-            Part {
-                name: "iphone-duo-open.usdz",
-                bytes: DUO_OPEN,
-                mode: 0o644,
-            },
-            Part {
-                name: "iphone-air.usdz",
-                bytes: AIR,
-                mode: 0o644,
-            },
-            Part {
-                name: "iphone-17-pro.usdz",
-                bytes: PRO_17,
-                mode: 0o644,
-            },
-            Part {
-                name: "iphone-16.usdz",
-                bytes: IPHONE_16,
-                mode: 0o644,
             },
             Part {
                 name: "leaf-duo-hinge",
@@ -645,6 +633,9 @@ fn open(udid: &str) -> Result<(), String> {
             device.name
         ));
     }
+    let model = crate::simmodels::path(device.body.model())?.ok_or_else(|| {
+        "the simulator's 3D iPhones aren't installed. Run `leaf sim install` (it lists them and asks before downloading), then open the simulator again.".to_owned()
+    })?;
     let executable = helper()?;
     let rex = crate::agent::rex_program()?;
     let mut command = Command::new(&executable);
@@ -663,7 +654,7 @@ fn open(udid: &str) -> Result<(), String> {
         .env("LEAF_SIM_RUNTIME", &device.runtime)
         .env("LEAF_SIM_SOCKET", &socket)
         .env("LEAF_DEVELOPER_DIR", &developer);
-    command.env("LEAF_SIM_MODEL", device.body.model());
+    command.env("LEAF_SIM_MODEL", model);
     if device.body == Body::Duo {
         command.env("LEAF_SIM_DUO", "1");
     } else {
@@ -739,6 +730,8 @@ fn command(args: &[String]) -> Result<(), SimError> {
             println!("{json}");
             Ok(())
         }
+        ["install"] => Ok(crate::simmodels::install(false).map_err(String::from)?),
+        ["install", "--yes" | "-y"] => Ok(crate::simmodels::install(true).map_err(String::from)?),
         ["open", udid] => Ok(open(udid)?),
         // Unpack the helper and print where, so a release can prove the
         // pane it ships runs, outside Rex.

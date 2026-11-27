@@ -569,12 +569,12 @@ struct Phone {
 
     static func load(_ url: URL, foldable: Bool) -> Result<Phone, SimFailure> {
         guard let model = models[url.lastPathComponent] else {
-            return .failure(SimFailure(message: "leaf doesn't know the phone model \(url.lastPathComponent). Reinstall leaf; if it persists, please report it."))
+            return .failure(SimFailure(message: "leaf doesn't know the phone model \(url.lastPathComponent). Update leaf and run `leaf sim install`; if it persists, please report it."))
         }
         let screenMaterial = model.screenMaterial
         let scene: SCNScene
         do { scene = try SCNScene(url: url, options: nil) } catch {
-            return .failure(SimFailure(message: "leaf's phone model at \(url.path) couldn't be read (\(error.localizedDescription)). Reinstall leaf to restore it."))
+            return .failure(SimFailure(message: "leaf's phone model at \(url.path) couldn't be read (\(error.localizedDescription)). Run `leaf sim install` to download it again."))
         }
         if foldable {
             scene.rootNode.enumerateHierarchy { node, _ in
@@ -586,7 +586,7 @@ struct Phone {
         let backward = model.facing == .minusZ
         guard let screen = node(in: scene, material: screenMaterial),
               let (width, height) = mapUVs(screen, mirrored: backward) else {
-            return .failure(SimFailure(message: "leaf's phone model at \(url.path) has no screen mesh (material \(screenMaterial)). Reinstall leaf to restore it."))
+            return .failure(SimFailure(message: "leaf's phone model at \(url.path) has no screen mesh (material \(screenMaterial)). Run `leaf sim install` to download it again."))
         }
         let (low, high) = screen.boundingBox
         let material = SCNMaterial()
@@ -609,7 +609,7 @@ struct Phone {
         if foldable {
             guard let node = node(in: scene, material: coverMaterial),
                   let (width, height) = mapUVs(node, mirrored: true) else {
-                return .failure(SimFailure(message: "leaf's iPhone Duo model at \(url.path) has no cover display (material \(coverMaterial)). Reinstall leaf to restore it."))
+                return .failure(SimFailure(message: "leaf's iPhone Duo model at \(url.path) has no cover display (material \(coverMaterial)). Run `leaf sim install` to download it again."))
             }
             node.geometry?.materials = [dark]
             cover = (node, width, height)
@@ -1322,16 +1322,18 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         return turn
     }()
 
-    /// Which body to draw, beside the helper.
+    /// Which body to draw: the model `leaf sim install` downloaded, which
+    /// leaf passes as LEAF_SIM_MODEL.
     func modelURL() -> URL? {
-        guard let executable = Bundle.main.executableURL else { return nil }
-        let chosen = ProcessInfo.processInfo.environment["LEAF_SIM_MODEL"] ?? ""
-        let name = pose != nil ? "iphone-duo-open.usdz" : (Phone.models[chosen] == nil ? "iphone.usdz" : chosen)
-        return executable.deletingLastPathComponent().appendingPathComponent(name)
+        guard let path = ProcessInfo.processInfo.environment["LEAF_SIM_MODEL"], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
     }
 
     func loadPhone() {
-        guard let url = modelURL() else { return }
+        guard let url = modelURL() else {
+            fail(SimFailure(message: "leaf didn't say which 3D iPhone to draw. Run `leaf sim install`, then open the simulator again with `leaf sim open`."))
+            return
+        }
         switch Phone.load(url, foldable: pose != nil) {
         case .success(let phone):
             self.phone = phone
@@ -1965,21 +1967,36 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// One request from `leaf sim`, on the server's thread. Coordinates are
     /// screenshot pixels, as `leaf sim screenshot` saves them.
     func handle(_ request: [String: Any]) -> [String: Any] {
-        guard let (hid, width, height) = DispatchQueue.main.sync(execute: { () -> (HID, Int, Int)? in
-            guard let hid = self.hid, let surface = self.surface else { return nil }
-            return (hid, surface.width, surface.height)
-        }) else {
+        enum State { case starting, folding, live(HID, Int, Int, turned: Bool, display: String) }
+        let state = DispatchQueue.main.sync { () -> State in
+            guard let hid = self.hid, let surface = self.surface else { return .starting }
+            if self.folding { return .folding }
+            // The open Duo's inner screen: simctl's screenshot of it is
+            // landscape, the framebuffer under it portrait.
+            let turned = self.quarterTurned
+            let display = self.pose == .open ? "primary-1" : "primary"
+            return turned ? .live(hid, surface.height, surface.width, turned: true, display: display)
+                : .live(hid, surface.width, surface.height, turned: false, display: display)
+        }
+        let hid: HID, width: Int, height: Int, turned: Bool, display: String
+        switch state {
+        case .starting:
             return ["failed": ["message": "\(name) is still starting. Wait for its home screen, then try again."]]
+        case .folding:
+            return ["failed": ["message": "\(name) is folding or opening. Wait a second, take a new screenshot, then try again."]]
+        case .live(let live, let across, let down, let quarter, let shown):
+            (hid, width, height, turned, display) = (live, across, down, quarter, shown)
         }
         func fraction(_ value: Any?, _ size: Int) -> CGFloat? {
             guard let number = value as? NSNumber else { return nil }
             return CGFloat(truncating: number) / CGFloat(size)
         }
+        /// A screenshot pixel as a fraction of the framebuffer.
         func point(_ value: Any?) -> CGPoint? {
             guard let pair = value as? [Any], pair.count == 2,
                   let x = fraction(pair[0], width), let y = fraction(pair[1], height),
                   (0...1).contains(x), (0...1).contains(y) else { return nil }
-            return CGPoint(x: x, y: y)
+            return turned ? CGPoint(x: y, y: 1 - x) : CGPoint(x: x, y: y)
         }
         let outside = "is outside the screen, which is \(width)×\(height) pixels with 0,0 at the top left"
         if let tap = request["tap"] as? [String: Any] {
@@ -2021,7 +2038,10 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             return ["ok": [:]]
         }
         if request["info"] != nil {
-            return ["ok": ["udid": udid, "name": name, "runtime": runtime, "width": width, "height": height]]
+            var info: [String: Any] = ["udid": udid, "name": name, "runtime": runtime, "width": width, "height": height]
+            // The Duo's screen in use, for `leaf sim screenshot`.
+            if pose != nil { info["display"] = display }
+            return ["ok": info]
         }
         return failed("leaf's simulator pane didn't understand that request. Update leaf so the CLI and the pane match.")
     }
@@ -2033,7 +2053,9 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         DispatchQueue.main.async { [weak self] in
             guard let self, let phone = self.phone, let glass = self.glass else { return }
             let fit = self.picture
-            let x = fit.minX + at.x * fit.width, y = fit.minY + at.y * fit.height
+            // `at` is a fraction of the framebuffer; the glass may show it a quarter turn round.
+            let shown = self.quarterTurned ? CGPoint(x: 1 - at.y, y: at.x) : at
+            let x = fit.minX + shown.x * fit.width, y = fit.minY + shown.y * fit.height
             let ring = SCNNode(geometry: SCNTorus(ringRadius: 0.035, pipeRadius: 0.004))
             let material = SCNMaterial()
             material.lightingModel = .constant

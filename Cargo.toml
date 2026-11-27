@@ -8,7 +8,9 @@ repository = "https://github.com/DeepanshuMishraa/leaf"
 readme = "README.md"
 keywords = ["pdf", "reader", "terminal", "tui", "articles"]
 categories = ["command-line-utilities"]
-exclude = ["CLAUDE.md", "site"]
+# The simulator's 3D models download on request (`leaf sim install`), so
+# they stay out of the crate.
+exclude = ["CLAUDE.md", "site", "vendor/devices/*.usdz"]
 
 [[bin]]
 name = "leaf"

@@ -21,6 +21,15 @@ pub struct Config {
     pub diff: DiffConfig,
     pub outline: OutlineConfig,
     pub keys: KeysConfig,
+    pub simulator: SimulatorConfig,
+}
+
+/// `[simulator]`: the iOS Simulator pane, on macOS. `leaf sim install`
+/// downloads its models and turns it on; Rex's palette offers it only then.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SimulatorConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -133,6 +142,65 @@ pub fn default_path() -> Option<PathBuf> {
         .map(|home| home.join("leaf").join("config.toml"))
 }
 
+/// Sets `enabled = true` under `[simulator]` in leaf's config, keeping the
+/// rest of the file as it was. Returns the file's path.
+pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
+    let path = default_path().ok_or_else(|| {
+        (
+            PathBuf::from("~/.config/leaf/config.toml"),
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither XDG_CONFIG_HOME nor HOME is set",
+            ),
+        )
+    })?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err((path, error)),
+    };
+    let updated = with_simulator_enabled(&text);
+    if updated != text {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|error| (path.clone(), error))?;
+        }
+        std::fs::write(&path, updated).map_err(|error| (path.clone(), error))?;
+    }
+    Ok(path)
+}
+
+/// `text` with `enabled = true` in its `[simulator]` table: an `enabled`
+/// line there is replaced, else one is added to the table, else the table
+/// is appended.
+fn with_simulator_enabled(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let header = |line: &str| line.trim().starts_with('[');
+    let Some(start) = lines.iter().position(|line| line.trim() == "[simulator]") else {
+        let mut out = text.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[simulator]\nenabled = true\n");
+        return out;
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| header(line))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    let mut out: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
+    let key = |line: &str| line.split('=').next().map(str::trim) == Some("enabled");
+    match (start + 1..end).find(|&index| key(lines[index])) {
+        Some(index) => out[index] = "enabled = true".into(),
+        None => out.insert(start + 1, "enabled = true".into()),
+    }
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    joined
+}
+
 pub fn load() -> Result<Config, ConfigFailed> {
     let Some(path) = default_path() else {
         return Ok(Config::default());
@@ -190,7 +258,28 @@ impl KeysConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, with_simulator_enabled};
+
+    #[test]
+    fn enabling_the_simulator_edits_only_its_table() {
+        assert_eq!(with_simulator_enabled(""), "[simulator]\nenabled = true\n");
+        assert_eq!(
+            with_simulator_enabled("[reader]\nmax_width = 90"),
+            "[reader]\nmax_width = 90\n\n[simulator]\nenabled = true\n"
+        );
+        assert_eq!(
+            with_simulator_enabled("[simulator]\nenabled = false\n[diff]\nlayout = \"inline\"\n"),
+            "[simulator]\nenabled = true\n[diff]\nlayout = \"inline\"\n"
+        );
+        assert_eq!(
+            with_simulator_enabled("[simulator]\n[keys.reader]\n"),
+            "[simulator]\nenabled = true\n[keys.reader]\n"
+        );
+        let enabled: Config =
+            toml::from_str(&with_simulator_enabled("[reader]\nmax_width = 90\n")).expect("parses");
+        assert!(enabled.simulator.enabled);
+        assert_eq!(enabled.reader.max_width, 90);
+    }
     use crate::diffkeys::DiffAction;
     use crate::readerkeys::ReaderAction;
 
