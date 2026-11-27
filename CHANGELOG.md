@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `[plan] jump = "top"` makes `]`, `[` and the other block jumps in `leaf plan` scroll the block they land on to the top of the screen. The default, `"nearest"`, keeps scrolling only as far as it takes to show the block's first line.
+- `[plan] scrolloff = 3` keeps that many rows below the cursor as it moves down in `leaf plan`, so the lines ahead stay in view. Like Vim's `scrolloff`, but only at the bottom edge, so a block a jump put at the top stays there. At most half the screen is kept; the default is 0.
+
 ## 0.18.4
 
 - Rebind any view's keys in `config.toml`: the reader, its ink and bookmarks, the outline, the diff and its comments, overview and verdict, `leaf plan`, `leaf board` and `leaf pr`, each under its own `[keys.<view>]` table. Each line names an action and a key or a list of keys, such as `quit = ["q", "ctrl+q"]`. Actions left out keep their keys, an empty list unbinds one, and a new key given to one action is taken from the others. `?` and the hints at the bottom of each view show the keys as you set them. Text you type, such as comments, find and filters, keeps its own keys. The defaults are the keys leaf had before.

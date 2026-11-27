@@ -1,6 +1,6 @@
 ---
 name: leaf-config
-description: Change leaf's settings and key bindings in its config.toml for the person. Use when they want a key rebound or unbound in leaf (the reader, leaf diff, leaf review, leaf plan, leaf board or leaf pr), ask what a key does or which keys are free, want the diff to open split or inline, want the outline sidebar wider, or when leaf stopped with "Could not load settings".
+description: Change leaf's settings and key bindings in its config.toml for the person. Use when they want a key rebound or unbound in leaf (the reader, leaf diff, leaf review, leaf plan, leaf board or leaf pr), ask what a key does or which keys are free, want the diff to open split or inline, want the outline sidebar wider, want leaf plan's block jumps to put the block at the top of the screen or keep rows below the cursor (scrolloff), or when leaf stopped with "Could not load settings".
 ---
 
 # leaf-config: settings and keys
@@ -30,6 +30,10 @@ layout = "inline"          # "split" or "inline"; left out, a diff opens in the 
 
 [outline]
 width = 40                 # outline sidebar width when it opens, 20 through 80, default 32
+
+[plan]
+jump = "top"               # where ], [ and other block jumps in leaf plan leave the block: "top" of the screen, or "nearest" (default), scrolling the least
+scrolloff = 3              # rows kept below the cursor as it moves down in leaf plan, at most half the screen, default 0
 
 [keys.reader]
 quit = ["q", "ctrl+q"]     # one key as a string, or a list

@@ -135,8 +135,8 @@ pub fn plan_command(args: &[String]) -> ExitCode {
     };
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
     if interactive {
-        let keys = match crate::config::load() {
-            Ok(config) => config.keys,
+        let (keys, settings) = match crate::config::load() {
+            Ok(config) => (config.keys, config.plan),
             Err(error) => {
                 eprintln!("leaf: {error}");
                 return ExitCode::FAILURE;
@@ -163,7 +163,7 @@ pub fn plan_command(args: &[String]) -> ExitCode {
             draft,
             save,
         };
-        let result = planview::run(plan, keys);
+        let result = planview::run(plan, keys, settings);
         if let Some(message) = failure.borrow().as_ref() {
             eprintln!(
                 "leaf: unsent notes couldn't be saved ({message}). They last only while the review is open."

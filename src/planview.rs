@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Frame_, BorderType, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::KeysConfig;
+use crate::config::{KeysConfig, PlanConfig};
 use crate::diffkeys::VerdictAction;
 use crate::doc::{WATCH_TICK, Watch};
 use crate::hue::Hue;
@@ -101,6 +101,18 @@ enum Listed {
     Global,
     /// `notes[index]`.
     Note(usize),
+}
+
+/// `[plan] jump`: where `]`, `[`, `D` and the other block jumps leave the
+/// block they land on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Jump {
+    /// Scroll only as far as it takes to show the block's first line.
+    #[default]
+    Nearest,
+    /// Scroll the block's first line to the top of the screen.
+    Top,
 }
 
 /// Text selected with the mouse inside one block: character offsets into
@@ -197,6 +209,9 @@ struct App {
     watch: Option<Watch>,
     /// The keys it answers to, as `[keys.plan]` and its neighbours set them.
     keys: KeysConfig,
+    jump: Jump,
+    /// `[plan] scrolloff`: rows kept below the cursor as it moves down.
+    scrolloff: usize,
 }
 
 impl App {
@@ -238,6 +253,8 @@ impl App {
             save: plan.save,
             watch: plan.watch,
             keys: KeysConfig::default(),
+            jump: Jump::default(),
+            scrolloff: 0,
         };
         if let Some(previous) = plan.previous.as_deref() {
             let mut before: std::collections::HashMap<String, usize> =
@@ -766,7 +783,8 @@ impl App {
         (first.unwrap_or(0), last.unwrap_or(0))
     }
 
-    /// Scrolls so the cursor's line (or the global row) is on screen.
+    /// Scrolls so the cursor's line (or the global row) is on screen, with
+    /// `scrolloff` rows below it while there are rows left to show.
     fn follow(&mut self) {
         let rows = self.rows();
         let (first, last) = match self.focus {
@@ -782,10 +800,14 @@ impl App {
             Focus::Global => self.focus_rows(&rows),
         };
         let height = self.view_height.max(1);
+        // Never so much margin that the cursor can't stay on screen.
+        let below = self.scrolloff.min(height.saturating_sub(1) / 2);
+        let max = rows.len().saturating_sub(height);
         if first < self.scroll {
             self.scroll = first;
-        } else if last >= self.scroll + height {
-            self.scroll = (last + 1).saturating_sub(height).min(first);
+        } else if last + below >= self.scroll + height {
+            let wanted = (last + 1 + below).saturating_sub(height).min(max);
+            self.scroll = wanted.max(self.scroll).min(first);
         }
     }
 
@@ -809,6 +831,19 @@ impl App {
             Focus::Global => 0,
         };
         self.follow();
+        if let (Jump::Top, Focus::Block(block)) = (self.jump, self.focus) {
+            let start = Row::Text {
+                block,
+                row: self.line_of(block, self.row).0,
+            };
+            let rows = self.rows();
+            // Near the end there's too little left to fill the screen, so the
+            // block shows lower down instead of over blank rows.
+            let max = rows.len().saturating_sub(self.view_height.max(1));
+            if let Some(at) = rows.iter().position(|row| *row == start) {
+                self.scroll = at.min(max);
+            }
+        }
     }
 
     fn step(&mut self, by: isize) {
@@ -2259,7 +2294,7 @@ fn draw_help(f: &mut Frame, area: Rect, keymap: &Keymap<PlanAction>) {
 }
 
 /// Opens the plan for review and says how it was left.
-pub fn run(plan: Plan, keys: KeysConfig) -> io::Result<(Outcome, String)> {
+pub fn run(plan: Plan, keys: KeysConfig, settings: PlanConfig) -> io::Result<(Outcome, String)> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -2275,6 +2310,8 @@ pub fn run(plan: Plan, keys: KeysConfig) -> io::Result<(Outcome, String)> {
     );
     let mut app = App::new(plan);
     app.keys = keys;
+    app.jump = settings.jump;
+    app.scrolloff = settings.scrolloff;
     let result = setup.and_then(|_| event_loop(&mut app, &mut terminal));
     let _ = execute!(
         io::stdout(),
@@ -2649,6 +2686,93 @@ create table tokens (id int);
 
     fn press(app: &mut App, code: KeyCode) {
         app.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// A plan of twelve sections, longer than a short screen.
+    fn long_app() -> App {
+        let source = (1..=12)
+            .map(|n| format!("## Step {n}\n\nDo thing {n}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        App::new(Plan {
+            subject: "plan.md".into(),
+            source,
+            watch: None,
+            round: None,
+            previous: None,
+            draft: None,
+            save: Box::new(|_| {}),
+        })
+    }
+
+    /// The row on the top line of the screen, and where the cursor's block starts.
+    fn top_and_block_start(app: &App) -> (Row, Row) {
+        let Focus::Block(block) = app.focus else {
+            panic!("the cursor should be on a block");
+        };
+        let rows = app.rows();
+        let start = Row::Text {
+            block,
+            row: app.line_of(block, app.row).0,
+        };
+        (rows[app.scroll], start)
+    }
+
+    #[test]
+    fn jump_top_puts_the_next_block_on_the_top_line() {
+        let mut app = long_app();
+        app.jump = Jump::Top;
+        draw(&mut app, 90, 8);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        let (top, start) = top_and_block_start(&app);
+        assert_eq!(top, start);
+        press(&mut app, KeyCode::Char('['));
+        let (top, start) = top_and_block_start(&app);
+        assert_eq!(top, start);
+    }
+
+    #[test]
+    fn scrolloff_keeps_rows_below_the_cursor_but_not_above() {
+        let mut app = long_app();
+        app.scrolloff = 2;
+        draw(&mut app, 90, 10);
+        let height = app.view_height;
+        for _ in 0..12 {
+            press(&mut app, KeyCode::Char('j'));
+            let rows = app.rows();
+            let Focus::Block(block) = app.focus else {
+                panic!("the cursor should be on a block");
+            };
+            let at = rows
+                .iter()
+                .position(|row| {
+                    *row == Row::Text {
+                        block,
+                        row: app.row,
+                    }
+                })
+                .unwrap();
+            assert!(
+                at + 2 < app.scroll + height,
+                "cursor {at} too low on {}",
+                app.scroll
+            );
+        }
+        // Moving back up scrolls only once the cursor reaches the top line.
+        let scroll = app.scroll;
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.scroll, scroll);
+    }
+
+    #[test]
+    fn jump_nearest_scrolls_the_least() {
+        let mut app = long_app();
+        draw(&mut app, 90, 8);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        let (top, start) = top_and_block_start(&app);
+        assert_ne!(top, start);
     }
 
     #[test]

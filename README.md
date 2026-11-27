@@ -59,6 +59,10 @@ layout = "inline"   # "split" or "inline"; left out, a diff opens in the layout 
 [outline]
 width = 40   # the outline sidebar's width when it opens, 20 through 80, default 32
 
+[plan]
+jump = "top"   # where ], [ and other block jumps in leaf plan leave the block: "top" of the screen, or "nearest" (default), scrolling the least
+scrolloff = 3   # rows kept below the cursor as it moves down in leaf plan, at most half the screen, default 0
+
 # Rebind keys. Each line names an action and one key or a list of them.
 # Actions you leave out keep their keys; an empty list unbinds one.
 [keys.reader]

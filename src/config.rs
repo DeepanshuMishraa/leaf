@@ -9,6 +9,7 @@ use crate::diffview::Layout;
 use crate::keymap::{self, Keymap};
 use crate::outline::{self, OutlineAction};
 use crate::plankeys::{PlanAction, PlanNotesAction, PlanQuitAction};
+use crate::planview::Jump;
 use crate::prkeys::{PrAction, PrListAction};
 use crate::readerkeys::{BookmarksAction, InkAction, ReaderAction};
 
@@ -20,7 +21,18 @@ pub struct Config {
     pub reader: ReaderConfig,
     pub diff: DiffConfig,
     pub outline: OutlineConfig,
+    pub plan: PlanConfig,
     pub keys: KeysConfig,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlanConfig {
+    /// Where `]`, `[` and the other block jumps leave the block they land on.
+    pub jump: Jump,
+    /// Rows kept below the cursor as it moves down, like Vim's `scrolloff`
+    /// but only at the bottom edge. At most half the screen is used.
+    pub scrolloff: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -231,6 +243,13 @@ mod tests {
         assert_eq!(config.diff.layout, Some(crate::diffview::Layout::Inline));
         assert_eq!(config.outline.width, 40);
         assert!(toml::from_str::<Config>("[diff]\nlayout = \"sideways\"").is_err());
+        let config: Config = toml::from_str("[plan]\njump = \"top\"").unwrap();
+        assert_eq!(config.plan.jump, crate::planview::Jump::Top);
+        assert_eq!(config.plan.scrolloff, 0);
+        let config: Config = toml::from_str("[plan]\nscrolloff = 3").unwrap();
+        assert_eq!(config.plan.scrolloff, 3);
+        assert_eq!(Config::default().plan.jump, crate::planview::Jump::Nearest);
+        assert!(toml::from_str::<Config>("[plan]\njump = \"middle\"").is_err());
     }
 
     #[test]
