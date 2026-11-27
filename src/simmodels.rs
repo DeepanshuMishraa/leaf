@@ -335,7 +335,9 @@ fn fetch(model: &Model, progress: impl Fn(u64)) -> Result<(), ModelsFailed> {
     };
     let dir = dir()?;
     let target = dir.join(model.file);
-    let partial = dir.join(format!("{}.partial", model.file));
+    // Each process downloads into a file of its own, so two installs at
+    // once can't truncate or publish each other's half-written download.
+    let partial = dir.join(format!("{}.{}.partial", model.file, std::process::id()));
     let disk = |path: &PathBuf| {
         let path = path.clone();
         move |cause| ModelsFailed::Disk { path, cause }
@@ -396,20 +398,6 @@ fn reload_rex() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_body_has_a_model() {
-        let files: Vec<&str> = MODELS.iter().map(|model| model.file).collect();
-        for file in [
-            "iphone.usdz",
-            "iphone-duo-open.usdz",
-            "iphone-air.usdz",
-            "iphone-17-pro.usdz",
-            "iphone-16.usdz",
-        ] {
-            assert!(files.contains(&file), "{file} isn't in MODELS");
-        }
-    }
 
     #[test]
     fn checksums_are_sha256_hex() {

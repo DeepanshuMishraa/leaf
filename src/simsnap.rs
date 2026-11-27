@@ -73,6 +73,9 @@ pub struct Key {
 pub struct Entry {
     pub number: u32,
     pub key: Key,
+    /// Where it was, to tell identical elements apart if they move.
+    #[serde(default)]
+    pub frame: [i64; 4],
 }
 
 /// The last snapshot of a device: its refs, and its text for `--diff`.
@@ -86,6 +89,23 @@ pub struct Snapshot {
     /// whether the screen changed.
     #[serde(default)]
     pub screen: u64,
+    /// The app in front; empty on the home screen. Refs belong to it.
+    #[serde(default)]
+    pub app: String,
+}
+
+/// Why a ref from the last snapshot can't be acted on now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    /// The last snapshot handed out no such ref.
+    Unknown,
+    /// Another app is in front than the one the snapshot read.
+    OtherApp { then: String, now: String },
+    /// Its element isn't on screen.
+    Gone(Key),
+    /// It's one of several identical elements, and they moved, so which
+    /// one it was can't be told.
+    Moved(Key),
 }
 
 /// Whether a snapshot shows every element or only those to act on.
@@ -126,14 +146,23 @@ impl Element {
     /// and a tap on the row's label doesn't flip it, so a switch is
     /// tapped at the row's right end, where the switch itself sits.
     pub fn tap_point(&self, width: i64, height: i64) -> (i64, i64) {
-        let [x, y, w, h] = self.frame;
-        let (left, top) = (x.max(0), y.max(0));
-        let (right, bottom) = ((x + w).min(width), (y + h).min(height));
+        let h = self.frame[3];
+        let [left, top, w, visible_h] = self.visible_frame(width, height);
+        let (right, bottom) = (left + w, top + visible_h);
         let middle = (top + bottom) / 2;
         if self.role == "CheckBox" && right - left > 2 * h {
             return (right - h * 9 / 10, middle);
         }
         ((left + right) / 2, middle)
+    }
+
+    /// The part of the element on a `width`×`height` screen, as x, y,
+    /// width and height.
+    pub fn visible_frame(&self, width: i64, height: i64) -> [i64; 4] {
+        let [x, y, w, h] = self.frame;
+        let (left, top) = (x.max(0), y.max(0));
+        let (right, bottom) = ((x + w).min(width), (y + h).min(height));
+        [left, top, (right - left).max(0), (bottom - top).max(0)]
     }
 
     fn line(&self, number: u32) -> String {
@@ -219,9 +248,58 @@ impl Tree {
             .filter(|element| element.visible(self.width, self.height))
     }
 
+    /// The element `@e<number>` from `snapshot` names, on this screen.
+    pub fn resolve(&self, snapshot: &Snapshot, number: u32) -> Result<&Element, Unresolved> {
+        let entry = snapshot.entry(number).ok_or(Unresolved::Unknown)?;
+        let now = self.app_name().unwrap_or_default();
+        if now != snapshot.app {
+            return Err(Unresolved::OtherApp {
+                then: snapshot.app.clone(),
+                now: now.to_owned(),
+            });
+        }
+        let element = self
+            .find(&entry.key)
+            .ok_or_else(|| Unresolved::Gone(entry.key.clone()))?;
+        // Order alone can't tell identical elements apart once they've
+        // moved (rows reordered, or the list scrolled): refuse to guess.
+        if entry.key.of > 1 && element.frame != entry.frame {
+            return Err(Unresolved::Moved(entry.key.clone()));
+        }
+        Ok(element)
+    }
+
+    /// The lines of `snapshot` for elements whose label, value or id
+    /// contains `wanted`, ignoring case, in full rather than as shown.
+    pub fn matching(&self, snapshot: &Snapshot, wanted: &str) -> Vec<String> {
+        let wanted = wanted.to_lowercase();
+        self.keyed()
+            .into_iter()
+            .filter(|(_, element)| {
+                element.visible(self.width, self.height)
+                    && !element.hollow()
+                    && [&element.label, &element.value, &element.id]
+                        .iter()
+                        .any(|text| text.to_lowercase().contains(&wanted))
+            })
+            .filter_map(|(key, element)| {
+                let entry = snapshot.entries.iter().find(|entry| entry.key == key)?;
+                Some(element.line(entry.number))
+            })
+            .collect()
+    }
+
     /// The outline, keeping `previous`'s refs for elements still here.
     pub fn snapshot(&self, previous: &Snapshot, detail: Detail) -> Snapshot {
         let mut next = previous.next.max(1);
+        let app = self.app_name().unwrap_or_default().to_owned();
+        // Refs belong to one app: another app's identical "Delete" is a
+        // different button.
+        let kept: &[Entry] = if previous.app == app {
+            &previous.entries
+        } else {
+            &[]
+        };
         let mut entries = Vec::new();
         let mut lines = Vec::new();
         let size = format!("{}×{}px", self.width, self.height);
@@ -240,14 +318,18 @@ impl Tree {
             }
             // Every element gets its ref, printed or not, so a full
             // snapshot after an interactive one keeps the same numbers.
-            let number = match previous.entries.iter().find(|entry| entry.key == key) {
+            let number = match kept.iter().find(|entry| entry.key == key) {
                 Some(entry) => entry.number,
                 None => {
                     next += 1;
                     next - 1
                 }
             };
-            entries.push(Entry { number, key });
+            entries.push(Entry {
+                number,
+                key,
+                frame: element.frame,
+            });
             if detail == Detail::Interactive && element.passive() {
                 continue;
             }
@@ -267,6 +349,7 @@ impl Tree {
             entries,
             text,
             screen: crate::plugin::fnv1a(&format!("{:?}", self.elements)),
+            app,
         }
     }
 }
@@ -541,5 +624,76 @@ mod tests {
         let tree: Tree = serde_json::from_str(json).expect("parses");
         assert_eq!(tree.elements.len(), 2);
         assert!(tree.elements[1].disabled);
+    }
+
+    fn two_deletes(app: &str) -> Tree {
+        Tree {
+            width: 100,
+            height: 100,
+            elements: vec![
+                element(0, "Application", app, [0, 0, 100, 100]),
+                element(1, "Button", "Delete", [0, 0, 10, 10]),
+                element(1, "Button", "Delete", [0, 20, 10, 10]),
+            ],
+        }
+    }
+
+    #[test]
+    fn refs_resolve_in_their_own_app_only() {
+        let notes = two_deletes("Notes");
+        let snapshot = notes.snapshot(&Snapshot::default(), Detail::Full);
+        assert_eq!(
+            notes.resolve(&snapshot, 2).map(|element| element.frame),
+            Ok([0, 20, 10, 10])
+        );
+        assert_eq!(notes.resolve(&snapshot, 9), Err(Unresolved::Unknown));
+        let mail = two_deletes("Mail");
+        assert_eq!(
+            mail.resolve(&snapshot, 2),
+            Err(Unresolved::OtherApp {
+                then: "Notes".into(),
+                now: "Mail".into()
+            })
+        );
+        // Mail's buttons get refs of their own, not Notes' ones.
+        let fresh = mail.snapshot(&snapshot, Detail::Full);
+        assert_eq!(
+            fresh.text,
+            "Mail 100×100px\n@e3 button \"Delete\"\n@e4 button \"Delete\"\n"
+        );
+    }
+
+    #[test]
+    fn moved_duplicates_are_refused_not_guessed() {
+        let notes = two_deletes("Notes");
+        let snapshot = notes.snapshot(&Snapshot::default(), Detail::Full);
+        let mut scrolled = notes.clone();
+        scrolled.elements[1].frame = [0, 40, 10, 10];
+        scrolled.elements[2].frame = [0, 60, 10, 10];
+        assert!(matches!(
+            scrolled.resolve(&snapshot, 1),
+            Err(Unresolved::Moved(_))
+        ));
+        // A unique element may move freely.
+        let mut settings = settings();
+        let first = settings.snapshot(&Snapshot::default(), Detail::Full);
+        settings.elements[3].frame[1] += 300;
+        assert!(settings.resolve(&first, 2).is_ok());
+    }
+
+    #[test]
+    fn wait_matches_whole_labels_not_shown_lines() {
+        let mut tree = settings();
+        let long = format!("{}needle", "a".repeat(100));
+        tree.elements
+            .push(element(1, "StaticText", &long, [48, 2000, 1110, 60]));
+        let snapshot = tree.snapshot(&Snapshot::default(), Detail::Full);
+        // Past the clip, and not a role name.
+        assert_eq!(tree.matching(&snapshot, "NEEDLE").len(), 1);
+        assert!(tree.matching(&snapshot, "button").is_empty());
+        assert_eq!(
+            tree.matching(&snapshot, "gener"),
+            vec!["@e2 button \"General\"".to_owned()]
+        );
     }
 }

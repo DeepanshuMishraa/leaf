@@ -39,12 +39,24 @@ enum Accessibility {
         @objc func accessibilityTranslationRootParentWithToken(_ token: NSString) -> Any? { nil }
     }
 
-    /// One request, waited for; an empty response when the device doesn't answer in time.
+    /// When the walk under way must end; every request waits at most until then.
+    private static var deadline = Date.distantFuture
+    private static let deadlineLock = NSLock()
+
+    private static var remaining: TimeInterval {
+        deadlineLock.lock()
+        defer { deadlineLock.unlock() }
+        return deadline.timeIntervalSinceNow
+    }
+
+    /// One request, waited for; an empty response when the device doesn't
+    /// answer in 3 s or by the walk's deadline.
     private static func send(_ request: AnyObject, to device: NSObject) -> AnyObject? {
         let selector = NSSelectorFromString("sendAccessibilityRequestAsync:completionQueue:completionHandler:")
         let empty = (NSClassFromString("AXPTranslatorResponse") as AnyObject?)?
             .perform(NSSelectorFromString("emptyResponse"))?.takeUnretainedValue()
-        guard device.responds(to: selector) else { return empty }
+        let wait = min(3, remaining)
+        guard device.responds(to: selector), wait > 0 else { return empty }
         let done = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var response: AnyObject?
@@ -54,7 +66,7 @@ enum Accessibility {
             lock.unlock()
             done.signal()
         }
-        guard done.wait(timeout: .now() + 3) == .success else { return empty }
+        guard done.wait(timeout: .now() + wait) == .success else { return empty }
         lock.lock()
         defer { lock.unlock() }
         return response ?? empty
@@ -98,7 +110,15 @@ enum Accessibility {
     }
 
     /// The frontmost app's elements, depth first, the app itself first.
-    static func tree(of device: NSObject) -> Result<[Node], SimFailure> {
+    static func tree(of device: NSObject, until end: Date) -> Result<[Node], SimFailure> {
+        deadlineLock.lock()
+        deadline = end
+        deadlineLock.unlock()
+        defer {
+            deadlineLock.lock()
+            deadline = .distantFuture
+            deadlineLock.unlock()
+        }
         let translator: NSObject
         switch self.translator(for: device) {
         case .success(let found): translator = found
@@ -141,24 +161,32 @@ enum Accessibility {
             // Deeper or bigger than any real screen: a guard against cycles.
             guard depth < 64 else { return }
             for child in element.accessibilityChildren() ?? [] {
-                guard nodes.count < 2000 else { return }
+                guard nodes.count < 2000, remaining > 0 else { return }
                 if let child = child as? NSAccessibilityElement { walk(child, depth: depth + 1) }
             }
         }
         walk(root, depth: 0)
+        // Past the deadline the walk stopped part way, and half a tree
+        // would read as a screen with things missing.
+        guard remaining > 0 else {
+            return .failure(SimFailure(message: "The simulator stopped answering accessibility requests while leaf read its screen. It may be busy or hung; take a screenshot with `leaf sim screenshot` to see, then try again."))
+        }
         return .success(nodes)
     }
 
     /// The tree once it has stayed the same for 0.3 s (an animation or a
     /// load has finished; a push can hold still for 0.1 s mid-slide), or the
     /// latest after `limit` seconds.
+    /// Each reading may take up to 3 s past `limit`, as a slow device
+    /// needs; the last complete one stands if a later one runs out of time.
     static func settledTree(of device: NSObject, limit: TimeInterval) -> Result<[Node], SimFailure> {
         let deadline = Date().addingTimeInterval(limit)
         var last: [Node]?
         var since = Date()
         while true {
-            switch tree(of: device) {
+            switch tree(of: device, until: max(deadline, Date()).addingTimeInterval(3)) {
             case .failure(let failure):
+                if let last { return .success(last) }
                 return .failure(failure)
             case .success(let nodes):
                 let now = Date()
@@ -212,13 +240,22 @@ enum Driver {
             return screen.turned ? CGPoint(x: y, y: 1 - x) : CGPoint(x: x, y: y)
         }
         let outside = "is outside the screen, which is \(width)×\(height) pixels with 0,0 at the top left"
+        /// False when the request was worked out for a screen of another
+        /// size, as when the Duo folds between reading an element and touching it.
+        func sameScreen(_ action: [String: Any]) -> Bool {
+            guard let size = action["size"] as? [NSNumber], size.count == 2 else { return true }
+            return size[0].intValue == width && size[1].intValue == height
+        }
+        let resized = "The screen changed size (it's \(width)×\(height) pixels now) since leaf read the element, so nothing was touched. Run `leaf sim snapshot` and try again."
         if let tap = request["tap"] as? [String: Any] {
+            guard sameScreen(tap) else { return failed(resized) }
             guard let at = point(tap["at"]) else { return failed("The tap \(outside).") }
             ripple(at)
             hid.tap(at: at)
             return ["ok": [:]]
         }
         if let swipe = request["swipe"] as? [String: Any] {
+            guard sameScreen(swipe) else { return failed(resized) }
             guard let from = point(swipe["from"]), let to = point(swipe["to"]) else {
                 return failed("The swipe \(outside).")
             }
@@ -355,14 +392,16 @@ enum Headless {
             return Driver.failed("CoreSimulator has no device \(udid). `leaf sim list` shows the ids.")
         }
         // The smallest built-in screen: the only one, or the Duo's cover.
-        let surfaces = CoreSim.builtInDisplays(of: device).compactMap(CoreSim.surface(of:))
+        let displays = CoreSim.builtInDisplays(of: device)
+        let surfaces = displays.compactMap(CoreSim.surface(of:))
         guard let surface = surfaces.min(by: { $0.width * $0.height < $1.width * $1.height }) else {
             return Driver.failed("Simulator \(udid) has no screen: it isn't booted, or is still starting. Boot it with `xcrun simctl boot \(udid)` (or open it in leaf) and wait for `xcrun simctl bootstatus \(udid)`, then try again.")
         }
         // The Duo's touches need a digitizer for the screen in front, which
         // only the pane sets up (it knows which screen that is). Without
-        // one, backboardd drops them or worse, so headless refuses them.
-        if surfaces.count > 1, request["tap"] != nil || request["swipe"] != nil {
+        // one, backboardd drops them or worse, so headless refuses them,
+        // whether or not the second screen has drawn yet.
+        if displays.count > 1, request["tap"] != nil || request["swipe"] != nil {
             return Driver.failed("Simulator \(udid) has two screens (an iPhone Duo), and leaf can only touch one from its pane. Open it with `leaf sim open \(udid)` in a Rex pane, then try again. Snapshots, typing, keys and buttons work without one.")
         }
         let hid: HID

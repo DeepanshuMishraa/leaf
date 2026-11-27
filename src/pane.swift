@@ -207,6 +207,17 @@ struct Chord: Hashable {
 
     static let relevant: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
 
+    /// Whether `event` types text (no command or control; option only when
+    /// it makes a character), as in browser.swift.
+    static func types(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags
+        if !flags.isDisjoint(with: [.command, .control]) { return false }
+        guard flags.contains(.option) else { return true }
+        return event.characters?.unicodeScalars.contains {
+            !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.controlCharacters.contains($0)
+        } ?? false
+    }
+
     init?(_ text: String) {
         var flags: NSEvent.ModifierFlags = []
         var key: String?
@@ -342,6 +353,9 @@ class PaneController: NSObject {
     var wasFocusedInRex = false
     var appClient: String?
     var bindings: [Binding] = []
+    /// True while the last `rex keymap` failed: the bindings are what an
+    /// earlier load found (or none), and keys try loading again.
+    var keymapFailed = false
     var pendingPrefix: [Chord] = []
     var forwardedAt = Date.distantPast
     /// Focus asked for before the window was first placed.
@@ -382,8 +396,12 @@ class PaneController: NSObject {
     @objc func closePane() {
         let session = session, block = block
         window.orderOut(nil)
-        Rex.run(["block", "close", "--session", session, block])
-        shutDown()
+        // Rex is waited for off the main thread, so AppKit keeps drawing and
+        // taking events meanwhile. The helper goes either way, as before.
+        Rex.background {
+            Rex.run(["block", "close", "--session", session, block])
+            DispatchQueue.main.async { self.shutDown() }
+        }
     }
 
     // MARK: Following the pane
@@ -537,7 +555,9 @@ class PaneController: NSObject {
         shown = true
         if focusWhenShown {
             focusWhenShown = false
-            takeFocus()
+            // Only if the block still has Rex's focus and Rex is still in
+            // front: the person may have moved on while the pane was hidden.
+            if placement.focused, rexIsActive || NSApp.isActive { takeFocus() }
         }
     }
 
@@ -598,6 +618,9 @@ class PaneController: NSObject {
     func syncFocus() {
         let focused = placement?.focused ?? false
         defer { wasFocusedInRex = focused }
+        // A focus request kept for when the pane shows again is stale once
+        // another block has focus.
+        if !focused { focusWhenShown = false }
         if focused && !wasFocusedInRex && rexIsActive {
             takeFocus()
         } else if !focused && wasFocusedInRex && NSApp.isActive {
@@ -642,16 +665,19 @@ class PaneController: NSObject {
     func loadBindings() {
         let session = session, reserved = reservedKeys
         Rex.background {
-            var parsed: [Binding] = []
+            // Nil when the keymap couldn't be read, unlike an empty keymap.
+            var parsed: [Binding]?
             if let data = Rex.run(["keymap", "--json"]),
                let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                var found: [Binding] = []
+                defer { parsed = found }
                 for item in object["bindings"] as? [[String: Any]] ?? [] {
                     guard let action = item["action"] as? String, action != "pane.send_key",
                           let keys = item["keys"] as? [String] else { continue }
                     let chords = keys.compactMap(Chord.init)
                     guard !chords.isEmpty, chords.count == keys.count,
                           !(chords.count == 1 && reserved.contains(chords[0])) else { continue }
-                    parsed.append(Binding(keys: chords, action: action, args: item["args"]))
+                    found.append(Binding(keys: chords, action: action, args: item["args"]))
                 }
             }
             var client: String?
@@ -660,7 +686,9 @@ class PaneController: NSObject {
                 client = (apps.first { ($0["session_ids"] as? [String] ?? []).contains(session) } ?? apps.first)?["client_id"] as? String
             }
             DispatchQueue.main.async {
-                self.bindings = parsed
+                // A failed read keeps what an earlier one found.
+                if let parsed { self.bindings = parsed }
+                self.keymapFailed = parsed == nil
                 self.appClient = client
             }
         }
@@ -668,17 +696,28 @@ class PaneController: NSObject {
 
     /// Handles a key that Rex binds; false lets the page and menus have it.
     func handleRexKey(_ event: NSEvent) -> Bool {
-        guard let chord = Chord(event), !bindings.isEmpty else { return false }
+        guard let chord = Chord(event) else { return false }
         // No Rex app was connected when the bindings loaded, so nothing could
-        // perform them: leave the key to the pane and look again.
-        guard appClient != nil else {
-            pendingPrefix = []
-            // At most every few seconds: each look runs rex twice.
+        // perform them, or the keymap couldn't be read: look again, at most
+        // every few seconds (each look runs rex twice). Bindings an earlier
+        // load found still work meanwhile.
+        if appClient == nil || keymapFailed {
             let now = ProcessInfo.processInfo.systemUptime
             if bindingsRetriedAt.map({ now - $0 > 3 }) ?? true {
                 bindingsRetriedAt = now
                 loadBindings()
             }
+        }
+        // Nothing to perform them with, or none: the key is the pane's.
+        guard appClient != nil, !bindings.isEmpty else {
+            pendingPrefix = []
+            return false
+        }
+        // Typing in a text field (the simulator's Ask card): a plain key is
+        // text even when Rex binds it, and a binding begun outside the
+        // field is dropped. Shortcuts with cmd or ctrl still reach Rex.
+        if (window.firstResponder as? NSTextView)?.isFieldEditor == true, Chord.types(event) {
+            pendingPrefix = []
             return false
         }
         let typed = pendingPrefix + [chord]

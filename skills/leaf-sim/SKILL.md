@@ -1,6 +1,6 @@
 ---
 name: leaf-sim
-description: Drive a booted iOS Simulator from the command line with leaf: read the screen as a short list of elements with refs (@e3), tap, type, scroll, wait and launch apps, without screenshots. Use when asked to open, use, test, click through or check an iPhone app or screen in a simulator, to reproduce a bug on iOS, or to fill in a form or walk a flow on an iPhone simulator. macOS with Xcode only.
+description: Drive a booted iOS Simulator from the command line with leaf. Read the screen as a short list of elements with refs (@e3), tap, type, scroll, wait and launch apps, without screenshots. Use when asked to open, use, test, click through or check an iPhone app or screen in a simulator, to reproduce a bug on iOS, or to fill in a form or walk a flow on an iPhone simulator. macOS with Xcode only.
 ---
 
 # leaf-sim: drive an iPhone simulator

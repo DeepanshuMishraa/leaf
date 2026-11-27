@@ -1047,6 +1047,11 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     var chassis: Chassis
     /// True while the Duo folds or opens; touches wait for it.
     var folding = false
+    /// On the Duo: whether touches are routed to the screen shown. Each
+    /// screen has its own digitizer, set up after it's shown; until then
+    /// touches would land on the other one. Other iPhones are always routed.
+    var routed = false
+    var touchable: Bool { pose == nil || routed }
     var orbit = Orbit()
     var device: NSObject?
     var display: NSObject?
@@ -1069,7 +1074,16 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     var askShown = false
     var mark: CGRect?
     var markStart: CGPoint?
-    var asking = false
+    /// Questions sent to leaf and not answered yet. leaf answers them one
+    /// at a time, in order, so each reply belongs to the oldest of them.
+    var unanswered = 0
+    /// Counts openings of the Ask card; a reply or timer meant for an
+    /// earlier opening leaves a newer one alone.
+    var askOpening = 0
+    /// The opening the newest question was sent from.
+    var askedFrom: Int?
+    /// Whether the open card's question is on its way.
+    var asking: Bool { unanswered > 0 && askedFrom == askOpening }
     var agentName: String = {
         let name = ProcessInfo.processInfo.environment["LEAF_AGENT"] ?? ""
         return name.isEmpty ? "your agent" : name
@@ -1227,6 +1241,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         let open = pose == .open
         fold.setSymbol(open ? "book.closed" : "book",
                        label: open ? "Fold iPhone Duo (⌘F)" : "Expand iPhone Duo (⌘F)")
+        fold.isEnabled = canFold || folding
         ask.contentTintColor = askShown ? .controlAccentColor : (ask.isEnabled ? .secondaryLabelColor : .tertiaryLabelColor)
     }
 
@@ -1370,7 +1385,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// screen does. Folding shut locks the phone, as on the device; a tap on
     /// the cover wakes it.
     @objc func toggleFold() {
-        guard let pose, let phone, let fold = phone.fold, !folding else { return }
+        guard canFold, let pose, let phone, let fold = phone.fold else { return }
         let opening = pose == .folded
         if case .touch(let last) = dragging {
             hid?.touch(.up, at: last)
@@ -1492,7 +1507,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     @objc func validateMenuItem(_ item: NSMenuItem) -> Bool {
         guard item.action == #selector(toggleFold) else { return true }
         item.title = pose == .open ? "Fold iPhone Duo" : "Expand iPhone Duo"
-        return pose != nil && !folding
+        return canFold
     }
 
     /// Where `event` lands on the simulator's picture, as fractions from its
@@ -1531,6 +1546,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             return
         }
         if let point = screenPoint(event, slide: false), let hid {
+            // The Duo's screen changed and its touches aren't routed yet.
+            guard touchable else { return }
             dragging = .touch(point)
             hid.touch(.down, at: point)
             return
@@ -1639,6 +1656,11 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     /// Pastes the clipboard's text by typing it.
     @objc func paste() {
+        // While a question is typed, Paste is the field's, not the phone's.
+        if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+            editor.paste(nil)
+            return
+        }
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
         hidAsync { $0.type(text) }
     }
@@ -1671,13 +1693,25 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     func started(_ device: NSObject) {
         self.device = device
+        // Held while the state is read and the device claimed, so a gone
+        // pane's guardian can't shut it down in between: one already
+        // shutting it down finishes first, and the state read after is fresh.
+        let locked = ownerFile.map(BootOwner.lock)
+        defer { if let owner = ownerFile, locked == true { BootOwner.unlock(owner) } }
         let state = device.responds(to: NSSelectorFromString("stateString")) ? device.value(forKey: "stateString") as? String : nil
         let booted = state == "Booted"
         // Booted, but by a leaf pane that's gone: still leaf's to shut down.
         // The Duo is shut down with its pane however it was booted: it's
         // heavy, and nothing but leaf drives its cover.
         bootedHere = !booted || BootOwner.orphaned(ownerFile) || pose != nil
-        if bootedHere { guardShutdown() }
+        if bootedHere, !guardShutdown() {
+            bootedHere = false
+            // Nothing would shut a device booted now down again.
+            if !booted {
+                fail(SimFailure(message: "leaf couldn't start the helper that shuts \(name) down when this pane closes, so it didn't boot it. Boot it with `xcrun simctl boot \(udid)` (it then stays on after the pane closes) and open it again."))
+                return
+            }
+        }
         if !booted {
             showStatus("Booting \(name)…", busy: true)
             simctl(["boot", udid]) { [weak self] status, output in
@@ -1852,11 +1886,23 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// cover folded.
     func showDuoScreen() {
         if duoDisplays == nil { findDuoDisplays() }
-        guard let duoDisplays, let pose else { return }
+        guard let pose else { return }
+        guard let duoDisplays else {
+            // The inner screen isn't up yet: look again until it is, or
+            // the phone is folded, when the cover will do.
+            if pose == .open {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showDuoScreen() }
+            }
+            return
+        }
         let wanted = pose == .open ? duoDisplays.inner : duoDisplays.cover
         guard wanted !== display else { return }
         display = wanted
-        if let latest = CoreSim.surface(of: wanted) { show(latest) }
+        if let latest = CoreSim.surface(of: wanted) {
+            show(latest)
+            // Mid-fold, the fold's end routes touches; found late, route now.
+            if !folding { routeTouches(to: latest) }
+        }
     }
 
     /// Looks again for the Duo's two screens, when the inner one wasn't up
@@ -1888,10 +1934,22 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     /// Starts the hinge helper inside the Duo (src/duo-hinge.m), which tells
     /// iOS where the hinge is, and folds it to match the phone.
+    /// The Duo's hinge helper beside this one; nil when this leaf was built
+    /// without it, and iOS can't leave the cover screen.
+    static let hingeHelper: URL? = {
+        guard let helper = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("leaf-duo-hinge"),
+              let size = (try? FileManager.default.attributesOfItem(atPath: helper.path))?[.size] as? Int, size > 0 else { return nil }
+        return helper
+    }()
+
+    /// Whether the Duo can open now: iOS's hinge has to move with the
+    /// model, or the pane would show the inner screen iOS isn't using.
+    /// Folding an open one is always allowed.
+    var canFold: Bool { pose != nil && !folding && (pose == .open || Simulator.hingeHelper != nil) }
+
     func startHinge() {
         guard hingeInput == nil, let pose else { return }
-        guard let helper = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("leaf-duo-hinge"),
-              let size = (try? FileManager.default.attributesOfItem(atPath: helper.path))?[.size] as? Int, size > 0 else {
+        guard let helper = Simulator.hingeHelper else {
             fail(SimFailure(message: "This leaf was built without the iPhone Duo's hinge helper (the iOS Simulator SDK wasn't available), so \(name)'s iOS stays on its cover screen. Install Xcode's iOS platform, then reinstall leaf."))
             return
         }
@@ -1939,18 +1997,29 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// Points the Duo's touches at the screen leaf shows, found in `simctl io
     /// enumerate` by its pixel size. Other iPhones keep the built-in
     /// digitizer. Until this resolves, Duo touches go nowhere.
-    func routeTouches(to surface: IOSurface) {
+    func routeTouches(to surface: IOSurface, tries: Int = 0) {
         guard pose != nil else { return }
+        routed = false
         let size = (surface.width, surface.height)
         simctl(["io", udid, "enumerate"]) { [weak self] status, output in
             guard let self, let hid = self.hid else { return }
             // The phone folded or opened meanwhile; that change routes again.
             guard let shown = self.surface, (shown.width, shown.height) == size else { return }
             guard status == 0, let screen = Simulator.screen(in: output, width: size.0, height: size.1) else {
+                // A screen just switched on may not be listed yet.
+                if tries < 10 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        guard let self, let shown = self.surface, (shown.width, shown.height) == size else { return }
+                        self.routeTouches(to: shown, tries: tries + 1)
+                    }
+                    return
+                }
                 self.fail(SimFailure(message: "\(self.name)'s screen shows, but touches can't reach it: leaf couldn't find its \(size.0)×\(size.1) screen in `xcrun simctl io \(self.udid) enumerate`\(status == 0 ? "" : " (simctl exited with \(status))"). Close the pane and open it again."))
                 return
             }
+            // Touches queue on the HID's queue behind the route.
             hid.route(to: screen)
+            self.routed = true
         }
     }
 
@@ -2021,7 +2090,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         enum State { case starting, folding, live(LiveScreen) }
         let state = DispatchQueue.main.sync { () -> State in
             guard let hid = self.hid, let surface = self.surface, let device = self.device else { return .starting }
-            if self.folding { return .folding }
+            if self.folding || !self.touchable { return .folding }
             var info: [String: Any] = ["udid": self.udid, "name": self.name, "runtime": self.runtime]
             // The Duo's screen in use, for `leaf sim screenshot`.
             if self.pose != nil { info["display"] = self.pose == .open ? "primary-1" : "primary" }
@@ -2071,6 +2140,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     @objc func toggleAsk() {
         if askShown { closeAsk(); return }
         askShown = true
+        askOpening += 1
         marking = true
         mark = nil
         if !orbit.front { toggleFront() }
@@ -2087,7 +2157,6 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     func closeAsk() {
         askShown = false
         marking = false
-        asking = false
         mark = nil
         marquee.isHidden = true
         askCard.isHidden = true
@@ -2133,7 +2202,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             askCard.note.textColor = .systemRed
             return
         }
-        asking = true
+        unanswered += 1
+        askedFrom = askOpening
         askCard.note.textColor = .secondaryLabelColor
         askCard.note.stringValue = "Sending to \(agentName)…"
     }
@@ -2159,15 +2229,18 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             nameAgent()
             return
         }
-        guard asking else { return }
-        asking = false
+        guard unanswered > 0 else { return }
+        unanswered -= 1
+        // An earlier question's answer, or one for a card since closed.
+        guard unanswered == 0, askShown, askedFrom == askOpening else { return }
         if let sent = object["sent"] as? [String: Any] {
             let agent = sent["agent"] as? String ?? agentName
             agentName = agent
             nameAgent()
             askCard.note.stringValue = "Sent to \(agent). Its answer is in the \(agent) pane."
+            let opening = askOpening
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
-                guard let self, self.askShown, !self.asking else { return }
+                guard let self, self.askShown, self.askOpening == opening, !self.asking else { return }
                 self.closeAsk()
             }
         } else if let failed = object["failed"] as? [String: Any] {
@@ -2267,18 +2340,33 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// Rex can kill them outright, so the helper can't count on running its
     /// own cleanup. The guardian runs in its own session, out of reach of
     /// that hangup, and stands down if another pane has taken the device.
-    func guardShutdown() {
-        guard let owner = ownerFile else { return }
+    /// False when no guardian could be started; the claim is then dropped.
+    func guardShutdown() -> Bool {
+        guard let owner = ownerFile else { return true }
         let pid = getpid()
-        guard BootOwner.claim(owner, pid: pid) else { return }
+        guard BootOwner.claim(owner, pid: pid) else { return false }
+        // The check, the record's removal and the shutdown happen under the
+        // device's lock (BootOwner.lock), so a pane adopting the device
+        // either goes first, and this stands down, or waits for it to be off.
         let script = """
         while kill -0 "$1" 2>/dev/null; do sleep 0.5; done
-        [ "$(cat "$3" 2>/dev/null)" = "$1" ] || exit 0
-        rm -f "$3"
-        exec /usr/bin/xcrun simctl shutdown "$2"
+        i=0
+        until mkdir "$3.lock" 2>/dev/null; do
+          i=$((i + 1)); [ "$i" -ge 300 ] && break; sleep 0.1
+        done
+        if [ "$(cat "$3" 2>/dev/null)" = "$1" ]; then
+          rm -f "$3"
+          /usr/bin/xcrun simctl shutdown "$2"
+        fi
+        rmdir "$3.lock" 2>/dev/null
+        exit 0
         """
-        BootOwner.spawnDetached(["/bin/sh", "-c", script, "leaf-sim-guardian", "\(pid)", udid, owner],
-                                environment: simctlEnvironment())
+        guard BootOwner.spawnDetached(["/bin/sh", "-c", script, "leaf-sim-guardian", "\(pid)", udid, owner],
+                                      environment: simctlEnvironment()) else {
+            if (try? String(contentsOfFile: owner, encoding: .utf8)) == "\(pid)" { BootOwner.release(owner) }
+            return false
+        }
+        return true
     }
 }
 
@@ -2307,6 +2395,26 @@ enum BootOwner {
 
     static func release(_ file: String) {
         try? FileManager.default.removeItem(atPath: file)
+    }
+
+    /// Takes the device's lock, `file`.lock, waiting up to 30 s for a
+    /// guardian's shutdown; one held longer is from a process that died
+    /// holding it, and is taken over. False when it can't be made at all.
+    static func lock(_ file: String) -> Bool {
+        let lock = file + ".lock"
+        try? FileManager.default.createDirectory(atPath: (file as NSString).deletingLastPathComponent,
+                                                 withIntermediateDirectories: true)
+        let deadline = Date().addingTimeInterval(30)
+        while mkdir(lock, 0o700) != 0 {
+            guard errno == EEXIST else { return false }
+            if Date() >= deadline { rmdir(lock) }
+            usleep(100_000)
+        }
+        return true
+    }
+
+    static func unlock(_ file: String) {
+        rmdir(file + ".lock")
     }
 
     /// Starts `arguments` in a new session with no open files but /dev/null,
@@ -2339,6 +2447,8 @@ final class ControlServer {
     let path: String
     let handle: ([String: Any]) -> [String: Any]
     private var listener: Int32 = -1
+    /// The socket file this server bound, to tell it from a later one.
+    private var inode: ino_t?
 
     init(path: String, handle: @escaping ([String: Any]) -> [String: Any]) {
         self.path = path
@@ -2355,11 +2465,16 @@ final class ControlServer {
         }
         withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: bytes) }
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                                 withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        // From the check to `listen`, under the path's lock: two panes
+        // opening the device at once can't both find it free, and the
+        // second can't unlink the first one's socket.
+        let locked = BootOwner.lock(path)
+        defer { if locked { BootOwner.unlock(path) } }
         // A live socket at the path belongs to another pane on this device.
         if ControlServer.answers(path) { return .failure(busy) }
         unlink(path)
-        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
-                                                 withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return .failure(SimFailure(message: "The agent can't drive this simulator: no socket (\(String(cString: strerror(errno))))).")) }
         let bound = withUnsafePointer(to: &address) {
@@ -2371,6 +2486,8 @@ final class ControlServer {
             return .failure(SimFailure(message: "The agent can't drive this simulator: \(path) couldn't be opened (\(why))."))
         }
         listener = fd
+        var info = stat()
+        if stat(path, &info) == 0 { inode = info.st_ino }
         let thread = Thread { [weak self] in self?.serve(fd) }
         thread.name = "leaf.sim.control"
         thread.start()
@@ -2379,7 +2496,9 @@ final class ControlServer {
 
     func stop() {
         if listener >= 0 { close(listener) }
-        unlink(path)
+        // Only this server's socket: another pane may have bound the path since.
+        var info = stat()
+        if let inode, stat(path, &info) == 0, info.st_ino == inode { unlink(path) }
     }
 
     static func answers(_ path: String) -> Bool {
@@ -2405,6 +2524,12 @@ final class ControlServer {
             }
             var one: Int32 = 1
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+            // Requests are served one at a time: a client that stalls while
+            // sending its line or reading the answer is cut off after 5 s
+            // rather than holding up every request after it.
+            var limit = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
             let reply: [String: Any]
             if let line = ControlServer.readLine(client),
                let request = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] {

@@ -21,7 +21,9 @@ export default {
     if (url.pathname === "/discord" || url.pathname === "/discord/") {
       const previewAgent = request.headers.get("user-agent") ?? "";
       if (UNFURL.test(previewAgent)) {
-        const page = await env.ASSETS.fetch(new Request(new URL("/discord.html", url)));
+        // The page's canonical path: Cloudflare's HTML handling answers
+        // `/discord.html` with a redirect to `/discord`, not the page.
+        const page = await env.ASSETS.fetch(new Request(new URL("/discord", url)));
         return new Response(page.body, {
           status: page.status,
           headers: {

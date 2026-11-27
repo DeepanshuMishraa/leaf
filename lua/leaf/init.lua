@@ -335,24 +335,11 @@ function M.setup(opts)
     return true
   end
 
+  -- Asks leaf, which reads config.toml with its own TOML parser, so any
+  -- way of writing `[simulator] enabled = true` counts the same here.
   local function simulator_enabled()
-    local base = os.getenv("XDG_CONFIG_HOME")
-    if base == nil or base == "" then base = (os.getenv("HOME") or "") .. "/.config" end
-    local file = io.open(base .. "/leaf/config.toml", "r")
-    if file == nil then return false end
-    local text = file:read("*a") or ""
-    file:close()
-    local section
-    for line in text:gmatch("[^\n]+") do
-      local header = line:match("^%s*%[%s*([^%]]-)%s*%]")
-      if header ~= nil then
-        section = header
-      elseif section == "simulator" then
-        local value = line:match("^%s*enabled%s*=%s*(%a+)")
-        if value ~= nil then return value == "true" end
-      end
-    end
-    return false
+    local result = rex.exec(argv("config", "--simulator"), { env = env, timeout = 5 })
+    return result ~= nil and result.ok and (result.stdout or ""):match("^%s*true") ~= nil
   end
 
   if on_mac() and simulator_enabled() then

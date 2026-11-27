@@ -161,15 +161,34 @@ pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
     };
     let updated = with_simulator_enabled(&text);
     if updated != text {
-        if let Some(dir) = path.parent() {
+        // The edit works line by line; a file it can't read the same way
+        // as leaf does (an inline `simulator = { … }`, or a file that was
+        // already broken) is left alone rather than broken.
+        if !simulator_enabled_in(&updated) {
+            return Err((
+                path,
+                io::Error::other(
+                    "leaf couldn't set it in this file without breaking it (it defines simulator in a form leaf doesn't edit, or doesn't parse). Set `enabled = true` under [simulator] yourself, then run `leaf config check`",
+                ),
+            ));
+        }
+        // A symlink (a managed dotfile) keeps pointing at the file it
+        // names: that file is the one replaced.
+        let target = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::canonicalize(&path).map_err(|error| (path.clone(), error))?
+            }
+            _ => path.clone(),
+        };
+        if let Some(dir) = target.parent() {
             std::fs::create_dir_all(dir).map_err(|error| (path.clone(), error))?;
         }
         // Written beside and renamed over, so a failed write (a full disk)
         // leaves the old file whole.
-        let partial = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let partial = target.with_extension(format!("toml.{}.tmp", std::process::id()));
         let written = std::fs::write(&partial, updated)
             .and_then(|()| std::fs::File::open(&partial)?.sync_all())
-            .and_then(|()| std::fs::rename(&partial, &path));
+            .and_then(|()| std::fs::rename(&partial, &target));
         if let Err(error) = written {
             let _ = std::fs::remove_file(&partial);
             return Err((path, error));
@@ -178,12 +197,42 @@ pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
     Ok(path)
 }
 
+/// Whether `text` parses as TOML with `simulator.enabled` true.
+fn simulator_enabled_in(text: &str) -> bool {
+    text.parse::<toml::Table>().is_ok_and(|table| {
+        table
+            .get("simulator")
+            .and_then(|simulator| simulator.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    })
+}
+
 /// `text` with `enabled = true` in its `[simulator]` table: an `enabled`
-/// line there is replaced, else one is added to the table, else the table
-/// is appended.
+/// line there is replaced, else a top-level `simulator.enabled` line, else
+/// one is added to the table, else the table is appended.
 fn with_simulator_enabled(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let header = |line: &str| line.trim().starts_with('[');
+    // `simulator.enabled = …` before any table: a [simulator] table added
+    // after it would define simulator twice.
+    let top = lines
+        .iter()
+        .position(|line| header(line))
+        .unwrap_or(lines.len());
+    let dotted = |line: &str| {
+        line.split('=').next().is_some_and(|key| {
+            let parts: Vec<&str> = key.split('.').map(|part| unquoted(part.trim())).collect();
+            parts == ["simulator", "enabled"]
+        })
+    };
+    if let Some(index) = (0..top).find(|&index| dotted(lines[index])) {
+        let mut out: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
+        out[index] = "simulator.enabled = true".into();
+        let mut joined = out.join("\n");
+        joined.push('\n');
+        return joined;
+    }
     let Some(start) = lines
         .iter()
         .position(|line| table_name(line).as_deref() == Some("simulator"))
@@ -295,7 +344,7 @@ impl KeysConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, table_name, with_simulator_enabled};
+    use super::{Config, simulator_enabled_in, table_name, with_simulator_enabled};
 
     #[test]
     fn table_headers_are_read_however_written() {
@@ -346,6 +395,21 @@ mod tests {
             toml::from_str(&with_simulator_enabled("[reader]\nmax_width = 90\n")).expect("parses");
         assert!(enabled.simulator.enabled);
         assert_eq!(enabled.reader.max_width, 90);
+    }
+
+    #[test]
+    fn a_dotted_simulator_key_is_edited_and_an_inline_table_refused() {
+        let updated =
+            with_simulator_enabled("simulator.enabled = false\n[reader]\nmax_width = 90\n");
+        assert_eq!(
+            updated,
+            "simulator.enabled = true\n[reader]\nmax_width = 90\n"
+        );
+        assert!(simulator_enabled_in(&updated));
+        // Line edits can't reach into an inline table: the result doesn't
+        // parse, so enable_simulator leaves the file alone.
+        let inline = with_simulator_enabled("simulator = { enabled = false }\n");
+        assert!(!simulator_enabled_in(&inline));
     }
     use crate::diffkeys::DiffAction;
     use crate::readerkeys::ReaderAction;

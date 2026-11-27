@@ -656,6 +656,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     var wasFocusedInRex = false
     var appClient: String?
     var bindings: [Binding] = []
+    /// True while the last `rex keymap` failed: the bindings are what an
+    /// earlier load found (or none), and keys try loading again.
+    var keymapFailed = false
     /// The start of a multi-key binding, and whether it was typed in a field.
     var pendingPrefix: (keys: [Chord], inField: Bool)?
     /// Whether a text field on the page has focus, as `Browser.focusScript` reports it.
@@ -2350,9 +2353,12 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     func loadBindings() {
         let session = session
         Rex.background {
-            var parsed: [Binding] = []
+            // Nil when the keymap couldn't be read, unlike an empty keymap.
+            var parsed: [Binding]?
             if let data = Rex.run(["keymap", "--json"]),
                let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                var found: [Binding] = []
+                defer { parsed = found }
                 for item in object["bindings"] as? [[String: Any]] ?? [] {
                     guard let action = item["action"] as? String, action != "pane.send_key",
                           let keys = item["keys"] as? [String] else { continue }
@@ -2362,7 +2368,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                     let chords = keys.compactMap(Chord.init)
                     guard !chords.isEmpty, chords.count == keys.count,
                           !(chords.count == 1 && Browser.reserved.contains(chords[0])) else { continue }
-                    parsed.append(Binding(keys: chords, action: action, args: item["args"]))
+                    found.append(Binding(keys: chords, action: action, args: item["args"]))
                 }
             }
             var client: String?
@@ -2371,7 +2377,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
                 client = (apps.first { ($0["session_ids"] as? [String] ?? []).contains(session) } ?? apps.first)?["client_id"] as? String
             }
             DispatchQueue.main.async {
-                self.bindings = parsed
+                // A failed read keeps what an earlier one found.
+                if let parsed { self.bindings = parsed }
+                self.keymapFailed = parsed == nil
                 self.appClient = client
             }
         }
@@ -2379,17 +2387,21 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
 
     /// Handles a key that Rex binds; false lets the page and menus have it.
     func handleRexKey(_ event: NSEvent) -> Bool {
-        guard let chord = Chord(event), !bindings.isEmpty else { return false }
+        guard let chord = Chord(event) else { return false }
         // No Rex app was connected when the bindings loaded, so nothing could
-        // perform them: leave the key to the page and look again.
-        guard appClient != nil else {
-            pendingPrefix = nil
-            // At most every few seconds: each look runs rex twice.
+        // perform them, or the keymap couldn't be read: look again, at most
+        // every few seconds (each look runs rex twice). Bindings an earlier
+        // load found still work meanwhile.
+        if appClient == nil || keymapFailed {
             let now = ProcessInfo.processInfo.systemUptime
             if bindingsRetriedAt.map({ now - $0 > 3 }) ?? true {
                 bindingsRetriedAt = now
                 loadBindings()
             }
+        }
+        // Nothing to perform them with, or none: the key is the page's.
+        guard appClient != nil, !bindings.isEmpty else {
+            pendingPrefix = nil
             return false
         }
         let inField = typingInField

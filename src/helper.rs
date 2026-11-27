@@ -37,6 +37,7 @@ pub fn unpack(prefix: &str, what: &str, parts: &[Part]) -> Result<PathBuf, Strin
         fs::metadata(dir.join(part.name)).is_ok_and(|meta| meta.len() == part.bytes.len() as u64)
     };
     if parts.iter().all(unpacked) {
+        mark_used(&dir);
         return Ok(dir);
     }
     fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
@@ -63,9 +64,11 @@ pub fn unpack(prefix: &str, what: &str, parts: &[Part]) -> Result<PathBuf, Strin
         }
         placed?;
     }
+    mark_used(&dir);
     // Removing old helpers is best effort: one left behind only takes a
     // little disk space. A folder a pane is still running from is kept, as
-    // the pane may still read files from it (the browser's scripts).
+    // the pane may still read files from it (the browser's scripts), and so
+    // is one handed out lately, which another leaf may be about to launch.
     if let Some(cache) = dir.parent()
         && let Ok(entries) = fs::read_dir(cache)
     {
@@ -75,6 +78,7 @@ pub fn unpack(prefix: &str, what: &str, parts: &[Part]) -> Result<PathBuf, Strin
             if path != dir
                 && entry.file_name().to_string_lossy().starts_with(&own)
                 && path.is_dir()
+                && !recently_used(&path)
                 && !in_use(&path)
             {
                 let _ = fs::remove_dir_all(path);
@@ -82,6 +86,28 @@ pub fn unpack(prefix: &str, what: &str, parts: &[Part]) -> Result<PathBuf, Strin
         }
     }
     Ok(dir)
+}
+
+/// The file whose time says when a helper folder was last handed out.
+const USED: &str = ".used";
+
+/// How long after it was handed out a helper folder is kept.
+const LEASE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Notes that `dir` was just handed out to be run; best effort.
+fn mark_used(dir: &std::path::Path) {
+    let _ = fs::write(dir.join(USED), b"");
+}
+
+/// Whether `folder` was handed out within `LEASE`. Folders from leaf
+/// versions without the mark go by their own time.
+fn recently_used(folder: &std::path::Path) -> bool {
+    fs::metadata(folder.join(USED))
+        .or_else(|_| fs::metadata(folder))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_none_or(|age| age < LEASE)
 }
 
 /// True when a running process was started from inside `folder` (or when

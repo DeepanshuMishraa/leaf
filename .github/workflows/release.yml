@@ -217,15 +217,12 @@ jobs:
               *"needs REX_SESSION and REX_BLOCK"*) echo "browser helper OK ($got)" ;;
               *) echo "::error::The browser helper didn't start: $said"; exit 1 ;;
             esac
-            # The simulator pane too, with the phone model beside it.
+            # The simulator pane too. Its phone models aren't part of leaf
+            # (`leaf sim install` downloads them), so only the helper is checked.
             helper=$($RUN ./smoke/leaf sim --check)
             got=$(lipo -archs "$helper")
             if [ "$got" != "$want" ]; then
               echo "::error::The simulator helper is built for '$got', expected '$want'."
-              exit 1
-            fi
-            if [ ! -s "$(dirname "$helper")/iphone.usdz" ]; then
-              echo "::error::The simulator helper was unpacked without its phone model."
               exit 1
             fi
             if said=$(env -u REX_SESSION -u REX_BLOCK $RUN "$helper" 2>&1); then

@@ -25,7 +25,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::helper::{Part, macos_version};
-use crate::simsnap::{Detail, Element, Snapshot, Tree, parse_ref};
+use crate::simsnap::{Detail, Element, Key, Snapshot, Tree, Unresolved, parse_ref};
 
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
 /// Runs inside the iPhone Duo's simulator to move its hinge (src/duo-hinge.m).
@@ -49,7 +49,8 @@ const USAGE: &str = "Usage: leaf sim install [--yes]          download the 3D iP
        leaf sim apps                     installed apps and their bundle ids
        leaf sim launch <bundle id|name>  start an installed app
        leaf sim open-url <url>           open a link or deep link
-Add --device <udid> to pick a simulator when more than one is open or booted.";
+Add --device <udid> to pick a simulator when more than one is open or booted.
+Put -- before text that starts with --device: leaf sim type -- --device";
 
 /// One installed iPhone simulator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -312,6 +313,11 @@ fn take_device(args: &[String]) -> Result<(Option<String>, Vec<String>), SimErro
     let mut rest = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        // `--` ends the options: `leaf sim type -- --device` types it.
+        if arg == "--" {
+            rest.extend(iter.cloned());
+            break;
+        }
         if arg == "--device" {
             device = Some(iter.next().ok_or(SimError::Usage)?.clone());
         } else if let Some(udid) = arg.strip_prefix("--device=") {
@@ -509,42 +515,112 @@ fn save_snapshot(udid: &str, snapshot: &Snapshot) -> Result<(), String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
     }
+    // Written beside it and renamed over it, so a reader never sees half a file.
+    let partial = path.with_extension(format!("json.{}", std::process::id()));
     let json = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| {
-        format!(
-            "couldn't save the snapshot's refs to {} ({e}); refs from it won't work.",
-            path.display()
-        )
-    })
+    std::fs::write(&partial, json)
+        .and_then(|()| std::fs::rename(&partial, &path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!(
+                "couldn't save the snapshot's refs to {} ({e}); refs from it won't work.",
+                path.display()
+            )
+        })
 }
 
-/// Where the element `@e<number>` from the last snapshot is now.
-fn locate(udid: &str, number: u32) -> Result<(Element, i64, i64), String> {
-    let snapshot = last_snapshot(udid);
-    let entry = snapshot.entry(number).ok_or_else(|| {
-        format!("@e{number} isn't in this simulator's last snapshot. Run `leaf sim snapshot` and use a ref it shows.")
+/// Holds `udid`'s snapshot for one command, from reading the last one to
+/// saving the next, so two commands at once can't hand out the same ref.
+/// Released when dropped.
+fn lock_snapshots(udid: &str) -> Result<std::fs::File, String> {
+    let path = socket_dir()?.join(format!("{}.snapshot.lock", udid.to_uppercase()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("couldn't open {} ({e}).", path.display()))?;
+    file.lock().map_err(|e| {
+        format!(
+            "couldn't lock {} ({e}); another leaf sim command may be stuck holding it.",
+            path.display()
+        )
     })?;
+    Ok(file)
+}
+
+/// The element `@e<number>` from `udid`'s last snapshot names, on the
+/// screen now, with the screen.
+fn locate(udid: &str, number: u32) -> Result<(Element, Tree), String> {
+    let snapshot = last_snapshot(udid);
     let tree = tree(udid, 1.0)?;
-    let element = tree.find(&entry.key).cloned().ok_or_else(|| {
-        let name = match (entry.key.label.as_str(), entry.key.id.as_str()) {
+    let element = tree
+        .resolve(&snapshot, number)
+        .cloned()
+        .map_err(|why| unresolved(number, why))?;
+    Ok((element, tree))
+}
+
+/// What to tell the agent when `@e<number>` can't be acted on.
+fn unresolved(number: u32, why: Unresolved) -> String {
+    let named = |key: &Key| {
+        let name = match (key.label.as_str(), key.id.as_str()) {
             ("", "") => String::new(),
             ("", id) => format!(" #{id}"),
             (label, _) => format!(" \"{label}\""),
         };
-        format!(
-            "@e{number} ({}{name}) isn't on the screen now. Run `leaf sim snapshot` to see what is.",
-            entry.key.role.to_lowercase()
-        )
-    })?;
-    Ok((element, tree.width, tree.height))
+        format!("@e{number} ({}{name})", key.role.to_lowercase())
+    };
+    let shown = |app: &str| match app {
+        "" => "the home screen".to_owned(),
+        app => app.to_owned(),
+    };
+    match why {
+        Unresolved::Unknown => format!(
+            "@e{number} isn't in this simulator's last snapshot. Run `leaf sim snapshot` and use a ref it shows."
+        ),
+        Unresolved::OtherApp { then, now } => format!(
+            "@e{number} is from {}, but {} is in front now. Run `leaf sim snapshot` for its refs.",
+            shown(&then),
+            shown(&now)
+        ),
+        Unresolved::Gone(key) => format!(
+            "{} isn't on the screen now. Run `leaf sim snapshot` to see what is.",
+            named(&key)
+        ),
+        Unresolved::Moved(key) => format!(
+            "{} is one of {} identical elements, and they've moved since the snapshot, so leaf can't tell which it was. Run `leaf sim snapshot` again.",
+            named(&key),
+            key.of
+        ),
+    }
 }
 
-/// Taps the middle of `@e<number>`.
+/// Taps `@e<number>` where a tap on it lands.
 fn tap_ref(udid: &str, number: u32) -> Result<(), String> {
-    let (element, width, height) = locate(udid, number)?;
-    let (x, y) = element.tap_point(width, height);
-    drive(udid, &serde_json::json!({ "tap": { "at": [x, y] } }))?;
+    let (element, tree) = locate(udid, number)?;
+    let (x, y) = element.tap_point(tree.width, tree.height);
+    // The screen's size goes with the tap: if the Duo folded since the
+    // frame was read, the pane refuses it rather than tap the wrong place.
+    let request = serde_json::json!({ "tap": { "at": [x, y], "size": [tree.width, tree.height] } });
+    drive(udid, &request)?;
     Ok(())
+}
+
+/// Characters `leaf sim type` can't type: it uses a US keyboard, which
+/// has every printable ASCII character, space, tab and return
+/// (`Keys.stroke` in simulator.swift).
+fn untypeable(text: &str) -> Vec<char> {
+    let mut out: Vec<char> = text
+        .chars()
+        .filter(|c| !(c.is_ascii_graphic() || matches!(c, ' ' | '\n' | '\t')))
+        .collect();
+    out.dedup();
+    out
 }
 
 /// A swipe that scrolls `direction` across `area` (x, y, width, height):
@@ -1033,6 +1109,7 @@ fn command(args: &[String]) -> Result<(), SimError> {
                 }
             }
             let udid = pick_device(named)?;
+            let _held = lock_snapshots(&udid)?;
             let before = last_snapshot(&udid);
             // Right after an action the screen may not have started to
             // change (going home takes about a second), so a still screen
@@ -1082,20 +1159,25 @@ fn command(args: &[String]) -> Result<(), SimError> {
         }
         ["scroll", direction, rest @ ..] if rest.len() <= 1 => {
             let udid = pick_device(named)?;
-            let area = match rest.first() {
+            let (area, size) = match rest.first() {
                 Some(target) => {
                     let number = parse_ref(target).ok_or(SimError::Usage)?;
-                    locate(&udid, number)?.0.frame
+                    let (element, tree) = locate(&udid, number)?;
+                    // Only the part on screen: a swipe off it is refused.
+                    let area = element.visible_frame(tree.width, tree.height);
+                    (area, [tree.width, tree.height])
                 }
                 None => {
                     let info = drive(&udid, &serde_json::json!({ "info": {} }))?;
                     let size = |key: &str| info.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-                    [0, 0, size("width"), size("height")]
+                    let (width, height) = (size("width"), size("height"));
+                    ([0, 0, width, height], [width, height])
                 }
             };
             let (from, to) = scroll_swipe(direction, area).ok_or(SimError::Usage)?;
-            let request =
-                serde_json::json!({ "swipe": { "from": from, "to": to, "duration": 0.4 } });
+            let request = serde_json::json!({ "swipe": {
+                "from": from, "to": to, "duration": 0.4, "size": size,
+            }});
             drive(&udid, &request)?;
             Ok(())
         }
@@ -1121,6 +1203,15 @@ fn command(args: &[String]) -> Result<(), SimError> {
         }
         ["fill", target, text @ ..] => {
             let number = parse_ref(target).ok_or(SimError::Usage)?;
+            // Checked before the field is cleared, so a text that can't be
+            // typed leaves what was there.
+            let skipped = untypeable(&text.join(" "));
+            if !skipped.is_empty() {
+                return Err(SimError::Message(format!(
+                    "leaf types on a US keyboard, which has no {}; the field wasn't touched. Paste such text with `xcrun simctl pbcopy <udid>` and a long-press Paste.",
+                    skipped.iter().collect::<String>()
+                )));
+            }
             let udid = pick_device(named)?;
             tap_ref(&udid, number)?;
             std::thread::sleep(Duration::from_millis(300));
@@ -1148,26 +1239,25 @@ fn command(args: &[String]) -> Result<(), SimError> {
         ["wait", text, rest @ ..] if rest.len() <= 1 => {
             let seconds = rest.first().map(|s| number(s)).transpose()?.unwrap_or(10.0);
             let udid = pick_device(named)?;
-            let wanted = text.to_lowercase();
             // A timeout too long for a Duration is a typo, not a wish.
             let timeout =
                 Duration::try_from_secs_f64(seconds.max(0.0)).map_err(|_| SimError::Usage)?;
             let deadline = std::time::Instant::now() + timeout;
             loop {
-                let before = last_snapshot(&udid);
-                let snapshot = tree(&udid, 0.0)?.snapshot(&before, Detail::Full);
-                let found: Vec<&str> = snapshot
-                    .text
-                    .lines()
-                    .skip(1)
-                    .filter(|line| line.to_lowercase().contains(&wanted))
-                    .collect();
-                if !found.is_empty() {
-                    for line in found {
-                        println!("{}", line.trim_start());
+                let screen = tree(&udid, 0.0)?;
+                {
+                    let _held = lock_snapshots(&udid)?;
+                    let before = last_snapshot(&udid);
+                    let snapshot = screen.snapshot(&before, Detail::Full);
+                    // Labels and values in full, not as shortened for display.
+                    let found = screen.matching(&snapshot, text);
+                    if !found.is_empty() {
+                        save_snapshot(&udid, &snapshot)?;
+                        for line in found {
+                            println!("{line}");
+                        }
+                        return Ok(());
                     }
-                    save_snapshot(&udid, &snapshot)?;
-                    return Ok(());
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(SimError::Message(format!(
@@ -1204,21 +1294,34 @@ fn command(args: &[String]) -> Result<(), SimError> {
                 return Ok(());
             };
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            // The app has started either way, so a screen that can't be read
+            // while it changes is retried, and never fails the launch.
+            let mut unread = None;
             while std::time::Instant::now() < deadline {
-                let front = tree(&udid, 0.0)?;
-                if front
-                    .app_name()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&app.name))
-                {
-                    return Ok(());
+                match tree(&udid, 0.0) {
+                    Ok(front)
+                        if front
+                            .app_name()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&app.name)) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) => unread = None,
+                    Err(why) => unread = Some(why),
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }
-            // simctl sometimes starts an app it just terminated in the background.
-            eprintln!(
-                "leaf: {} is running but didn't come to the front within 3 s. Run `leaf sim snapshot` to check; if it's not there, tap its icon on the home screen.",
-                app.name
-            );
+            match unread {
+                Some(why) => eprintln!(
+                    "leaf: {} launched, but leaf couldn't read the screen to check it's in front ({why}). Run `leaf sim snapshot` to see.",
+                    app.name
+                ),
+                // simctl sometimes starts an app it just terminated in the background.
+                None => eprintln!(
+                    "leaf: {} is running but didn't come to the front within 3 s. Run `leaf sim snapshot` to check; if it's not there, tap its icon on the home screen.",
+                    app.name
+                ),
+            }
             Ok(())
         }
         _ => Err(SimError::Usage),
@@ -1359,6 +1462,22 @@ mod tests {
         assert_eq!(body("iPhone-16-Pro"), Body::Generic);
         assert_eq!(body("iPhone-17"), Body::Generic);
         assert_eq!(Body::for_device_type(""), Body::Generic);
+        // Each body's model is one `leaf sim install` downloads.
+        for body in [
+            Body::Duo,
+            Body::Air,
+            Body::Pro17,
+            Body::Iphone16,
+            Body::Generic,
+        ] {
+            assert!(
+                crate::simmodels::MODELS
+                    .iter()
+                    .any(|model| model.file == body.model()),
+                "{body:?}'s {} isn't in MODELS",
+                body.model()
+            );
+        }
     }
 
     #[test]
@@ -1372,6 +1491,22 @@ mod tests {
         let (device, _) = take_device(&["--device=C3".to_owned()]).expect("parses");
         assert_eq!(device.as_deref(), Some("C3"));
         assert_eq!(take_device(&["--device".to_owned()]), Err(SimError::Usage));
+    }
+
+    #[test]
+    fn a_double_dash_ends_the_options() {
+        let args: Vec<String> = ["--device", "B2", "type", "--", "--device", "C3"]
+            .map(String::from)
+            .to_vec();
+        let (device, rest) = take_device(&args).expect("parses");
+        assert_eq!(device.as_deref(), Some("B2"));
+        assert_eq!(rest, vec!["type", "--device", "C3"]);
+    }
+
+    #[test]
+    fn only_us_keyboard_characters_can_be_typed() {
+        assert!(untypeable("Hello, world! ~`|\\\"{}\n\t").is_empty());
+        assert_eq!(untypeable("café naïve"), vec!['é', 'ï']);
     }
 
     #[test]

@@ -418,6 +418,13 @@ fn config_command(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // For Rex's palette: whether `[simulator] enabled` is on, as leaf
+        // reads it, so the palette and the CLI never disagree.
+        [what] if what == "--simulator" => {
+            let enabled = config::load().is_ok_and(|config| config.simulator.enabled);
+            println!("{enabled}");
+            ExitCode::SUCCESS
+        }
         [what] if what == "keys" => {
             println!(
                 "# Every key table leaf reads from {}, with each action at its\n\
