@@ -24,6 +24,7 @@ mod font;
 mod gec;
 mod github;
 mod grid;
+mod helper;
 mod highlight;
 mod home;
 mod hook;
@@ -68,6 +69,13 @@ mod rextheme;
 mod scheme;
 mod shape;
 mod sheet;
+// Only macOS runs `leaf sim`; elsewhere these are compiled but unused.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod simmodels;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod simsnap;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod simulator;
 mod skills;
 mod slides;
 mod spinner;
@@ -94,12 +102,15 @@ use doc::Doc;
 use progress::Store;
 use viewer::ViewerOptions;
 
-const USAGE: &str = "Usage: leaf [open] [file.pdf | file.epub | file.md | file.html | office file | picture | url]   (nothing named: pick one)
+/// The usage text, with `leaf sim` only on macOS, where simulators run.
+macro_rules! usage {
+    ($sim:expr) => {
+        concat!("Usage: leaf [open] [file.pdf | file.epub | file.md | file.html | office file | picture | url]   (nothing named: pick one)
        leaf diff [options] [path | revision | pull request or merge request url]
        leaf pr [number | owner/repo#number | url]   pull requests and issues that concern you, or the pull request named
        leaf browser [URL]   open a WebKit browser pane in Rex on macOS
        leaf browser bar [minimal | full | toggle]   hide the address bar until the pointer is at the top
-       leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
+", $sim, "       leaf plan [--wait | --print] <plan.md>   review a plan block by block and send the verdict
        leaf review [--wait | --print] [diff options] [source]   review changes file by file and send the verdict
        leaf agent setup [--yes] [--dry-run]   set up agents, skills and plan review hooks
        leaf board [file.excalidraw]   draw on a whiteboard with the agent (default: a new board-<words>.excalidraw here)
@@ -146,7 +157,15 @@ F frame, e eraser, drag to draw, move or resize, the knob turns, double-click or
 u/U undo/redo, arrows nudge or pan, ctrl+scroll or +/- zoom, f fit, i pictures or dots,
 E export, @ ask the agent (it draws by editing the file), ? keys, q quit
 
-Rex: leaf rex install puts Leaf in the command palette: open (with a picker), review diffs, ask the agent pane about a selection, read aloud and pick a voice. In a remote session, leaf is installed on the host with cargo the first time.";
+Rex: leaf rex install puts Leaf in the command palette: open (with a picker), review diffs, ask the agent pane about a selection, read aloud and pick a voice. In a remote session, leaf is installed on the host with cargo the first time.")
+    };
+}
+#[cfg(target_os = "macos")]
+const USAGE: &str = usage!(
+    "       leaf sim [install | list | open <udid> | tap | swipe | type | screenshot | …]   an iOS Simulator on a 3D iPhone in Rex (leaf sim help)\n"
+);
+#[cfg(not(target_os = "macos"))]
+const USAGE: &str = usage!("");
 
 const SPONSOR_URL: &str = "https://leaf.dipxsy.app/sponsor";
 
@@ -416,6 +435,13 @@ fn config_command(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // For Rex's palette: whether `[simulator] enabled` is on, as leaf
+        // reads it, so the palette and the CLI never disagree.
+        [what] if what == "--simulator" => {
+            let enabled = config::load().is_ok_and(|config| config.simulator.enabled);
+            println!("{enabled}");
+            ExitCode::SUCCESS
+        }
         [what] if what == "keys" => {
             println!(
                 "# Every key table leaf reads from {}, with each action at its\n\
@@ -512,6 +538,8 @@ fn main() -> ExitCode {
             }
         },
         "browser" => browser::run(rest),
+        #[cfg(target_os = "macos")]
+        "sim" | "simulator" => simulator::run(rest),
         "voices" => match rest {
             [] => voices_command(None),
             [flag, block] if flag == "--reader" => voices_command(Some(block)),

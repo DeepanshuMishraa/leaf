@@ -324,6 +324,86 @@ function M.setup(opts)
     end,
   }
 
+  -- The simulator pane runs on macOS only, and only once `leaf sim install`
+  -- has downloaded its 3D iPhones and set `[simulator] enabled = true` in
+  -- leaf's config. Until then the palette offers the install instead; after
+  -- it, leaf has Rex reload this file.
+  local function on_mac()
+    local file = io.open("/System/Library/CoreServices/SystemVersion.plist", "r")
+    if file == nil then return false end
+    file:close()
+    return true
+  end
+
+  -- Asks leaf, which reads config.toml with its own TOML parser, so any
+  -- way of writing `[simulator] enabled = true` counts the same here.
+  local function simulator_enabled()
+    local result = rex.exec(argv("config", "--simulator"), { env = env, timeout = 5 })
+    return result ~= nil and result.ok and (result.stdout or ""):match("^%s*true") ~= nil
+  end
+
+  if on_mac() and simulator_enabled() then
+    rex.action{
+      name = "leaf_simulator",
+      title = "Leaf: Open Simulator…",
+      description = "Pick an installed iPhone simulator and open it on a 3D iPhone in a pane beside"
+        .. " this one. Your agent can tap, swipe and type on it with `leaf sim`.",
+      category = "Leaf",
+      keywords = "leaf simulator ios iphone xcode device app simctl 3d",
+      args = { udid = "string?" },
+      run = function(ctx, args)
+        if ctx.server ~= nil then
+          error("leaf: simulators run on this Mac, so they aren't available in a session on a remote host.", 0)
+        end
+        local udid = args and args.udid
+        if udid == nil or udid == "" then
+          if not can_ask() then
+            error("leaf: picking a simulator needs Rex 17 or later. Run `leaf sim list`, then"
+              .. " `leaf sim open <udid>` in a pane.", 0)
+          end
+          local items, err = leaf_json("sim", "--list")
+          if items == nil then error("leaf: couldn't list simulators: " .. tostring(err), 0) end
+          if #items == 0 then
+            error("leaf: no iPhone simulators are installed. Add an iOS runtime in Xcode → Settings"
+              .. " → Components (or run `xcodebuild -downloadPlatform iOS`), then try again.", 0)
+          end
+          local picked, reason = ask{
+            title = "Open simulator",
+            placeholder = "Search installed iPhone simulators",
+            items = items,
+          }
+          if reason == "fallback" then
+            error("leaf: Rex couldn't show the simulator picker. Run `leaf sim list`, then"
+              .. " `leaf sim open <udid>` in a pane.", 0)
+          end
+          if type(picked) ~= "string" then return end
+          udid = picked
+        end
+        open_pane(ctx, "simulator", argv("sim", "open", udid), cwd(ctx))
+      end,
+    }
+  elseif on_mac() then
+    rex.action{
+      name = "leaf_simulator_install",
+      title = "Leaf: Install Simulator…",
+      description = "Download the 3D iPhones leaf's iOS Simulator pane draws on (it lists them and"
+        .. " asks first), then Leaf: Open Simulator… appears here.",
+      category = "Leaf",
+      keywords = "leaf simulator ios iphone xcode install download 3d models",
+      run = function(ctx)
+        if ctx.server ~= nil then
+          error("leaf: simulators run on this Mac, so they aren't available in a session on a remote host.", 0)
+        end
+        -- Kept open after leaf exits, so its last words can be read.
+        local command = { "/bin/sh", "-c",
+          '"$@"; status=$?; printf \'\\nPress enter to close.\'; read -r _; exit $status',
+          "leaf-sim-install" }
+        for _, word in ipairs(argv("sim", "install")) do command[#command + 1] = word end
+        open_pane(ctx, "simulator install", command, cwd(ctx))
+      end,
+    }
+  end
+
   rex.action{
     name = "leaf_open",
     title = "Leaf: Open Document…",

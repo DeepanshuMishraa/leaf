@@ -5,7 +5,7 @@ description: Change leaf's settings and key bindings in its config.toml for the 
 
 # leaf-config: settings and keys
 
-leaf reads one file, `config.toml`, when a view starts. It never writes the file, so you edit it by hand. Changes apply the next time the person opens leaf. A view that's already open keeps the keys it started with.
+leaf reads one file, `config.toml`, when a view starts. It writes the file only for `leaf sim install`, which sets `[simulator] enabled = true` and leaves the rest as it was. Everything else you edit by hand. Changes apply the next time the person opens leaf. A view that's already open keeps the keys it started with.
 
 ## Find out first
 

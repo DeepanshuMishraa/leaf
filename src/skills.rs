@@ -14,7 +14,7 @@ pub struct Skill {
     text: &'static str,
 }
 
-pub const SKILLS: [Skill; 4] = [
+pub const SKILLS: [Skill; 5] = [
     Skill {
         name: "leaf",
         text: include_str!("../skills/leaf/SKILL.md"),
@@ -30,6 +30,10 @@ pub const SKILLS: [Skill; 4] = [
     Skill {
         name: "leaf-config",
         text: include_str!("../skills/leaf-config/SKILL.md"),
+    },
+    Skill {
+        name: "leaf-sim",
+        text: include_str!("../skills/leaf-sim/SKILL.md"),
     },
 ];
 

@@ -9,6 +9,8 @@
     "run_worker_first": [
       "/",
       "/install",
+      "/discord",
+      "/discord/",
       "/api/*"
     ]
   },

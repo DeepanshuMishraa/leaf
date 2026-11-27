@@ -448,7 +448,7 @@ and OpenCode. Each gets the leaf skills, and a hook where it has one.
 setup      shows what will change, asks once, then does it
            (--yes doesn't ask, --dry-run only shows)
 skill      prints one skill to stdout, for agents that take a file:
-           leaf, leaf-plan, leaf-review or leaf-config";
+           leaf, leaf-plan, leaf-review, leaf-config or leaf-sim";
 
 const HOOK_USAGE: &str = "Usage: leaf hook <agent>
 
@@ -496,7 +496,7 @@ fn skill(args: &[String]) -> ExitCode {
         },
         _ => {
             eprintln!(
-                "leaf: name the skill to print: leaf, leaf-plan, leaf-review or leaf-config."
+                "leaf: name the skill to print: leaf, leaf-plan, leaf-review, leaf-config or leaf-sim."
             );
             ExitCode::from(2)
         }
