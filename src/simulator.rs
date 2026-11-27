@@ -1149,7 +1149,10 @@ fn command(args: &[String]) -> Result<(), SimError> {
             let seconds = rest.first().map(|s| number(s)).transpose()?.unwrap_or(10.0);
             let udid = pick_device(named)?;
             let wanted = text.to_lowercase();
-            let deadline = std::time::Instant::now() + Duration::from_secs_f64(seconds.max(0.0));
+            // A timeout too long for a Duration is a typo, not a wish.
+            let timeout =
+                Duration::try_from_secs_f64(seconds.max(0.0)).map_err(|_| SimError::Usage)?;
+            let deadline = std::time::Instant::now() + timeout;
             loop {
                 let before = last_snapshot(&udid);
                 let snapshot = tree(&udid, 0.0)?.snapshot(&before, Detail::Full);

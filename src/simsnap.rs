@@ -53,14 +53,19 @@ pub struct Tree {
 }
 
 /// What names an element across snapshots: its role, label and id, and
-/// which of the elements sharing those it is, in order. Its value isn't
-/// part of it, so a field keeps its ref while it's typed in.
+/// which of the elements sharing those it is, in order, out of how many.
+/// When one of several identical elements comes or goes, the count
+/// changes and all of their refs retire, so a survivor can't take over a
+/// removed sibling's ref. Its value isn't part of it, so a field keeps its
+/// ref while it's typed in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Key {
     pub role: String,
     pub label: String,
     pub id: String,
     pub nth: usize,
+    #[serde(default)]
+    pub of: usize,
 }
 
 /// One ref handed out.
@@ -183,35 +188,24 @@ impl Tree {
     /// Every element but the app, with its key.
     pub fn keyed(&self) -> Vec<(Key, &Element)> {
         let skip = usize::from(self.app().is_some());
-        let mut seen: Vec<(String, String, String, usize)> = Vec::new();
-        self.elements
+        let elements: Vec<&Element> = self.elements.iter().skip(skip).collect();
+        let same =
+            |a: &Element, b: &Element| a.role == b.role && a.label == b.label && a.id == b.id;
+        elements
             .iter()
-            .skip(skip)
-            .map(|element| {
-                let nth = match seen.iter_mut().find(|(role, label, id, _)| {
-                    *role == element.role && *label == element.label && *id == element.id
-                }) {
-                    Some(found) => {
-                        found.3 += 1;
-                        found.3
-                    }
-                    None => {
-                        seen.push((
-                            element.role.clone(),
-                            element.label.clone(),
-                            element.id.clone(),
-                            0,
-                        ));
-                        0
-                    }
-                };
+            .enumerate()
+            .map(|(index, element)| {
                 let key = Key {
                     role: element.role.clone(),
                     label: element.label.clone(),
                     id: element.id.clone(),
-                    nth,
+                    nth: elements[..index]
+                        .iter()
+                        .filter(|e| same(e, element))
+                        .count(),
+                    of: elements.iter().filter(|e| same(e, element)).count(),
                 };
-                (key, element)
+                (key, *element)
             })
             .collect()
     }
@@ -244,9 +238,8 @@ impl Tree {
             if !element.visible(self.width, self.height) || element.hollow() {
                 continue;
             }
-            if detail == Detail::Interactive && element.passive() {
-                continue;
-            }
+            // Every element gets its ref, printed or not, so a full
+            // snapshot after an interactive one keeps the same numbers.
             let number = match previous.entries.iter().find(|entry| entry.key == key) {
                 Some(entry) => entry.number,
                 None => {
@@ -254,12 +247,15 @@ impl Tree {
                     next - 1
                 }
             };
+            entries.push(Entry { number, key });
+            if detail == Detail::Interactive && element.passive() {
+                continue;
+            }
             let indent = match detail {
                 Detail::Full => "  ".repeat(shown.len()),
                 Detail::Interactive => String::new(),
             };
             lines.push(format!("{indent}{}", element.line(number)));
-            entries.push(Entry { number, key });
             shown.push(element.depth);
         }
         // Refs of elements gone from this snapshot stay reserved, so an
@@ -390,7 +386,18 @@ mod tests {
         let snapshot = settings().snapshot(&Snapshot::default(), Detail::Interactive);
         assert_eq!(
             snapshot.text,
-            "Settings 1206×2622px\n@e1 button \"General\"\n@e2 button \"Camera\"\n@e3 textfield = \"Search\"\n"
+            "Settings 1206×2622px\n@e2 button \"General\"\n@e3 button \"Camera\"\n@e4 textfield = \"Search\"\n"
+        );
+    }
+
+    #[test]
+    fn refs_hold_when_switching_between_interactive_and_full() {
+        let interactive = settings().snapshot(&Snapshot::default(), Detail::Interactive);
+        let full = settings().snapshot(&interactive, Detail::Full);
+        // The heading -i left out kept the ref it was given.
+        assert_eq!(
+            full.text,
+            settings().snapshot(&Snapshot::default(), Detail::Full).text
         );
     }
 
@@ -465,6 +472,27 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_duplicate_retires_its_siblings_refs() {
+        let two = Tree {
+            width: 100,
+            height: 100,
+            elements: vec![
+                element(0, "Button", "Delete", [0, 0, 10, 10]),
+                element(0, "Button", "Delete", [0, 20, 10, 10]),
+            ],
+        };
+        let first = two.snapshot(&Snapshot::default(), Detail::Full);
+        let mut one = two.clone();
+        one.elements.remove(0);
+        // @e1 named the removed button; the survivor must not take it over,
+        // and @e2 no longer finds anything.
+        let second = one.snapshot(&first, Detail::Full);
+        assert_eq!(second.text, "100×100px\n@e3 button \"Delete\"\n");
+        let old = first.entry(2).map(|entry| entry.key.clone());
+        assert_eq!(old.and_then(|key| one.find(&key).cloned()), None);
+    }
+
+    #[test]
     fn offscreen_elements_are_left_out_and_cant_be_found() {
         let mut tree = settings();
         tree.elements
@@ -476,6 +504,7 @@ mod tests {
             label: "Below".into(),
             id: String::new(),
             nth: 0,
+            of: 1,
         };
         assert_eq!(tree.find(&key), None);
     }

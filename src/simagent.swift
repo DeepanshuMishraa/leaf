@@ -138,9 +138,10 @@ enum Accessibility {
                               identifier: element.accessibilityIdentifier() ?? "",
                               frame: element.accessibilityFrame(),
                               enabled: element.isAccessibilityEnabled()))
-            // Deeper than any real screen: a cycle guard.
-            guard depth < 64, nodes.count < 2000 else { return }
+            // Deeper or bigger than any real screen: a guard against cycles.
+            guard depth < 64 else { return }
             for child in element.accessibilityChildren() ?? [] {
+                guard nodes.count < 2000 else { return }
                 if let child = child as? NSAccessibilityElement { walk(child, depth: depth + 1) }
             }
         }
@@ -258,18 +259,27 @@ enum Driver {
 
     /// A key or a chord such as `cmd+a`, pressed and let go.
     static func press(key name: String, hid: HID) -> [String: Any] {
-        let lowered = name.lowercased()
-        var parts = lowered == "+" ? ["+"] : lowered.split(separator: "+").map(String.init)
+        // Empty parts are kept, so `a+` has no key; two empty parts at the
+        // end are the + key itself, as in `+` or `cmd++`.
+        var parts = name.split(separator: "+", omittingEmptySubsequences: false).map(String.init)
+        if parts.count >= 2, parts[parts.count - 1].isEmpty, parts[parts.count - 2].isEmpty {
+            parts.removeLast(2)
+            parts.append("+")
+        }
+        // The key keeps its case: `A` is shift+a.
         let last = parts.popLast() ?? ""
-        let held = parts.compactMap { modifiers[$0] }
+        guard !last.isEmpty else {
+            return failed("\(name) has no key after its last +. Write chords like cmd+a.")
+        }
+        let held = parts.compactMap { modifiers[$0.lowercased()] }
         guard held.count == parts.count else {
             return failed("No modifier key in \(name). Modifiers: cmd, shift, ctrl, alt.")
         }
         var shifted = false
         let usage: UInt32
-        if let named = Keys.named[last] {
+        if let named = Keys.named[last.lowercased()] {
             usage = named
-        } else if last.count == 1, let character = name.last, let stroke = Keys.stroke(for: character) {
+        } else if last.count == 1, let character = last.first, let stroke = Keys.stroke(for: character) {
             (usage, shifted) = (stroke.usage, stroke.shift)
         } else {
             return failed("No key named \(name). Keys: \(Keys.named.keys.sorted().joined(separator: ", ")), or one character, after cmd+, shift+, ctrl+ or alt+.")
@@ -345,9 +355,15 @@ enum Headless {
             return Driver.failed("CoreSimulator has no device \(udid). `leaf sim list` shows the ids.")
         }
         // The smallest built-in screen: the only one, or the Duo's cover.
-        guard let surface = CoreSim.builtInDisplays(of: device).compactMap(CoreSim.surface(of:))
-                .min(by: { $0.width * $0.height < $1.width * $1.height }) else {
+        let surfaces = CoreSim.builtInDisplays(of: device).compactMap(CoreSim.surface(of:))
+        guard let surface = surfaces.min(by: { $0.width * $0.height < $1.width * $1.height }) else {
             return Driver.failed("Simulator \(udid) has no screen: it isn't booted, or is still starting. Boot it with `xcrun simctl boot \(udid)` (or open it in leaf) and wait for `xcrun simctl bootstatus \(udid)`, then try again.")
+        }
+        // The Duo's touches need a digitizer for the screen in front, which
+        // only the pane sets up (it knows which screen that is). Without
+        // one, backboardd drops them or worse, so headless refuses them.
+        if surfaces.count > 1, request["tap"] != nil || request["swipe"] != nil {
+            return Driver.failed("Simulator \(udid) has two screens (an iPhone Duo), and leaf can only touch one from its pane. Open it with `leaf sim open \(udid)` in a Rex pane, then try again. Snapshots, typing, keys and buttons work without one.")
         }
         let hid: HID
         switch HID.connect(to: device) {
