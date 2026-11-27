@@ -94,7 +94,7 @@ leaf sim snapshot -i --diff      # only what changed
 leaf sim launch Settings         # by name or bundle id
 ```
 
-These work on any booted iPhone simulator, in a Leaf pane or not, except taps and swipes on the iPhone Duo: open it with `leaf sim open` first, since only its pane knows which screen faces front. With more than one booted, add `--device <udid>`. In a pane, the person sees a ring wherever you touch. Build and install apps with `xcodebuild` and `xcrun simctl install <udid> <app>` as usual.
+These work on any booted iPhone simulator, in a Leaf pane or not, except anything that touches the iPhone Duo's screen (`tap`, `swipe`, `scroll`, `fill`, and `type` with a ref, which taps first): open it with `leaf sim open` first, since only its pane knows which screen faces front. With more than one booted, add `--device <udid>`. In a pane, the person sees a ring wherever you touch. Build and install apps with `xcodebuild` and `xcrun simctl install <udid> <app>` as usual.
 
 **Questions about the screen.** The person presses the speech bubble (or `shift+cmd+a`), optionally drags over part of the screen, types a question and presses `enter`. It arrives as a message starting `From the iOS Simulator open in leaf:` with the device, a screenshot path and the marked region in pixels. Read the screenshot, then answer.
 

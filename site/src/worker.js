@@ -29,6 +29,8 @@ export default {
           headers: {
             "content-type": "text/html; charset=utf-8",
             "cache-control": "public, max-age=300",
+            // People get a redirect from the same path: a cache must keep them apart.
+            vary: "user-agent",
           },
         });
       }

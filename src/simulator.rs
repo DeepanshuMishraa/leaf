@@ -592,8 +592,8 @@ fn unresolved(number: u32, why: Unresolved) -> String {
             "{} isn't on the screen now. Run `leaf sim snapshot` to see what is.",
             named(&key)
         ),
-        Unresolved::Moved(key) => format!(
-            "{} is one of {} identical elements, and they've moved since the snapshot, so leaf can't tell which it was. Run `leaf sim snapshot` again.",
+        Unresolved::Ambiguous { key, at: (x, y) } => format!(
+            "{} is one of {} elements that nothing tells apart, so a ref to it could hit another. In the snapshot it was at {x}, {y}: if the screen hasn't changed, tap it by position with `leaf sim tap {x} {y}`.",
             named(&key),
             key.of
         ),

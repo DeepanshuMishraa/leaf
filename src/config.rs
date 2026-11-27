@@ -154,7 +154,16 @@ pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
             ),
         )
     })?;
-    let text = match std::fs::read_to_string(&path) {
+    // A symlink (a managed dotfile) keeps pointing at the file it names:
+    // that file is read and replaced. It's resolved once, so both use the
+    // same file even if the link is repointed meanwhile.
+    let target = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(&path).map_err(|error| (path.clone(), error))?
+        }
+        _ => path.clone(),
+    };
+    let text = match std::fs::read_to_string(&target) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err((path, error)),
@@ -172,14 +181,6 @@ pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
                 ),
             ));
         }
-        // A symlink (a managed dotfile) keeps pointing at the file it
-        // names: that file is the one replaced.
-        let target = match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                std::fs::canonicalize(&path).map_err(|error| (path.clone(), error))?
-            }
-            _ => path.clone(),
-        };
         if let Some(dir) = target.parent() {
             std::fs::create_dir_all(dir).map_err(|error| (path.clone(), error))?;
         }

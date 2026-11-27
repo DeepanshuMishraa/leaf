@@ -674,6 +674,9 @@ class PaneController: NSObject {
                 for item in object["bindings"] as? [[String: Any]] ?? [] {
                     guard let action = item["action"] as? String, action != "pane.send_key",
                           let keys = item["keys"] as? [String] else { continue }
+                    // A key mode's bindings apply only while Rex is in that mode,
+                    // which this window can't see; outside it the key is the pane's.
+                    if let mode = item["mode"] as? String, !mode.isEmpty { continue }
                     let chords = keys.compactMap(Chord.init)
                     guard !chords.isEmpty, chords.count == keys.count,
                           !(chords.count == 1 && reserved.contains(chords[0])) else { continue }

@@ -107,6 +107,8 @@ enum Accessibility {
         let identifier: String
         let frame: CGRect
         let enabled: Bool
+        /// The app's process, on the app's own node (the first); 0 elsewhere.
+        var pid: Int32 = 0
     }
 
     /// The frontmost app's elements, depth first, the app itself first.
@@ -170,6 +172,9 @@ enum Accessibility {
         // would read as a screen with things missing.
         guard remaining > 0 else {
             return .failure(SimFailure(message: "The simulator stopped answering accessibility requests while leaf read its screen. It may be busy or hung; take a screenshot with `leaf sim screenshot` to see, then try again."))
+        }
+        if !nodes.isEmpty, let pid = (translation.value(forKey: "pid") as? NSNumber)?.int32Value {
+            nodes[0].pid = pid
         }
         return .success(nodes)
     }
@@ -356,7 +361,10 @@ enum Driver {
             if !node.enabled { element["disabled"] = true }
             return element
         }
-        return ["ok": ["width": screen.width, "height": screen.height, "elements": elements]]
+        var reply: [String: Any] = ["width": screen.width, "height": screen.height, "elements": elements]
+        // Which app this is, beyond its name, so refs don't cross apps.
+        if let pid = nodes.first?.pid, pid > 0 { reply["pid"] = pid }
+        return ["ok": reply]
     }
 }
 

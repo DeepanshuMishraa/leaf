@@ -50,6 +50,9 @@ pub struct Tree {
     pub width: i64,
     pub height: i64,
     pub elements: Vec<Element>,
+    /// The process of the app in front, when the helper can tell.
+    #[serde(default)]
+    pub pid: Option<i64>,
 }
 
 /// What names an element across snapshots: its role, label and id, and
@@ -66,6 +69,11 @@ pub struct Key {
     pub nth: usize,
     #[serde(default)]
     pub of: usize,
+    /// For elements that look alike, the labels of the elements they sit
+    /// in ("Alice", "Bob"), so each row's Delete button is told apart by
+    /// its row, not by where it is. Empty for elements that are unique.
+    #[serde(default)]
+    pub context: String,
 }
 
 /// One ref handed out.
@@ -92,6 +100,10 @@ pub struct Snapshot {
     /// The app in front; empty on the home screen. Refs belong to it.
     #[serde(default)]
     pub app: String,
+    /// Its process. Two apps can share a name; two running apps can't
+    /// share a process, and a relaunched app gets a new one.
+    #[serde(default)]
+    pub pid: Option<i64>,
 }
 
 /// Why a ref from the last snapshot can't be acted on now.
@@ -102,10 +114,11 @@ pub enum Unresolved {
     /// Another app is in front than the one the snapshot read.
     OtherApp { then: String, now: String },
     /// Its element isn't on screen.
-    Gone(Key),
-    /// It's one of several identical elements, and they moved, so which
-    /// one it was can't be told.
-    Moved(Key),
+    Gone(Box<Key>),
+    /// It's one of several elements nothing tells apart, not even what
+    /// they sit in. Order or position could pick the wrong one, so it's
+    /// refused; `at` is where it was in the snapshot, in screenshot pixels.
+    Ambiguous { key: Box<Key>, at: (i64, i64) },
 }
 
 /// Whether a snapshot shows every element or only those to act on.
@@ -218,21 +231,59 @@ impl Tree {
     pub fn keyed(&self) -> Vec<(Key, &Element)> {
         let skip = usize::from(self.app().is_some());
         let elements: Vec<&Element> = self.elements.iter().skip(skip).collect();
-        let same =
+        let alike =
             |a: &Element, b: &Element| a.role == b.role && a.label == b.label && a.id == b.id;
-        elements
-            .iter()
+        // What each element sits in: the labels (or ids) of its ancestors.
+        let mut contexts = Vec::with_capacity(elements.len());
+        let mut path: Vec<(usize, String)> = Vec::new();
+        for element in &elements {
+            while path
+                .last()
+                .is_some_and(|(depth, _)| *depth >= element.depth)
+            {
+                path.pop();
+            }
+            let names: Vec<&str> = path
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .filter(|name| !name.is_empty())
+                .collect();
+            contexts.push(names.join(" › "));
+            let name = if element.label.is_empty() {
+                &element.id
+            } else {
+                &element.label
+            };
+            path.push((element.depth, name.clone()));
+        }
+        // Only elements that look alike carry their context, so a unique
+        // one keeps its ref when what it sits in is relabelled.
+        let context = |index: usize| {
+            let element = elements[index];
+            if elements.iter().filter(|e| alike(e, element)).count() > 1 {
+                contexts[index].clone()
+            } else {
+                String::new()
+            }
+        };
+        let keys: Vec<(String, &Element)> = (0..elements.len())
+            .map(|index| (context(index), elements[index]))
+            .collect();
+        let same = |a: &(String, &Element), b: &(String, &Element)| a.0 == b.0 && alike(a.1, b.1);
+        keys.iter()
             .enumerate()
-            .map(|(index, element)| {
+            .map(|(index, keyed)| {
+                let (context, element) = keyed;
                 let key = Key {
                     role: element.role.clone(),
                     label: element.label.clone(),
                     id: element.id.clone(),
-                    nth: elements[..index]
+                    nth: keys[..index]
                         .iter()
-                        .filter(|e| same(e, element))
+                        .filter(|other| same(other, keyed))
                         .count(),
-                    of: elements.iter().filter(|e| same(e, element)).count(),
+                    of: keys.iter().filter(|other| same(other, keyed)).count(),
+                    context: context.clone(),
                 };
                 (key, *element)
             })
@@ -252,7 +303,7 @@ impl Tree {
     pub fn resolve(&self, snapshot: &Snapshot, number: u32) -> Result<&Element, Unresolved> {
         let entry = snapshot.entry(number).ok_or(Unresolved::Unknown)?;
         let now = self.app_name().unwrap_or_default();
-        if now != snapshot.app {
+        if now != snapshot.app || !self.same_process(snapshot) {
             return Err(Unresolved::OtherApp {
                 then: snapshot.app.clone(),
                 now: now.to_owned(),
@@ -260,13 +311,26 @@ impl Tree {
         }
         let element = self
             .find(&entry.key)
-            .ok_or_else(|| Unresolved::Gone(entry.key.clone()))?;
-        // Order alone can't tell identical elements apart once they've
-        // moved (rows reordered, or the list scrolled): refuse to guess.
-        if entry.key.of > 1 && element.frame != entry.frame {
-            return Err(Unresolved::Moved(entry.key.clone()));
+            .ok_or_else(|| Unresolved::Gone(Box::new(entry.key.clone())))?;
+        // Alike even with what they sit in: only order or position could
+        // pick one, and rows that swapped would pick the wrong one.
+        if entry.key.of > 1 {
+            let [x, y, w, h] = entry.frame;
+            return Err(Unresolved::Ambiguous {
+                key: Box::new(entry.key.clone()),
+                at: (x + w / 2, y + h / 2),
+            });
         }
         Ok(element)
+    }
+
+    /// False when both this tree and `snapshot` name the app's process and
+    /// they differ: another app of the same name, or the app relaunched.
+    fn same_process(&self, snapshot: &Snapshot) -> bool {
+        match (self.pid, snapshot.pid) {
+            (Some(now), Some(then)) => now == then,
+            _ => true,
+        }
     }
 
     /// The lines of `snapshot` for elements whose label, value or id
@@ -295,7 +359,7 @@ impl Tree {
         let app = self.app_name().unwrap_or_default().to_owned();
         // Refs belong to one app: another app's identical "Delete" is a
         // different button.
-        let kept: &[Entry] = if previous.app == app {
+        let kept: &[Entry] = if previous.app == app && self.same_process(previous) {
             &previous.entries
         } else {
             &[]
@@ -350,6 +414,7 @@ impl Tree {
             text,
             screen: crate::plugin::fnv1a(&format!("{:?}", self.elements)),
             app,
+            pid: self.pid,
         }
     }
 }
@@ -406,6 +471,7 @@ mod tests {
         Tree {
             width: 1206,
             height: 2622,
+            pid: None,
             elements: vec![
                 element(0, "Application", "Settings", [0, 0, 1206, 2622]),
                 element(1, "Heading", "Settings", [48, 359, 399, 122]),
@@ -450,6 +516,7 @@ mod tests {
         let tree = Tree {
             width: 100,
             height: 100,
+            pid: None,
             elements: vec![
                 element(0, "Application", "App", [0, 0, 100, 100]),
                 element(1, "NavigationBar", "Title", [0, 0, 100, 10]),
@@ -510,6 +577,7 @@ mod tests {
         let home = Tree {
             width: 1206,
             height: 2622,
+            pid: None,
             elements: vec![
                 element(0, "Application", "", [0, 0, 1206, 2622]),
                 element(1, "Button", "Maps", [72, 264, 505, 573]),
@@ -543,6 +611,7 @@ mod tests {
         let tree = Tree {
             width: 100,
             height: 100,
+            pid: None,
             elements: vec![
                 element(0, "Button", "Delete", [0, 0, 10, 10]),
                 element(0, "Button", "Delete", [0, 20, 10, 10]),
@@ -559,6 +628,7 @@ mod tests {
         let two = Tree {
             width: 100,
             height: 100,
+            pid: None,
             elements: vec![
                 element(0, "Button", "Delete", [0, 0, 10, 10]),
                 element(0, "Button", "Delete", [0, 20, 10, 10]),
@@ -588,6 +658,7 @@ mod tests {
             id: String::new(),
             nth: 0,
             of: 1,
+            context: String::new(),
         };
         assert_eq!(tree.find(&key), None);
     }
@@ -626,28 +697,32 @@ mod tests {
         assert!(tree.elements[1].disabled);
     }
 
-    fn two_deletes(app: &str) -> Tree {
+    /// Two rows, each with a Delete button inside it.
+    fn two_rows(app: &str, first: &str, second: &str) -> Tree {
         Tree {
             width: 100,
             height: 100,
+            pid: Some(42),
             elements: vec![
                 element(0, "Application", app, [0, 0, 100, 100]),
-                element(1, "Button", "Delete", [0, 0, 10, 10]),
-                element(1, "Button", "Delete", [0, 20, 10, 10]),
+                element(1, "Cell", first, [0, 0, 100, 20]),
+                element(2, "Button", "Delete", [80, 0, 20, 20]),
+                element(1, "Cell", second, [0, 20, 100, 20]),
+                element(2, "Button", "Delete", [80, 20, 20, 20]),
             ],
         }
     }
 
     #[test]
     fn refs_resolve_in_their_own_app_only() {
-        let notes = two_deletes("Notes");
+        let notes = two_rows("Notes", "Alice", "Bob");
         let snapshot = notes.snapshot(&Snapshot::default(), Detail::Full);
         assert_eq!(
-            notes.resolve(&snapshot, 2).map(|element| element.frame),
-            Ok([0, 20, 10, 10])
+            notes.resolve(&snapshot, 4).map(|element| element.frame),
+            Ok([80, 20, 20, 20])
         );
         assert_eq!(notes.resolve(&snapshot, 9), Err(Unresolved::Unknown));
-        let mail = two_deletes("Mail");
+        let mail = two_rows("Mail", "Alice", "Bob");
         assert_eq!(
             mail.resolve(&snapshot, 2),
             Err(Unresolved::OtherApp {
@@ -659,20 +734,51 @@ mod tests {
         let fresh = mail.snapshot(&snapshot, Detail::Full);
         assert_eq!(
             fresh.text,
-            "Mail 100×100px\n@e3 button \"Delete\"\n@e4 button \"Delete\"\n"
+            "Mail 100×100px\n@e5 cell \"Alice\"\n  @e6 button \"Delete\"\n@e7 cell \"Bob\"\n  @e8 button \"Delete\"\n"
         );
     }
 
     #[test]
-    fn moved_duplicates_are_refused_not_guessed() {
-        let notes = two_deletes("Notes");
+    fn another_app_with_the_same_name_is_another_app() {
+        let notes = two_rows("Notes", "Alice", "Bob");
         let snapshot = notes.snapshot(&Snapshot::default(), Detail::Full);
-        let mut scrolled = notes.clone();
-        scrolled.elements[1].frame = [0, 40, 10, 10];
-        scrolled.elements[2].frame = [0, 60, 10, 10];
+        let mut other = notes.clone();
+        other.pid = Some(7);
+        assert_eq!(
+            other.resolve(&snapshot, 2),
+            Err(Unresolved::OtherApp {
+                then: "Notes".into(),
+                now: "Notes".into()
+            })
+        );
+        assert!(
+            !other
+                .snapshot(&snapshot, Detail::Full)
+                .text
+                .contains("@e2 ")
+        );
+    }
+
+    #[test]
+    fn swapped_rows_keep_each_buttons_ref() {
+        let before = two_rows("Notes", "Alice", "Bob");
+        let snapshot = before.snapshot(&Snapshot::default(), Detail::Full);
+        // Alice's Delete is @e2. Bob's row moves to the top.
+        let after = two_rows("Notes", "Bob", "Alice");
+        assert_eq!(
+            after.resolve(&snapshot, 2).map(|element| element.frame),
+            Ok([80, 20, 20, 20])
+        );
+    }
+
+    #[test]
+    fn duplicates_nothing_tells_apart_are_refused_not_guessed() {
+        // Two rows with the same name: even their context matches.
+        let twins = two_rows("Notes", "Alice", "Alice");
+        let snapshot = twins.snapshot(&Snapshot::default(), Detail::Full);
         assert!(matches!(
-            scrolled.resolve(&snapshot, 1),
-            Err(Unresolved::Moved(_))
+            twins.resolve(&snapshot, 2),
+            Err(Unresolved::Ambiguous { at: (90, 10), .. })
         ));
         // A unique element may move freely.
         let mut settings = settings();

@@ -1674,13 +1674,19 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     func boot() {
         showStatus("Starting \(name)…", busy: true)
-        let developerDir = developerDir, udid = udid
+        let developerDir = developerDir, udid = udid, name = name, owner = ownerFile
         DispatchQueue.global(qos: .userInitiated).async {
             let result = CoreSim.deviceSet(developerDir: developerDir).flatMap { set -> Result<(NSObject, NSObject), SimFailure> in
                 guard let device = CoreSim.device(udid, in: set) else {
                     return .failure(SimFailure(message: "No simulator with id \(udid) is installed. Pick another with Leaf: Open Simulator…, or list them with `leaf sim list`."))
                 }
                 return .success((set, device))
+            }.flatMap { found -> Result<(NSObject, NSObject), SimFailure> in
+                // The device's lock is waited for here, off the main thread:
+                // a closed pane's guardian may be shutting it down. `started`
+                // reads its state and claims it while it's held.
+                guard let owner, !BootOwner.lock(owner, wait: 60) else { return .success(found) }
+                return .failure(SimFailure(message: "Another leaf pane is still shutting \(name) down. Wait a moment, then open it again."))
             }
             DispatchQueue.main.async {
                 switch result {
@@ -1693,11 +1699,11 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
 
     func started(_ device: NSObject) {
         self.device = device
-        // Held while the state is read and the device claimed, so a gone
-        // pane's guardian can't shut it down in between: one already
-        // shutting it down finishes first, and the state read after is fresh.
-        let locked = ownerFile.map(BootOwner.lock)
-        defer { if let owner = ownerFile, locked == true { BootOwner.unlock(owner) } }
+        // `boot` took the device's lock: held while the state is read and the
+        // device claimed, so a gone pane's guardian can't shut it down in
+        // between. One already shutting it down finished first, so the state
+        // read here is fresh.
+        defer { if let owner = ownerFile { BootOwner.unlock(owner) } }
         let state = device.responds(to: NSSelectorFromString("stateString")) ? device.value(forKey: "stateString") as? String : nil
         let booted = state == "Booted"
         // Booted, but by a leaf pane that's gone: still leaf's to shut down.
@@ -2348,17 +2354,25 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         // The check, the record's removal and the shutdown happen under the
         // device's lock (BootOwner.lock), so a pane adopting the device
         // either goes first, and this stands down, or waits for it to be off.
+        // A lock whose holder has exited is taken over; without the lock
+        // after a minute, the guardian leaves everything as it is.
         let script = """
         while kill -0 "$1" 2>/dev/null; do sleep 0.5; done
+        lock="$3.lock"
         i=0
-        until mkdir "$3.lock" 2>/dev/null; do
-          i=$((i + 1)); [ "$i" -ge 300 ] && break; sleep 0.1
+        until mkdir "$lock" 2>/dev/null; do
+          held=$(cat "$lock/pid" 2>/dev/null)
+          if [ -n "$held" ] && ! kill -0 "$held" 2>/dev/null; then rm -rf "$lock"; continue; fi
+          i=$((i + 1)); [ "$i" -ge 600 ] && exit 0
+          sleep 0.1
         done
+        echo $$ > "$lock/pid"
         if [ "$(cat "$3" 2>/dev/null)" = "$1" ]; then
           rm -f "$3"
           /usr/bin/xcrun simctl shutdown "$2"
         fi
-        rmdir "$3.lock" 2>/dev/null
+        rm -f "$lock/pid"
+        rmdir "$lock" 2>/dev/null
         exit 0
         """
         guard BootOwner.spawnDetached(["/bin/sh", "-c", script, "leaf-sim-guardian", "\(pid)", udid, owner],
@@ -2397,24 +2411,51 @@ enum BootOwner {
         try? FileManager.default.removeItem(atPath: file)
     }
 
-    /// Takes the device's lock, `file`.lock, waiting up to 30 s for a
-    /// guardian's shutdown; one held longer is from a process that died
-    /// holding it, and is taken over. False when it can't be made at all.
-    static func lock(_ file: String) -> Bool {
+    /// Takes `file`.lock: a folder holding its holder's pid, made with
+    /// `mkdir` so the guardian's shell script can take it too. A lock whose
+    /// holder has exited is taken over; a live holder keeps it however
+    /// long it takes, and is waited for up to `wait` seconds. False when
+    /// the lock wasn't had in that time.
+    static func lock(_ file: String, wait: TimeInterval) -> Bool {
         let lock = file + ".lock"
         try? FileManager.default.createDirectory(atPath: (file as NSString).deletingLastPathComponent,
                                                  withIntermediateDirectories: true)
-        let deadline = Date().addingTimeInterval(30)
-        while mkdir(lock, 0o700) != 0 {
+        let deadline = Date().addingTimeInterval(wait)
+        while true {
+            if mkdir(lock, 0o700) == 0 {
+                if (try? "\(getpid())".write(toFile: lock + "/pid", atomically: true, encoding: .utf8)) != nil { return true }
+                rmdir(lock)
+                return false
+            }
             guard errno == EEXIST else { return false }
-            if Date() >= deadline { rmdir(lock) }
+            if stale(lock) {
+                try? FileManager.default.removeItem(atPath: lock)
+                continue
+            }
+            if Date() >= deadline { return false }
             usleep(100_000)
         }
-        return true
     }
 
+    /// Whether `lock`'s holder has exited. One that hasn't written its pid
+    /// yet is between making the folder and writing it, unless it made the
+    /// folder over 10 s ago and died there.
+    static func stale(_ lock: String) -> Bool {
+        if let text = try? String(contentsOfFile: lock + "/pid", encoding: .utf8),
+           let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return kill(pid, 0) != 0 && errno == ESRCH
+        }
+        guard let made = (try? FileManager.default.attributesOfItem(atPath: lock))?[.modificationDate] as? Date else { return false }
+        return Date().timeIntervalSince(made) > 10
+    }
+
+    /// Lets go of `file`.lock, if this process holds it.
     static func unlock(_ file: String) {
-        rmdir(file + ".lock")
+        let lock = file + ".lock"
+        guard let text = try? String(contentsOfFile: lock + "/pid", encoding: .utf8),
+              text.trimmingCharacters(in: .whitespacesAndNewlines) == "\(getpid())" else { return }
+        unlink(lock + "/pid")
+        rmdir(lock)
     }
 
     /// Starts `arguments` in a new session with no open files but /dev/null,
@@ -2470,8 +2511,8 @@ final class ControlServer {
         // From the check to `listen`, under the path's lock: two panes
         // opening the device at once can't both find it free, and the
         // second can't unlink the first one's socket.
-        let locked = BootOwner.lock(path)
-        defer { if locked { BootOwner.unlock(path) } }
+        guard BootOwner.lock(path, wait: 5) else { return .failure(busy) }
+        defer { BootOwner.unlock(path) }
         // A live socket at the path belongs to another pane on this device.
         if ControlServer.answers(path) { return .failure(busy) }
         unlink(path)
