@@ -212,18 +212,19 @@ struct Chrome: Equatable {
             ?? (((setting("showsPaneHeaders") as? NSNumber)?.boolValue ?? true) ? "always" : "never")
         if headers != "always" { chrome.header = 0 }
         let vertical = setting("tabStyle") as? String == "vertical"
+        let bottomTabs = !vertical && setting("tabBarEdge") as? String == "bottom"
         let toolbar = setting("toolbarBehavior") as? String ?? "alwaysShow"
         if vertical || toolbar != "alwaysShow" { chrome.top = edge }
-        if !vertical && toolbar == "alwaysShow" && setting("tabBarEdge") as? String == "bottom" {
+        if bottomTabs && toolbar == "alwaysShow" {
             // Horizontal tabs take the same space on either edge. Reserve it
             // below both canvases when Rex places the tab bar at the bottom.
             chrome.bottom = chrome.top
             chrome.top = edge
         }
         chrome.floatTop = chrome.top
-        if vertical && toolbar == "alwaysShow" {
-            // The vertical-tab layout leaves a title area above the floating
-            // canvas in Rex. This is measured in points, including on Retina.
+        if (vertical || bottomTabs) && toolbar == "alwaysShow" {
+            // Side and bottom tabs leave a title area above Rex's floating
+            // canvas. Tiled panes extend into that area; floats start below it.
             chrome.floatTop += 34
         }
         if vertical, !((setting("sidebarCollapsed") as? NSNumber)?.boolValue ?? false) {
