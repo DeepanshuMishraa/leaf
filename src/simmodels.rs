@@ -1,8 +1,33 @@
-//! The simulator pane's 3D phones. They aren't shipped inside leaf, so
-//! nobody downloads them just by upgrading: `leaf sim install` lists them,
-//! asks, downloads them from leaf's model store (a Cloudflare R2 bucket),
-//! checks each against its checksum, and turns the simulator on in leaf's
-//! config so Rex's palette offers it. macOS only.
+//! The simulator pane's 3D phones. They aren't shipped inside leaf, or kept
+//! in its repository, so nobody downloads them just by upgrading:
+//! `leaf sim install` lists them, asks, downloads them from leaf's model
+//! store, checks each against its size and checksum, and turns the simulator
+//! on in leaf's config so Rex's palette offers it. macOS only.
+//!
+//! The store is the Cloudflare R2 bucket `leaf-sim-models`, served at
+//! `STORE`. A changed model goes up under a new version folder, and `STORE`
+//! and `MODELS` move to it, so a URL always names the same bytes:
+//!
+//! ```text
+//! wrangler r2 object put leaf-sim-models/v2/<file> --file <file> \
+//!   --content-type model/vnd.usdz+zip \
+//!   --cache-control "public, max-age=31536000, immutable" --remote
+//! ```
+//!
+//! The models, and what the pane relies on in each (see `Phone.models` in
+//! src/simulator.swift):
+//!
+//! - iphone.usdz: made for leaf by its author. Screen material
+//!   COLOUR_Cherry_Screen.
+//! - iphone-duo-open.usdz: the iPhone Duo, open, baked for leaf from "Apple
+//!   iPhone Duo Fold Night Sky 2026" by extraakash
+//!   (https://sketchfab.com/AakashMansukhani), Sketchfab Standard. Screen
+//!   COLOUR_Cherry_Screen, cover display C_NS_Screen_Outer; the pane folds
+//!   it by turning the left half half a turn about x = 0, z = 0.002584.
+//! - iphone-air.usdz (sky blue), iphone-17-pro.usdz (deep blue),
+//!   iphone-16.usdz (teal): supplied by leaf's author. Screens _7Air_Screen
+//!   (facing -Z), Screen and HdvBvHLgXAUNOwl; the 17 Pro file shows the phone
+//!   twice, front and back, and the pane keeps the one with the screen.
 
 use std::fmt;
 use std::fs;
@@ -16,7 +41,7 @@ use crate::spinner;
 
 /// Where the models are served from. A new set of models goes under a new
 /// version, so a file's URL always names the same bytes.
-const STORE: &str = "https://pub-451fde5e332d42679206eb1aee0e9528.r2.dev/v1";
+const STORE: &str = "https://leaf-models.dipxsy.app/v1";
 const USER_AGENT: &str = concat!("leaf/", env!("CARGO_PKG_VERSION"));
 /// The Duo's model, which can't be swapped for another.
 const DUO: &str = "iphone-duo-open.usdz";
