@@ -199,7 +199,7 @@ struct Chrome: Equatable {
         return sessionID(from: setting("lastFocusedSession"))
     }
 
-    static func current() -> Chrome {
+    static func current(setting: (String) -> Any? = Chrome.setting) -> Chrome {
         CFPreferencesAppSynchronize(domain)
         let compact = setting("paneDensity") as? String == "compact"
         let edge: CGFloat = compact ? 0 : 8
@@ -214,6 +214,12 @@ struct Chrome: Equatable {
         let vertical = setting("tabStyle") as? String == "vertical"
         let toolbar = setting("toolbarBehavior") as? String ?? "alwaysShow"
         if vertical || toolbar != "alwaysShow" { chrome.top = edge }
+        if !vertical && toolbar == "alwaysShow" && setting("tabBarEdge") as? String == "bottom" {
+            // Horizontal tabs take the same space on either edge. Reserve it
+            // below both canvases when Rex places the tab bar at the bottom.
+            chrome.bottom = chrome.top
+            chrome.top = edge
+        }
         chrome.floatTop = chrome.top
         if vertical && toolbar == "alwaysShow" {
             // The vertical-tab layout leaves a title area above the floating

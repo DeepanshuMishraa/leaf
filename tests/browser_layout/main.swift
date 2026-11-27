@@ -19,6 +19,42 @@ var failures = [String]()
 func checkResize(_ condition: Bool, _ message: String) {
     if !condition { failures.append(message) }
 }
+// Read the tab bar's configured edge rather than always reserving its row above the panes.
+for compact in [false, true] {
+    let edge: CGFloat = compact ? 0 : 8
+    let toolbar: CGFloat = compact ? 41 : 46
+    let preferences: Object = ["paneDensity": compact ? "compact" : "comfortable",
+                               "tabStyle": "horizontal", "toolbarBehavior": "alwaysShow"]
+    func configured(_ overrides: Object = [:]) -> Chrome {
+        let values = preferences.merging(overrides) { _, new in new }
+        return Chrome.current(setting: { values[$0] })
+    }
+    let top = configured(["tabBarEdge": "top"])
+    let bottom = configured(["tabBarEdge": "bottom"])
+    precondition(configured() == top)
+    precondition(top.top == toolbar && top.bottom == edge && top.floatTop == toolbar)
+    precondition(bottom.top == edge && bottom.bottom == toolbar && bottom.floatTop == edge,
+                 "bottom tabs must reserve space below the tiled and floating canvases")
+    let window = CGRect(x: 100, y: 50, width: 1000, height: 700)
+    for floating in [false, true] {
+        let pane = Placement(rect: CGRect(x: 0, y: 0, width: 1, height: 1), focused: true,
+                             floating: floating, gapOffset: .zero, layerBounds: nil)
+        let a = top.body(pane, in: window)!, b = bottom.body(pane, in: window)!
+        precondition(a.size == b.size && a.minY - b.minY == toolbar - edge)
+        precondition(b.maxY == window.maxY - toolbar - (floating || !compact ? 1 : 0))
+    }
+    let hidden = configured(["tabBarEdge": "bottom", "toolbarBehavior": "autoHide"])
+    precondition(hidden.top == edge && hidden.bottom == edge && hidden.floatTop == edge)
+    for side in ["left", "right"] {
+        let values: Object = ["tabStyle": "vertical", "sidebarPosition": side, "sidebarWidth": 230]
+        let sidebarTop = configured(values.merging(["tabBarEdge": "top"]) { _, new in new })
+        let sidebarBottom = configured(values.merging(["tabBarEdge": "bottom"]) { _, new in new })
+        precondition(sidebarTop == sidebarBottom)
+        precondition(sidebarTop.top == edge && sidebarTop.bottom == edge && sidebarTop.floatTop == edge + 34)
+        precondition(side == "left" ? sidebarTop.left == 230 : sidebarTop.right == 230)
+    }
+}
+
 let full = [0.0, 0, 1, 1]
 let card = [0.125, 0.25, 0.5, 0.5]
 func layer(_ kind: String, _ rect: [Double], _ id: String) -> Object {
