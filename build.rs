@@ -94,9 +94,23 @@ const DUO_HINGE_SOURCE: &str = "src/duo-hinge.m";
 /// shows the Duo, but its iOS stays on the cover screen.
 fn compile_duo_hinge(arch: &str, output: &Path) -> bool {
     let result = Command::new("xcrun")
-        .args(["-sdk", "iphonesimulator", "clang", "-O2", "-fobjc-arc", "-target"])
+        .args([
+            "-sdk",
+            "iphonesimulator",
+            "clang",
+            "-O2",
+            "-fobjc-arc",
+            "-target",
+        ])
         .arg(format!("{arch}-apple-ios17.0-simulator"))
-        .args(["-framework", "Foundation", "-framework", "IOKit", DUO_HINGE_SOURCE, "-o"])
+        .args([
+            "-framework",
+            "Foundation",
+            "-framework",
+            "IOKit",
+            DUO_HINGE_SOURCE,
+            "-o",
+        ])
         .arg(output)
         .env_remove("MACOSX_DEPLOYMENT_TARGET")
         .env_remove("IPHONEOS_DEPLOYMENT_TARGET")
@@ -104,11 +118,15 @@ fn compile_duo_hinge(arch: &str, output: &Path) -> bool {
     match result {
         Ok(status) if status.success() => true,
         Ok(status) => {
-            println!("cargo:warning=the iPhone Duo hinge helper failed to compile ({status}); the Duo's iOS will stay on its cover screen in this build");
+            println!(
+                "cargo:warning=the iPhone Duo hinge helper failed to compile ({status}); the Duo's iOS will stay on its cover screen in this build"
+            );
             false
         }
         Err(error) => {
-            println!("cargo:warning=xcrun wasn't found ({error}); the iPhone Duo hinge helper will be unavailable. Install Xcode with the iOS Simulator SDK.");
+            println!(
+                "cargo:warning=xcrun wasn't found ({error}); the iPhone Duo hinge helper will be unavailable. Install Xcode with the iOS Simulator SDK."
+            );
             false
         }
     }

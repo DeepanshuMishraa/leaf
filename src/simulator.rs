@@ -27,6 +27,9 @@ use crate::helper::{Part, macos_version};
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
 const PHONE: &[u8] = include_bytes!("../vendor/devices/iphone.usdz");
 const DUO_OPEN: &[u8] = include_bytes!("../vendor/devices/iphone-duo-open.usdz");
+const AIR: &[u8] = include_bytes!("../vendor/devices/iphone-air.usdz");
+const PRO_17: &[u8] = include_bytes!("../vendor/devices/iphone-17-pro.usdz");
+const IPHONE_16: &[u8] = include_bytes!("../vendor/devices/iphone-16.usdz");
 /// Runs inside the iPhone Duo's simulator to move its hinge (src/duo-hinge.m).
 const DUO_HINGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-duo-hinge"));
 
@@ -52,11 +55,48 @@ pub struct Device {
     pub runtime: String,
     /// simctl's state: "Booted", "Shutdown", "Booting"…
     pub state: String,
-    /// The foldable iPhone Duo, drawn on its own model.
+    /// The 3D body the pane draws it on.
     #[serde(skip)]
-    duo: bool,
+    body: Body,
     #[serde(skip)]
     version: Vec<u32>,
+}
+
+/// Which 3D phone the pane draws a simulator on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    /// The foldable iPhone Duo, which opens and shuts.
+    Duo,
+    Air,
+    Pro17,
+    Iphone16,
+    /// Every other iPhone.
+    Generic,
+}
+
+impl Body {
+    /// The body for a simctl device type identifier, such as
+    /// `com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro`.
+    fn for_device_type(identifier: &str) -> Body {
+        match identifier.rsplit('.').next().unwrap_or_default() {
+            "iPhone-Duo" => Body::Duo,
+            "iPhone-Air" => Body::Air,
+            "iPhone-17-Pro" | "iPhone-17-Pro-Max" => Body::Pro17,
+            "iPhone-16" | "iPhone-16-Plus" => Body::Iphone16,
+            _ => Body::Generic,
+        }
+    }
+
+    /// Its model's file name beside the helper (see `helper`).
+    fn model(self) -> &'static str {
+        match self {
+            Body::Duo => "iphone-duo-open.usdz",
+            Body::Air => "iphone-air.usdz",
+            Body::Pro17 => "iphone-17-pro.usdz",
+            Body::Iphone16 => "iphone-16.usdz",
+            Body::Generic => "iphone.usdz",
+        }
+    }
 }
 
 impl Device {
@@ -130,7 +170,7 @@ fn parse_devices(json: &str) -> Result<Vec<Device>, String> {
                             .join(".")
                     ),
                     state: device.state.clone(),
-                    duo: device.device_type_identifier.ends_with(".iPhone-Duo"),
+                    body: Body::for_device_type(&device.device_type_identifier),
                     version: version.clone(),
                 })
         })
@@ -553,6 +593,21 @@ fn helper() -> Result<PathBuf, String> {
                 mode: 0o644,
             },
             Part {
+                name: "iphone-air.usdz",
+                bytes: AIR,
+                mode: 0o644,
+            },
+            Part {
+                name: "iphone-17-pro.usdz",
+                bytes: PRO_17,
+                mode: 0o644,
+            },
+            Part {
+                name: "iphone-16.usdz",
+                bytes: IPHONE_16,
+                mode: 0o644,
+            },
+            Part {
                 name: "leaf-duo-hinge",
                 bytes: DUO_HINGE,
                 mode: 0o755,
@@ -608,7 +663,8 @@ fn open(udid: &str) -> Result<(), String> {
         .env("LEAF_SIM_RUNTIME", &device.runtime)
         .env("LEAF_SIM_SOCKET", &socket)
         .env("LEAF_DEVELOPER_DIR", &developer);
-    if device.duo {
+    command.env("LEAF_SIM_MODEL", device.body.model());
+    if device.body == Body::Duo {
         command.env("LEAF_SIM_DUO", "1");
     } else {
         command.env_remove("LEAF_SIM_DUO");
@@ -854,7 +910,7 @@ mod tests {
         let devices = parse_devices(listing).expect("parses");
         let rows: Vec<(&str, &str, bool)> = devices
             .iter()
-            .map(|d| (d.name.as_str(), d.runtime.as_str(), d.duo))
+            .map(|d| (d.name.as_str(), d.runtime.as_str(), d.body == Body::Duo))
             .collect();
         assert_eq!(
             rows,
@@ -868,6 +924,22 @@ mod tests {
             .map(|item| item.id)
             .collect();
         assert_eq!(ids, ["A1", "B2"]);
+    }
+
+    #[test]
+    fn each_device_type_gets_its_body() {
+        let body = |name: &str| {
+            Body::for_device_type(&format!("com.apple.CoreSimulator.SimDeviceType.{name}"))
+        };
+        assert_eq!(body("iPhone-Duo"), Body::Duo);
+        assert_eq!(body("iPhone-Air"), Body::Air);
+        assert_eq!(body("iPhone-17-Pro"), Body::Pro17);
+        assert_eq!(body("iPhone-17-Pro-Max"), Body::Pro17);
+        assert_eq!(body("iPhone-16"), Body::Iphone16);
+        assert_eq!(body("iPhone-16-Plus"), Body::Iphone16);
+        assert_eq!(body("iPhone-16-Pro"), Body::Generic);
+        assert_eq!(body("iPhone-17"), Body::Generic);
+        assert_eq!(Body::for_device_type(""), Body::Generic);
     }
 
     #[test]
@@ -896,7 +968,7 @@ mod tests {
             name: "iPhone 17 Pro".into(),
             runtime: "iOS 26.1".into(),
             state: "Booted".into(),
-            duo: false,
+            body: Body::Pro17,
             version: vec![26, 1],
         }
     }

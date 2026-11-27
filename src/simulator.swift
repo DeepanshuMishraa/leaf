@@ -488,12 +488,32 @@ struct Phone {
     /// Present on the iPhone Duo.
     let fold: Fold?
 
-    /// The model's screen material, and the nodes that sit on the screen
-    /// (the Dynamic Island), which are lifted just above it.
-    static let screenMaterial = "COLOUR_Cherry_Screen"
+    /// What leaf needs to know about one of its phone models.
+    struct Model {
+        /// The screen's material.
+        let screenMaterial: String
+        /// Prefixes of the nodes that sit on the screen (the Dynamic
+        /// Island), which are lifted just above it.
+        var onScreen: [String] = []
+        /// Which way the screen faces in its mesh's own space.
+        var facing: Facing = .plusZ
+        /// The file holds more than one phone (a showcase of front and
+        /// back); every mesh beside the screen's phone is dropped.
+        var showcase = false
+
+        enum Facing { case plusZ, minusZ }
+    }
+
+    /// leaf's models, by file name (Rust's `Body::model` picks one).
+    static let models: [String: Model] = [
+        "iphone.usdz": Model(screenMaterial: "COLOUR_Cherry_Screen", onScreen: ["Front_Cam", "Front_Sensor"]),
+        "iphone-duo-open.usdz": Model(screenMaterial: "COLOUR_Cherry_Screen", onScreen: ["Front_Cam", "Front_Sensor"]),
+        "iphone-air.usdz": Model(screenMaterial: "_7Air_Screen", facing: .minusZ),
+        "iphone-17-pro.usdz": Model(screenMaterial: "Screen", showcase: true),
+        "iphone-16.usdz": Model(screenMaterial: "HdvBvHLgXAUNOwl"),
+    ]
     /// The Duo's cover display, on the back of its left half.
     static let coverMaterial = "C_NS_Screen_Outer"
-    static let onScreen = ["Front_Cam", "Front_Sensor"]
     /// The Duo's hinge line, in the model's own space: x = 0, z = this. Its
     /// open and folded models differ by half a turn about it.
     static let hingeZ: Float = 0.002584
@@ -548,6 +568,10 @@ struct Phone {
     }()
 
     static func load(_ url: URL, foldable: Bool) -> Result<Phone, SimFailure> {
+        guard let model = models[url.lastPathComponent] else {
+            return .failure(SimFailure(message: "leaf doesn't know the phone model \(url.lastPathComponent). Reinstall leaf; if it persists, please report it."))
+        }
+        let screenMaterial = model.screenMaterial
         let scene: SCNScene
         do { scene = try SCNScene(url: url, options: nil) } catch {
             return .failure(SimFailure(message: "leaf's phone model at \(url.path) couldn't be read (\(error.localizedDescription)). Reinstall leaf to restore it."))
@@ -559,8 +583,9 @@ struct Phone {
                 }
             }
         }
+        let backward = model.facing == .minusZ
         guard let screen = node(in: scene, material: screenMaterial),
-              let (width, height) = mapUVs(screen, mirrored: false) else {
+              let (width, height) = mapUVs(screen, mirrored: backward) else {
             return .failure(SimFailure(message: "leaf's phone model at \(url.path) has no screen mesh (material \(screenMaterial)). Reinstall leaf to restore it."))
         }
         let (low, high) = screen.boundingBox
@@ -590,11 +615,16 @@ struct Phone {
             cover = (node, width, height)
         }
 
-        // The screen and the island share a depth; lift each a hair so the
-        // island stays on top and nothing flickers.
-        screen.simdPosition.z += 0.00001
+        if model.showcase { keepScreensPhone(scene, screen: screen) }
+
+        // The screen and the island share a depth; lift each a hair (in
+        // screen heights, as the models' units differ) so the island stays
+        // on top and nothing flickers.
+        screen.simdLocalTranslate(by: SIMD3(0, 0, (backward ? -height : height) * 0.00006))
         scene.rootNode.enumerateHierarchy { node, _ in
-            if let name = node.name, onScreen.contains(where: name.hasPrefix) { node.simdPosition.z += 0.00002 }
+            if let name = node.name, model.onScreen.contains(where: name.hasPrefix) {
+                node.simdLocalTranslate(by: SIMD3(0, 0, height * 0.00013))
+            }
         }
 
         let center = SIMD3<Float>(Float(low.x + high.x) / 2, Float(low.y + high.y) / 2, Float(high.z))
@@ -604,7 +634,9 @@ struct Phone {
         let holder = SCNNode()
         let worldToScreen = screen.simdWorldTransform.inverse
         for child in scene.rootNode.childNodes { holder.addChildNode(child) }
-        holder.simdTransform = scale * move * worldToScreen
+        // A screen facing -Z is turned half a turn about Y to face the camera.
+        let toFront = backward ? simd_float4x4(simd_quatf(angle: .pi, axis: SIMD3(0, 1, 0))) : matrix_identity_float4x4
+        holder.simdTransform = toFront * scale * move * worldToScreen
         let pivot = SCNNode()
         pivot.addChildNode(holder)
         scene.rootNode.addChildNode(pivot)
@@ -648,6 +680,25 @@ struct Phone {
         let screenNodes = [screen] + (moved[ObjectIdentifier(screen)].map { [$0] } ?? [])
         return .success(Phone(scene: scene, pivot: pivot, screen: Glass(nodes: screenNodes, size: main.size),
                               material: material, dark: dark, size: openSize, fold: fold))
+    }
+
+    /// Drops every mesh that sits beside the screen's phone rather than
+    /// within it: a showcase file's other phones.
+    static func keepScreensPhone(_ scene: SCNScene, screen: SCNNode) {
+        let (low, high) = screen.boundingBox
+        let margin = Float(high.x - low.x) * 0.25
+        let left = Float(low.x) - margin, right = Float(high.x) + margin
+        var beside: [SCNNode] = []
+        var screenAndAncestors: [SCNNode] = []
+        var walk: SCNNode? = screen
+        while let next = walk { screenAndAncestors.append(next); walk = next.parent }
+        scene.rootNode.enumerateHierarchy { node, _ in
+            guard node.geometry != nil, !screenAndAncestors.contains(where: { $0 === node }) else { return }
+            let (a, b) = node.boundingBox
+            let middle = screen.simdConvertPosition((SIMD3<Float>(a) + SIMD3<Float>(b)) / 2, from: node)
+            if middle.x < left || middle.x > right { beside.append(node) }
+        }
+        for node in beside { node.removeFromParentNode() }
     }
 
     /// The first node drawn with `material`.
@@ -1274,7 +1325,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// Which body to draw, beside the helper.
     func modelURL() -> URL? {
         guard let executable = Bundle.main.executableURL else { return nil }
-        let name = pose == nil ? "iphone.usdz" : "iphone-duo-open.usdz"
+        let chosen = ProcessInfo.processInfo.environment["LEAF_SIM_MODEL"] ?? ""
+        let name = pose != nil ? "iphone-duo-open.usdz" : (Phone.models[chosen] == nil ? "iphone.usdz" : chosen)
         return executable.deletingLastPathComponent().appendingPathComponent(name)
     }
 

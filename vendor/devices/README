@@ -1,3 +1,5 @@
 iphone.usdz: the iPhone model leaf's simulator pane draws the simulator's screen on (src/simulator.swift), made for leaf by its author. The screen is the mesh with material COLOUR_Cherry_Screen.
 
 iphone-duo-open.usdz: the iPhone Duo, open. The pane folds it by turning the left half half a turn about the hinge (x = 0, z = 0.002584); the cover display is the mesh with material C_NS_Screen_Outer. Baked for leaf from "Apple iPhone Duo Fold Night Sky 2026" by extraakash (https://sketchfab.com/AakashMansukhani), Sketchfab Standard. The live screen is the mesh with material COLOUR_Cherry_Screen.
+
+iphone-air.usdz (iPhone Air, sky blue), iphone-17-pro.usdz (iPhone 17 Pro and Pro Max, deep blue), iphone-16.usdz (iPhone 16 and 16 Plus, teal): supplied by leaf's author. Their screens are the meshes with materials _7Air_Screen, Screen and HdvBvHLgXAUNOwl; the Air's screen faces -Z in its mesh, and the 17 Pro file shows the phone twice (front and back), of which the pane keeps the one with the screen. src/simulator.rs picks a model by device type; others use iphone.usdz.
