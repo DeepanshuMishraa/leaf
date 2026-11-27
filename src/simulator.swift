@@ -498,10 +498,66 @@ struct Phone {
     /// open and folded models differ by half a turn about it.
     static let hingeZ: Float = 0.002584
 
+    /// A surface's look: its base colour and how metal and rough it is.
+    struct Finish {
+        let red: CGFloat, green: CGFloat, blue: CGFloat
+        let metalness: CGFloat, roughness: CGFloat
+
+        static func gray(_ level: CGFloat, metalness: CGFloat, roughness: CGFloat) -> Finish {
+            Finish(red: level, green: level, blue: level, metalness: metalness, roughness: roughness)
+        }
+
+        func apply(to material: SCNMaterial) {
+            material.diffuse.contents = NSColor(srgbRed: red, green: green, blue: blue, alpha: 1)
+            material.metalness.contents = metalness
+            material.roughness.contents = roughness
+        }
+    }
+
+    /// The Duo's black finish, by material. The model's bake kept only its
+    /// sides' colour; every other body part came out the default near-white.
+    static let duoFinish: [String: Finish] = {
+        let black = Finish.gray(0.012, metalness: 0, roughness: 0.4)
+        let backGlass = Finish(red: 0.028, green: 0.03, blue: 0.036, metalness: 0.15, roughness: 0.32)
+        let frame = Finish(red: 0.06, green: 0.065, blue: 0.075, metalness: 1, roughness: 0.22)
+        let darkMetal = Finish.gray(0.14, metalness: 1, roughness: 0.3)
+        return [
+            "BASE_Black_Front_Border": black,
+            "BASE_Black_Plastic": black,
+            "BASE_Black_Pure": black,
+            "BASE_Glass_Black": black,
+            "BASE_Cam_Edge_Black": black,
+            "C_NS_Plastic": black,
+            "C_NS_Antenna": Finish.gray(0.03, metalness: 0, roughness: 0.6),
+            "C_NS_ButtonCap": frame,
+            "C_NS_Side": frame,
+            "C_NS_Side_001": frame,
+            "C_NS_Side_Matte": Finish(red: 0.06, green: 0.065, blue: 0.075, metalness: 1, roughness: 0.4),
+            "C_NS_Backpanel": backGlass,
+            "C_NS_Backpanel_Inner": backGlass,
+            "C_NS_Apple": Finish.gray(0.1, metalness: 1, roughness: 0.15),
+            "BASE_Hinge": Finish.gray(0.04, metalness: 1, roughness: 0.35),
+            "BASE_Grey": Finish.gray(0.08, metalness: 0, roughness: 0.8),
+            "C_NS_BackCamSpeaker": black,
+            "C_NS_BottomTopSpeaker": black,
+            "C_NS_Screws": darkMetal,
+            "C_NS_Screws_Aniso": darkMetal,
+            "BASE_Flash_Base": darkMetal,
+            "BASE_Copper": darkMetal,
+        ]
+    }()
+
     static func load(_ url: URL, foldable: Bool) -> Result<Phone, SimFailure> {
         let scene: SCNScene
         do { scene = try SCNScene(url: url, options: nil) } catch {
             return .failure(SimFailure(message: "leaf's phone model at \(url.path) couldn't be read (\(error.localizedDescription)). Reinstall leaf to restore it."))
+        }
+        if foldable {
+            scene.rootNode.enumerateHierarchy { node, _ in
+                for material in node.geometry?.materials ?? [] {
+                    if let name = material.name, let finish = duoFinish[name] { finish.apply(to: material) }
+                }
+            }
         }
         guard let screen = node(in: scene, material: screenMaterial),
               let (width, height) = mapUVs(screen, mirrored: false) else {
