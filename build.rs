@@ -30,7 +30,11 @@ const HELPERS: [Helper; 2] = [
     },
     Helper {
         name: "leaf-sim-host",
-        sources: &["src/pane.swift", "src/simulator.swift"],
+        sources: &[
+            "src/pane.swift",
+            "src/simulator.swift",
+            "src/simagent.swift",
+        ],
         library: true,
         what: "the iOS Simulator helper",
     },

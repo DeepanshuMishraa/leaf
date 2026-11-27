@@ -32,7 +32,7 @@ After opening a screen, end your turn or carry on with other work. Don't sleep, 
 | Read a saved web page | `leaf open page.html` (no JavaScript runs; pages built by scripts show an error) |
 | Read an online article, paper or Markdown link | `leaf open https://…`. Readability text. PDF links open as PDFs, arXiv `/abs/` opens the full paper, GitHub `blob/…/*.md` opens the raw file |
 | Use a real, interactive web page: a dev server, a web app, a site that needs sign-in or JavaScript | `leaf browser [url]` (Rex on macOS only, see below) |
-| See or drive an iOS app in an iPhone simulator | `leaf sim open <udid>`, then `leaf sim tap/swipe/type/screenshot` (Rex on macOS with Xcode, see below) |
+| See or drive an iOS app in an iPhone simulator | `leaf sim open <udid>`, then `leaf sim snapshot` and `leaf sim tap @e3` (macOS with Xcode, see below and the `leaf-sim` skill) |
 | Flip through pictures | `leaf open shot.png` (`←/→` move through the folder) |
 | Pick from recent documents | `leaf` or `leaf open` with no file |
 | Hear a document read aloud | open it, then tell them to press `a` |
@@ -84,21 +84,17 @@ The person can also use **Leaf: Open Simulator…** in Rex's command palette. Wi
 
 **iPhone Duo.** It starts folded, with iOS on its cover screen. `cmd+f` (or the book button) opens it: iOS's hinge moves with the model, the same way Xcode's Device Hub folds it, and iOS moves to the wide inner screen in landscape. Folding it shut locks the phone, as on the device; a tap on the cover wakes it. You can't fold it from the command line. Screenshots and coordinates follow whichever screen faces front, so take a new screenshot after the person folds or opens it. While it's moving, touches fail with a message to wait.
 
-**Driving it.** Coordinates are pixels of the screenshot, with 0,0 at the top left. Take a screenshot first and read it, then act, then take another to check:
+**Driving it.** Follow the `leaf-sim` skill (`leaf agent skill leaf-sim` prints it). In short: read the screen as text, act on refs, read only what changed. Don't screenshot every step:
 
 ```bash
-leaf sim screenshot              # prints the PNG's path; read it to see the screen
-leaf sim info                    # name, udid and the screen's width and height in pixels
-leaf sim tap 600 1400
-leaf sim swipe 600 2000 600 600 0.4   # x1 y1 x2 y2 [seconds]; scroll by swiping
-leaf sim type "hello@example.com"    # into the focused field, US keyboard characters
-leaf sim key enter               # enter, escape, backspace, tab, space, up, down, left, right…
-leaf sim button home             # home, lock, side, siri
-leaf sim open-url myapp://settings
-leaf sim launch com.example.MyApp
+leaf sim snapshot -i             # the elements you can act on, each with a ref
+leaf sim tap @e3                 # or a point: leaf sim tap 600 1400 (screenshot pixels)
+leaf sim fill @e5 "hello@example.com"
+leaf sim snapshot -i --diff      # only what changed
+leaf sim launch Settings         # by name or bundle id
 ```
 
-`tap`, `swipe`, `type`, `key`, `button` and `info` need the simulator open in a Leaf pane. `screenshot`, `open-url` and `launch` work on any booted simulator. With more than one, add `--device <udid>`. The person sees a ring wherever you touch. Build and install apps with `xcodebuild` and `xcrun simctl install <udid> <app>` as usual.
+These work on any booted iPhone simulator, in a Leaf pane or not. With more than one booted, add `--device <udid>`. In a pane, the person sees a ring wherever you touch. Build and install apps with `xcodebuild` and `xcrun simctl install <udid> <app>` as usual.
 
 **Questions about the screen.** The person presses the speech bubble (or `shift+cmd+a`), optionally drags over part of the screen, types a question and presses `enter`. It arrives as a message starting `From the iOS Simulator open in leaf:` with the device, a screenshot path and the marked region in pixels. Read the screenshot, then answer.
 

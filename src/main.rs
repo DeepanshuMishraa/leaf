@@ -73,6 +73,8 @@ mod sheet;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod simmodels;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod simsnap;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod simulator;
 mod skills;
 mod slides;

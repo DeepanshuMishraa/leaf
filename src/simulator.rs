@@ -5,9 +5,11 @@
 //! compiled by build.rs and embedded here; see src/helper.rs), unpacked with
 //! the iPhone and iPhone Duo models beside it. It boots the device, shows its
 //! live screen and sends touches and keys. It also listens on a Unix socket, one per
-//! device, which `leaf sim tap|swipe|type|key|button|info` talk to.
-//! `screenshot`, `open-url` and `launch` go through `simctl` and work on any
-//! booted simulator.
+//! device, which `leaf sim snapshot|tap|swipe|type|key|button|info` talk to.
+//! With no pane on a booted device, those run the helper headless
+//! (`leaf-sim-host --drive`), one request each. `screenshot`, `open-url`
+//! and `launch` go through `simctl`. Snapshots and their refs are in
+//! simsnap.rs.
 //!
 //! Asking about the screen: the helper writes one JSON line per question to
 //! its stdout; this process saves a screenshot, sends the question with its
@@ -23,6 +25,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::helper::{Part, macos_version};
+use crate::simsnap::{Detail, Element, Snapshot, Tree, parse_ref};
 
 const SIM_HOST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/leaf-sim-host"));
 /// Runs inside the iPhone Duo's simulator to move its hinge (src/duo-hinge.m).
@@ -32,14 +35,20 @@ const USAGE: &str = "Usage: leaf sim install [--yes]          download the 3D iP
        leaf sim list [--json]            installed iPhone simulators
        leaf sim open <udid>              show one in this Rex pane, on a 3D iPhone
        leaf sim info                     the device and its screen size in pixels
+       leaf sim snapshot [-i] [--diff]   the screen's elements, each with a ref (@e3) to act on;
+                                         -i only what can be acted on, --diff only what changed
        leaf sim screenshot [file.png]    save the screen; prints the file's path
-       leaf sim tap <x> <y>              tap, in screenshot pixels (0,0 is the top left)
+       leaf sim tap <@ref | x y>         tap an element, or a point in screenshot pixels (0,0 top left)
        leaf sim swipe <x1> <y1> <x2> <y2> [seconds]
-       leaf sim type <text>              type on the simulator's keyboard
-       leaf sim key <name>               enter, escape, backspace, tab, space, up, down, left, right…
+       leaf sim scroll <up|down|left|right> [@ref]
+       leaf sim type [@ref] <text>       type on the simulator's keyboard, first tapping @ref
+       leaf sim fill <@ref> <text>       tap a field, clear it and type
+       leaf sim key <name>               enter, escape, backspace, tab, space, up, down… or a chord: cmd+a
        leaf sim button <name>            home, lock, side or siri
+       leaf sim wait <text> [seconds]    until an element showing the text is on screen (10 s)
+       leaf sim apps                     installed apps and their bundle ids
+       leaf sim launch <bundle id|name>  start an installed app
        leaf sim open-url <url>           open a link or deep link
-       leaf sim launch <bundle id>       start an installed app
 Add --device <udid> to pick a simulator when more than one is open or booted.";
 
 /// One installed iPhone simulator.
@@ -315,8 +324,8 @@ fn take_device(args: &[String]) -> Result<(Option<String>, Vec<String>), SimErro
 }
 
 /// Which device a command means: the one named, else the only one open in a
-/// pane, else (when `booted_will_do`) the only booted one.
-fn pick_device(named: Option<String>, booted_will_do: bool) -> Result<String, String> {
+/// pane, else the only booted one.
+fn pick_device(named: Option<String>) -> Result<String, String> {
     if let Some(udid) = named.or_else(|| {
         std::env::var("LEAF_SIM_DEVICE")
             .ok()
@@ -335,9 +344,6 @@ fn pick_device(named: Option<String>, booted_will_do: bool) -> Result<String, St
                 many.join(", ")
             ));
         }
-    }
-    if !booted_will_do {
-        return Err("No simulator is open in a Leaf pane. Open one with Leaf: Open Simulator… in Rex's command palette, or `leaf sim open <udid>` in a Rex pane (`leaf sim list` shows the ids).".into());
     }
     let booted: Vec<Device> = devices()?.into_iter().filter(Device::booted).collect();
     match booted.as_slice() {
@@ -384,6 +390,253 @@ fn ask_pane(udid: &str, request: &serde_json::Value) -> Result<serde_json::Value
         Ok(Answer::Failed { message }) => Err(message),
         Err(e) => Err(format!(
             "The simulator pane answered with something leaf couldn't read ({e}). Update leaf so the CLI and the pane match."
+        )),
+    }
+}
+
+/// How long after an action a snapshot waits for the screen to react.
+const ACTION_GRACE: Duration = Duration::from_millis(1500);
+
+fn action_path(udid: &str) -> Result<PathBuf, String> {
+    Ok(socket_dir()?.join(format!("{}.acted", udid.to_uppercase())))
+}
+
+/// Notes that something was just done to `udid`; best effort.
+fn acted(udid: &str) {
+    if let Ok(path) = action_path(udid) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, b"");
+    }
+}
+
+/// How long ago something was last done to `udid` through leaf.
+fn since_action(udid: &str) -> Option<Duration> {
+    let modified = std::fs::metadata(action_path(udid).ok()?)
+        .ok()?
+        .modified()
+        .ok()?;
+    modified.elapsed().ok()
+}
+
+/// Sends `request` to the pane showing `udid` or, with none open, to the
+/// helper run headless for this one request.
+fn drive(udid: &str, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let acts = ["tap", "swipe", "type", "key", "button"]
+        .iter()
+        .any(|action| request.get(action).is_some());
+    let answer = drive_once(udid, request);
+    if acts {
+        acted(udid);
+    }
+    answer
+}
+
+fn drive_once(udid: &str, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if UnixStream::connect(socket_path(udid)?).is_ok() {
+        return ask_pane(udid, request);
+    }
+    let executable = helper()?;
+    let mut child = Command::new(&executable)
+        .arg("--drive")
+        .env("LEAF_SIM_UDID", udid)
+        .env("LEAF_DEVELOPER_DIR", developer_dir()?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "couldn't start leaf's simulator driver at {} ({e}). Nothing was sent.",
+                executable.display()
+            )
+        })?;
+    if let Some(mut input) = child.stdin.take() {
+        let line = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+        input.write_all(&line).map_err(|e| {
+            format!("leaf's simulator driver stopped early ({e}). Nothing was sent.")
+        })?;
+    }
+    let output = child.wait_with_output().map_err(|e| {
+        format!("lost track of leaf's simulator driver ({e}). The action may or may not have happened; take a snapshot to check.")
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match serde_json::from_str::<Answer>(stdout.trim()) {
+        Ok(Answer::Ok(value)) => Ok(value),
+        Ok(Answer::Failed { message }) => Err(message),
+        Err(_) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let why = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty());
+            Err(format!(
+                "leaf's simulator driver stopped without answering ({}; {}). The action may or may not have happened; take a snapshot to check.",
+                output.status,
+                why.unwrap_or("it printed nothing")
+            ))
+        }
+    }
+}
+
+/// The frontmost app's elements, once the screen has been still for a
+/// moment or after `settle` seconds.
+fn tree(udid: &str, settle: f64) -> Result<Tree, String> {
+    let value = drive(
+        udid,
+        &serde_json::json!({ "snapshot": { "settle": settle } }),
+    )?;
+    serde_json::from_value(value).map_err(|e| {
+        format!("The simulator sent its screen in a form leaf couldn't read ({e}). Update leaf so the CLI and the pane match.")
+    })
+}
+
+/// Where the last snapshot of `udid` is kept, for its refs and `--diff`.
+fn snapshot_path(udid: &str) -> Result<PathBuf, String> {
+    Ok(socket_dir()?.join(format!("{}.snapshot.json", udid.to_uppercase())))
+}
+
+/// The last snapshot of `udid`; an empty one when there's none yet.
+fn last_snapshot(udid: &str) -> Snapshot {
+    snapshot_path(udid)
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_snapshot(udid: &str, snapshot: &Snapshot) -> Result<(), String> {
+    let path = snapshot_path(udid)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    }
+    let json = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| {
+        format!(
+            "couldn't save the snapshot's refs to {} ({e}); refs from it won't work.",
+            path.display()
+        )
+    })
+}
+
+/// Where the element `@e<number>` from the last snapshot is now.
+fn locate(udid: &str, number: u32) -> Result<(Element, i64, i64), String> {
+    let snapshot = last_snapshot(udid);
+    let entry = snapshot.entry(number).ok_or_else(|| {
+        format!("@e{number} isn't in this simulator's last snapshot. Run `leaf sim snapshot` and use a ref it shows.")
+    })?;
+    let tree = tree(udid, 1.0)?;
+    let element = tree.find(&entry.key).cloned().ok_or_else(|| {
+        let name = match (entry.key.label.as_str(), entry.key.id.as_str()) {
+            ("", "") => String::new(),
+            ("", id) => format!(" #{id}"),
+            (label, _) => format!(" \"{label}\""),
+        };
+        format!(
+            "@e{number} ({}{name}) isn't on the screen now. Run `leaf sim snapshot` to see what is.",
+            entry.key.role.to_lowercase()
+        )
+    })?;
+    Ok((element, tree.width, tree.height))
+}
+
+/// Taps the middle of `@e<number>`.
+fn tap_ref(udid: &str, number: u32) -> Result<(), String> {
+    let (element, width, height) = locate(udid, number)?;
+    let (x, y) = element.tap_point(width, height);
+    drive(udid, &serde_json::json!({ "tap": { "at": [x, y] } }))?;
+    Ok(())
+}
+
+/// A swipe that scrolls `direction` across `area` (x, y, width, height):
+/// "down" moves the content up to show what's below.
+fn scroll_swipe(direction: &str, area: [i64; 4]) -> Option<([i64; 2], [i64; 2])> {
+    let [x, y, w, h] = area;
+    let (cx, cy) = (x + w / 2, y + h / 2);
+    let (near_x, far_x) = (x + w * 3 / 10, x + w * 7 / 10);
+    let (near_y, far_y) = (y + h * 3 / 10, y + h * 7 / 10);
+    match direction {
+        "down" => Some(([cx, far_y], [cx, near_y])),
+        "up" => Some(([cx, near_y], [cx, far_y])),
+        "right" => Some(([far_x, cy], [near_x, cy])),
+        "left" => Some(([near_x, cy], [far_x, cy])),
+        _ => None,
+    }
+}
+
+/// An installed app.
+#[derive(Debug, PartialEq, Eq)]
+struct App {
+    name: String,
+    bundle: String,
+    /// Installed by someone, not part of iOS.
+    user: bool,
+}
+
+/// `simctl listapps`, as JSON (plutil's conversion of its property list).
+fn parse_apps(json: &str) -> Result<Vec<App>, String> {
+    let listed: BTreeMap<String, serde_json::Value> = serde_json::from_str(json)
+        .map_err(|e| format!("couldn't read simctl's list of apps ({e})."))?;
+    let mut apps: Vec<App> = listed
+        .into_iter()
+        .map(|(bundle, info)| {
+            let text = |key: &str| info.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+            App {
+                name: text("CFBundleDisplayName")
+                    .or_else(|| text("CFBundleName"))
+                    .unwrap_or_else(|| bundle.clone()),
+                user: text("ApplicationType").as_deref() == Some("User"),
+                bundle,
+            }
+        })
+        .collect();
+    apps.sort_by_key(|app| (!app.user, app.name.to_lowercase()));
+    Ok(apps)
+}
+
+fn apps(udid: &str) -> Result<Vec<App>, String> {
+    let plist = simctl(&["listapps", udid])?;
+    let mut plutil = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("plutil couldn't run ({e}), so leaf can't read the app list."))?;
+    if let Some(mut input) = plutil.stdin.take() {
+        input
+            .write_all(plist.as_bytes())
+            .map_err(|e| format!("plutil stopped early ({e})."))?;
+    }
+    let output = plutil
+        .wait_with_output()
+        .map_err(|e| format!("plutil didn't finish ({e})."))?;
+    parse_apps(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The bundle id `name` means: itself when it looks like one, else the
+/// app with that name, or the only one whose name starts with it.
+fn bundle_for(name: &str, apps: &[App]) -> Result<String, String> {
+    if let Some(app) = apps.iter().find(|app| app.bundle == name) {
+        return Ok(app.bundle.clone());
+    }
+    let wanted = name.to_lowercase();
+    if let Some(app) = apps.iter().find(|app| app.name.to_lowercase() == wanted) {
+        return Ok(app.bundle.clone());
+    }
+    let starting: Vec<&App> = apps
+        .iter()
+        .filter(|app| app.name.to_lowercase().starts_with(&wanted))
+        .collect();
+    match starting.as_slice() {
+        [one] => Ok(one.bundle.clone()),
+        [] => Err(format!(
+            "No installed app is called {name}. `leaf sim apps` lists them."
+        )),
+        many => Err(format!(
+            "{name} could be {}. Use the full name or the bundle id.",
+            many.iter()
+                .map(|app| format!("{} ({})", app.name, app.bundle))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -545,7 +798,7 @@ fn prompt(device: &Device, shot: &Shot, ask: &Ask) -> String {
         }
     }
     out.push_str(&format!(
-        "You can drive this simulator with `leaf sim tap X Y`, `leaf sim swipe X1 Y1 X2 Y2`, `leaf sim type TEXT`, `leaf sim key NAME`, `leaf sim button home` and `leaf sim screenshot`, in screenshot pixels, adding `--device {}`.\n\n",
+        "You can drive this simulator with `leaf sim snapshot` (its elements, each with a ref like @e3), `leaf sim tap @e3` or `leaf sim tap X Y`, `leaf sim swipe X1 Y1 X2 Y2`, `leaf sim type TEXT`, `leaf sim key NAME`, `leaf sim button home` and `leaf sim screenshot`, in screenshot pixels, adding `--device {}`.\n\n",
         device.udid
     ));
     let question = match ask.question.trim() {
@@ -758,59 +1011,211 @@ fn command(args: &[String]) -> Result<(), SimError> {
             Ok(())
         }
         ["info"] => {
-            let udid = pick_device(named, false)?;
-            print_value(&ask_pane(&udid, &serde_json::json!({ "info": {} }))?);
+            let udid = pick_device(named)?;
+            let mut info = drive(&udid, &serde_json::json!({ "info": {} }))?;
+            // Run headless, the helper doesn't know the device's name.
+            if info.get("name").and_then(|n| n.as_str()) == Some("")
+                && let Some(device) = devices()?.into_iter().find(|d| d.udid == udid)
+            {
+                info["name"] = device.name.into();
+                info["runtime"] = device.runtime.into();
+            }
+            print_value(&info);
+            Ok(())
+        }
+        ["snapshot", flags @ ..] => {
+            let (mut detail, mut diff) = (Detail::Full, false);
+            for flag in flags {
+                match *flag {
+                    "-i" | "--interactive" => detail = Detail::Interactive,
+                    "--diff" | "-d" => diff = true,
+                    _ => return Err(SimError::Usage),
+                }
+            }
+            let udid = pick_device(named)?;
+            let before = last_snapshot(&udid);
+            // Right after an action the screen may not have started to
+            // change (going home takes about a second), so a still screen
+            // that matches the last snapshot isn't trusted until then.
+            let mut snapshot = tree(&udid, 2.0)?.snapshot(&before, detail);
+            while snapshot.screen == before.screen
+                && since_action(&udid).is_some_and(|since| since < ACTION_GRACE)
+            {
+                std::thread::sleep(Duration::from_millis(150));
+                snapshot = tree(&udid, 2.0)?.snapshot(&before, detail);
+            }
+            save_snapshot(&udid, &snapshot)?;
+            if diff && !before.text.is_empty() {
+                print!("{}", snapshot.diff(&before));
+            } else {
+                print!("{}", snapshot.text);
+            }
             Ok(())
         }
         ["screenshot"] | ["screenshot", _] => {
-            let udid = pick_device(named, true)?;
+            let udid = pick_device(named)?;
             let path = screenshot(&udid, words.get(1).copied())?;
             println!("{}", path.display());
             Ok(())
         }
+        ["tap", target] => {
+            let number = parse_ref(target).ok_or(SimError::Usage)?;
+            let udid = pick_device(named)?;
+            Ok(tap_ref(&udid, number)?)
+        }
         ["tap", x, y] => {
-            let udid = pick_device(named, false)?;
+            let udid = pick_device(named)?;
             let at = [number(x)?, number(y)?];
-            ask_pane(&udid, &serde_json::json!({ "tap": { "at": at } }))?;
+            drive(&udid, &serde_json::json!({ "tap": { "at": at } }))?;
             Ok(())
         }
         ["swipe", x1, y1, x2, y2, rest @ ..] if rest.len() <= 1 => {
-            let udid = pick_device(named, false)?;
+            let udid = pick_device(named)?;
             let duration = rest.first().map(|s| number(s)).transpose()?.unwrap_or(0.3);
             let request = serde_json::json!({ "swipe": {
                 "from": [number(x1)?, number(y1)?],
                 "to": [number(x2)?, number(y2)?],
                 "duration": duration,
             }});
-            ask_pane(&udid, &request)?;
+            drive(&udid, &request)?;
             Ok(())
         }
-        ["type", text @ ..] if !text.is_empty() => {
-            let udid = pick_device(named, false)?;
-            ask_pane(
+        ["scroll", direction, rest @ ..] if rest.len() <= 1 => {
+            let udid = pick_device(named)?;
+            let area = match rest.first() {
+                Some(target) => {
+                    let number = parse_ref(target).ok_or(SimError::Usage)?;
+                    locate(&udid, number)?.0.frame
+                }
+                None => {
+                    let info = drive(&udid, &serde_json::json!({ "info": {} }))?;
+                    let size = |key: &str| info.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+                    [0, 0, size("width"), size("height")]
+                }
+            };
+            let (from, to) = scroll_swipe(direction, area).ok_or(SimError::Usage)?;
+            let request =
+                serde_json::json!({ "swipe": { "from": from, "to": to, "duration": 0.4 } });
+            drive(&udid, &request)?;
+            Ok(())
+        }
+        ["type", target, text @ ..] if !text.is_empty() && parse_ref(target).is_some() => {
+            let number = parse_ref(target).ok_or(SimError::Usage)?;
+            let udid = pick_device(named)?;
+            tap_ref(&udid, number)?;
+            // The keyboard takes a moment to come up.
+            std::thread::sleep(Duration::from_millis(300));
+            drive(
                 &udid,
                 &serde_json::json!({ "type": { "text": text.join(" ") } }),
             )?;
             Ok(())
         }
+        ["type", text @ ..] if !text.is_empty() => {
+            let udid = pick_device(named)?;
+            drive(
+                &udid,
+                &serde_json::json!({ "type": { "text": text.join(" ") } }),
+            )?;
+            Ok(())
+        }
+        ["fill", target, text @ ..] => {
+            let number = parse_ref(target).ok_or(SimError::Usage)?;
+            let udid = pick_device(named)?;
+            tap_ref(&udid, number)?;
+            std::thread::sleep(Duration::from_millis(300));
+            for key in ["cmd+a", "backspace"] {
+                drive(&udid, &serde_json::json!({ "key": { "name": key } }))?;
+            }
+            if !text.is_empty() {
+                drive(
+                    &udid,
+                    &serde_json::json!({ "type": { "text": text.join(" ") } }),
+                )?;
+            }
+            Ok(())
+        }
         ["key", name] => {
-            let udid = pick_device(named, false)?;
-            ask_pane(&udid, &serde_json::json!({ "key": { "name": name } }))?;
+            let udid = pick_device(named)?;
+            drive(&udid, &serde_json::json!({ "key": { "name": name } }))?;
             Ok(())
         }
         ["button", name] => {
-            let udid = pick_device(named, false)?;
-            ask_pane(&udid, &serde_json::json!({ "button": { "name": name } }))?;
+            let udid = pick_device(named)?;
+            drive(&udid, &serde_json::json!({ "button": { "name": name } }))?;
+            Ok(())
+        }
+        ["wait", text, rest @ ..] if rest.len() <= 1 => {
+            let seconds = rest.first().map(|s| number(s)).transpose()?.unwrap_or(10.0);
+            let udid = pick_device(named)?;
+            let wanted = text.to_lowercase();
+            let deadline = std::time::Instant::now() + Duration::from_secs_f64(seconds.max(0.0));
+            loop {
+                let before = last_snapshot(&udid);
+                let snapshot = tree(&udid, 0.0)?.snapshot(&before, Detail::Full);
+                let found: Vec<&str> = snapshot
+                    .text
+                    .lines()
+                    .skip(1)
+                    .filter(|line| line.to_lowercase().contains(&wanted))
+                    .collect();
+                if !found.is_empty() {
+                    for line in found {
+                        println!("{}", line.trim_start());
+                    }
+                    save_snapshot(&udid, &snapshot)?;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(SimError::Message(format!(
+                        "Nothing on the screen showed \"{text}\" within {seconds} s. Run `leaf sim snapshot` to see what's there."
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        ["apps"] => {
+            let udid = pick_device(named)?;
+            for app in apps(&udid)? {
+                let mark = if app.user { "" } else { "  (iOS)" };
+                println!("{}  {}{mark}", app.name, app.bundle);
+            }
             Ok(())
         }
         ["open-url", url] => {
-            let udid = pick_device(named, true)?;
+            let udid = pick_device(named)?;
             simctl(&["openurl", &udid, url])?;
+            acted(&udid);
             Ok(())
         }
-        ["launch", bundle] => {
-            let udid = pick_device(named, true)?;
-            simctl(&["launch", &udid, bundle])?;
+        ["launch", name @ ..] if !name.is_empty() => {
+            let udid = pick_device(named)?;
+            let installed = apps(&udid)?;
+            let bundle = bundle_for(&name.join(" "), &installed)?;
+            simctl(&["launch", &udid, &bundle])?;
+            acted(&udid);
+            // simctl returns once the app runs; wait until it's in front, so
+            // the next snapshot shows it. Its accessibility name is usually
+            // its display name.
+            let Some(app) = installed.iter().find(|app| app.bundle == bundle) else {
+                return Ok(());
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                let front = tree(&udid, 0.0)?;
+                if front
+                    .app_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&app.name))
+                {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            // simctl sometimes starts an app it just terminated in the background.
+            eprintln!(
+                "leaf: {} is running but didn't come to the front within 3 s. Run `leaf sim snapshot` to check; if it's not there, tap its icon on the home screen.",
+                app.name
+            );
             Ok(())
         }
         _ => Err(SimError::Usage),
@@ -982,6 +1387,58 @@ mod tests {
             body: Body::Pro17,
             version: vec![26, 1],
         }
+    }
+
+    #[test]
+    fn apps_list_installed_ones_first_by_name() {
+        let json = r#"{
+            "com.apple.Preferences": {"CFBundleDisplayName": "Settings", "ApplicationType": "System"},
+            "com.example.Notes": {"CFBundleName": "Notes Pro", "ApplicationType": "User"},
+            "com.apple.mobilesafari": {"CFBundleDisplayName": "Safari", "ApplicationType": "System"},
+            "com.apple.bare": {}
+        }"#;
+        let apps = parse_apps(json).expect("parses");
+        let names: Vec<&str> = apps.iter().map(|app| app.name.as_str()).collect();
+        assert_eq!(names, ["Notes Pro", "com.apple.bare", "Safari", "Settings"]);
+        assert!(apps[0].user);
+    }
+
+    #[test]
+    fn apps_are_found_by_bundle_name_or_unique_start() {
+        let app = |name: &str, bundle: &str| App {
+            name: name.into(),
+            bundle: bundle.into(),
+            user: false,
+        };
+        let apps = [
+            app("Settings", "com.apple.Preferences"),
+            app("Safari", "com.apple.mobilesafari"),
+            app("Shortcuts", "com.apple.shortcuts"),
+        ];
+        assert_eq!(
+            bundle_for("settings", &apps).as_deref(),
+            Ok("com.apple.Preferences")
+        );
+        assert_eq!(
+            bundle_for("Saf", &apps).as_deref(),
+            Ok("com.apple.mobilesafari")
+        );
+        assert_eq!(
+            bundle_for("com.apple.shortcuts", &apps).as_deref(),
+            Ok("com.apple.shortcuts")
+        );
+        let many = bundle_for("S", &apps).expect_err("ambiguous");
+        assert!(many.contains("Settings (com.apple.Preferences)"));
+        assert!(bundle_for("Maps", &apps).is_err());
+    }
+
+    #[test]
+    fn scrolling_down_swipes_up_inside_the_area() {
+        let area = [0, 100, 1000, 1000];
+        assert_eq!(scroll_swipe("down", area), Some(([500, 800], [500, 400])));
+        assert_eq!(scroll_swipe("up", area), Some(([500, 400], [500, 800])));
+        assert_eq!(scroll_swipe("right", area), Some(([700, 600], [300, 600])));
+        assert_eq!(scroll_swipe("sideways", area), None);
     }
 
     #[test]

@@ -2016,89 +2016,30 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         }
     }
 
-    /// One request from `leaf sim`, on the server's thread. Coordinates are
-    /// screenshot pixels, as `leaf sim screenshot` saves them.
+    /// One request from `leaf sim`, on the server's thread (see `Driver`).
     func handle(_ request: [String: Any]) -> [String: Any] {
-        enum State { case starting, folding, live(HID, Int, Int, turned: Bool, display: String) }
+        enum State { case starting, folding, live(LiveScreen) }
         let state = DispatchQueue.main.sync { () -> State in
-            guard let hid = self.hid, let surface = self.surface else { return .starting }
+            guard let hid = self.hid, let surface = self.surface, let device = self.device else { return .starting }
             if self.folding { return .folding }
-            // The open Duo's inner screen: simctl's screenshot of it is
-            // landscape, the framebuffer under it portrait.
+            var info: [String: Any] = ["udid": self.udid, "name": self.name, "runtime": self.runtime]
+            // The Duo's screen in use, for `leaf sim screenshot`.
+            if self.pose != nil { info["display"] = self.pose == .open ? "primary-1" : "primary" }
             let turned = self.quarterTurned
-            let display = self.pose == .open ? "primary-1" : "primary"
-            return turned ? .live(hid, surface.height, surface.width, turned: true, display: display)
-                : .live(hid, surface.width, surface.height, turned: false, display: display)
+            return .live(LiveScreen(hid: hid, device: device,
+                                    width: turned ? surface.height : surface.width,
+                                    height: turned ? surface.width : surface.height,
+                                    turned: turned, info: info))
         }
-        let hid: HID, width: Int, height: Int, turned: Bool, display: String
         switch state {
         case .starting:
-            return ["failed": ["message": "\(name) is still starting. Wait for its home screen, then try again."]]
+            return Driver.failed("\(name) is still starting. Wait for its home screen, then try again.")
         case .folding:
-            return ["failed": ["message": "\(name) is folding or opening. Wait a second, take a new screenshot, then try again."]]
-        case .live(let live, let across, let down, let quarter, let shown):
-            (hid, width, height, turned, display) = (live, across, down, quarter, shown)
+            return Driver.failed("\(name) is folding or opening. Wait a second, take a new screenshot, then try again.")
+        case .live(let screen):
+            return Driver.handle(request, on: screen) { ripple($0) }
         }
-        func fraction(_ value: Any?, _ size: Int) -> CGFloat? {
-            guard let number = value as? NSNumber else { return nil }
-            return CGFloat(truncating: number) / CGFloat(size)
-        }
-        /// A screenshot pixel as a fraction of the framebuffer.
-        func point(_ value: Any?) -> CGPoint? {
-            guard let pair = value as? [Any], pair.count == 2,
-                  let x = fraction(pair[0], width), let y = fraction(pair[1], height),
-                  (0...1).contains(x), (0...1).contains(y) else { return nil }
-            return turned ? CGPoint(x: y, y: 1 - x) : CGPoint(x: x, y: y)
-        }
-        let outside = "is outside the screen, which is \(width)×\(height) pixels with 0,0 at the top left"
-        if let tap = request["tap"] as? [String: Any] {
-            guard let at = point(tap["at"]) else { return failed("The tap \(outside).") }
-            ripple(at)
-            hid.tap(at: at)
-            return ["ok": [:]]
-        }
-        if let swipe = request["swipe"] as? [String: Any] {
-            guard let from = point(swipe["from"]), let to = point(swipe["to"]) else {
-                return failed("The swipe \(outside).")
-            }
-            let duration = min(max((swipe["duration"] as? NSNumber)?.doubleValue ?? 0.3, 0.05), 5)
-            ripple(from)
-            hid.swipe(from: from, to: to, duration: duration)
-            return ["ok": [:]]
-        }
-        if let type = request["type"] as? [String: Any], let text = type["text"] as? String {
-            let skipped = hid.type(text)
-            if skipped.isEmpty { return ["ok": [:]] }
-            let list = String(Set(skipped).prefix(20))
-            return failed("Typed the rest, but these characters aren't on a US keyboard and were skipped: \(list). Paste such text with `xcrun simctl pbcopy \(udid)` and a long-press Paste.")
-        }
-        if let key = request["key"] as? [String: Any], let name = key["name"] as? String {
-            guard let usage = Keys.named[name.lowercased()] else {
-                return failed("No key named \(name). Keys: \(Keys.named.keys.sorted().joined(separator: ", ")).")
-            }
-            hid.key(usage, down: true)
-            usleep(40_000)
-            hid.key(usage, down: false)
-            hid.queue.sync {}
-            return ["ok": [:]]
-        }
-        if let button = request["button"] as? [String: Any], let name = button["name"] as? String {
-            guard let which = HID.Button(rawValue: name.lowercased()) else {
-                return failed("No button named \(name). Buttons: \(HID.Button.allCases.map(\.rawValue).joined(separator: ", ")).")
-            }
-            hid.press(which)
-            return ["ok": [:]]
-        }
-        if request["info"] != nil {
-            var info: [String: Any] = ["udid": udid, "name": name, "runtime": runtime, "width": width, "height": height]
-            // The Duo's screen in use, for `leaf sim screenshot`.
-            if pose != nil { info["display"] = display }
-            return ["ok": info]
-        }
-        return failed("leaf's simulator pane didn't understand that request. Update leaf so the CLI and the pane match.")
     }
-
-    func failed(_ message: String) -> [String: Any] { ["failed": ["message": message]] }
 
     /// A ring where the agent touches, so the person sees what it does.
     func ripple(_ at: CGPoint) {
@@ -2576,6 +2517,7 @@ final class SimulatorDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 @main
 enum SimulatorMain {
     static func main() {
+        if CommandLine.arguments.dropFirst().first == "--drive" { Headless.run() }
         let (session, block) = PaneApp.rexBlock(for: "the simulator")
         let environment = ProcessInfo.processInfo.environment
         guard let udid = environment["LEAF_SIM_UDID"], !udid.isEmpty,
