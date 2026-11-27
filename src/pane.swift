@@ -665,6 +665,13 @@ class PaneController: NSObject {
     /// Handles a key that Rex binds; false lets the page and menus have it.
     func handleRexKey(_ event: NSEvent) -> Bool {
         guard let chord = Chord(event), !bindings.isEmpty else { return false }
+        // No Rex app was connected when the bindings loaded, so nothing could
+        // perform them: leave the key to the pane and look again.
+        guard appClient != nil else {
+            pendingPrefix = []
+            loadBindings()
+            return false
+        }
         let typed = pendingPrefix + [chord]
         if let binding = bindings.first(where: { $0.keys == typed }) {
             pendingPrefix = []

@@ -45,32 +45,55 @@ pub fn unpack(prefix: &str, what: &str, parts: &[Part]) -> Result<PathBuf, Strin
     for part in parts {
         let target = dir.join(part.name);
         let partial = target.with_extension(format!("{}.part", std::process::id()));
-        fs::write(&partial, part.bytes)
-            .map_err(|e| format!("couldn't write {}: {e}", partial.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&partial, fs::Permissions::from_mode(part.mode))
-                .map_err(|e| format!("couldn't set permissions on {}: {e}", partial.display()))?;
+        let placed = (|| {
+            fs::write(&partial, part.bytes)
+                .map_err(|e| format!("couldn't write {}: {e}", partial.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&partial, fs::Permissions::from_mode(part.mode)).map_err(
+                    |e| format!("couldn't set permissions on {}: {e}", partial.display()),
+                )?;
+            }
+            fs::rename(&partial, &target)
+                .map_err(|e| format!("couldn't place {}: {e}", target.display()))
+        })();
+        if placed.is_err() {
+            let _ = fs::remove_file(&partial);
         }
-        fs::rename(&partial, &target)
-            .map_err(|e| format!("couldn't place {}: {e}", target.display()))?;
+        placed?;
     }
     // Removing old helpers is best effort: one left behind only takes a
-    // little disk space, and a pane still running from it keeps working.
+    // little disk space. A folder a pane is still running from is kept, as
+    // the pane may still read files from it (the browser's scripts).
     if let Some(cache) = dir.parent()
         && let Ok(entries) = fs::read_dir(cache)
     {
         let own = format!("{prefix}-");
         for entry in entries.flatten() {
             let path = entry.path();
-            if path != dir && entry.file_name().to_string_lossy().starts_with(&own) && path.is_dir()
+            if path != dir
+                && entry.file_name().to_string_lossy().starts_with(&own)
+                && path.is_dir()
+                && !in_use(&path)
             {
                 let _ = fs::remove_dir_all(path);
             }
         }
     }
     Ok(dir)
+}
+
+/// True when a running process was started from inside `folder` (or when
+/// that can't be told, to be safe).
+fn in_use(folder: &std::path::Path) -> bool {
+    let pattern = format!("^{}/", regex::escape(&folder.to_string_lossy()));
+    Command::new("/usr/bin/pgrep")
+        .args(["-f", &pattern])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| status.code() != Some(1))
 }
 
 /// This Mac's macOS version as (major, minor), when it can be read.

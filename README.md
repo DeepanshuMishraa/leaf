@@ -16,7 +16,7 @@ Homebrew:
 brew install deepanshumishraa/tap/leaf
 ```
 
-From source (Linux also needs `build-essential pkg-config libclang-dev libasound2-dev libfontconfig1`; macOS needs `xcode-select --install` for the browser):
+From source (Linux also needs `build-essential pkg-config libclang-dev libasound2-dev libfontconfig1`; macOS needs `xcode-select --install` for the browser and the simulator pane, and Xcode's iOS Simulator SDK for the iPhone Duo's hinge):
 
 ```sh
 cargo install leaf-reader
@@ -130,7 +130,7 @@ Adds Leaf to Rex's command palette (`cmd+shift+p`): open documents, review diffs
 
 **Open Browser** (or `leaf browser [url]`) opens a WebKit browser in a pane, macOS 13+. Its start page lists local dev servers. Press the pointer button (`shift+cmd+c`) to pick an element with [React Grab](https://github.com/aidenybai/react-grab) and ask your agent about it.
 
-**Open Simulator…** (or `leaf sim open <udid>`) opens an installed iPhone simulator on a 3D iPhone in a pane, macOS 13+ with Xcode. The 3D iPhones (about 11 MB) aren't part of leaf: run `leaf sim install` (or **Install Simulator…** in the palette) once, which lists them, asks, downloads them and turns the simulator on. The iPhone Duo runs its own iOS and folds and opens with `cmd+f`. Your agent drives it with `leaf sim tap|swipe|type|screenshot` (see `leaf sim help`).
+**Open Simulator…** (or `leaf sim open <udid>`) opens an installed iPhone simulator on a 3D iPhone in a pane, macOS 13+ with Xcode. The 3D iPhones (about 11 MB) aren't part of leaf: run `leaf sim install` (or **Install Simulator…** in the palette) once, which lists them, asks, downloads them and turns the simulator on. The iPhone Duo runs its own iOS and folds and opens with `cmd+f`. Your agent drives it with `leaf sim tap|swipe|type|screenshot|info` (see `leaf sim help`).
 
 ### With Amber
 

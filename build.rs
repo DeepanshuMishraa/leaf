@@ -56,12 +56,13 @@ fn main() {
     };
     let arch = if arch == "aarch64" { "arm64" } else { arch };
     let hinge = out.join(DUO_HINGE);
+    let mut any_failed = false;
     if !compile_duo_hinge(arch, &hinge) {
         fs::write(&hinge, []).expect("write an empty helper");
+        any_failed = true;
     }
     // The helpers use macOS 13 API, whatever Leaf itself targets.
     let triple = format!("{arch}-apple-macos13.0");
-    let mut any_failed = false;
     for helper in &HELPERS {
         let output = out.join(helper.name);
         if compile(&triple, helper, &output) {
@@ -80,6 +81,10 @@ fn main() {
         ] {
             println!("cargo:rerun-if-changed={swiftc}");
         }
+        // And the iOS Simulator SDK, which the Duo's hinge helper needs.
+        println!(
+            "cargo:rerun-if-changed=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk"
+        );
     }
 }
 
@@ -115,6 +120,11 @@ fn compile_duo_hinge(arch: &str, output: &Path) -> bool {
         .env_remove("MACOSX_DEPLOYMENT_TARGET")
         .env_remove("IPHONEOS_DEPLOYMENT_TARGET")
         .status();
+    // A release must never ship a Duo that can't unfold, as with the helpers.
+    let failed = !matches!(&result, Ok(status) if status.success());
+    if failed && env::var_os("CI").is_some() {
+        panic!("could not compile {DUO_HINGE_SOURCE} for the iOS Simulator: {result:?}");
+    }
     match result {
         Ok(status) if status.success() => true,
         Ok(status) => {

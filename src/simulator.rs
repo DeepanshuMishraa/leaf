@@ -96,6 +96,19 @@ impl Body {
 }
 
 impl Device {
+    /// A device as `leaf sim list` would list it, for other modules' tests.
+    #[cfg(test)]
+    pub fn listed(udid: &str, name: &str, runtime: &str, state: &str) -> Device {
+        Device {
+            udid: udid.into(),
+            name: name.into(),
+            runtime: runtime.into(),
+            state: state.into(),
+            body: Body::for_device_type(""),
+            version: Vec::new(),
+        }
+    }
+
     pub fn booted(&self) -> bool {
         self.state == "Booted"
     }
@@ -728,6 +741,10 @@ fn command(args: &[String]) -> Result<(), SimError> {
             let rows = crate::palette::simulators(&devices()?);
             let json = serde_json::to_string(&rows).map_err(|e| e.to_string())?;
             println!("{json}");
+            Ok(())
+        }
+        ["help"] | ["--help"] | ["-h"] => {
+            println!("{USAGE}");
             Ok(())
         }
         ["install"] => Ok(crate::simmodels::install(false).map_err(String::from)?),

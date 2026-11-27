@@ -1716,7 +1716,12 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
                 pending.removeSubrange(pending.startIndex...end)
                 if let step = Simulator.bootStep(line) { latest = step }
             }
-            if let latest { DispatchQueue.main.async { self?.bootProgress(latest) } }
+            if let latest {
+                DispatchQueue.main.async {
+                    self?.lastBootLine = latest
+                    self?.bootProgress(latest)
+                }
+            }
         }
         task.terminationHandler = { [weak self] finished in
             DispatchQueue.main.async { self?.bootFinished(finished.terminationStatus) }
@@ -1742,10 +1747,22 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     }
 
     var booted = false
+    /// `bootstatus`'s last line, for when it fails.
+    var lastBootLine: String?
+    /// True after `bootstatus` failed before the screen appeared.
+    var bootFailed = false
 
+    /// `bootstatus` exited. A failure there isn't always fatal (it reports
+    /// "Data Migration Failed" on devices that then run fine), so it only
+    /// counts while the screen hasn't appeared; `attachDisplay` clears it
+    /// if the screen comes after all.
     func bootFinished(_ status: Int32) {
         booted = true
-        if display == nil {
+        if display == nil, status != 0 {
+            bootFailed = true
+            let why = lastBootLine.map { " (\($0))" } ?? ""
+            fail(SimFailure(message: "\(name) didn't finish booting\(why). leaf keeps waiting for its screen; if it doesn't come, close the pane, run `xcrun simctl shutdown \(udid)`, and open the simulator again."))
+        } else if display == nil {
             showStatus("Connecting to the screen…", busy: true)
         } else {
             fadeStatus()
@@ -1814,7 +1831,14 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
             fail(failure)
         }
         updateControls()
-        if booted { fadeStatus() }
+        if bootFailed, hid != nil {
+            // bootstatus gave up, but the screen came: it was a false alarm.
+            bootFailed = false
+            status.isHidden = true
+            statusLabel.textColor = .labelColor
+        } else if booted {
+            fadeStatus()
+        }
     }
 
     func surfaceChanged() {
@@ -1827,11 +1851,30 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     /// Shows the Duo's screen that faces front: the inner one open, the
     /// cover folded.
     func showDuoScreen() {
+        if duoDisplays == nil { findDuoDisplays() }
         guard let duoDisplays, let pose else { return }
         let wanted = pose == .open ? duoDisplays.inner : duoDisplays.cover
         guard wanted !== display else { return }
         display = wanted
         if let latest = CoreSim.surface(of: wanted) { show(latest) }
+    }
+
+    /// Looks again for the Duo's two screens, when the inner one wasn't up
+    /// in time for `attachDisplay`, and watches the one that's new.
+    func findDuoDisplays() {
+        guard pose != nil, let device else { return }
+        let screens = CoreSim.builtInDisplays(of: device).compactMap { display in
+            CoreSim.surface(of: display).map { (display: display, area: $0.width * $0.height) }
+        }
+        guard screens.count >= 2,
+              let cover = screens.min(by: { $0.area < $1.area }),
+              let inner = screens.max(by: { $0.area < $1.area }) else { return }
+        duoDisplays = (cover: cover.display, inner: inner.display)
+        for found in [cover.display, inner.display] where found !== display {
+            _ = CoreSim.watchSurfaces(of: found) { [weak self] in
+                DispatchQueue.main.async { self?.surfaceChanged() }
+            }
+        }
     }
 
     /// Starts the hinge helper inside the Duo (src/duo-hinge.m), which tells
@@ -2296,8 +2339,14 @@ enum BootOwner {
         return kill(pid, 0) != 0 && errno == ESRCH
     }
 
+    /// Records `pid` as the device's owner. The folder is made here: on a
+    /// fresh install nothing else has made it yet (the control socket that
+    /// lives beside it comes later), and without the record no guardian
+    /// shuts the device down.
     static func claim(_ file: String, pid: pid_t) -> Bool {
-        (try? "\(pid)".write(toFile: file, atomically: true, encoding: .utf8)) != nil
+        let folder = (file as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        return (try? "\(pid)".write(toFile: file, atomically: true, encoding: .utf8)) != nil
     }
 
     static func release(_ file: String) {

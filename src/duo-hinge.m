@@ -12,6 +12,8 @@
 #import <objc/message.h>
 #include <dlfcn.h>
 #include <mach/mach_time.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 extern CFDataRef IOCFSerialize(CFTypeRef object, uint32_t options);
 static const uint32_t kSerializeToBinary = 1;
@@ -47,7 +49,9 @@ static void send(double degrees) {
         @"type": @"range",
         @"value": @(MAX(0, MIN(180, degrees))),
     };
-    NSData *data = CFBridgingRelease(IOCFSerialize((__bridge CFTypeRef)control, kSerializeToBinary));
+    // Kept alive to the end: HID reads `data.bytes` after its last mention.
+    __attribute__((objc_precise_lifetime)) NSData *data =
+        CFBridgingRelease(IOCFSerialize((__bridge CFTypeRef)control, kSerializeToBinary));
     if (data == nil) {
         fprintf(stderr, "leaf-duo-hinge: couldn't serialize the hinge angle %.1f; the hinge didn't move.\n", degrees);
         return;

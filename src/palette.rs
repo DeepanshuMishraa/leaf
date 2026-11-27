@@ -210,7 +210,36 @@ pub fn simulators(devices: &[crate::simulator::Device]) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulator::Device;
     use std::path::PathBuf;
+
+    #[test]
+    fn simulators_keep_their_order_and_mark_the_booted() {
+        let devices = [
+            Device::listed("B2", "iPhone 17 Pro", "iOS 26.1", "Booted"),
+            Device::listed("A1", "iPhone 16", "iOS 18.6", "Shutdown"),
+        ];
+        let rows = simulators(&devices);
+        let summary: Vec<(&str, &str, &str, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.as_str(),
+                    row.title.as_str(),
+                    row.subtitle.as_str(),
+                    row.detail.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("B2", "iPhone 17 Pro", "iOS 26.1", "booted"),
+                ("A1", "iPhone 16", "iOS 18.6", ""),
+            ]
+        );
+        assert!(rows.iter().all(|row| row.icon == "iphone"));
+    }
 
     fn tree(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("leaf-palette-{name}-{}", std::process::id()));
