@@ -434,7 +434,9 @@ fn screenshot(udid: &str, path: Option<&str>) -> Result<PathBuf, String> {
     let display = ask_pane(udid, &serde_json::json!({ "info": {} }))
         .ok()
         .and_then(|info| info.get("display")?.as_str().map(str::to_owned));
-    let first = match &display {
+    match &display {
+        // The pane named the screen that faces front; capturing another
+        // would show the agent the wrong one, so its error stands.
         Some(display) => simctl(&[
             "io",
             udid,
@@ -442,20 +444,19 @@ fn screenshot(udid: &str, path: Option<&str>) -> Result<PathBuf, String> {
             "--type=png",
             &format!("--display={display}"),
             &shown,
-        ]),
-        None => simctl(&["io", udid, "screenshot", "--type=png", &shown]),
+        ])?,
+        None => simctl(&["io", udid, "screenshot", "--type=png", &shown]).or_else(|first| {
+            simctl(&[
+                "io",
+                udid,
+                "screenshot",
+                "--type=png",
+                "--display=primary",
+                &shown,
+            ])
+            .map_err(|_| first)
+        })?,
     };
-    first.or_else(|first| {
-        simctl(&[
-            "io",
-            udid,
-            "screenshot",
-            "--type=png",
-            "--display=primary",
-            &shown,
-        ])
-        .map_err(|_| first)
-    })?;
     Ok(target)
 }
 

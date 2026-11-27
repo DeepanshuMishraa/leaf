@@ -1050,6 +1050,8 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     var orbit = Orbit()
     var device: NSObject?
     var display: NSObject?
+    /// Polls for surface swaps, when they can't be watched (`pollSurfaces`).
+    var surfacePoll: Timer?
     /// The Duo's two screens, once both are up.
     var duoDisplays: (cover: NSObject, inner: NSObject)?
     /// The Duo's hinge helper's stdin, while it runs.
@@ -1814,9 +1816,7 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
                 DispatchQueue.main.async { self?.surfaceChanged() }
             } && watched
         }
-        if !watched {
-            Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.surfaceChanged() }
-        }
+        if !watched { pollSurfaces() }
         if pose != nil {
             startHinge()
             // Opened before the screens were up: catch up.
@@ -1871,10 +1871,19 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
               let inner = screens.max(by: { $0.area < $1.area }) else { return }
         duoDisplays = (cover: cover.display, inner: inner.display)
         for found in [cover.display, inner.display] where found !== display {
-            _ = CoreSim.watchSurfaces(of: found) { [weak self] in
+            let watched = CoreSim.watchSurfaces(of: found) { [weak self] in
                 DispatchQueue.main.async { self?.surfaceChanged() }
             }
+            if !watched { pollSurfaces() }
         }
+    }
+
+    /// Checks the shown screen's surface twice a second, for a display whose
+    /// surface swaps can't be watched. One timer serves every display, as
+    /// `surfaceChanged` reads whichever is shown.
+    func pollSurfaces() {
+        guard surfacePoll == nil else { return }
+        surfacePoll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.surfaceChanged() }
     }
 
     /// Starts the hinge helper inside the Duo (src/duo-hinge.m), which tells
@@ -2169,8 +2178,14 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
         guard !asking else { return }
         var request: [String: Any] = ["question": askCard.field.stringValue]
         if let mark, let surface {
-            let w = CGFloat(surface.width), h = CGFloat(surface.height)
-            request["region"] = [Int(mark.minX * w), Int(mark.minY * h), Int(mark.width * w), Int(mark.height * h)]
+            // `mark` is a fraction of the framebuffer. The open Duo's screenshot
+            // is landscape: a framebuffer point (x, y) is at (1 - y, x) there.
+            let shot = quarterTurned
+                ? CGRect(x: 1 - mark.maxY, y: mark.minX, width: mark.height, height: mark.width)
+                : mark
+            let (w, h) = quarterTurned ? (CGFloat(surface.height), CGFloat(surface.width))
+                : (CGFloat(surface.width), CGFloat(surface.height))
+            request["region"] = [Int(shot.minX * w), Int(shot.minY * h), Int(shot.width * w), Int(shot.height * h)]
         }
         guard tellLeaf(["ask": request]) else {
             askCard.note.stringValue = "leaf stopped listening, so nothing was sent. Close this pane and open the simulator again."

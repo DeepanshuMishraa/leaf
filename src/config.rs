@@ -164,7 +164,16 @@ pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|error| (path.clone(), error))?;
         }
-        std::fs::write(&path, updated).map_err(|error| (path.clone(), error))?;
+        // Written beside and renamed over, so a failed write (a full disk)
+        // leaves the old file whole.
+        let partial = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let written = std::fs::write(&partial, updated)
+            .and_then(|()| std::fs::File::open(&partial)?.sync_all())
+            .and_then(|()| std::fs::rename(&partial, &path));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&partial);
+            return Err((path, error));
+        }
     }
     Ok(path)
 }
@@ -175,7 +184,10 @@ pub fn enable_simulator() -> Result<PathBuf, (PathBuf, io::Error)> {
 fn with_simulator_enabled(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let header = |line: &str| line.trim().starts_with('[');
-    let Some(start) = lines.iter().position(|line| line.trim() == "[simulator]") else {
+    let Some(start) = lines
+        .iter()
+        .position(|line| table_name(line).as_deref() == Some("simulator"))
+    else {
         let mut out = text.to_owned();
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
@@ -199,6 +211,27 @@ fn with_simulator_enabled(text: &str) -> String {
     let mut joined = out.join("\n");
     joined.push('\n');
     joined
+}
+
+/// The table a `[name]` header line opens, however it's spaced, quoted or
+/// commented (`[ simulator ]  # the pane`); None for any other line,
+/// including `[[array]]` headers.
+fn table_name(line: &str) -> Option<String> {
+    let line = line.split('#').next()?.trim();
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.starts_with('[') {
+        return None;
+    }
+    let name = inner.trim();
+    let unquoted = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+        .or_else(|| {
+            name.strip_prefix('\'')
+                .and_then(|name| name.strip_suffix('\''))
+        })
+        .unwrap_or(name);
+    Some(unquoted.to_owned())
 }
 
 pub fn load() -> Result<Config, ConfigFailed> {
@@ -258,7 +291,20 @@ impl KeysConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, with_simulator_enabled};
+    use super::{Config, table_name, with_simulator_enabled};
+
+    #[test]
+    fn table_headers_are_read_however_written() {
+        assert_eq!(table_name("[simulator]").as_deref(), Some("simulator"));
+        assert_eq!(
+            table_name("  [ simulator ]  # the pane").as_deref(),
+            Some("simulator")
+        );
+        assert_eq!(table_name("['simulator']").as_deref(), Some("simulator"));
+        assert_eq!(table_name("[keys.reader]").as_deref(), Some("keys.reader"));
+        assert_eq!(table_name("[[simulator]]"), None);
+        assert_eq!(table_name("enabled = true"), None);
+    }
 
     #[test]
     fn enabling_the_simulator_edits_only_its_table() {
@@ -275,6 +321,18 @@ mod tests {
             with_simulator_enabled("[simulator]\n[keys.reader]\n"),
             "[simulator]\nenabled = true\n[keys.reader]\n"
         );
+        // However the header is written, the one table is edited.
+        for header in [
+            "[ simulator ]",
+            "[simulator]  # the pane",
+            "[\"simulator\"]",
+        ] {
+            let text = format!("{header}\nenabled = false\n");
+            let updated = with_simulator_enabled(&text);
+            assert_eq!(updated, format!("{header}\nenabled = true\n"), "{header}");
+            let parsed: Config = toml::from_str(&updated).expect("parses");
+            assert!(parsed.simulator.enabled, "{header}");
+        }
         let enabled: Config =
             toml::from_str(&with_simulator_enabled("[reader]\nmax_width = 90\n")).expect("parses");
         assert!(enabled.simulator.enabled);

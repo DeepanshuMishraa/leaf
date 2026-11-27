@@ -2343,6 +2343,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
         "shift+cmd+c",
     ].compactMap(Chord.init))
 
+    /// When `handleRexKey` last looked for a Rex app to perform bindings.
+    var bindingsRetriedAt: Date?
+
     func loadBindings() {
         let session = session
         Rex.background {
@@ -2376,6 +2379,17 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDel
     /// Handles a key that Rex binds; false lets the page and menus have it.
     func handleRexKey(_ event: NSEvent) -> Bool {
         guard let chord = Chord(event), !bindings.isEmpty else { return false }
+        // No Rex app was connected when the bindings loaded, so nothing could
+        // perform them: leave the key to the page and look again.
+        guard appClient != nil else {
+            pendingPrefix = nil
+            // At most every few seconds: each look runs rex twice.
+            if bindingsRetriedAt.map({ Date().timeIntervalSince($0) > 3 }) ?? true {
+                bindingsRetriedAt = Date()
+                loadBindings()
+            }
+            return false
+        }
         let inField = typingInField
         // Focus moved into a field after a multi-key binding began, such as a
         // click on the address bar: drop the binding so the key is text.

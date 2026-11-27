@@ -139,10 +139,27 @@ impl Model {
         format!("{STORE}/{}", self.file)
     }
 
-    /// True when it's on disk at its full size. The checksum was checked
-    /// when it was downloaded.
+    /// True when it's on disk whole: its size and SHA-256 match. A damaged
+    /// or half-replaced file counts as missing, so `leaf sim install`
+    /// fetches it again.
     fn installed(&self) -> Result<bool, ModelsFailed> {
-        Ok(fs::metadata(dir()?.join(self.file)).is_ok_and(|meta| meta.len() == self.bytes))
+        let path = dir()?.join(self.file);
+        if !fs::metadata(&path).is_ok_and(|meta| meta.len() == self.bytes) {
+            return Ok(false);
+        }
+        let Ok(mut file) = fs::File::open(&path) else {
+            return Ok(false);
+        };
+        let mut hash = Sha256::new();
+        let mut chunk = [0; 64 * 1024];
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => hash.update(&chunk[..read]),
+                Err(_) => return Ok(false),
+            }
+        }
+        Ok(hex(&hash.finalize()) == self.sha256)
     }
 }
 
@@ -250,6 +267,10 @@ pub fn install(yes: bool) -> Result<(), ModelsFailed> {
     Ok(())
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
@@ -311,11 +332,7 @@ fn fetch(model: &Model, progress: impl Fn(u64)) -> Result<(), ModelsFailed> {
             got += read as u64;
             progress(got);
         }
-        let actual: String = hash
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let actual = hex(&hash.finalize());
         if got != model.bytes || actual != model.sha256 {
             return Err(ModelsFailed::Corrupt {
                 file: model.file,
