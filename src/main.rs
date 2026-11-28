@@ -67,6 +67,7 @@ mod remote;
 mod render;
 mod review;
 mod rextheme;
+mod rst;
 mod scheme;
 mod shape;
 mod sheet;
@@ -86,6 +87,7 @@ mod sponsors;
 mod stroke;
 mod syntax;
 mod tempo;
+mod text;
 mod theme;
 mod typeset;
 mod upgrade;
@@ -237,6 +239,9 @@ fn load_file(path: &Path) -> Result<Doc, String> {
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(path).map_err(|e| e.to_string());
     }
+    if rst::is_rst(path) {
+        return rst::open(path).map_err(|e| e.to_string());
+    }
     if html::is_html(path) {
         return html::open(path).map_err(|e| e.to_string());
     }
@@ -249,9 +254,7 @@ fn load_file(path: &Path) -> Result<Doc, String> {
     if let Some(advice) = office::older(path) {
         return Err(advice);
     }
-    Err(format!(
-        "Can't open \"{target}\". leaf reads PDF files (.pdf), EPUB books (.epub), markdown files (.md), HTML pages (.html, .htm), Word documents (.docx), slide decks (.pptx), spreadsheets (.xlsx, .xls, .ods, .csv, .tsv), pictures (.png, .jpg, .gif, .webp, .svg and more; .heic needs macOS) and web pages (http:// or https:// URLs)."
-    ))
+    text::open(path).map_err(|e| e.to_string())
 }
 
 /// Remembers the image mode, each document's highlights and bookmarks, and where each
