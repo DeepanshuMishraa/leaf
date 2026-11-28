@@ -94,10 +94,13 @@ fn pages(text: &str, lang: Option<&str>) -> Vec<Rc<str>> {
     let lines: Vec<&str> = text.split('\n').collect();
     lines
         .chunks(LINES)
-        .map(|chunk| {
+        .enumerate()
+        .map(|(page, chunk)| {
             let code = chunk.join("\n");
             let fence = fence(&code);
-            format!("{fence}{}\n{code}\n{fence}\n", lang.unwrap_or("")).into()
+            let line = page * LINES + 1;
+            let lang = lang.map(|l| format!("{l} ")).unwrap_or_default();
+            format!("{fence}{lang}line={line}\n{code}\n{fence}\n").into()
         })
         .collect()
 }
@@ -180,9 +183,10 @@ mod tests {
         let text: String = (0..LINES + 5).map(|i| format!("line {i}\n")).collect();
         let pages = pages(&text, Some("rust"));
         assert_eq!(pages.len(), 2);
-        assert!(pages[0].starts_with("```rust\nline 0\n"));
+        assert!(pages[0].starts_with("```rust line=1\nline 0\n"));
         assert!(pages[0].ends_with(&format!("line {}\n```\n", LINES - 1)));
-        assert!(pages[1].starts_with(&format!("```rust\nline {LINES}\n")));
+        assert!(pages[1].starts_with(&format!("```rust line={}\nline {LINES}\n", LINES + 1)));
+        assert!(super::pages("x", None)[0].starts_with("```line=1\n"));
     }
 
     #[test]
@@ -193,7 +197,10 @@ mod tests {
         std::fs::write(&script, "@echo off\r\necho hi\r\n").unwrap();
         let doc = open(&script).unwrap();
         assert_eq!(doc.title, "go.bat");
-        assert_eq!(&*doc.source.page(0), "```bat\n@echo off\necho hi\n```\n");
+        assert_eq!(
+            &*doc.source.page(0),
+            "```bat line=1\n@echo off\necho hi\n```\n"
+        );
 
         let blob = dir.join("blob.bin");
         std::fs::write(&blob, [0u8, 1, 2, 3]).unwrap();

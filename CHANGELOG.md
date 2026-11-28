@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `leaf open` reads any text file: source code, scripts, config files and logs open as code, colored by the language their extension or name points to, such as `.py`, `.bat`, `.rs`, `Makefile` or `Dockerfile` (#74, #89). Long files are split into pages of 1,000 lines. A binary file gets a message saying so instead of noise.
+- `leaf open` reads any text file: source code, scripts, config files and logs open as code with line numbers, colored by the language their extension or name points to, such as `.py`, `.bat`, `.rs`, `Makefile` or `Dockerfile` (#74, #89). Long files are split into pages of 1,000 lines. A binary file gets a message saying so instead of noise.
 
 ## 0.19.2
 

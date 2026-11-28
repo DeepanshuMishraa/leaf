@@ -225,6 +225,9 @@ enum Node {
     Code {
         lang: Option<String>,
         text: String,
+        /// The first line's number, for a block that shows line numbers
+        /// in a gutter instead of a rule (a whole file, see `text`).
+        first_line: Option<usize>,
     },
     List {
         start: Option<u64>,
@@ -256,7 +259,9 @@ struct Builder {
     images: Vec<String>,
     /// Open links and wikilink embeds, innermost last.
     links: Vec<Link>,
-    code: Option<(Option<String>, String)>,
+    /// The open code block: its language, its first line's number when it
+    /// shows line numbers, and its text so far.
+    code: Option<(Option<String>, Option<usize>, String)>,
     html: Option<String>,
     table: Option<TableParts>,
     /// Whether HTML blocks are converted to markdown and read; off while reading a converted block.
@@ -367,8 +372,16 @@ impl Builder {
 fn fence_lang(info: &str) -> Option<String> {
     let name = info
         .split(|c: char| c.is_whitespace() || c == ',')
-        .find(|part| !part.is_empty())?;
+        .find(|part| !part.is_empty() && !part.starts_with("line="))?;
     Some(name.to_owned())
+}
+
+/// The first line number a fence asks for with `line=N`, as in
+/// ```` ```rust line=1001 ````. Such a block shows numbers in a gutter.
+fn fence_first_line(info: &str) -> Option<usize> {
+    info.split_whitespace()
+        .find_map(|part| part.strip_prefix("line="))
+        .and_then(|n| n.parse().ok())
 }
 
 pub(crate) fn code_style(kind: syntax::Kind) -> Style {
@@ -432,11 +445,11 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 }
                 Tag::CodeBlock(kind) => {
                     b.flush_paragraph();
-                    let lang = match kind {
-                        CodeBlockKind::Fenced(info) => fence_lang(&info),
-                        CodeBlockKind::Indented => None,
+                    let (lang, first_line) = match kind {
+                        CodeBlockKind::Fenced(info) => (fence_lang(&info), fence_first_line(&info)),
+                        CodeBlockKind::Indented => (None, None),
                     };
-                    b.code = Some((lang, String::new()));
+                    b.code = Some((lang, first_line, String::new()));
                 }
                 Tag::HtmlBlock => {
                     b.flush_paragraph();
@@ -547,12 +560,16 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                     }
                 }
                 TagEnd::CodeBlock => {
-                    if let Some((lang, code)) = b.code.take() {
+                    if let Some((lang, first_line, code)) = b.code.take() {
                         let text = code
                             .strip_suffix('\n')
                             .unwrap_or(&code)
                             .replace('\t', "    ");
-                        b.emit(Node::Code { lang, text });
+                        b.emit(Node::Code {
+                            lang,
+                            text,
+                            first_line,
+                        });
                     }
                 }
                 TagEnd::HtmlBlock => {
@@ -656,7 +673,7 @@ fn parse(markdown: &str, read_html: bool) -> Vec<Node> {
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some((_, code)) = b.code.as_mut() {
+                if let Some((_, _, code)) = b.code.as_mut() {
                     code.push_str(&text);
                 } else if image_depth == 0 {
                     b.text(&text);
@@ -991,6 +1008,47 @@ impl Ctx<'_> {
         }
     }
 
+    /// A whole file's code: dim line numbers in a gutter, then the code, with
+    /// no rule. A wrapped line leaves the gutter blank on its later rows.
+    fn numbered_code(&mut self, code: &str, lang: Option<&str>, first: usize, x: u16, width: u16) {
+        let start = self.record(code);
+        let kinds = syntax::kinds(code, lang);
+        let last = first + code.split('\n').count().saturating_sub(1);
+        let digits = last.to_string().len() as u16;
+        let gutter = digits + 3;
+        let mut line_start = 0usize;
+        for (n, line) in code.split('\n').enumerate() {
+            let cells: Vec<Cell> = line
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    let index = line_start + i;
+                    let kind = kinds.get(index).copied().unwrap_or(syntax::Kind::Plain);
+                    (c, code_style(kind), Some(start + index))
+                })
+                .collect();
+            line_start += cells.len() + 1;
+            let wrapped: Vec<&[Cell]> = if cells.is_empty() {
+                vec![&[]]
+            } else {
+                wrap_cells(&cells, width.saturating_sub(gutter).max(1), Wrap::Char)
+            };
+            for (row, part) in wrapped.into_iter().enumerate() {
+                let mut row_segs = Vec::new();
+                if row == 0 {
+                    row_segs.push(Seg {
+                        x,
+                        text: format!("{:>w$}", first + n, w = digits as usize),
+                        style: Style::default().fg(DIM),
+                        offset: None,
+                    });
+                }
+                row_segs.extend(segs(part, x + gutter));
+                self.laid.rows.push(Row { segs: row_segs });
+            }
+        }
+    }
+
     fn list(&mut self, start: Option<u64>, items: &[Vec<Node>], tight: bool, x: u16, width: u16) {
         let markers: Vec<String> = (0..items.len())
             .map(|i| match start {
@@ -1203,7 +1261,16 @@ impl Ctx<'_> {
             }
             Node::Heading(depth, runs) => self.heading(*depth, runs, x, width, Align::Left),
             Node::Quote(kind, blocks) => self.quote(*kind, blocks, x, width),
-            Node::Code { lang, text } => self.code(text, lang.as_deref(), x, width),
+            Node::Code {
+                lang,
+                text,
+                first_line: None,
+            } => self.code(text, lang.as_deref(), x, width),
+            Node::Code {
+                lang,
+                text,
+                first_line: Some(first),
+            } => self.numbered_code(text, lang.as_deref(), *first, x, width),
             Node::List {
                 start,
                 items,
@@ -1658,6 +1725,22 @@ mod tests {
         assert_eq!(
             draw("```\na = 1\n  b\n```", 20),
             vec!["┃ a = 1", "┃   b", ""]
+        );
+    }
+
+    #[test]
+    fn whole_files_number_their_lines_without_a_rule() {
+        assert_eq!(
+            draw("```py line=9\na = 1\n\nb = 2\n```", 20),
+            vec![" 9   a = 1", "10", "11   b = 2", ""]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_numbered_line_leaves_the_gutter_blank() {
+        assert_eq!(
+            draw("```line=1\nabcdefghij\n```", 9),
+            vec!["1   abcde", "    fghij", ""]
         );
     }
 
