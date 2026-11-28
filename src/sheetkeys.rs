@@ -34,6 +34,7 @@ actions! {
         Wider = "wider" [">"] "widen the column",
         Narrower = "narrower" ["<"] "narrow the column",
         Copy = "copy" ["y"] "copy the selection as tab-separated text",
+        Ask = "ask" ["@"] "ask your agent about the selected cells",
         Edit = "edit" ["e", "f2"] "edit the cell (CSV and TSV files)",
         Clear = "clear" ["x", "delete"] "empty the selected cells",
         InsertRowBelow = "insert_row_below" ["o"] "add a row below",

@@ -28,7 +28,7 @@ After opening a screen, end your turn or carry on with other work. Don't sleep, 
 |---|---|
 | Read a PDF or EPUB | `leaf open paper.pdf`, `leaf book.epub` |
 | Read Markdown, a README or notes | `leaf open README.md` |
-| Read a Word doc, deck or spreadsheet | `leaf open report.docx`, `talk.pptx`, `budget.xlsx` (also `.xls`, `.ods`, `.csv`, `.tsv`). Spreadsheets open in a grid the person can move around, select, sort and filter. CSV and TSV files can also be edited there, and are written only when the person saves |
+| Read a Word doc, deck or spreadsheet | `leaf open report.docx`, `talk.pptx`, `budget.xlsx` (also `.xls`, `.ods`, `.csv`, `.tsv`). Spreadsheets open in a grid the person can move around, select, sort and filter. CSV and TSV files can also be edited there, and are written only when the person saves. With `@` the person sends you the selected cells, with the header row, and a question |
 | Read a saved web page | `leaf open page.html` (no JavaScript runs; pages built by scripts show an error) |
 | Read an online article, paper or Markdown link | `leaf open https://…`. Readability text. PDF links open as PDFs, arXiv `/abs/` opens the full paper, GitHub `blob/…/*.md` opens the raw file |
 | Use a real, interactive web page: a dev server, a web app, a site that needs sign-in or JavaScript | `leaf browser [url]` (Rex on macOS only, see below) |

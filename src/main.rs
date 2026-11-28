@@ -153,7 +153,7 @@ Comments: leaf comments lists every saved review comment with its diff key.
 
 Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, : go to page, t outline beside the text (T over it), m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, @ or ctrl+enter send the selection, with the lines around it, to an agent, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit
 
-Sheet keys: arrows/hjkl or click move, shift+arrows/HJKL or drag select, g/G first/last row, 0/$ first/last column, / find (n/N), : go to a cell, s sort, F filter, y copy, [ ] sheets, < > column width, e edit, x empty, o/O add a row, D delete rows, I add a column, X delete columns, u/U undo/redo, ctrl+s save (CSV and TSV), ? keys, q quit
+Sheet keys: arrows/hjkl or click move, shift+arrows/HJKL or drag select, g/G first/last row, 0/$ first/last column, / find (n/N), : go to a cell, s sort, F filter, y copy, @ ask the agent about the cells, [ ] sheets, < > column width, e edit, x empty, o/O add a row, D delete rows, I add a column, X delete columns, u/U undo/redo, ctrl+s save (CSV and TSV), ? keys, q quit
 
 Board keys: v select, h hand, r box, d diamond, o ellipse, a arrow, l line, p pen, t text,
 F frame, e eraser, drag to draw, move or resize, the knob turns, double-click or enter writes text,
