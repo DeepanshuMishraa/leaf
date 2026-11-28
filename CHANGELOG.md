@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `leaf open` reads any text file: source code, scripts, config files and logs open as code with line numbers, colored by the language their extension or name points to, such as `.py`, `.bat`, `.rs`, `Makefile` or `Dockerfile` (#74, #89). Long files are split into pages of 1,000 lines. A binary file gets a message saying so instead of noise.
+- `leaf open` reads reStructuredText (`.rst`) as a formatted document, the way it reads markdown (#74, #90). Section titles, lists, literal and `code-block` blocks with their colors, notes and warnings, images, grid and simple tables, field lists, links and inline markup all show. Notes, tips and warnings get the same colored labels as GitHub alerts in markdown. Directives leaf doesn't know, such as `toctree`, are left out.
 - Spreadsheets and CSV files (`.xlsx`, `.xls`, `.ods`, `.csv`, `.tsv` and the rest) open in a grid of cells instead of pages of tables. Column letters and row numbers frame it, the first row stays pinned as the header, and numbers line up on the right. Move with the arrows or `hjkl`, or click a cell; drag or hold shift to select a range, and the bottom line shows its count, sum and average. Clicking a column letter or row number selects the whole column or row. `/` finds text, `:` goes to a cell such as `B12`, `s` sorts by the column, `F` filters rows by the column, `y` copies the selection as tab-separated text, `[` and `]` switch sheets, and `<` and `>` resize a column. The cell bar shows a cell's whole text and, in Excel files, its formula. `[keys.sheet]` rebinds the keys (#91).
 
 ## 0.19.2

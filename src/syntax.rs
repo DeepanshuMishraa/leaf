@@ -55,6 +55,12 @@ fn resolve(hint: Option<&str>, code: &str) -> Option<(u8, &'static str)> {
     guess(code)
 }
 
+/// Whether `name` is a fence language or alias the lexers know, such as
+/// `rust`, `py` or `bat`.
+pub fn knows(name: &str) -> bool {
+    lookup(name).is_some()
+}
+
 fn lookup(name: &str) -> Option<(u8, &'static str)> {
     let lower = name.to_ascii_lowercase();
     let index = ALIASES
