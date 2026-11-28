@@ -215,6 +215,18 @@ const ADMONITIONS: [&str; 12] = [
     "deprecated",
 ];
 
+/// The GitHub alert an admonition maps to, for those that have one.
+fn alert(name: &str) -> Option<&'static str> {
+    match name {
+        "note" => Some("NOTE"),
+        "tip" | "hint" => Some("TIP"),
+        "important" => Some("IMPORTANT"),
+        "warning" | "attention" => Some("WARNING"),
+        "caution" | "danger" | "error" => Some("CAUTION"),
+        _ => None,
+    }
+}
+
 /// The markdown for a block of reStructuredText whose base indent is 0.
 fn convert(lines: &[&str], state: &mut State) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -307,6 +319,21 @@ fn convert(lines: &[&str], state: &mut State) -> Vec<String> {
                         let mut quote = vec![format!("**{}**", inline(args, state))];
                         if !content.is_empty() {
                             quote.push(String::new());
+                            quote.extend(convert(content, state));
+                        }
+                        out.extend(quoted(quote));
+                    }
+                    name if alert(name).is_some() => {
+                        // GitHub's alert syntax, which the reader draws
+                        // with its own label and color.
+                        let mut quote = vec![format!("[!{}]", alert(name).unwrap_or("NOTE"))];
+                        if !args.is_empty() {
+                            quote.push(inline(args, state));
+                        }
+                        if !content.is_empty() {
+                            if !args.is_empty() {
+                                quote.push(String::new());
+                            }
                             quote.extend(convert(content, state));
                         }
                         out.extend(quoted(quote));
@@ -721,9 +748,13 @@ mod tests {
     }
 
     #[test]
-    fn admonitions_become_quotes_with_a_label() {
+    fn admonitions_become_alerts_or_labeled_quotes() {
         let md = to_markdown(".. warning::\n\n   Back up *first*.\n");
-        assert_eq!(md, "> **Warning**\n>\n> Back up *first*.\n");
+        assert_eq!(md, "> [!WARNING]\n> Back up *first*.\n");
+        let md = to_markdown(".. tip:: Short one.\n");
+        assert_eq!(md, "> [!TIP]\n> Short one.\n");
+        let md = to_markdown(".. seealso::\n\n   The README.\n");
+        assert_eq!(md, "> **See also**\n>\n> The README.\n");
     }
 
     #[test]
