@@ -1,8 +1,11 @@
 # Changelog
 
-## 0.19.1
+## 0.19.2
 
 - Clicks on the simulator's screen land where you click. Before, every click on the iPhone and iPhone 16 models went to the spot mirrored top to bottom, so a tap on one control hit another, and clicks on the iPhone Air and 17 Pro models stopped at the cover glass and did nothing. Swipes from the side edges were the only touches that worked.
+
+## 0.19.1
+
 - `leaf sim install` now swaps **Leaf: Install Simulator…** for **Leaf: Open Simulator…** in Rex's palette right away. Before, the palette kept the old action until Rex's config was reloaded by hand, and picking it failed with "defines no action".
 
 ## 0.19.0
