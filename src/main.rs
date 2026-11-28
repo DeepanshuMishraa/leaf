@@ -66,6 +66,7 @@ mod remote;
 mod render;
 mod review;
 mod rextheme;
+mod rst;
 mod scheme;
 mod shape;
 mod sheet;
@@ -232,6 +233,9 @@ fn load_file(path: &Path) -> Result<Doc, String> {
     }
     if lower.ends_with(".md") || lower.ends_with(".markdown") {
         return markdown::open(path).map_err(|e| e.to_string());
+    }
+    if rst::is_rst(path) {
+        return rst::open(path).map_err(|e| e.to_string());
     }
     if html::is_html(path) {
         return html::open(path).map_err(|e| e.to_string());
