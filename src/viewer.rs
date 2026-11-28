@@ -4759,7 +4759,7 @@ mod tests {
     fn only_a_successful_new_link_clears_forward_history() {
         let links = "[[plan|Open Plan]] [Open broken](broken.txt) [[other|Open Other]]";
         let (mut s, dir, _) = linked_note("history-branch", links);
-        std::fs::write(dir.join("broken.txt"), "unsupported format").unwrap();
+        std::fs::write(dir.join("broken.txt"), b"\0binary").unwrap();
         std::fs::write(dir.join("other.md"), "# Other").unwrap();
         click_text(&mut s, "Open Plan");
         s.open_next(ViewerOptions::default());

@@ -34,7 +34,7 @@ leaf open https://example.com/post
 leaf                       # pick a recent or nearby document
 ```
 
-Supports PDF, EPUB, Markdown (GitHub extensions, wikilinks, mermaid), saved HTML, pictures, Word, PowerPoint, Excel/ODS and CSV/TSV. Links to PDFs, arXiv papers and raw Markdown open as such; other pages go through Readability.
+Supports PDF, EPUB, Markdown (GitHub extensions, wikilinks, mermaid), reStructuredText, saved HTML, pictures, Word, PowerPoint, Excel/ODS and CSV/TSV. Any other text file (source code, scripts, config, logs) opens as code, colored by its language. Links to PDFs, arXiv papers and raw Markdown open as such; other pages go through Readability.
 
 - `←/→` page, `j/k` scroll, `g/G` first/last, `f` find, `?` all keys, `q` quit
 - Drag to select and copy; `y` highlights, `d` draws, `@` asks your agent about the selection
