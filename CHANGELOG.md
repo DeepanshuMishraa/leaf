@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `leaf sim install` now swaps **Leaf: Install Simulator…** for **Leaf: Open Simulator…** in Rex's palette right away. Before, the palette kept the old action until Rex's config was reloaded by hand, and picking it failed with "defines no action".
+
 ## 0.19.0
 
 - `[plan] jump = "top"` makes `]`, `[` and the other block jumps in `leaf plan` scroll the block they land on to the top of the screen. The default, `"nearest"`, keeps scrolling only as far as it takes to show the block's first line.

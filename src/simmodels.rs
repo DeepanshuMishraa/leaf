@@ -33,7 +33,6 @@ use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
@@ -381,18 +380,12 @@ fn fetch(model: &Model, progress: impl Fn(u64)) -> Result<(), ModelsFailed> {
 }
 
 /// Has Rex read its config again, so the palette's simulator actions match
-/// leaf's config; false when Rex isn't there to ask.
+/// leaf's config; false when Rex isn't there to ask. A bare `rex config
+/// reload` isn't enough: the Rex app refetches its actions only when init.lua
+/// changed, so this rewrites the plugin's open line, which names the
+/// simulator once it's on.
 fn reload_rex() -> bool {
-    let Ok(rex) = crate::agent::rex_program() else {
-        return false;
-    };
-    Command::new(rex)
-        .args(["config", "reload"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    crate::plugin::note_open(&crate::remote::state()).is_ok()
 }
 
 #[cfg(test)]

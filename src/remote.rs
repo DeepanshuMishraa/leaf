@@ -216,7 +216,9 @@ fn refresh_palettes() {
 
 /// What leaf shows on this machine and the look it's in, as the plugin reads
 /// it: `document diff dither`, or `idle classic`. `minimal` is added while
-/// the browser's address bar hides until the pointer is at the top.
+/// the browser's address bar hides until the pointer is at the top, and
+/// `simulator` while `[simulator] enabled` is on, so turning it on rewrites
+/// the plugin's open line and Rex's palette swaps Install for Open.
 pub fn state() -> String {
     let open: Vec<&str> = Readers::here().open().into_iter().map(Kind::name).collect();
     let open = if open.is_empty() {
@@ -233,7 +235,12 @@ pub fn state() -> String {
     } else {
         ""
     };
-    format!("{open} {}{bar}", ui.as_str())
+    let simulator = if crate::config::load().is_ok_and(|config| config.simulator.enabled) {
+        " simulator"
+    } else {
+        ""
+    };
+    format!("{open} {}{bar}{simulator}", ui.as_str())
 }
 
 fn inside_rex() -> bool {
