@@ -827,10 +827,30 @@ impl App {
     fn ask_context(&self) -> Option<String> {
         let tab = self.tabs.get(self.current)?;
         let (from, to) = tab.selection();
+        let span = |row: usize| {
+            let (a, b) = (Pos { row, col: from.col }, Pos { row, col: to.col });
+            if a == b {
+                tab.address(a)
+            } else {
+                format!("{}:{}", tab.address(a), tab.address(b))
+            }
+        };
+        // Sorting or a filter can make the shown rows a jumble of file
+        // rows, which one range would misname, so each row gets its own.
+        let sources: Vec<Option<usize>> = (from.row..=to.row).map(|r| tab.source(r)).collect();
+        let in_file_order = sources
+            .windows(2)
+            .all(|w| matches!(w, [Some(a), Some(b)] if *b == a + 1));
         let range = if from == to {
             tab.address(from)
-        } else {
+        } else if in_file_order {
             format!("{}:{}", tab.address(from), tab.address(to))
+        } else {
+            (from.row..=to.row)
+                .take(ASK_ROWS)
+                .map(span)
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let file = self.source.as_deref().unwrap_or(&self.title);
         let sheet = if self.tabs.len() > 1 {
@@ -2272,6 +2292,39 @@ mod tests {
             ]
         );
         assert!(screen(&mut app, 80, 10)[9].contains("Sent to claude."));
+    }
+
+    #[test]
+    fn a_sorted_selection_names_each_row_where_it_sits_in_the_file() {
+        let (mut app, sent) = asking();
+        let tab = &mut app.tabs[0];
+        tab.cursor.col = 1;
+        tab.cycle_sort();
+        tab.cycle_sort();
+        tab.go(Pos { row: 1, col: 0 }, false);
+        tab.go(Pos { row: 2, col: 0 }, true);
+        press(&mut app, "@x\n");
+        assert!(
+            sent.borrow()[0].starts_with("From /data/people.csv, cells A4, A3. "),
+            "{}",
+            sent.borrow()[0]
+        );
+        assert!(sent.borrow()[0].contains("\n\nName\nLinus\nGrace\n"));
+    }
+
+    #[test]
+    fn a_filtered_selection_leaves_out_the_hidden_rows() {
+        let (mut app, sent) = asking();
+        press(&mut app, "llFo\n");
+        let tab = &mut app.tabs[0];
+        tab.go(Pos { row: 2, col: 0 }, false);
+        tab.go(Pos { row: 3, col: 1 }, true);
+        press(&mut app, "@x\n");
+        assert!(
+            sent.borrow()[0].starts_with("From /data/people.csv, cells A3:B3, A5:B5. "),
+            "{}",
+            sent.borrow()[0]
+        );
     }
 
     #[test]
