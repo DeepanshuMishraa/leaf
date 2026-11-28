@@ -42,6 +42,21 @@ fn is_text(bytes: &[u8]) -> bool {
     }
 }
 
+/// All of `file`, or `None` when its first `SNIFF` bytes aren't text. The
+/// rest is read only after the start passes, so a large binary file is
+/// refused without loading it.
+fn read_text(file: impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = file;
+    let mut bytes = Vec::with_capacity(SNIFF);
+    file.by_ref().take(SNIFF as u64).read_to_end(&mut bytes)?;
+    if !is_text(&bytes) {
+        return Ok(None);
+    }
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 /// The fence language for a file, from its extension or its whole name.
 /// `None` leaves the language to be guessed from the code.
 fn language(path: &Path) -> Option<String> {
@@ -107,22 +122,24 @@ fn pages(text: &str, lang: Option<&str>) -> Vec<Rc<str>> {
 
 pub fn open(path: &Path) -> Result<Doc, TextFailed> {
     let shown = || path.display().to_string();
-    let bytes = std::fs::read(path).map_err(|cause| {
-        if cause.kind() == std::io::ErrorKind::PermissionDenied {
-            TextFailed::Blocked {
-                path: shown(),
-                cause,
+    let bytes = std::fs::File::open(path)
+        .and_then(read_text)
+        .map_err(|cause| {
+            if cause.kind() == std::io::ErrorKind::PermissionDenied {
+                TextFailed::Blocked {
+                    path: shown(),
+                    cause,
+                }
+            } else {
+                TextFailed::Read {
+                    path: shown(),
+                    cause,
+                }
             }
-        } else {
-            TextFailed::Read {
-                path: shown(),
-                cause,
-            }
-        }
-    })?;
-    if !is_text(&bytes) {
+        })?;
+    let Some(bytes) = bytes else {
         return Err(TextFailed::Binary { path: shown() });
-    }
+    };
     let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
     let pages = pages(&text, language(path).as_deref());
     let title = path
@@ -154,6 +171,29 @@ mod tests {
         let mut bytes = vec![b'a'; SNIFF - 1];
         bytes.extend_from_slice("é".as_bytes());
         assert!(is_text(&bytes));
+    }
+
+    #[test]
+    fn a_binary_file_is_refused_after_reading_only_its_start() {
+        struct Endless;
+        impl std::io::Read for Endless {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("read past the sniffed start of a binary file");
+            }
+        }
+        let start = std::io::Cursor::new(vec![0u8; SNIFF]);
+        assert!(
+            read_text(std::io::Read::chain(start, Endless))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_text_file_is_read_past_its_start() {
+        let text = "a".repeat(SNIFF * 2);
+        let bytes = read_text(text.as_bytes()).unwrap();
+        assert_eq!(bytes.as_deref(), Some(text.as_bytes()));
     }
 
     #[test]

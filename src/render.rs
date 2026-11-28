@@ -1010,12 +1010,19 @@ impl Ctx<'_> {
 
     /// A whole file's code: dim line numbers in a gutter, then the code, with
     /// no rule. A wrapped line leaves the gutter blank on its later rows.
+    /// Numbers that don't fit, in the type or in the width, fall back to
+    /// unnumbered code.
     fn numbered_code(&mut self, code: &str, lang: Option<&str>, first: usize, x: u16, width: u16) {
-        let start = self.record(code);
-        let kinds = syntax::kinds(code, lang);
-        let last = first + code.split('\n').count().saturating_sub(1);
+        let Some(last) = first.checked_add(code.split('\n').count().saturating_sub(1)) else {
+            return self.code(code, lang, x, width);
+        };
         let digits = last.to_string().len() as u16;
         let gutter = digits + 3;
+        if gutter >= width {
+            return self.code(code, lang, x, width);
+        }
+        let start = self.record(code);
+        let kinds = syntax::kinds(code, lang);
         let mut line_start = 0usize;
         for (n, line) in code.split('\n').enumerate() {
             let cells: Vec<Cell> = line
@@ -1742,6 +1749,20 @@ mod tests {
             draw("```line=1\nabcdefghij\n```", 9),
             vec!["1   abcde", "    fghij", ""]
         );
+    }
+
+    #[test]
+    fn line_numbers_past_the_largest_number_show_the_code_unnumbered() {
+        let max = usize::MAX;
+        assert_eq!(
+            draw(&format!("```line={max}\na\nb\n```"), 20),
+            vec!["┃ a", "┃ b", ""]
+        );
+    }
+
+    #[test]
+    fn a_gutter_that_leaves_no_room_for_code_is_dropped() {
+        assert_eq!(draw("```line=1\nx\n```", 4), vec!["┃ x", ""]);
     }
 
     #[test]
