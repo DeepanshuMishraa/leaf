@@ -69,6 +69,8 @@ mod rextheme;
 mod scheme;
 mod shape;
 mod sheet;
+mod sheetkeys;
+mod sheetview;
 // Only macOS runs `leaf sim`; elsewhere these are compiled but unused.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod simmodels;
@@ -149,6 +151,8 @@ Comments: leaf comments lists every saved review comment with its diff key.
   --json prints them for tools and agents.
 
 Reader keys: ←/→ page, j/k scroll, ctrl+d/u half, space/b screen, g/G ends, : go to page, t outline beside the text (T over it), m bookmark, ' bookmarks, f find (n/N next/previous), i painted images, drag select + copy, @ or ctrl+enter send the selection, with the lines around it, to an agent, y highlight, 1-6 color, d pen, e eraser, v move ink, ! guide, ? keys, q quit
+
+Sheet keys: arrows/hjkl or click move, shift+arrows/HJKL or drag select, g/G first/last row, 0/$ first/last column, / find (n/N), : go to a cell, s sort, F filter, y copy, [ ] sheets, < > column width, ? keys, q quit
 
 Board keys: v select, h hand, r box, d diamond, o ellipse, a arrow, l line, p pen, t text,
 F frame, e eraser, drag to draw, move or resize, the knob turns, double-click or enter writes text,
@@ -935,6 +939,19 @@ fn open(first: &str) -> ExitCode {
         let source_path = path_override
             .clone()
             .unwrap_or_else(|| PathBuf::from(&target));
+        // Spreadsheets open in their own grid, where cells can be picked.
+        if pending.is_none()
+            && !is_url(&target)
+            && office::Kind::of(&source_path) == Some(office::Kind::Sheets)
+        {
+            return match sheetview::run(&source_path, config.keys.sheet.clone()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("leaf: {e}");
+                    ExitCode::from(1)
+                }
+            };
+        }
         let watch = (!is_url(&target)).then(|| doc::Watch::new(source_path.clone()));
         let (doc, viewport, notice) = match pending.take().map(Ok).unwrap_or_else(|| {
             path_override

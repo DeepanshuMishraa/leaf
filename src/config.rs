@@ -12,6 +12,7 @@ use crate::plankeys::{PlanAction, PlanNotesAction, PlanQuitAction};
 use crate::planview::Jump;
 use crate::prkeys::{PrAction, PrListAction};
 use crate::readerkeys::{BookmarksAction, InkAction, ReaderAction};
+use crate::sheetkeys::SheetAction;
 
 pub const DEFAULT_MAX_WIDTH: u16 = 76;
 
@@ -114,6 +115,7 @@ keys_config! {
     board: BoardAction,
     pr_list: PrListAction,
     pr: PrAction,
+    sheet: SheetAction,
 }
 
 #[derive(Debug, Clone, Deserialize)]

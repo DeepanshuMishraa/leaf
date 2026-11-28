@@ -41,6 +41,8 @@ Supports PDF, EPUB, Markdown (GitHub extensions, wikilinks, mermaid), saved HTML
 - `a` reads aloud with Microsoft Edge's online voices; `s` picks a voice
 - `<`/`>` narrow or widen the column, `i` toggles painted images
 
+Spreadsheets and CSV files open in a grid of cells, with column letters, row numbers and the first row pinned as the header. Move with the arrows or `hjkl`, or click a cell. Drag, or hold shift, to select a range, and the bottom line shows its count, sum and average. Click a column letter or row number to select the whole column or row. `/` finds, `:` goes to a cell such as `B12`, `s` sorts by the column, `F` shows only rows whose cell in the column holds some text, `y` copies the selection as tab-separated text, `[`/`]` switch sheets and `<`/`>` resize the column. The cell bar at the top shows a cell's whole text, and its formula in Excel files. Sorting and filtering change only the view; the file is never written.
+
 Images use the Kitty, iTerm2 or Sixel protocol, falling back to half blocks. Reading place, highlights and drawings are saved in `~/.local/share/leaf/leaf.db`. Local files reload when they change.
 
 ### Configuration
@@ -77,7 +79,7 @@ next_file = ["]", "n", "tab"]
 tool_box = "R"
 ```
 
-Every view has its own key table: `reader`, `ink`, `bookmarks`, `outline`, `diff`, `diff_comments`, `diff_overview`, `confirm_post`, `verdict`, `plan`, `plan_notes`, `plan_quit`, `board`, `pr_list` and `pr`. `leaf config keys` prints them all with every action, its default keys and what it does, ready to copy. Text you type, such as comments, find and filters, keeps its own keys.
+Every view has its own key table: `reader`, `ink`, `bookmarks`, `outline`, `diff`, `diff_comments`, `diff_overview`, `confirm_post`, `verdict`, `plan`, `plan_notes`, `plan_quit`, `board`, `pr_list`, `pr` and `sheet`. `leaf config keys` prints them all with every action, its default keys and what it does, ready to copy. Text you type, such as comments, find and filters, keeps its own keys.
 
 Keys are written as `q`, `G`, `ctrl+d`, `alt+enter`, `shift+tab`, `space`, `enter`, `esc`, `tab`, `up`, `pagedown`, `home`, `f1` and so on. A key an action didn't have before is taken from any other action that had it, so each key does one thing; restating an action's defaults changes nothing. A reader color can't share a key with a `[keys.ink]` action, since ink keys come first while a stroke is picked. `?` lists the keys as you set them.
 
