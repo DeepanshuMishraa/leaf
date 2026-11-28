@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `leaf open` reads any text file: source code, scripts, config files and logs open as code with line numbers, colored by the language their extension or name points to, such as `.py`, `.bat`, `.rs`, `Makefile` or `Dockerfile` (#74, #89). Long files are split into pages of 1,000 lines. A binary file gets a message saying so instead of noise.
+- `leaf open` reads reStructuredText (`.rst`) as a formatted document, the way it reads markdown (#74, #90). Section titles, lists, literal and `code-block` blocks with their colors, notes and warnings, images, grid and simple tables, field lists, links and inline markup all show. Notes, tips and warnings get the same colored labels as GitHub alerts in markdown. Directives leaf doesn't know, such as `toctree`, are left out.
+
 ## 0.19.2
 
 - Clicks on the simulator's screen land where you click. Before, every click on the iPhone and iPhone 16 models went to the spot mirrored top to bottom, so a tap on one control hit another, and clicks on the iPhone Air and 17 Pro models stopped at the cover glass and did nothing. Swipes from the side edges were the only touches that worked.

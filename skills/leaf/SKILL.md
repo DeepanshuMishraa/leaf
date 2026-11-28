@@ -27,8 +27,9 @@ After opening a screen, end your turn or carry on with other work. Don't sleep, 
 | The person wants to… | Run |
 |---|---|
 | Read a PDF or EPUB | `leaf open paper.pdf`, `leaf book.epub` |
-| Read Markdown, a README or notes | `leaf open README.md` |
+| Read Markdown, reStructuredText, a README or notes | `leaf open README.md`, `docs/index.rst` |
 | Read a Word doc, deck or spreadsheet | `leaf open report.docx`, `talk.pptx`, `budget.xlsx` (also `.xls`, `.ods`, `.csv`, `.tsv`) |
+| Show a source file, script, config or log | `leaf open main.py`, `run.bat`, `Makefile`. Any text file opens as code, colored by its language |
 | Read a saved web page | `leaf open page.html` (no JavaScript runs; pages built by scripts show an error) |
 | Read an online article, paper or Markdown link | `leaf open https://…`. Readability text. PDF links open as PDFs, arXiv `/abs/` opens the full paper, GitHub `blob/…/*.md` opens the raw file |
 | Use a real, interactive web page: a dev server, a web app, a site that needs sign-in or JavaScript | `leaf browser [url]` (Rex on macOS only, see below) |
