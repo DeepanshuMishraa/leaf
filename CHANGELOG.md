@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.0
 
 - `[plan] jump = "top"` makes `]`, `[` and the other block jumps in `leaf plan` scroll the block they land on to the top of the screen. The default, `"nearest"`, keeps scrolling only as far as it takes to show the block's first line.
 - `[plan] scrolloff = 3` keeps that many rows below the cursor as it moves down in `leaf plan`, so the lines ahead stay in view. Like Vim's `scrolloff`, but only at the bottom edge, so a block a jump put at the top stays there. At most half the screen is kept; the default is 0.
