@@ -500,16 +500,24 @@ struct Phone {
         /// The file holds more than one phone (a showcase of front and
         /// back); every mesh beside the screen's phone is dropped.
         var showcase = false
+        /// Materials of the clear cover glass over the screen. Clicks pass
+        /// through it to the screen below.
+        var coverGlass: [String] = []
 
         enum Facing { case plusZ, minusZ }
     }
+
+    /// The category of every node a click can land on. Cover glass gets
+    /// another, so hit tests that ask for this one skip it.
+    static let clickable = 1
+    static let clickThrough = 1 << 1
 
     /// leaf's models, by file name (Rust's `Body::model` picks one).
     static let models: [String: Model] = [
         "iphone.usdz": Model(screenMaterial: "COLOUR_Cherry_Screen", onScreen: ["Front_Cam", "Front_Sensor"]),
         "iphone-duo-open.usdz": Model(screenMaterial: "COLOUR_Cherry_Screen", onScreen: ["Front_Cam", "Front_Sensor"]),
-        "iphone-air.usdz": Model(screenMaterial: "_7Air_Screen", facing: .minusZ),
-        "iphone-17-pro.usdz": Model(screenMaterial: "Screen", showcase: true),
+        "iphone-air.usdz": Model(screenMaterial: "_7Air_Screen", facing: .minusZ, coverGlass: ["_7Air_Glass"]),
+        "iphone-17-pro.usdz": Model(screenMaterial: "Screen", showcase: true, coverGlass: ["Screen_glass"]),
         "iphone-16.usdz": Model(screenMaterial: "HdvBvHLgXAUNOwl"),
     ]
     /// The Duo's cover display, on the back of its left half.
@@ -616,6 +624,11 @@ struct Phone {
         }
 
         if model.showcase { keepScreensPhone(scene, screen: screen) }
+        scene.rootNode.enumerateHierarchy { node, _ in
+            if node.geometry?.materials.contains(where: { model.coverGlass.contains($0.name ?? "") }) == true {
+                node.categoryBitMask = clickThrough
+            }
+        }
 
         // The screen and the island share a depth; lift each a hair (in
         // screen heights, as the models' units differ) so the island stays
@@ -1516,17 +1529,17 @@ final class Simulator: PaneController, SCNSceneRendererDelegate, NSTextFieldDele
     func screenPoint(_ event: NSEvent, slide: Bool) -> CGPoint? {
         guard let glass, let root = glass.nodes.first, !folding else { return nil }
         let point = phoneView.convert(event.locationInWindow, from: nil)
-        var options: [SCNHitTestOption: Any] = [.ignoreHiddenNodes: true]
+        var options: [SCNHitTestOption: Any] = [.ignoreHiddenNodes: true, .categoryBitMask: Phone.clickable]
         if slide {
             options[.rootNode] = root
         } else {
             options[.searchMode] = SCNHitTestSearchMode.closest.rawValue
         }
         guard let hit = phoneView.hitTest(point, options: options).first, glass.contains(hit.node) else { return nil }
-        // SceneKit reports V from the bottom; the glass's UVs start at the top.
+        // The UVs `Phone.mapUVs` gave the glass, (0, 0) at its top left, as stored.
         let uv = hit.textureCoordinates(withMappingChannel: 0)
         let fit = picture
-        let across = (uv.x - fit.minX) / fit.width, down = (1 - uv.y - fit.minY) / fit.height
+        let across = (uv.x - fit.minX) / fit.width, down = (uv.y - fit.minY) / fit.height
         let (x, y) = quarterTurned ? (down, 1 - across) : (across, down)
         if slide { return CGPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1)) }
         return (0...1).contains(x) && (0...1).contains(y) ? CGPoint(x: x, y: y) : nil
