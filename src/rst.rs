@@ -55,11 +55,11 @@ pub fn open(path: &Path) -> Result<Doc, RstFailed> {
 }
 
 static TARGET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*\.\. _([^:`]+|`[^`]+`):\s*(\S+)\s*$").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"^\.\. _([^:`]+|`[^`]+`):(?:\s+(.*))?$").expect("valid regex"));
 static DIRECTIVE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\.\. ([\w:-]+)::(?:\s+(.*))?$").expect("valid regex"));
 static FOOTNOTE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\.\. \[([^\]]+)\]\s+(.*)$").expect("valid regex"));
+    LazyLock::new(|| Regex::new(r"^\.\. \[([^\]]+)\](?:\s+(.*))?$").expect("valid regex"));
 static BULLET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([-*+•])( +|$)").expect("valid regex"));
 static ENUMERATED: LazyLock<Regex> =
@@ -70,9 +70,10 @@ static OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^:([\w-]+):\s*(.*)$").expect("valid regex"));
 static INTERPRETED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?::([\w:.+-]+):)?`([^`]+)`(__?)?").expect("valid regex"));
-static BARE_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(^|[\s(])([A-Za-z][\w-]*)_([\s.,;:!?)]|$)").expect("valid regex")
-});
+/// The character after a match is checked in `references`, not matched here,
+/// so it stays free to open the next reference.
+static BARE_REFERENCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|[\s(])([A-Za-z][\w-]*)_").expect("valid regex"));
 static FOOTNOTE_REFERENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[([#*\w]+)\]_").expect("valid regex"));
 static LABELED: LazyLock<Regex> =
@@ -83,18 +84,21 @@ pub fn to_markdown(text: &str) -> String {
     let lines: Vec<String> = text
         .replace("\r\n", "\n")
         .split('\n')
-        .map(|l| l.replace('\t', "        ").trim_end().to_owned())
+        .map(|l| expand_tabs(l).trim_end().to_owned())
         .collect();
-    let targets = lines
-        .iter()
-        .filter_map(|l| TARGET.captures(l))
-        .map(|c| (c[1].trim_matches('`').to_lowercase(), c[2].to_owned()))
-        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // A first pass collects the link targets, so references above their
+    // target resolve. Collecting while converting skips literal blocks,
+    // code and comments, where a target is only an example.
     let mut state = State {
-        targets,
+        targets: HashMap::new(),
         levels: Vec::new(),
     };
-    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    convert(&lines, &mut state);
+    let mut state = State {
+        targets: state.targets,
+        levels: Vec::new(),
+    };
     let mut out = convert(&lines, &mut state).join("\n");
     out.push('\n');
     out
@@ -120,8 +124,27 @@ impl State {
     }
 }
 
+/// `line` with each tab widened to the next eight-column stop.
+fn expand_tabs(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut column = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let next = (column / 8 + 1) * 8;
+            out.extend(std::iter::repeat_n(' ', next - column));
+            column = next;
+        } else {
+            out.push(c);
+            column += 1;
+        }
+    }
+    out
+}
+
+/// Leading spaces. Tabs are expanded by then, and other whitespace, such
+/// as a no-break space, is text.
 fn indent(line: &str) -> usize {
-    line.len() - line.trim_start().len()
+    line.len() - line.trim_start_matches(' ').len()
 }
 
 fn blank(line: &str) -> bool {
@@ -215,6 +238,20 @@ const ADMONITIONS: [&str; 12] = [
     "deprecated",
 ];
 
+/// Directives whose first lines are an argument (a path, a language, a
+/// title), not content.
+const TAKES_ARGUMENT: [&str; 9] = [
+    "image",
+    "figure",
+    "code-block",
+    "code",
+    "sourcecode",
+    "rubric",
+    "topic",
+    "sidebar",
+    "admonition",
+];
+
 /// The GitHub alert an admonition maps to, for those that have one.
 fn alert(name: &str) -> Option<&'static str> {
     match name {
@@ -270,9 +307,19 @@ fn convert(lines: &[&str], state: &mut State) -> Vec<String> {
         if line.starts_with("..") && (line == ".." || line.starts_with(".. ")) {
             let end = block_end(lines, i + 1, 1);
             let body = dedent(&lines[i + 1..end]);
-            if let Some(c) = FOOTNOTE.captures(line) {
+            if let Some(c) = TARGET.captures(line) {
+                // The URL may sit on the target's line or in the block under
+                // it, split over lines that join without spaces.
+                let mut url = c.get(2).map_or("", |m| m.as_str()).trim().to_owned();
+                url.extend(body.iter().map(|l| l.trim()));
+                if !url.is_empty() {
+                    let name = c[1].trim_matches('`').to_lowercase();
+                    state.targets.insert(name, url);
+                }
+            } else if let Some(c) = FOOTNOTE.captures(line) {
                 gap(&mut out);
-                let mut text = vec![inline(&format!("[{}] {}", &c[1], &c[2]), state)];
+                let first = c.get(2).map_or("", |m| m.as_str());
+                let mut text = vec![inline(format!("[{}] {first}", &c[1]).trim_end(), state)];
                 text.extend(
                     body.iter()
                         .filter(|l| !l.is_empty())
@@ -281,7 +328,19 @@ fn convert(lines: &[&str], state: &mut State) -> Vec<String> {
                 out.push(text.join(" "));
             } else if let Some(c) = DIRECTIVE.captures(line) {
                 let name = c[1].to_ascii_lowercase();
-                let args = c.get(2).map_or("", |m| m.as_str()).trim();
+                let mut args = c.get(2).map_or("", |m| m.as_str()).trim().to_owned();
+                // An argument may start on the next line instead, running
+                // until a blank line or the first option.
+                let mut body = &body[..];
+                if args.is_empty() && TAKES_ARGUMENT.contains(&name.as_str()) {
+                    let n = body
+                        .iter()
+                        .take_while(|l| !l.is_empty() && !OPTION.is_match(l))
+                        .count();
+                    args = body[..n].join(" ");
+                    body = &body[n..];
+                }
+                let args = args.as_str();
                 let options = body.iter().take_while(|l| OPTION.is_match(l)).count();
                 let option = |key: &str| {
                     body[..options]
@@ -419,8 +478,12 @@ fn convert(lines: &[&str], state: &mut State) -> Vec<String> {
             continue;
         }
         if is_simple_border(line) {
-            let end = (i..lines.len())
-                .find(|&j| blank(lines[j]))
+            // Rows may have blank lines between them, so the table ends at
+            // the border followed by a blank line, not at the first blank.
+            let end = (i + 1..lines.len())
+                .find(|&j| is_simple_border(lines[j]) && lines.get(j + 1).is_none_or(|l| blank(l)))
+                .map(|j| j + 1)
+                .or_else(|| (i..lines.len()).find(|&j| blank(lines[j])))
                 .unwrap_or(lines.len());
             gap(&mut out);
             out.extend(simple_table(&lines[i..end], state));
@@ -452,14 +515,17 @@ fn convert(lines: &[&str], state: &mut State) -> Vec<String> {
                     (c[0].len(), format!("{number}. "))
                 })
             });
-        if let Some((column, marker)) = item {
-            let column = if column == line.len() {
+        if let Some((offset, marker)) = item {
+            // `offset` slices the item's line; `column` is where its text
+            // starts on screen, which a bullet like `•` makes differ.
+            let column = line[..offset].chars().count();
+            let column = if offset == line.len() {
                 column.max(2)
             } else {
                 column
             };
             let end = block_end(lines, i + 1, column);
-            let mut body = vec![line.get(column..).unwrap_or("")];
+            let mut body = vec![line.get(offset..).unwrap_or("")];
             body.extend(
                 lines[i + 1..end]
                     .iter()
@@ -613,23 +679,50 @@ fn simple_table(lines: &[&str], state: &State) -> Vec<String> {
             _ => {}
         }
     }
+    // The border is ASCII, so its byte offsets are character columns. A row
+    // may not be, so its columns are turned into byte offsets before slicing.
     let cell = |line: &str, c: usize| {
+        let byte = |column: usize| {
+            line.char_indices()
+                .nth(column)
+                .map_or(line.len(), |(b, _)| b)
+        };
         let (from, to) = columns[c];
         let to = if c + 1 == columns.len() {
             line.len()
         } else {
-            to
+            byte(to)
         };
-        line.get(from.min(line.len())..to.min(line.len()))
-            .unwrap_or("")
-            .trim()
-            .to_owned()
+        line[byte(from)..to].trim().to_owned()
     };
-    let rows: Vec<Vec<String>> = lines[1..]
-        .iter()
-        .filter(|l| !is_simple_border(l) && !l.starts_with("---"))
-        .map(|l| (0..columns.len()).map(|c| cell(l, c)).collect())
-        .collect();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    // A line with an empty first column continues the row above it, but
+    // never across a border.
+    let mut continues = false;
+    for line in &lines[1..] {
+        if is_simple_border(line) {
+            continues = false;
+            continue;
+        }
+        if blank(line) || line.starts_with("---") {
+            continue;
+        }
+        let cells: Vec<String> = (0..columns.len()).map(|c| cell(line, c)).collect();
+        match rows.last_mut() {
+            Some(row) if continues && cells[0].is_empty() => {
+                for (cell, more) in row.iter_mut().zip(cells) {
+                    if !more.is_empty() {
+                        if !cell.is_empty() {
+                            cell.push(' ');
+                        }
+                        cell.push_str(&more);
+                    }
+                }
+            }
+            _ => rows.push(cells),
+        }
+        continues = true;
+    }
     table(rows, state)
 }
 
@@ -711,9 +804,14 @@ fn references(text: &str, state: &State) -> String {
     let text = FOOTNOTE_REFERENCE.replace_all(text, "[$1]");
     BARE_REFERENCE
         .replace_all(&text, |c: &regex::Captures| {
+            let end = c.get(0).map_or(0, |m| m.end());
+            let ends_word = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|n| n.is_whitespace() || ".,;:!?)".contains(n));
             match state.targets.get(&c[2].to_lowercase()) {
-                Some(url) => format!("{}[{}](<{url}>){}", &c[1], &c[2], &c[3]),
-                None => c[0].to_owned(),
+                Some(url) if ends_word => format!("{}[{}](<{url}>)", &c[1], &c[2]),
+                _ => c[0].to_owned(),
             }
         })
         .into_owned()
@@ -835,6 +933,87 @@ mod tests {
             md,
             "- **Author:** Ada\n- **Version:** 2\n\n![A picture](<pic.png>)\n\nEnd.\n"
         );
+    }
+
+    #[test]
+    fn a_footnote_body_can_start_on_the_next_line() {
+        let md = to_markdown(".. [1]\n   Important detail.\n");
+        assert_eq!(md, "[1] Important detail.\n");
+    }
+
+    #[test]
+    fn adjacent_references_both_resolve() {
+        let state = State {
+            targets: HashMap::from([("docs".to_owned(), "https://d.io".to_owned())]),
+            levels: Vec::new(),
+        };
+        assert_eq!(
+            inline("docs_ docs_", &state),
+            "[docs](<https://d.io>) [docs](<https://d.io>)"
+        );
+    }
+
+    #[test]
+    fn tabs_advance_to_the_next_eight_column_stop() {
+        let md = to_markdown("-\tfirst\n\tcontinued\n");
+        assert_eq!(md, "- first\n  continued\n");
+    }
+
+    #[test]
+    fn targets_inside_literal_blocks_are_examples_not_targets() {
+        let md = to_markdown(
+            "Read docs_.\n\n.. _docs: https://real.example\n\n::\n\n    .. _docs: https://example.invalid\n",
+        );
+        assert_eq!(
+            md,
+            "Read [docs](<https://real.example>).\n\n```\n.. _docs: https://example.invalid\n```\n"
+        );
+    }
+
+    #[test]
+    fn a_target_url_can_start_on_the_next_line() {
+        let md = to_markdown("Read docs_.\n\n.. _docs:\n   https://example.com\n");
+        assert_eq!(md, "Read [docs](<https://example.com>).\n");
+    }
+
+    #[test]
+    fn non_ascii_whitespace_in_code_is_kept_as_code() {
+        let md = to_markdown(".. code-block:: text\n\n   \u{a0}x\n    y\n");
+        assert_eq!(md, "```text\n\u{a0}x\n y\n```\n");
+    }
+
+    #[test]
+    fn a_directive_argument_can_start_on_the_next_line() {
+        let md = to_markdown(".. image::\n   pic.png\n   :alt: A\n");
+        assert_eq!(md, "![A](<pic.png>)\n");
+    }
+
+    #[test]
+    fn simple_tables_keep_rows_after_a_blank_line() {
+        let md = to_markdown(
+            "=====  =====\nA      B\n=====  =====\n1      x\n\n2      y\n=====  =====\n\nAfter.\n",
+        );
+        assert_eq!(md, "| A | B |\n|---|---|\n| 1 | x |\n| 2 | y |\n\nAfter.\n");
+    }
+
+    #[test]
+    fn a_bullet_wider_in_bytes_than_columns_keeps_its_continuation() {
+        let md = to_markdown("• first\n  continued\n");
+        assert_eq!(md, "- first\n  continued\n");
+    }
+
+    #[test]
+    fn simple_table_columns_count_characters_not_bytes() {
+        let md = to_markdown("=====  =====\nA      B\n=====  =====\nééééé  1\n=====  =====\n");
+        assert_eq!(md, "| A | B |\n|---|---|\n| ééééé | 1 |\n");
+    }
+
+    #[test]
+    fn a_simple_table_line_with_an_empty_first_column_continues_the_row() {
+        let md = to_markdown(
+            "=====  =====\nA      B\n=====  =====\n1      first\n       second\n=====  =====\n",
+        );
+        assert_eq!(md, "| A | B |\n|---|---|\n| 1 | first second |\n");
     }
 
     #[test]
