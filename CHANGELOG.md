@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.1
 
 - `leaf sim install` now swaps **Leaf: Install Simulator…** for **Leaf: Open Simulator…** in Rex's palette right away. Before, the palette kept the old action until Rex's config was reloaded by hand, and picking it failed with "defines no action".
 
