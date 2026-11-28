@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `leaf open` reads any text file: source code, scripts, config files and logs open as code, colored by the language their extension or name points to, such as `.py`, `.bat`, `.rs`, `Makefile` or `Dockerfile` (#74). Long files are split into pages of 1,000 lines. A binary file gets a message saying so instead of noise.
+
 ## 0.19.2
 
 - Clicks on the simulator's screen land where you click. Before, every click on the iPhone and iPhone 16 models went to the spot mirrored top to bottom, so a tap on one control hit another, and clicks on the iPhone Air and 17 Pro models stopped at the cover glass and did nothing. Swipes from the side edges were the only touches that worked.
