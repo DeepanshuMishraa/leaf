@@ -1,0 +1,31 @@
+Date,Region,Rep,Product,Units,Unit Price,Total,Notes
+2026-01-04,North,Asha Rao,Widget,12,4.50,54.00,
+2026-01-04,South,Ben Ortiz,Gadget,3,19.99,59.97,First order
+2026-01-05,East,Chen Wei,Widget,40,4.50,180.00,"Bulk, paid upfront"
+2026-01-06,West,Dana Kim,Gizmo,7,12.00,84.00,
+2026-01-07,North,Asha Rao,Gadget,5,19.99,99.95,"Said ""ship fast"""
+2026-01-08,South,Ben Ortiz,Widget,22,4.50,99.00,
+2026-01-09,East,Chen Wei,Gizmo,1,12.00,12.00,Sample
+2026-01-10,West,Dana Kim,Widget,15,4.50,67.50,
+2026-01-11,North,Eli Novak,Gizmo,9,12.00,108.00,
+2026-01-12,South,Ben Ortiz,Gadget,11,19.99,219.89,"Multi-line
+note in one cell"
+2026-01-13,East,Fay Lund,Widget,30,4.50,135.00,
+2026-01-14,West,Dana Kim,Gadget,2,19.99,39.98,Returned one
+2026-01-15,North,Asha Rao,Widget,18,4.50,81.00,
+2026-01-16,South,Gus Mendes,Gizmo,6,12.00,72.00,
+2026-01-17,East,Chen Wei,Gadget,8,19.99,159.92,
+2026-01-18,West,Hana Sato,Widget,25,4.50,112.50,
+2026-01-19,North,Eli Novak,Gadget,4,19.99,79.96,
+2026-01-20,South,Ben Ortiz,Widget,50,4.50,225.00,Largest order
+2026-01-21,East,Fay Lund,Gizmo,3,12.00,36.00,
+2026-01-22,West,Hana Sato,Gadget,6,19.99,119.94,
+2026-01-23,North,Asha Rao,Gizmo,10,12.00,120.00,
+2026-01-24,South,Gus Mendes,Widget,14,4.50,63.00,
+2026-01-25,East,Chen Wei,Widget,27,4.50,121.50,
+2026-01-26,West,Dana Kim,Gizmo,5,12.00,60.00,
+2026-01-27,North,Eli Novak,Widget,33,4.50,148.50,
+2026-01-28,South,Ben Ortiz,Gizmo,2,12.00,24.00,
+2026-01-29,East,Fay Lund,Gadget,9,19.99,179.91,
+2026-01-30,West,Hana Sato,Widget,21,4.50,94.50,
+2026-01-31,North,Asha Rao,Gadget,7,19.99,139.93,Month end

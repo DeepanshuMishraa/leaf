@@ -1,0 +1,11 @@
+SKU	Name	Category	In stock	Reorder at	Price	Supplier
+W-100	Widget	Hardware	412	100	4.50	Acme Parts
+W-101	Widget, large	Hardware	87	50	6.25	Acme Parts
+G-200	Gadget	Electronics	33	40	19.99	Volt & Co
+G-201	Gadget Pro	Electronics	0	20	34.00	Volt & Co
+Z-300	Gizmo	Hardware	150	75	12.00	Northwind
+Z-301	Gizmo Mini	Hardware	9	25	8.40	Northwind
+C-400	Cable, 2 m	Accessories	1200	300	1.10	Linkline
+C-401	Cable, 5 m	Accessories	640	200	2.30	Linkline
+B-500	Battery pack	Electronics	58	60	15.75	Volt & Co
+S-600	Stand	Accessories	21	10	22.00	Acme Parts

@@ -1,0 +1,12 @@
+# Sample config file, opened as highlighted TOML.
+[server]
+host = "127.0.0.1"
+port = 8080
+workers = 4
+
+[logging]
+level = "info"
+files = ["app.log", "error.log"]
+
+[features]
+beta = false
