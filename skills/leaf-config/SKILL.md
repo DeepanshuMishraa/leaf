@@ -63,6 +63,7 @@ Every table is optional, and so is every line in it. An action you leave out kee
 | `keys.plan`, `keys.plan_notes`, `keys.plan_quit` | `leaf plan`, its note list, its "quit with notes unsent?" |
 | `keys.board` | `leaf board` |
 | `keys.pr_list`, `keys.pr` | `leaf pr`'s list, and a pull request or issue |
+| `keys.sheet` | a spreadsheet or CSV file in its grid |
 
 Text you type keeps its own keys and can't be rebound. That covers comment and note boxes, find, go to page, the ask box, the voice picker, the outline's filter, the list filters in `leaf pr` and the file picker, board text, and the merge, close and re-run menus. Letters type there.
 

@@ -5,6 +5,7 @@
 //! spreadsheet draws it (see `grid`), or as a table in the terminal's font.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -35,11 +36,15 @@ const COLUMNS: usize = 8;
 
 /// One sheet's cells, as text, without empty rows and columns at its edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Sheet {
-    name: String,
+pub struct Sheet {
+    pub name: String,
     /// The first row and column the cells start at, counting from 0.
-    origin: (usize, usize),
-    rows: Vec<Vec<String>>,
+    pub origin: (usize, usize),
+    /// Every row as wide as the widest.
+    pub rows: Vec<Vec<String>>,
+    /// Formulas by the row and column they sit at (counting from 0, like
+    /// `origin`), for the cells that have one.
+    pub formulas: HashMap<(usize, usize), String>,
 }
 
 struct Book {
@@ -117,14 +122,15 @@ impl Source for Book {
     }
 }
 
-pub fn open(path: &Path) -> Result<Doc, SheetFailed> {
+/// Every sheet in a spreadsheet or CSV file, trimmed of empty edges.
+pub fn load(path: &Path) -> Result<Vec<Sheet>, SheetFailed> {
     let shown = || path.display().to_string();
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    let sheets = match ext.as_str() {
+    match ext.as_str() {
         "csv" | "tsv" => {
             let bytes = std::fs::read(path).map_err(|cause| SheetFailed::Read {
                 path: shown(),
@@ -132,14 +138,19 @@ pub fn open(path: &Path) -> Result<Doc, SheetFailed> {
             })?;
             let text = String::from_utf8_lossy(&bytes);
             let delimiter = if ext == "tsv" { '\t' } else { delimiter(&text) };
-            vec![trim(Sheet {
+            Ok(vec![trim(Sheet {
                 name: String::new(),
                 origin: (0, 0),
                 rows: parse_csv(&text, delimiter),
-            })]
+                formulas: HashMap::new(),
+            })])
         }
-        _ => workbook(path, &shown())?,
-    };
+        _ => workbook(path, &shown()),
+    }
+}
+
+pub fn open(path: &Path) -> Result<Doc, SheetFailed> {
+    let sheets = load(path)?;
     let pages = paginate(&sheets);
     Ok(Doc {
         title: path
@@ -182,6 +193,7 @@ fn workbook(path: &Path, shown: &str) -> Result<Vec<Sheet>, SheetFailed> {
                 name,
                 origin: (0, 0),
                 rows: vec![vec!["(leaf could not read this sheet)".into()]],
+                formulas: HashMap::new(),
             });
             continue;
         };
@@ -193,7 +205,27 @@ fn workbook(path: &Path, shown: &str) -> Result<Vec<Sheet>, SheetFailed> {
             .rows()
             .map(|row| row.iter().map(cell).collect())
             .collect();
-        sheets.push(trim(Sheet { name, origin, rows }));
+        // A sheet whose formulas can't be read still shows its values.
+        let formulas = book
+            .worksheet_formula(&name)
+            .map(|range| {
+                let (top, left) = range
+                    .start()
+                    .map(|(r, c)| (r as usize, c as usize))
+                    .unwrap_or_default();
+                range
+                    .cells()
+                    .filter(|(_, _, f)| !f.is_empty())
+                    .map(|(r, c, f)| ((top + r, left + c), format!("={f}")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        sheets.push(trim(Sheet {
+            name,
+            origin,
+            rows,
+            formulas,
+        }));
     }
     Ok(sheets)
 }
@@ -208,7 +240,7 @@ fn cell(data: &Data) -> String {
     }
 }
 
-fn number(f: f64) -> String {
+pub fn number(f: f64) -> String {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         return format!("{}", f as i64);
     }
@@ -265,7 +297,7 @@ fn duration(days: f64) -> String {
 
 /// Comma, unless the first line has more semicolons (as exported where a
 /// comma is the decimal point) or tabs.
-fn delimiter(text: &str) -> char {
+pub fn delimiter(text: &str) -> char {
     let first = text.lines().next().unwrap_or("");
     [',', ';', '\t']
         .into_iter()
@@ -361,7 +393,7 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn thousands(n: usize) -> String {
+pub fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -576,6 +608,7 @@ mod tests {
                 &["", "c", ""],
                 &["", "", ""],
             ]),
+            formulas: HashMap::new(),
         });
         assert_eq!(sheet.origin, (1, 1));
         assert_eq!(sheet.rows, s(&[&["a", "b"], &["c", ""]]));
@@ -590,6 +623,7 @@ mod tests {
                 vec!["Name".into(), "Score".into()],
                 vec!["A|da".into(), "42".into()],
             ],
+            formulas: HashMap::new(),
         };
         assert_eq!(
             sheet_pages(&sheet, false),
@@ -609,6 +643,7 @@ mod tests {
                 name: "Big".into(),
                 origin: (0, 0),
                 rows,
+                formulas: HashMap::new(),
             },
             false,
         );
