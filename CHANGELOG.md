@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Spreadsheets and CSV files (`.xlsx`, `.xls`, `.ods`, `.csv`, `.tsv` and the rest) open in a grid of cells instead of pages of tables. Column letters and row numbers frame it, the first row stays pinned as the header, and numbers line up on the right. Move with the arrows or `hjkl`, or click a cell; drag or hold shift to select a range, and the bottom line shows its count, sum and average. Clicking a column letter or row number selects the whole column or row. `/` finds text, `:` goes to a cell such as `B12`, `s` sorts by the column, `F` filters rows by the column, `y` copies the selection as tab-separated text, `[` and `]` switch sheets, and `<` and `>` resize a column. The cell bar shows a cell's whole text and, in Excel files, its formula. `[keys.sheet]` rebinds the keys.
+- Spreadsheets and CSV files (`.xlsx`, `.xls`, `.ods`, `.csv`, `.tsv` and the rest) open in a grid of cells instead of pages of tables. Column letters and row numbers frame it, the first row stays pinned as the header, and numbers line up on the right. Move with the arrows or `hjkl`, or click a cell; drag or hold shift to select a range, and the bottom line shows its count, sum and average. Clicking a column letter or row number selects the whole column or row. `/` finds text, `:` goes to a cell such as `B12`, `s` sorts by the column, `F` filters rows by the column, `y` copies the selection as tab-separated text, `[` and `]` switch sheets, and `<` and `>` resize a column. The cell bar shows a cell's whole text and, in Excel files, its formula. `[keys.sheet]` rebinds the keys (#91).
 
 ## 0.19.2
 
