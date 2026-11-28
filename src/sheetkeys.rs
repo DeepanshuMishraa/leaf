@@ -34,6 +34,16 @@ actions! {
         Wider = "wider" [">"] "widen the column",
         Narrower = "narrower" ["<"] "narrow the column",
         Copy = "copy" ["y"] "copy the selection as tab-separated text",
+        Edit = "edit" ["e", "f2"] "edit the cell (CSV and TSV files)",
+        Clear = "clear" ["x", "delete"] "empty the selected cells",
+        InsertRowBelow = "insert_row_below" ["o"] "add a row below",
+        InsertRowAbove = "insert_row_above" ["O"] "add a row above",
+        DeleteRows = "delete_rows" ["D"] "delete the selected rows",
+        InsertColumn = "insert_column" ["I"] "add a column to the right",
+        DeleteColumns = "delete_columns" ["X"] "delete the selected columns",
+        Undo = "undo" ["u", "ctrl+z"] "undo the last edit",
+        Redo = "redo" ["U", "ctrl+r"] "redo it",
+        Save = "save" ["ctrl+s", "w"] "save the file",
         Help = "help" ["?"] "list the keys",
     }
 }

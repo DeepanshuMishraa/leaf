@@ -1,10 +1,11 @@
 //! A spreadsheet or CSV file as a grid of cells you move around, the way a
 //! spreadsheet app shows it: column letters and row numbers, the first row
 //! pinned as the header, a cursor cell and a selection you make with keys or
-//! the mouse. Sorting and filtering change only what is shown; the file is
-//! never written. Cells come from `sheet::load`, so CSV, TSV, Excel and
-//! OpenDocument files all open here; `leaf open` sends them here instead of
-//! to the reader.
+//! the mouse. Sorting and filtering change only what is shown. Cells come
+//! from `sheet::load`, so CSV, TSV, Excel and OpenDocument files all open
+//! here; `leaf open` sends them here instead of to the reader. CSV and TSV
+//! files can be edited, with undo, and are written only when saved (see
+//! `csvfile`); workbooks are only read.
 
 use std::cmp::Ordering;
 use std::io::{self, Write as _};
@@ -22,6 +23,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::csvfile::CsvFile;
 use crate::grid::letters;
 use crate::keymap::{Action, Keymap};
 use crate::render::DIM;
@@ -506,6 +508,176 @@ impl Tab {
             *w = w.saturating_add_signed(by).clamp(MIN_WIDTH, 200);
         }
     }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            rows: self.sheet.rows.clone(),
+            widths: self.widths.clone(),
+            cursor: self.cursor,
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) {
+        let columns = self.columns();
+        self.sheet.rows = snapshot.rows;
+        self.widths = snapshot.widths;
+        self.numeric = numeric(&self.sheet);
+        if self.columns() != columns {
+            self.sort = None;
+            self.filter = None;
+        }
+        self.arrange();
+        self.go(snapshot.cursor, false);
+    }
+
+    /// Writes a cell without looking at the column again; see `set`.
+    fn write(&mut self, pos: Pos, text: String) {
+        let Some(r) = self.source(pos.row) else {
+            return;
+        };
+        let width = one_line(&text)
+            .width()
+            .clamp(MIN_WIDTH as usize, MAX_WIDTH as usize) as u16;
+        if let Some(cell) = self
+            .sheet
+            .rows
+            .get_mut(r)
+            .and_then(|row| row.get_mut(pos.col))
+        {
+            *cell = text;
+            if let Some(w) = self.widths.get_mut(pos.col) {
+                *w = (*w).max(width);
+            }
+        }
+    }
+
+    fn set(&mut self, pos: Pos, text: String) {
+        self.write(pos, text);
+        self.numeric = numeric(&self.sheet);
+    }
+
+    fn clear(&mut self) {
+        let (from, to) = self.selection();
+        for row in from.row..=to.row {
+            for col in from.col..=to.col {
+                self.write(Pos { row, col }, String::new());
+            }
+        }
+        self.numeric = numeric(&self.sheet);
+    }
+
+    /// Drops the sort and the filter, so lines are rows in the file's
+    /// order again. Says whether there was either.
+    fn unsorted(&mut self) -> bool {
+        let had = self.sort.is_some() || self.filter.is_some();
+        self.sort = None;
+        self.filter = None;
+        self.arrange();
+        had
+    }
+
+    /// Adds an empty row next to the cursor's. Expects `unsorted` first, so
+    /// the new row shows where it went.
+    fn insert_row(&mut self, below: bool) {
+        if self.widths.is_empty() {
+            self.widths.push(8);
+            self.numeric.push(false);
+        }
+        let at = match self.source(self.cursor.row) {
+            Some(r) if below => r + 1,
+            Some(r) => r,
+            None => 0,
+        };
+        self.sheet
+            .rows
+            .insert(at, vec![String::new(); self.columns()]);
+        self.arrange();
+        self.go(
+            Pos {
+                row: at,
+                col: self.cursor.col,
+            },
+            false,
+        );
+    }
+
+    /// The rows the selection covers, by index into `sheet.rows`.
+    fn selected_rows(&self) -> Vec<usize> {
+        let (from, to) = self.selection();
+        (from.row..=to.row)
+            .filter_map(|line| self.source(line))
+            .collect()
+    }
+
+    /// Deletes the selected rows. The caller checks that some row is left.
+    fn delete_rows(&mut self) {
+        let line = self.selection().0.row;
+        let mut doomed = self.selected_rows();
+        doomed.sort_unstable();
+        for r in doomed.into_iter().rev() {
+            self.sheet.rows.remove(r);
+        }
+        self.numeric = numeric(&self.sheet);
+        self.arrange();
+        self.go(
+            Pos {
+                row: line,
+                col: self.cursor.col,
+            },
+            false,
+        );
+    }
+
+    /// Adds an empty column right of the cursor's. Expects `unsorted` first.
+    fn insert_column(&mut self) {
+        let at = if self.columns() == 0 {
+            0
+        } else {
+            self.cursor.col + 1
+        };
+        if self.sheet.rows.is_empty() {
+            self.sheet.rows.push(Vec::new());
+            self.arrange();
+        }
+        for row in &mut self.sheet.rows {
+            row.insert(at, String::new());
+        }
+        self.widths.insert(at, 8);
+        self.numeric.insert(at, false);
+        self.go(
+            Pos {
+                col: at,
+                ..self.cursor
+            },
+            false,
+        );
+    }
+
+    /// Deletes the selected columns. Expects `unsorted` first, and the
+    /// caller checks that some column is left.
+    fn delete_columns(&mut self) {
+        let (from, to) = self.selection();
+        for row in &mut self.sheet.rows {
+            row.drain(from.col..=to.col.min(row.len().saturating_sub(1)));
+        }
+        self.widths.drain(from.col..=to.col);
+        self.numeric.drain(from.col..=to.col);
+        self.go(
+            Pos {
+                col: from.col,
+                ..self.cursor
+            },
+            false,
+        );
+    }
+}
+
+/// A sheet's cells before an edit, so it can be undone.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    rows: Vec<Vec<String>>,
+    widths: Vec<u16>,
+    cursor: Pos,
 }
 
 /// Text being typed at the bottom of the screen.
@@ -514,15 +686,20 @@ enum Prompt {
     Find(String),
     GoTo(String),
     Filter(String),
+    /// The cursor's cell, being edited.
+    Edit(String),
 }
 
 impl Prompt {
     fn text(&mut self) -> &mut String {
         match self {
-            Prompt::Find(t) | Prompt::GoTo(t) | Prompt::Filter(t) => t,
+            Prompt::Find(t) | Prompt::GoTo(t) | Prompt::Filter(t) | Prompt::Edit(t) => t,
         }
     }
 }
+
+/// Edits kept for undo; the oldest go first.
+const UNDO_LIMIT: usize = 200;
 
 /// Where things were drawn, for the mouse.
 #[derive(Debug, Default, Clone)]
@@ -586,6 +763,16 @@ struct App {
     geometry: Geometry,
     /// Whether the left button is held after pressing on a cell.
     dragging: bool,
+    /// The CSV or TSV file edits are saved to; `None` for a workbook,
+    /// which leaf only reads.
+    file: Option<CsvFile>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// How many edits deep the undo list was when the file last matched
+    /// the screen; `None` once that point is lost.
+    saved_at: Option<usize>,
+    /// Set by `q` with edits unsaved, so the next `q` quits anyway.
+    quit_armed: bool,
 }
 
 impl App {
@@ -604,7 +791,161 @@ impl App {
             quit: false,
             geometry: Geometry::default(),
             dragging: false,
+            file: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            saved_at: Some(0),
+            quit_armed: false,
         }
+    }
+
+    fn unsaved(&self) -> bool {
+        self.saved_at != Some(self.undo.len())
+    }
+
+    /// Whether edits can be saved; says why not when they can't.
+    fn editable(&mut self) -> bool {
+        if self.file.is_none() {
+            self.notice = Some(
+                "leaf edits CSV and TSV files only. Save this workbook as CSV to edit it here. The file was not changed."
+                    .to_owned(),
+            );
+        }
+        self.file.is_some()
+    }
+
+    /// Keeps the sheet as it is now for undo, before an edit.
+    fn record(&mut self) {
+        let Some(tab) = self.tabs.get(self.current) else {
+            return;
+        };
+        self.undo.push(tab.snapshot());
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+            self.saved_at = self.saved_at.and_then(|at| at.checked_sub(1));
+        }
+        self.redo.clear();
+        if self.saved_at.is_some_and(|at| at >= self.undo.len()) {
+            self.saved_at = None;
+        }
+    }
+
+    /// Undoes (or, with `redo`, redoes) the last edit.
+    fn step_history(&mut self, redo: bool) {
+        let (from, to) = if redo {
+            (&mut self.redo, &mut self.undo)
+        } else {
+            (&mut self.undo, &mut self.redo)
+        };
+        let Some(snapshot) = from.pop() else {
+            self.notice = Some(if redo {
+                "Nothing to redo.".to_owned()
+            } else {
+                "Nothing to undo.".to_owned()
+            });
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(self.current) {
+            to.push(tab.snapshot());
+            tab.restore(snapshot);
+        }
+    }
+
+    fn save(&mut self) {
+        let (Some(file), Some(tab)) = (&self.file, self.tabs.get(self.current)) else {
+            return;
+        };
+        match file.save(&tab.sheet.rows, tab.sheet.origin) {
+            Ok(()) => {
+                self.saved_at = Some(self.undo.len());
+                self.notice = Some(format!("Saved {}.", file.name()));
+            }
+            Err(e) => self.notice = Some(e.to_string()),
+        }
+    }
+
+    /// Does an editing action; false when it isn't one.
+    fn edit(&mut self, action: SheetAction) -> bool {
+        use SheetAction as A;
+        let editing = matches!(
+            action,
+            A::Edit
+                | A::Clear
+                | A::InsertRowBelow
+                | A::InsertRowAbove
+                | A::DeleteRows
+                | A::InsertColumn
+                | A::DeleteColumns
+                | A::Undo
+                | A::Redo
+                | A::Save
+        );
+        if !editing {
+            return false;
+        }
+        if !self.editable() {
+            return true;
+        }
+        let Some(tab) = self.tabs.get(self.current) else {
+            return true;
+        };
+        match action {
+            A::Edit => {
+                self.prompt = Some(Prompt::Edit(tab.cell(tab.cursor).to_owned()));
+            }
+            A::Clear => {
+                self.record();
+                if let Some(tab) = self.tab() {
+                    tab.clear();
+                }
+            }
+            A::InsertRowBelow | A::InsertRowAbove => {
+                self.record();
+                if let Some(tab) = self.tab() {
+                    let had = tab.unsorted();
+                    tab.insert_row(action == A::InsertRowBelow);
+                    if had {
+                        self.notice = Some(
+                            "Sort and filter are off, so the new row shows where it goes."
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            A::DeleteRows => {
+                if tab.selected_rows().len() >= tab.sheet.rows.len() {
+                    self.notice =
+                        Some("A sheet keeps at least one row. Nothing was deleted.".to_owned());
+                    return true;
+                }
+                self.record();
+                if let Some(tab) = self.tab() {
+                    tab.delete_rows();
+                }
+            }
+            A::InsertColumn | A::DeleteColumns => {
+                let (from, to) = tab.selection();
+                if action == A::DeleteColumns && to.col - from.col + 1 >= tab.columns() {
+                    self.notice =
+                        Some("A sheet keeps at least one column. Nothing was deleted.".to_owned());
+                    return true;
+                }
+                self.record();
+                if let Some(tab) = self.tab() {
+                    tab.unsorted();
+                    if action == A::InsertColumn {
+                        tab.insert_column();
+                    } else {
+                        tab.delete_columns();
+                    }
+                }
+            }
+            A::Undo => self.step_history(false),
+            A::Redo => self.step_history(true),
+            A::Save => self.save(),
+            _ => return false,
+        }
+        true
     }
 
     fn tab(&mut self) -> Option<&mut Tab> {
@@ -626,6 +967,7 @@ impl App {
             return;
         }
         self.notice = None;
+        let quit_armed = std::mem::take(&mut self.quit_armed);
         if self.help {
             self.help = false;
             return;
@@ -649,7 +991,20 @@ impl App {
             return;
         }
         for action in self.keys.actions(&key) {
-            if self.act(action) {
+            if action == SheetAction::Quit && self.unsaved() && !quit_armed {
+                self.quit_armed = true;
+                let name = self
+                    .file
+                    .as_ref()
+                    .map_or_else(|| self.title.clone(), CsvFile::name);
+                self.notice = Some(format!(
+                    "{name} has unsaved edits. Press {} to save them, or {} again to quit without saving.",
+                    self.keys.first(SheetAction::Save),
+                    self.keys.first(SheetAction::Quit)
+                ));
+                return;
+            }
+            if self.edit(action) || self.act(action) {
                 return;
             }
         }
@@ -767,6 +1122,13 @@ impl App {
 
     fn submit(&mut self, prompt: Prompt) {
         match prompt {
+            Prompt::Edit(text) => {
+                self.record();
+                if let Some(tab) = self.tab() {
+                    tab.set(tab.cursor, text);
+                    tab.step(1, 0, false);
+                }
+            }
             Prompt::Find(text) if !text.is_empty() => self.find(&text, true),
             Prompt::Find(_) => {}
             Prompt::GoTo(text) => {
@@ -970,8 +1332,32 @@ impl App {
                         .map_or(0, |tab| tab.sheet.origin.1 + tab.cursor.col);
                     (format!("Show rows whose {} holds", letters(col)), t)
                 }
+                Prompt::Edit(t) => {
+                    let address = self
+                        .tabs
+                        .get(self.current)
+                        .map_or_else(String::new, |tab| tab.address(tab.cursor));
+                    (format!("Edit {address}"), t)
+                }
             };
-            let line = format!(" {label}: {text}▏");
+            // A long text shows its end, where the typing is.
+            let head = format!(" {label}: ");
+            let room = width.saturating_sub(head.width() + 2);
+            let shown: String = if text.width() > room {
+                let mut tail: Vec<char> = Vec::new();
+                let mut used = 1;
+                for c in text.chars().rev() {
+                    used += c.width().unwrap_or(0);
+                    if used > room {
+                        break;
+                    }
+                    tail.push(c);
+                }
+                std::iter::once('…').chain(tail.into_iter().rev()).collect()
+            } else {
+                text.clone()
+            };
+            let line = format!("{head}{}▏", one_line(&shown));
             buf.set_string(area.x, y, fit(&line, width), self.colors.accent);
             let hint = "enter · esc cancel ";
             if line.width() + hint.width() + 2 < width {
@@ -1001,6 +1387,10 @@ impl App {
             let title = fit(&self.title, width / 2);
             buf.set_string(x, y, &title, Style::default().add_modifier(Modifier::BOLD));
             x += title.width() as u16 + 1;
+        }
+        if self.unsaved() {
+            buf.set_string(x, y, "● unsaved", self.colors.accent);
+            x += 10;
         }
         let right = match &self.notice {
             Some(notice) => notice.clone(),
@@ -1269,6 +1659,7 @@ pub fn run(path: &Path, keys: Keymap<SheetAction>) -> Result<(), SheetViewFailed
     // before, it arrived late and was read as typed keys.
     let colors = Colors::of(Theme::query());
     let mut app = App::new(title.clone(), sheets, keys, colors);
+    app.file = CsvFile::detect(path);
     let result = execute!(io::stdout(), EnableMouseCapture, SetTitle(&title))
         .and_then(|()| event_loop(&mut app, &mut terminal));
     let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -1312,6 +1703,7 @@ fn event_loop(app: &mut App, terminal: &mut ratatui::DefaultTerminal) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn sheet(rows: &[&[&str]]) -> Sheet {
         Sheet {
@@ -1619,5 +2011,148 @@ mod tests {
         let mut app = app(vec![sheet]);
         press(&mut app, "jl");
         assert_eq!(screen(&mut app, 60, 10)[0], " B2  =30+6  →  36");
+    }
+
+    /// A CSV file of `text` in its own folder, opened as `leaf open` would.
+    fn csv_app(name: &str, text: &str) -> (App, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("leaf-sheetedit-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("people.csv");
+        std::fs::write(&path, text).unwrap();
+        let mut app = app(sheet::load(&path).unwrap());
+        app.file = CsvFile::detect(&path);
+        (app, path)
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn backspace(app: &mut App, times: usize) {
+        for _ in 0..times {
+            app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+    }
+
+    const PEOPLE: &str = "Name,Age\nAda,36\nGrace,85\n";
+
+    #[test]
+    fn an_edited_cell_is_written_only_when_saved() {
+        let (mut app, path) = csv_app("save", PEOPLE);
+        press(&mut app, "jle");
+        assert!(screen(&mut app, 60, 10)[9].contains("Edit B2: 36"));
+        backspace(&mut app, 2);
+        press(&mut app, "37\n");
+        assert_eq!(app.tabs[0].cell(Pos { row: 1, col: 1 }), "37");
+        assert_eq!(
+            app.tabs[0].cursor,
+            Pos { row: 2, col: 1 },
+            "enter moves down"
+        );
+        assert!(screen(&mut app, 60, 10)[9].contains("● unsaved"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PEOPLE);
+        ctrl(&mut app, 's');
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Name,Age\nAda,37\nGrace,85\n"
+        );
+        let status = &screen(&mut app, 60, 10)[9];
+        assert!(
+            status.contains("Saved people.csv.") && !status.contains("unsaved"),
+            "{status}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn undo_and_redo_step_through_edits_and_know_the_saved_point() {
+        let (mut app, path) = csv_app("undo", PEOPLE);
+        press(&mut app, "jx");
+        assert_eq!(app.tabs[0].cell(Pos { row: 1, col: 0 }), "");
+        ctrl(&mut app, 's');
+        press(&mut app, "o");
+        assert_eq!(app.tabs[0].sheet.rows.len(), 4);
+        assert!(app.unsaved());
+        press(&mut app, "u");
+        assert_eq!(app.tabs[0].sheet.rows.len(), 3);
+        assert!(!app.unsaved(), "back where the file was saved");
+        press(&mut app, "u");
+        assert_eq!(app.tabs[0].cell(Pos { row: 1, col: 0 }), "Ada");
+        assert!(app.unsaved());
+        press(&mut app, "UU");
+        assert_eq!(app.tabs[0].sheet.rows.len(), 4);
+        press(&mut app, "u");
+        assert!(!app.unsaved());
+        press(&mut app, "uu");
+        assert!(screen(&mut app, 60, 10)[9].contains("Nothing to undo."));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rows_and_columns_are_added_and_deleted_around_the_cursor() {
+        let (mut app, path) = csv_app("rows", PEOPLE);
+        press(&mut app, "jo");
+        assert_eq!(app.tabs[0].cursor.row, 2);
+        press(&mut app, "eLin\n");
+        assert_eq!(app.tabs[0].sheet.rows[2], ["Lin", ""]);
+        press(&mut app, "gO");
+        assert_eq!(
+            app.tabs[0].sheet.rows[0],
+            ["", ""],
+            "a row above the header"
+        );
+        press(&mut app, "D");
+        assert_eq!(app.tabs[0].sheet.rows[0], ["Name", "Age"]);
+        press(&mut app, "I");
+        assert_eq!(app.tabs[0].sheet.rows[0], ["Name", "", "Age"]);
+        assert_eq!(app.tabs[0].cursor.col, 1);
+        press(&mut app, "X");
+        assert_eq!(app.tabs[0].sheet.rows[0], ["Name", "Age"]);
+        ctrl(&mut app, 's');
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Name,Age\nAda,36\nLin,\nGrace,85\n"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn deleting_every_row_or_column_is_refused() {
+        let (mut app, path) = csv_app("keep", PEOPLE);
+        press(&mut app, "JJD");
+        assert_eq!(app.tabs[0].sheet.rows.len(), 3);
+        assert!(screen(&mut app, 80, 10)[9].contains("at least one row"));
+        press(&mut app, "\x1bLX");
+        assert_eq!(app.tabs[0].columns(), 2);
+        assert!(!app.unsaved());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn quitting_with_unsaved_edits_asks_once() {
+        let (mut app, path) = csv_app("quit", PEOPLE);
+        press(&mut app, "x");
+        press(&mut app, "q");
+        assert!(!app.quit);
+        assert!(
+            screen(&mut app, 100, 10)[9]
+                .contains("people.csv has unsaved edits. Press ^s to save them, or q again")
+        );
+        press(&mut app, "q");
+        assert!(app.quit);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PEOPLE);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_workbook_is_only_read() {
+        let mut app = app(vec![people()]);
+        press(&mut app, "xe");
+        assert!(app.prompt.is_none());
+        assert_eq!(app.tabs[0].cell(Pos { row: 0, col: 0 }), "Name");
+        assert!(screen(&mut app, 120, 10)[9].contains("leaf edits CSV and TSV files only."));
+        press(&mut app, "q");
+        assert!(app.quit);
     }
 }

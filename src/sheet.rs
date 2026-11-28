@@ -297,7 +297,7 @@ fn duration(days: f64) -> String {
 
 /// Comma, unless the first line has more semicolons (as exported where a
 /// comma is the decimal point) or tabs.
-fn delimiter(text: &str) -> char {
+pub fn delimiter(text: &str) -> char {
     let first = text.lines().next().unwrap_or("");
     [',', ';', '\t']
         .into_iter()
