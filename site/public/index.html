@@ -177,7 +177,34 @@
     transition: opacity .18s var(--ease), transform .18s var(--ease);
   }
   .nav-discord:hover::after, .nav-discord:focus-visible::after { opacity: 1; transform: translate(-50%, 0) scale(1); }
-  @media (max-width: 960px) { nav .opt:not(.heart) { display: none; } }
+  /* Features: one button opens every section as a two-column menu, so the bar stays short. */
+  .menu-btn { display: inline-flex; align-items: center; gap: 5px; border: 0; background: none; font: inherit; letter-spacing: inherit; cursor: pointer; }
+  .menu-btn svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; transition: transform .25s var(--ease); }
+  .menu-btn[aria-expanded="true"] { color: var(--ink); background: rgba(var(--tint), .045); }
+  .menu-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+  .menu {
+    position: absolute; top: calc(100% + 8px); left: 50%;
+    width: min(540px, calc(100vw - 32px));
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px;
+    padding: 6px; border-radius: 16px;
+    background: var(--surface); box-shadow: var(--raise-hi);
+    transform: translateX(-50%);
+    animation: menu-in .2s var(--ease);
+  }
+  .menu[hidden] { display: none; }
+  @keyframes menu-in { from { opacity: 0; transform: translate(-50%, -4px) scale(.98); } }
+  .menu a { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; transition: background-color .15s var(--ease); }
+  .menu a:hover, .menu a:focus-visible { background: rgba(var(--tint), .045); outline: none; }
+  .menu a.wide { grid-column: 1 / -1; box-shadow: 0 -1px 0 rgba(var(--tint), .06); border-radius: 0 0 10px 10px; }
+  .menu .tile { width: 26px; height: 26px; border-radius: 7px; font-size: 26px; }
+  .menu img { width: 26px; height: 26px; flex: none; border-radius: 7px; box-shadow: 0 1px 3px rgba(17, 17, 26, .2); }
+  .menu span { display: grid; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--muted); }
+  .menu b { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 500; color: var(--ink); }
+  .menu em { font: 600 10px/1 var(--sans); letter-spacing: .02em; text-transform: uppercase; font-style: normal; padding: 3px 5px; border-radius: 5px; color: var(--docs); background: color-mix(in oklab, var(--docs) 14%, transparent); }
+  @media (max-width: 520px) {
+    .menu { grid-template-columns: minmax(0, 1fr); }
+    .menu a.wide { grid-column: auto; }
+  }
   @media (max-width: 520px) {
     nav .opt.heart span { display: none; }
     nav .opt.heart { padding: 7px 10px; }
@@ -210,6 +237,21 @@
   .pill .gh-logo { width: 14px; height: 14px; color: var(--ink); }
   a.pill { display: inline-flex; align-items: center; gap: 8px; transition: color .2s var(--ease); }
   a.pill:hover { color: var(--ink); }
+  /* What's new: the release's headline feature, first thing in the hero. */
+  .news {
+    display: inline-flex; align-items: center; gap: 10px;
+    max-width: 100%; padding: 5px 12px 5px 5px;
+    border-radius: 999px;
+    font-size: 14px; font-weight: 500; letter-spacing: -.01em; color: var(--ink);
+    background: linear-gradient(180deg, var(--surface), var(--surface-2)); box-shadow: var(--raise);
+    transition: transform .25s var(--ease), box-shadow .25s var(--ease);
+  }
+  .news:hover { transform: translateY(-1px); box-shadow: var(--raise-hi); }
+  .news-tag { padding: 4px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--docs); background: color-mix(in oklab, var(--docs) 12%, transparent); white-space: nowrap; }
+  .news .tile { width: 20px; height: 20px; border-radius: 6px; font-size: 20px; }
+  .news-go { width: 14px; height: 14px; flex: none; fill: none; stroke: var(--faint); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: transform .25s var(--ease), stroke .25s var(--ease); }
+  .news:hover .news-go { transform: translateX(2px); stroke: var(--ink); }
+  @media (max-width: 520px) { .news .tile { display: none; } .news { font-size: 13px; } }
   .pill { display: inline-block; padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 500; color: var(--muted); background: var(--surface); box-shadow: var(--raise); }
   h1 {
     margin: 28px 0 0;
@@ -654,20 +696,27 @@
   <symbol id="i-plan" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18h2"/></symbol>
   <symbol id="i-skill" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></symbol>
   <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20.5s-7.5-4.6-9.3-9.4C1.5 7.9 3.6 4.5 7 4.5c2 0 3.5 1.1 5 3 1.5-1.9 3-3 5-3 3.4 0 5.5 3.4 4.3 6.6-1.8 4.8-9.3 9.4-9.3 9.4Z"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M10.5 5.5h3"/></symbol>
+  <symbol id="i-board" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M6 3.5 10.5 8 6 12.5"/></symbol>
   <symbol id="i-plus" viewBox="0 0 16 16"><path class="plus" d="M8 3v10M3 8h10"/></symbol>
   <symbol id="i-pr"viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M6 8.5v7M18 15.5V10a3 3 0 0 0-3-3h-4M13 4.5 10.5 7 13 9.5"/></symbol>
 </svg>
 <div class="page">
   <nav>
     <a class="name" href="#">leaf</a>
-    <a class="opt" href="#read">Read</a>
-    <a class="opt" href="#review">Review</a>
-    <a class="opt" href="#agent">Agents</a>
-    <a class="opt" href="#plans">Plans</a>
-    <a class="opt" href="#prs">Pull requests</a>
-    <a class="opt" href="#board">Whiteboard</a>
-    <a class="opt" href="#browser">Browser</a>
-    <a class="opt" href="#rex">Rex</a>
+    <button class="opt menu-btn" id="menu-btn" type="button" aria-expanded="false" aria-controls="menu">Features<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5"/></svg></button>
+    <div class="menu" id="menu" hidden>
+      <a href="#read" style="--c: var(--book)"><i class="tile"><svg><use href="#i-book"/></svg></i><span><b>Read</b>Papers, books, docs and the web</span></a>
+      <a href="#review" style="--c: var(--diff)"><i class="tile"><svg><use href="#i-diff"/></svg></i><span><b>Review</b>Diffs before you push</span></a>
+      <a href="#agent" style="--c: var(--paper)"><i class="tile"><svg><use href="#i-skill"/></svg></i><span><b>Agents</b>Ask about what you select</span></a>
+      <a href="#plans" style="--c: var(--pr)"><i class="tile"><svg><use href="#i-plan"/></svg></i><span><b>Plans</b>Approve before it builds</span></a>
+      <a href="#prs" style="--c: var(--pr)"><i class="tile"><svg><use href="#i-pr"/></svg></i><span><b>Pull requests</b>Your GitHub review queue</span></a>
+      <a href="#board" style="--c: var(--gold)"><i class="tile"><svg><use href="#i-board"/></svg></i><span><b>Whiteboard</b>Sketch with your agent</span></a>
+      <a href="#browser" style="--c: var(--web)"><i class="tile"><svg><use href="#i-web"/></svg></i><span><b>Browser</b>Point at a page, ask</span></a>
+      <a href="#simulator" style="--c: var(--docs)"><i class="tile"><svg><use href="#i-phone"/></svg></i><span><b>Simulator <em>New</em></b>iPhone apps beside your agent</span></a>
+      <a href="#rex" class="wide"><img src="rex.png" width="26" height="26" alt=""><span><b>Rex</b>Every action in the command palette</span></a>
+    </div>
     <a class="opt heart" href="/sponsor" aria-label="Sponsor"><svg aria-hidden="true"><use href="#i-heart"/></svg><span>Sponsor</span></a>
     <a class="nav-discord" href="/discord" aria-label="Discord">
       <svg viewBox="0 0 256 199" aria-hidden="true"><path fill="currentColor" d="M216.856 16.597A208.502 208.502 0 0 0 164.042 0c-2.275 4.113-4.933 9.645-6.766 14.046-19.692-2.961-39.203-2.961-58.533 0-1.832-4.4-4.55-9.933-6.846-14.046a207.809 207.809 0 0 0-52.855 16.638C5.618 67.147-3.443 116.4 1.087 164.956c22.169 16.555 43.653 26.612 64.775 33.193A161.094 161.094 0 0 0 79.735 175.3a136.413 136.413 0 0 1-21.846-10.632 108.636 108.636 0 0 0 5.356-4.237c42.122 19.702 87.89 19.702 129.51 0a131.66 131.66 0 0 0 5.355 4.237 136.07 136.07 0 0 1-21.886 10.653c4.006 8.02 8.638 15.67 13.873 22.848 21.142-6.58 42.646-16.637 64.815-33.213 5.316-56.288-9.08-105.09-38.056-148.36ZM85.474 135.095c-12.645 0-23.015-11.805-23.015-26.18s10.149-26.2 23.015-26.2c12.867 0 23.236 11.804 23.015 26.2.02 14.375-10.148 26.18-23.015 26.18Zm85.051 0c-12.645 0-23.014-11.805-23.014-26.18s10.148-26.2 23.014-26.2c12.867 0 23.236 11.804 23.015 26.2 0 14.375-10.148 26.18-23.015 26.18Z"/></svg>
@@ -681,7 +730,7 @@
   <header class="hero">
     <div class="hero-top" id="hero-top">
     <div class="orbit" id="orbit" aria-hidden="true"></div>
-    <a class="pill ver" href="https://github.com/DeepanshuMishraa/leaf"><svg class="gh-logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5C5.65.5.5 5.65.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.87-1.37-3.87-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>v0.18 · Free and open source</a>
+    <a class="news ver" href="#simulator"><span class="news-tag">New in v0.19</span><i class="tile" style="--c: var(--docs)"><svg><use href="#i-phone"/></svg></i>Run iPhone simulators beside your agent<svg class="news-go" viewBox="0 0 16 16" aria-hidden="true"><use href="#i-arrow"/></svg></a>
     <h1>
       <span class="line">Read <span class="chip" style="--c: var(--paper); --r: -2deg"><i class="tile"><svg><use href="#i-paper"/></svg></i>papers</span> <span class="chip" style="--c: var(--book); --r: 1.5deg"><i class="tile"><svg><use href="#i-book"/></svg></i>books</span> and <span class="chip" style="--c: var(--docs); --r: -1deg"><i class="tile"><svg><use href="#i-docs"/></svg></i>docs</span></span>
       <span class="line">Review <span class="chip" style="--c: var(--diff); --r: 1.5deg"><i class="tile"><svg><use href="#i-diff"/></svg></i>diffs</span> and <span class="chip" style="--c: var(--pr); --r: -1.5deg"><i class="tile"><svg><use href="#i-pr"/></svg></i>pull requests</span></span>
@@ -812,6 +861,25 @@
     </div>
   </section>
 
+  <section id="simulator">
+    <span class="pill">Simulator · New</span>
+    <h2>Your iPhone app, <span class="hl" style="--hl: var(--hl-blue)">one pane from your agent</span>.</h2>
+    <p class="sub">An iOS Simulator on a 3D iPhone in the Rex pane beside you. Tap, drag and type on it yourself, or let your agent drive it with <code>leaf sim</code>. Mark part of the screen and press <code>shift+cmd+a</code> to ask about it.</p>
+    <code class="run">leaf sim install</code>
+    <div class="stage">
+      <span class="scribble" style="top: 16px; left: 7%; --r: -3deg">Claude reads the screen, no screenshots</span>
+      <img src="shots/simulator.webp" width="1600" height="1058" loading="lazy" alt="Rex split in two: Claude Code on the left, and an iPhone 18 Pro simulator drawn on a 3D iPhone on the right.">
+    </div>
+    <div class="kinds card">
+      <ul>
+        <li><span class="chip" style="--c: var(--docs)"><i class="tile"><svg><use href="#i-phone"/></svg></i>Open</span><p>Pick an installed iPhone from Rex's palette. Drag beside it to turn it, pinch to zoom.</p><code>leaf sim open</code></li>
+        <li><span class="chip" style="--c: var(--diff)"><i class="tile"><svg><use href="#i-docs"/></svg></i>See</span><p>The screen's elements from iOS accessibility, one short line each. No screenshots.</p><code>leaf sim snapshot -i</code></li>
+        <li><span class="chip" style="--c: var(--pr)"><i class="tile"><svg><use href="#i-skill"/></svg></i>Act</span><p>Tap, fill, scroll, type and launch apps by ref, such as @e3.</p><code>leaf sim tap @e3</code></li>
+      </ul>
+    </div>
+    <p class="note">macOS 13 or later with Xcode. <code>leaf agent setup</code> teaches your agent the rest.</p>
+  </section>
+
   <section id="rex">
     <img class="rexmark" src="rex.png" width="96" height="96" alt="Rex">
     <h2>Built into <span class="hl" style="--hl: var(--hl-purple)">Rex</span>.</h2>
@@ -823,6 +891,7 @@
         <li class="on"><span>Leaf: Open Document…</span><em>PDF, EPUB, markdown or a link</em></li>
         <li><span>Leaf: Review This Branch</span><em>this branch against its base</em></li>
         <li><span>Leaf: Pull Requests &amp; Issues</span><em>open, merged and closed</em></li>
+        <li><span>Leaf: Open Simulator…</span><em>an iPhone on a 3D phone</em></li>
         <li><span>Leaf: Ask Agent About Selection</span><em>⇧⌘A</em></li>
         <li><span>Leaf: Choose Agent…</span><em>claude, codex, opencode…</em></li>
         <li><span>Leaf: Read Aloud / Pause</span><em>from the selection</em></li>
@@ -1066,6 +1135,31 @@
     const say = () => spans.forEach((sp, i) => { sp.className = i === at ? "now" : i < at ? "dim" : ""; });
     say();
     if (!still) setInterval(() => { at = (at + 1) % spans.length; say(); }, 420);
+  }
+
+  // Features menu: opens on click, or on hover with a mouse; closes on a pick,
+  // Escape or a click outside.
+  {
+    const btn = $("menu-btn");
+    const menu = $("menu");
+    const hover = matchMedia("(hover: hover) and (pointer: fine)").matches;
+    let timer;
+    const set = (open) => {
+      clearTimeout(timer);
+      menu.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+    };
+    // With a mouse, hovering already opened it, so a click keeps it open.
+    btn.addEventListener("click", () => set(hover || menu.hidden));
+    menu.addEventListener("click", (e) => { if (e.target.closest("a")) set(false); });
+    document.addEventListener("click", (e) => { if (!menu.hidden && !btn.contains(e.target) && !menu.contains(e.target)) set(false); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !menu.hidden) { set(false); btn.focus(); } });
+    if (hover) {
+      for (const el of [btn, menu]) {
+        el.addEventListener("mouseenter", () => set(true));
+        el.addEventListener("mouseleave", () => { timer = setTimeout(() => set(false), 180); });
+      }
+    }
   }
 
   // The palette: the picked row walks down the list.
